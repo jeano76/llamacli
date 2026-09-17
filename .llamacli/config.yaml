@@ -1,0 +1,18 @@
+# llamacli 프로젝트 설정 예시 (PROMPT.md §1, §7)
+backend: local-llama   # local-llama | openai-compatible
+model: local-model
+
+# backend: openai-compatible 일 때 사용
+# baseUrl: http://127.0.0.1:8081
+# apiKey: sk-...
+
+llama:
+  binPath: llama-server      # PATH에 있거나 절대경로
+  modelPath: ""              # 필수: .gguf 모델 경로
+  port: 8081
+  contextSize: 8192          # 8GB RAM 기본 프로파일
+  threads: 4
+  gpuLayers: 0
+
+compaction:
+  autoTriggerRatio: 0.85     # 컨텍스트 윈도우의 85% 도달 시 자동 컴팩션
