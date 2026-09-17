@@ -19,6 +19,13 @@ export interface LlamacliConfig {
   compaction: {
     autoTriggerRatio: number;
   };
+  /** Remote debugging (Chrome DevTools Protocol) for the browser tools —
+   *  connects to an already-running Chrome/Chromium started with
+   *  --remote-debugging-port, never launches one itself. */
+  browser?: {
+    debugPort: number;
+    host?: string;
+  };
 }
 
 export const DEFAULT_CONFIG: LlamacliConfig = {
@@ -33,6 +40,7 @@ export const DEFAULT_CONFIG: LlamacliConfig = {
     threads: DEFAULT_8GB_PROFILE.threads,
     gpuLayers: DEFAULT_8GB_PROFILE.gpuLayers,
   },
+  browser: { debugPort: 9222, host: "127.0.0.1" },
 };
 
 export async function loadConfig(projectRoot: string): Promise<LlamacliConfig> {

@@ -19,7 +19,7 @@ src/
   skills/       Lazy skill loading + always-on rule loading, reuses existing
                 CLI conventions (§5)
   tools/        read_file / write_file / edit_file / run_shell + ANSI-colored
-                diff rendering
+                diff rendering + browser_* (remote CDP control)
   tui/          Ink-based bottom-anchored UI: input box, status bar, spinner,
                 slash popup (§6)
 .llamacli/
@@ -38,7 +38,7 @@ src/
 >   compaction/   체크포인트 기록/재개, 컨텍스트 요약 (PROMPT.md §2)
 >   hermes/       자가 치유 회로차단기, 실패 로그, 자가 개선 제안 루프 (§3)
 >   skills/       skill 지연 로딩 + rule 상시 로딩, 기존 CLI 컨벤션 재사용 (§5)
->   tools/        read_file / write_file / edit_file / run_shell 도구 + ANSI 컬러 diff 렌더링
+>   tools/        read_file / write_file / edit_file / run_shell 도구 + ANSI 컬러 diff 렌더링 + browser_* (원격 CDP 제어)
 >   tui/          Ink 기반 하단 고정 UI: 입력창, 상태바, 스피너, 슬래시 팝업 (§6)
 > .llamacli/
 >   config.yaml   백엔드/모델/컴팩션 설정
@@ -174,3 +174,36 @@ requires the user to review it and approve with a separate command:
 > - `/quit` — 세션 종료 시 미검토 실패 로그가 있으면 즉시 종료하지 않고 자동으로 제안을
 >   분석해 보여준다. 확인 후 `/quit`을 한 번 더 누르면 종료된다(적용은 별도로 `/improve-apply`
 >   가 필요 — 종료 자체가 rule을 쓰지는 않는다).
+
+## Remote browser control (Chrome DevTools Protocol)
+
+`src/tools/browser.ts` attaches to a browser the user already has running with
+`--remote-debugging-port=<port>` (default `9222`, set in `.llamacli/config.yaml`
+under `browser:`). It **never launches or manages a browser process itself** —
+only connects to one that's already listening, over Node's built-in
+`WebSocket` (no extra dependency). Four tools are exposed to the model:
+
+- `browser_list_tabs` — list open page tabs (id/title/url).
+- `browser_navigate` — navigate a tab to a URL and wait for load.
+- `browser_eval` — evaluate JS in the page, returns the value.
+- `browser_screenshot` — capture a PNG to `.llamacli/state/screenshots/`.
+
+Verified end-to-end against a real headless Chrome instance: navigate,
+evaluate (both string and non-string return values), and a real screenshot
+that renders correctly.
+
+> ## 브라우저 원격 제어 (Chrome DevTools Protocol)
+>
+> `src/tools/browser.ts`는 사용자가 이미 `--remote-debugging-port=<port>`
+> (기본 `9222`, `.llamacli/config.yaml`의 `browser:`에서 설정)로 띄워둔 브라우저에
+> 붙는다. **절대 브라우저 프로세스를 직접 실행하거나 관리하지 않으며**, 이미 떠 있는
+> 브라우저에만 Node 내장 `WebSocket`(별도 의존성 없음)으로 연결한다. 모델에게 4개
+> 도구를 노출한다:
+>
+> - `browser_list_tabs` — 열린 탭 목록(id/title/url) 조회
+> - `browser_navigate` — 탭을 특정 URL로 이동, 로드 완료까지 대기
+> - `browser_eval` — 페이지에서 JS 표현식 실행 후 값 반환
+> - `browser_screenshot` — PNG 스크린샷을 `.llamacli/state/screenshots/`에 저장
+>
+> 실제 headless Chrome으로 end-to-end 검증 완료: navigate, eval(문자열/비문자열
+> 반환값 모두), 실제로 렌더링되는 스크린샷까지 확인.

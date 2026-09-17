@@ -1,10 +1,23 @@
 import { exec } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ToolDef } from "../backend/types.js";
 import { formatDiff } from "./diff.js";
+import * as browser from "./browser.js";
+import type { BrowserConfig } from "./browser.js";
 
 const execAsync = promisify(exec);
+
+/** Set once at startup from .llamacli/config.yaml (PROMPT.md new requirement:
+ *  remote-control an already-running browser over its CDP debug port). */
+let browserConfig: BrowserConfig = { debugPort: 9222, host: "127.0.0.1" };
+let browserScreenshotDir = join(process.cwd(), ".llamacli", "state", "screenshots");
+
+export function configureBrowserTools(config: BrowserConfig, projectRoot: string): void {
+  browserConfig = config;
+  browserScreenshotDir = join(projectRoot, ".llamacli", "state", "screenshots");
+}
 
 export const TOOL_DEFS: ToolDef[] = [
   {
@@ -86,6 +99,60 @@ export const TOOL_DEFS: ToolDef[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "browser_list_tabs",
+      description:
+        "List open page tabs on the browser attached via its remote debugging port " +
+        "(--remote-debugging-port). Does not launch a browser — only attaches to one already running.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_navigate",
+      description: "Navigate the (first, or given) browser tab to a URL and wait for it to load.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string" },
+          target_id: { type: "string", description: "Tab id from browser_list_tabs; defaults to the first tab." },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_eval",
+      description: "Evaluate a JavaScript expression in the page and return its value (JSON-stringified if not a string).",
+      parameters: {
+        type: "object",
+        properties: {
+          expression: { type: "string" },
+          target_id: { type: "string", description: "Tab id from browser_list_tabs; defaults to the first tab." },
+        },
+        required: ["expression"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_screenshot",
+      description: "Capture a PNG screenshot of the page and save it to disk; returns the saved path.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Optional output path; defaults to .llamacli/state/screenshots/<timestamp>.png" },
+          target_id: { type: "string", description: "Tab id from browser_list_tabs; defaults to the first tab." },
+        },
+      },
+    },
+  },
 ];
 
 /** Tools handled directly by the agent loop (they mutate its in-memory state)
@@ -129,6 +196,16 @@ export async function executeTool(name: string, argsJson: string): Promise<ToolR
     case "run_shell": {
       const { stdout, stderr } = await execAsync(args.command, { cwd: process.cwd() });
       return { content: stdout || stderr };
+    }
+    case "browser_list_tabs":
+      return { content: await browser.listTabs(browserConfig) };
+    case "browser_navigate":
+      return { content: await browser.navigate(browserConfig, args.url, args.target_id) };
+    case "browser_eval":
+      return { content: await browser.evaluate(browserConfig, args.expression, args.target_id) };
+    case "browser_screenshot": {
+      const path = args.path ?? join(browserScreenshotDir, `${Date.now()}.png`);
+      return { content: await browser.screenshot(browserConfig, path, args.target_id) };
     }
     default:
       throw new Error(`unknown tool: ${name}`);

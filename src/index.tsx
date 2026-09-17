@@ -8,6 +8,7 @@ import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { LlamaServerManager } from "./backend/llamaServer.js";
 import { OpenAICompatibleClient } from "./backend/openaiClient.js";
 import { AgentLoop } from "./agent/loop.js";
+import { configureBrowserTools } from "./tools/index.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -15,7 +16,12 @@ conventions, never make unverified changes, and confirm before destructive comma
 
 When starting a task that needs multiple steps, declare them with the update_plan tool, and
 update each step's status (todo/in_progress/done) as it starts or finishes. This plan survives
-context compaction, so work can resume accurately after it.`;
+context compaction, so work can resume accurately after it.
+
+You can also remotely control a browser the user already has running with
+--remote-debugging-port, via browser_list_tabs / browser_navigate / browser_eval /
+browser_screenshot. These attach to an existing tab only — never assume a browser is running,
+and never try to launch one yourself.`;
 
 async function main() {
   const projectRoot = process.cwd();
@@ -23,6 +29,7 @@ async function main() {
   const rules = await loadRules(projectRoot);
   const skillIndex = await loadSkillIndex(projectRoot);
   const systemPrompt = injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT, rules);
+  configureBrowserTools(config.browser ?? { debugPort: 9222, host: "127.0.0.1" }, projectRoot);
 
   let backend: OpenAICompatibleClient;
   if (config.backend === "local-llama" && config.llama?.modelPath) {

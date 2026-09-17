@@ -16,3 +16,8 @@ llama:
 
 compaction:
   autoTriggerRatio: 0.85     # 컨텍스트 윈도우의 85% 도달 시 자동 컴팩션
+
+browser:
+  # 이미 --remote-debugging-port=9222 로 띄워둔 브라우저에만 붙는다. 새 브라우저를 실행하지 않음.
+  debugPort: 9222
+  host: 127.0.0.1

@@ -13,6 +13,14 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
 핵심 목표다. 특히 **컨텍스트가 길어지며 이전 지시나 진행 상황을 잊어버리는 문제**를
 구조적으로 방지해야 한다.
 
+## 1.5 브라우저 원격 제어 (Chrome DevTools Protocol)
+
+사용자가 요청한 추가 기능: 브라우저 디버그 포트(`--remote-debugging-port`)로 이미 떠
+있는 브라우저를 원격으로 호출해 조작할 수 있어야 한다.
+- 브라우저 프로세스를 직접 실행/관리하지 않는다 — 이미 실행 중인 것에만 붙는다.
+- 탭 목록 조회, URL 이동, JS 평가, 스크린샷 캡처를 최소 기능으로 제공한다.
+- 디버그 포트/호스트는 설정 파일(`.llamacli/config.yaml`)로 관리한다.
+
 ## 1. 모델 백엔드
 
 - 로컬 `llama.cpp` 서버(`llama-server`)를 **직접** 호출하는 클라이언트를 구현한다
@@ -174,6 +182,13 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
   실제 토크나이저(llama.cpp `/tokenize`) 연동과 함께 AgentLoop → UI로 사용량 전달 필요.
 - 로그의 `log.slice(-logHeight)`가 항목(entry) 개수 기준이라, 여러 줄짜리 diff 항목은
   렌더링 시 줄 단위로 펼쳐지므로 화면이 `logHeight`보다 살짝 넘칠 수 있음(사소한 표시 한계).
+
+### 8.2 추가 항목: 브라우저 원격 제어 (§1.5)
+
+✅ `src/tools/browser.ts` + `browser_list_tabs`/`browser_navigate`/`browser_eval`/
+`browser_screenshot` 도구로 구현. 실제 headless Chrome(`--remote-debugging-port`)에
+붙여 탭 목록 조회 → 페이지 이동(로드 완료 대기 확인) → JS 평가(문자열/숫자 반환값
+모두) → 스크린샷 캡처(실제 PNG 렌더링 확인)까지 end-to-end 실기 검증 완료.
 
 ---
 *이 문서는 구현을 지시하기 위한 명세서이며, 각 섹션은 별도 이슈/작업 단위로 분리해
