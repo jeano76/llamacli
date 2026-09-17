@@ -122,30 +122,58 @@ real thing.
 
 ## Implementation status
 
-The following are known remaining TODOs:
+All four previously-known TODOs here are now resolved:
 
-- Checkpoint `pendingToolCall` collection — the current architecture only
-  checks for compaction between turns, so this is always `null`. Supporting
-  mid-turn interruption would need a compaction check inside the tool-call
-  loop too.
-- The log's `log.slice(-logHeight)` cuts by entry count, but a multi-line
-  diff entry expands into several rendered lines, so the screen can slightly
-  overflow `logHeight`.
-- The StatusBar's context gauge isn't wired to a real tokenizer yet — it
-  still uses `estimateTokens` (a character-count approximation). Needs the
-  actual llama.cpp `/tokenize` endpoint plus a path from AgentLoop → UI for
-  live usage.
+- ✅ Checkpoint `pendingToolCall` collection — compaction is now also checked
+  between individual tool calls within a batch (not just between turns). If
+  it fires mid-batch, the about-to-run call is recorded as `pendingToolCall`
+  and the rest of that batch is abandoned (the assistant message that
+  requested it gets summarized away, so there's no valid tool_call_id left
+  to answer anyway) — the resume prompt has the model reissue it next turn.
+- ✅ Log height overflow — `App.tsx` now flattens log entries into rendered
+  rows *before* slicing to `logHeight`, so a multi-line diff entry can no
+  longer push the visible tail off-screen.
+- ✅ Real tokenizer — `estimateTokens` uses the backend's `/tokenize`
+  endpoint (llama.cpp-specific) when available, falling back to the
+  character-count approximation for backends that don't have it (verified
+  against a real llama-server: exact token counts match). `AgentLoop` now
+  has an `onContextUsage` callback wired straight to the StatusBar gauge.
+- ✅ `resumeIfCheckpointExists()` used to only inject a system message and
+  then sit idle — it didn't actually drive a turn, so "resume automatically,
+  no user input required" (PROMPT.md §2.4) wasn't really true. It now runs
+  the turn itself, and clears the checkpoint *before* starting it (so a
+  fresh checkpoint written by a compaction during that very turn survives).
+  Also fixed `clearCheckpoint()`, which was overwriting the file with an
+  empty string instead of deleting it — `readCheckpoint()` would then throw
+  a `SyntaxError` instead of cleanly returning `null`.
+
+All four are covered by unit tests (`src/agent/loop.test.ts`,
+`src/compaction/checkpoint.test.ts`, `src/compaction/compactor.test.ts`).
 
 > ## 구현 상태
 >
-> 이 저장소는 PROMPT.md의 뼈대(스캐폴드)이며, 다음은 TODO로 남아 있다:
+> 이전까지 남아있던 TODO 4개는 모두 해결됨:
 >
-> - 체크포인트의 `pendingToolCall` 수집 (현재 아키텍처는 턴 사이에서만 컴팩션을 체크하므로
->   항상 null — 턴 도중 중단을 지원하려면 도구 실행 루프 안에서도 컴팩션 체크가 필요)
-> - 로그의 `log.slice(-logHeight)`는 항목(entry) 개수 기준으로 잘라내는데, 여러 줄짜리
->   diff 항목은 렌더링 시 줄 단위로 펼쳐지므로 화면이 `logHeight`보다 살짝 넘칠 수 있음
-> - StatusBar의 컨텍스트 게이지가 아직 `estimateTokens`(문자 수 기반 추정치)에 연결되지 않음 —
->   실제 토크나이저(llama.cpp `/tokenize`) 연동과 함께 AgentLoop → UI로 사용량을 전달해야 함
+> - ✅ 체크포인트 `pendingToolCall` 수집 — 이제 배치 내 개별 도구 호출 사이에도 컴팩션을
+>   체크한다(턴 사이뿐 아니라). 중간에 발동하면 지금 실행하려던 호출을 `pendingToolCall`로
+>   기록하고 나머지 배치는 포기한다(그 호출을 요청한 assistant 메시지 자체가 요약되어
+>   사라지므로 응답할 tool_call_id가 더 이상 유효하지 않기 때문) — 재개 프롬프트가 다음
+>   턴에 모델이 다시 호출하도록 유도한다.
+> - ✅ 로그 높이 초과 — `App.tsx`가 이제 `logHeight`로 자르기 *전에* 로그 항목을 렌더링
+>   행 단위로 먼저 펼쳐서, 여러 줄짜리 diff 항목이 더 이상 최신 내용을 화면 밖으로 밀어내지
+>   않는다.
+> - ✅ 실제 토크나이저 — `estimateTokens`가 백엔드의 `/tokenize`(llama.cpp 전용) 엔드포인트를
+>   쓰되, 없는 백엔드는 문자 수 근사치로 폴백한다(실제 llama-server로 검증: 토큰 수 정확히
+>   일치). `AgentLoop`에 `onContextUsage` 콜백을 추가해 StatusBar 게이지에 바로 연결.
+> - ✅ `resumeIfCheckpointExists()`가 기존에는 system 메시지만 주입하고 그냥 대기했음 —
+>   실제로 턴을 진행시키지 않아서 "사용자 재입력 없이 자동 재개"(PROMPT.md §2.4)가 사실이
+>   아니었음. 이제 직접 턴을 실행하며, 체크포인트는 턴 시작 *전에* 지운다(그 턴 도중 새
+>   컴팩션이 발생해 새 체크포인트가 써지면 그게 지워지지 않도록). 덤으로 `clearCheckpoint()`가
+>   파일을 삭제하는 대신 빈 문자열로 덮어써서 `readCheckpoint()`가 `SyntaxError`를 던지던
+>   버그도 수정.
+>
+> 4가지 전부 유닛테스트로 커버됨(`src/agent/loop.test.ts`,
+> `src/compaction/checkpoint.test.ts`, `src/compaction/compactor.test.ts`).
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

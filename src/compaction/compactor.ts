@@ -13,14 +13,32 @@ export interface CompactionResult {
   checkpoint: Checkpoint;
 }
 
-/** Very rough token estimate until a real tokenizer is wired in (llama.cpp /tokenize). */
-export function estimateTokens(messages: ChatMessage[]): number {
+function charBasedEstimate(messages: ChatMessage[]): number {
   const chars = messages.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0);
   return Math.ceil(chars / 4);
 }
 
-export function shouldCompact(messages: ChatMessage[], thresholds: CompactionThresholds): boolean {
-  const used = estimateTokens(messages);
+/** Uses the backend's real tokenizer (llama.cpp `/tokenize`) when available;
+ *  falls back to a chars/4 approximation when the backend has no tokenizer
+ *  or the call fails (e.g. a generic OpenAI-compatible endpoint without it). */
+export async function estimateTokens(messages: ChatMessage[], backend?: ModelBackend): Promise<number> {
+  if (backend?.tokenize) {
+    try {
+      const text = messages.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+      return await backend.tokenize(text);
+    } catch {
+      // tokenizer unavailable/errored — fall through to the approximation
+    }
+  }
+  return charBasedEstimate(messages);
+}
+
+export async function shouldCompact(
+  messages: ChatMessage[],
+  thresholds: CompactionThresholds,
+  backend?: ModelBackend
+): Promise<boolean> {
+  const used = await estimateTokens(messages, backend);
   return used >= thresholds.contextWindowTokens * thresholds.autoTriggerRatio;
 }
 

@@ -188,13 +188,26 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
    덮어쓰지 않음)로 분리. `/quit` 시 미검토 실패 로그가 있으면 자동으로 제안을 보여주고
    한 번 더 `/quit`해야 종료되도록 세션 종료 시점 트리거도 연결.
 
-### 8.1 남은 TODO (README "구현 상태"와 동기화)
-- 체크포인트의 `pendingToolCall` 수집 — 현재는 턴 사이에서만 컴팩션을 체크하므로 항상
-  `null`. 턴 도중 중단을 지원하려면 도구 실행 루프 안에서도 컴팩션 체크가 필요.
-- StatusBar의 컨텍스트 게이지가 아직 `estimateTokens`(문자 수 기반 추정치)에 연결됨 —
-  실제 토크나이저(llama.cpp `/tokenize`) 연동과 함께 AgentLoop → UI로 사용량 전달 필요.
-- 로그의 `log.slice(-logHeight)`가 항목(entry) 개수 기준이라, 여러 줄짜리 diff 항목은
-  렌더링 시 줄 단위로 펼쳐지므로 화면이 `logHeight`보다 살짝 넘칠 수 있음(사소한 표시 한계).
+### 8.1 남은 TODO — 전부 해결됨 (README "구현 상태"와 동기화)
+- ✅ 체크포인트의 `pendingToolCall` 수집 — `AgentLoop`에 `maybeCompact()` 헬퍼를 추가해
+  턴 사이뿐 아니라 배치 내 개별 도구 호출 사이에도 컴팩션을 체크하도록 변경. 중간에
+  발동하면 그 호출을 `pendingToolCall`로 기록하고 나머지 배치는 포기(해당 assistant
+  메시지가 요약되어 사라지므로 tool_call_id가 무효화됨) — `src/agent/loop.test.ts`로
+  검증(가짜 백엔드로 정확히 두 번째 도구 호출 직전에 컴팩션을 발동시켜 체크포인트의
+  `pendingToolCall`/`steps` 내용을 확인).
+- ✅ StatusBar 컨텍스트 게이지 — `estimateTokens`가 백엔드의 `/tokenize`(llama.cpp
+  전용) 를 쓰고 없으면 문자 수 근사치로 폴백하도록 변경, `AgentLoop`에
+  `onContextUsage` 콜백을 추가해 UI로 실사용량 전달. 실제 llama-server의 `/tokenize`로
+  실기 검증(반환된 토큰 개수가 raw 호출과 정확히 일치).
+- ✅ 로그의 `log.slice(-logHeight)` 표시 한계 — `App.tsx`가 이제 로그 항목을 렌더링
+  행 단위로 먼저 펼친 뒤 `logHeight`로 자르도록 수정, 멀티라인 diff가 최신 내용을
+  화면 밖으로 밀어내는 문제 해결.
+- ✅ **(발견되어 함께 고친 추가 버그)** `resumeIfCheckpointExists()`가 재개 안내
+  system 메시지만 주입하고 실제로 턴을 진행시키지 않아 "사용자 재입력 없이 자동
+  재개"(§2.4)가 실제로는 동작하지 않던 문제 — 이제 직접 턴을 실행하고, 체크포인트는
+  턴 시작 전에 지운다. 함께 발견된 `clearCheckpoint()`가 파일을 삭제하지 않고 빈
+  문자열로 덮어써 `readCheckpoint()`가 `SyntaxError`를 던지던 버그도 수정.
+  `src/agent/loop.test.ts`/`src/compaction/checkpoint.test.ts`로 검증.
 
 ### 8.2 추가 항목: 브라우저 원격 제어 (§1.5)
 

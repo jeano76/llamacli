@@ -3,7 +3,8 @@ import { AGENT_STATE_TOOLS, FILE_TOOLS, TOOL_DEFS, executeTool } from "../tools/
 import { CircuitBreaker } from "../hermes/selfHeal.js";
 import { logFailure, getFailureLog } from "../hermes/selfHeal.js";
 import { proposeImprovement, writeProposedRule, ImprovementProposal } from "../hermes/selfImprove.js";
-import { runCompaction, shouldCompact, buildResumePrompt, CompactionThresholds } from "../compaction/compactor.js";
+import { runCompaction, estimateTokens, buildResumePrompt, CompactionThresholds } from "../compaction/compactor.js";
+import { clearCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
 
 export interface AgentLoopOptions {
@@ -21,6 +22,10 @@ export interface AgentLoopOptions {
   /** ANSI-colored diff for a file-mutating tool call, UI-only. */
   onDiff?: (path: string, diff: string) => void;
   onStatus?: (status: string) => void;
+  /** Fires whenever context usage is (re-)measured, so the UI's context
+   *  battery gauge can reflect real usage (PROMPT.md §2.5) instead of being
+   *  disconnected from the agent loop. */
+  onContextUsage?: (usedTokens: number, totalTokens: number) => void;
 }
 
 /**
@@ -52,12 +57,23 @@ export class AgentLoop {
     this.messages = [{ role: "system", content: opts.systemPrompt }];
   }
 
+  /** PROMPT.md §2.4: on startup, if a checkpoint was left behind (compaction
+   *  fired in a previous session that then exited/crashed before finishing),
+   *  resume automatically — no user input required. */
   async resumeIfCheckpointExists(): Promise<void> {
-    const resumeText = await buildResumePrompt(this.opts.projectRoot);
-    if (resumeText) {
+    await this.enqueue(async () => {
+      const resumeText = await buildResumePrompt(this.opts.projectRoot);
+      if (!resumeText) return;
+
       this.opts.onStatus?.(resumeText);
       this.messages.push({ role: "system", content: resumeText });
-    }
+      // Consume the checkpoint before running the turn (not after): if this
+      // resumed turn itself triggers a fresh compaction, that new checkpoint
+      // must survive — clearing afterward would wipe it out along with the
+      // one we just consumed.
+      await clearCheckpoint(this.opts.projectRoot);
+      await this.runUntilIdle();
+    });
   }
 
   async send(userText: string): Promise<void> {
@@ -83,9 +99,7 @@ export class AgentLoop {
 
   private async runUntilIdle(): Promise<void> {
     while (true) {
-      if (shouldCompact(this.messages, this.opts.thresholds)) {
-        await this.compact();
-      }
+      await this.maybeCompact();
 
       const res = await this.opts.backend.chat(
         { model: this.opts.model, messages: this.messages, tools: TOOL_DEFS, stream: true },
@@ -109,6 +123,24 @@ export class AgentLoop {
           return;
         }
         this.breaker.record({ toolName: call.function.name, argsSignature: call.function.arguments });
+
+        // Check compaction between individual tool calls too, not just
+        // between turns — otherwise pendingToolCall (PROMPT.md §2.2) can
+        // never be captured, since a whole batch of tool calls always ran
+        // to completion before the next compaction check. If it fires here,
+        // this call (and any after it in the same batch) is abandoned in
+        // favor of the checkpoint's resume prompt reissuing it next turn —
+        // the assistant message that requested it gets summarized away by
+        // compact(), so there's no valid tool_call_id left to answer anyway.
+        if (
+          await this.maybeCompact({
+            name: call.function.name,
+            argumentsJson: call.function.arguments,
+            reason: "compaction threshold hit before this call could run",
+          })
+        ) {
+          return;
+        }
 
         this.opts.onToolCall?.(call.function.name, call.function.arguments);
 
@@ -192,16 +224,32 @@ export class AgentLoop {
   /** Entry point for the /compact slash command — runs compaction immediately
    *  regardless of current context usage. */
   async forceCompact(): Promise<void> {
-    await this.enqueue(() => this.compact("manual"));
+    await this.enqueue(() => this.compact("manual", null));
   }
 
-  private async compact(reason: Checkpoint["reason"] = "auto-threshold"): Promise<void> {
+  /** Measures current context usage, reports it to the UI (§2.5), and
+   *  compacts if over threshold. Returns whether it compacted, so callers
+   *  mid-tool-call-batch know to abandon the rest of the batch. */
+  private async maybeCompact(pendingToolCall: Checkpoint["pendingToolCall"] = null): Promise<boolean> {
+    const used = await estimateTokens(this.messages, this.opts.backend);
+    this.opts.onContextUsage?.(used, this.opts.thresholds.contextWindowTokens);
+    if (used >= this.opts.thresholds.contextWindowTokens * this.opts.thresholds.autoTriggerRatio) {
+      await this.compact("auto-threshold", pendingToolCall);
+      return true;
+    }
+    return false;
+  }
+
+  private async compact(
+    reason: Checkpoint["reason"],
+    pendingToolCall: Checkpoint["pendingToolCall"]
+  ): Promise<void> {
     const partial: Omit<Checkpoint, "version" | "timestamp"> = {
       reason,
       goal: this.currentGoalSummary(),
       steps: this.currentSteps(),
       files: this.currentFiles(),
-      pendingToolCall: null,
+      pendingToolCall,
       mustPreserve: [],
     };
     const { messages, checkpoint } = await runCompaction(

@@ -31,6 +31,19 @@ export class OpenAICompatibleClient implements ModelBackend {
     return json.data.map((m) => m.id);
   }
 
+  /** llama.cpp-server-specific endpoint (not all OpenAI-compatible servers
+   *  have it) — callers must be ready for this to throw and fall back. */
+  async tokenize(text: string): Promise<number> {
+    const res = await fetch(`${this.baseUrl}/tokenize`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ content: text }),
+    });
+    if (!res.ok) throw new Error(`tokenize failed: ${res.status} ${await res.text()}`);
+    const json = (await res.json()) as { tokens: unknown[] };
+    return json.tokens.length;
+  }
+
   async chat(
     req: ChatCompletionRequest,
     onDelta?: (chunk: ChatCompletionChunk) => void

@@ -5,27 +5,63 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { estimateTokens, shouldCompact, buildResumePrompt } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
-import type { ChatMessage } from "../backend/types.js";
+import type { ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
-test("estimateTokens approximates chars/4 across all messages", () => {
+function fakeBackendWithTokenizer(tokensPerCall: number | ((text: string) => number)): ModelBackend {
+  return {
+    async chat(): Promise<ChatCompletionResponse> {
+      throw new Error("not used in these tests");
+    },
+    async listModels() {
+      return [];
+    },
+    async tokenize(text: string) {
+      return typeof tokensPerCall === "function" ? tokensPerCall(text) : tokensPerCall;
+    },
+  };
+}
+
+test("estimateTokens approximates chars/4 across all messages when no tokenizer is available", async () => {
   const messages: ChatMessage[] = [
     { role: "user", content: "a".repeat(40) },
     { role: "assistant", content: "b".repeat(20) },
   ];
-  assert.equal(estimateTokens(messages), 15); // (40+20)/4
+  assert.equal(await estimateTokens(messages), 15); // (40+20)/4
 });
 
-test("estimateTokens ignores non-string content (e.g. tool_calls-only messages)", () => {
+test("estimateTokens ignores non-string content (e.g. tool_calls-only messages)", async () => {
   const messages: ChatMessage[] = [{ role: "assistant", content: null as any }];
-  assert.equal(estimateTokens(messages), 0);
+  assert.equal(await estimateTokens(messages), 0);
 });
 
-test("shouldCompact is false below the threshold and true at/above it", () => {
+test("estimateTokens uses the backend's real tokenizer when one is available", async () => {
+  const messages: ChatMessage[] = [{ role: "user", content: "x".repeat(400) }]; // char/4 estimate would be 100
+  const backend = fakeBackendWithTokenizer(7); // but the "real" tokenizer says 7
+  assert.equal(await estimateTokens(messages, backend), 7);
+});
+
+test("estimateTokens falls back to the char-based estimate when the tokenizer throws", async () => {
+  const messages: ChatMessage[] = [{ role: "user", content: "a".repeat(40) }];
+  const backend: ModelBackend = {
+    async chat(): Promise<ChatCompletionResponse> {
+      throw new Error("not used");
+    },
+    async listModels() {
+      return [];
+    },
+    async tokenize() {
+      throw new Error("tokenizer endpoint not implemented by this server");
+    },
+  };
+  assert.equal(await estimateTokens(messages, backend), 10); // 40/4, the fallback
+});
+
+test("shouldCompact is false below the threshold and true at/above it", async () => {
   const thresholds = { autoTriggerRatio: 0.5, contextWindowTokens: 100 };
   const small: ChatMessage[] = [{ role: "user", content: "x".repeat(4 * 40) }]; // 40 tokens, < 50
   const big: ChatMessage[] = [{ role: "user", content: "x".repeat(4 * 60) }]; // 60 tokens, >= 50
-  assert.equal(shouldCompact(small, thresholds), false);
-  assert.equal(shouldCompact(big, thresholds), true);
+  assert.equal(await shouldCompact(small, thresholds), false);
+  assert.equal(await shouldCompact(big, thresholds), true);
 });
 
 test("buildResumePrompt returns null when there's no checkpoint", async () => {

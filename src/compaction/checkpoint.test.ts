@@ -51,14 +51,22 @@ test("writeCheckpoint creates .llamacli/state/ if it doesn't exist yet", async (
   }
 });
 
-test("clearCheckpoint makes readCheckpoint fail to parse (not throw ENOENT)", async () => {
+test("clearCheckpoint deletes the file so readCheckpoint returns null afterward", async () => {
   const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
   try {
     await writeCheckpoint(dir, sample());
+    assert.ok(await readCheckpoint(dir));
     await clearCheckpoint(dir);
-    // the file exists but is now empty — JSON.parse("") throws a SyntaxError,
-    // which readCheckpoint does NOT special-case (only ENOENT returns null).
-    await assert.rejects(() => readCheckpoint(dir), SyntaxError);
+    assert.equal(await readCheckpoint(dir), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("clearCheckpoint on a project with no checkpoint yet is a no-op, not an error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+  try {
+    await assert.doesNotReject(() => clearCheckpoint(dir));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -62,6 +62,8 @@ async function main() {
     onToolCall: (name, args) => (globalThis as any).__llamacli_ui?.pushTool(`[tool] ${name} ${args}`),
     onDiff: (_path, diff) => (globalThis as any).__llamacli_ui?.pushDiff(diff),
     onStatus: (s) => (globalThis as any).__llamacli_ui?.pushStatus(s),
+    onContextUsage: (used, total) =>
+      (globalThis as any).__llamacli_ui?.setContextUsedRatio(total > 0 ? Math.min(1, used / total) : 0),
   });
 
   // Session-end self-improvement gate (PROMPT.md §3): if failures were

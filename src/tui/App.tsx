@@ -133,25 +133,36 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   const rows = stdout?.rows ?? 24;
   const logHeight = Math.max(3, rows - 6);
 
+  // Slicing `log` itself by logHeight is wrong: a single multi-line diff
+  // entry expands into several rendered rows, so a naive slice can hand the
+  // fixed-height Box more rows than it can show — and since Box clips from
+  // the bottom, that clips off the MOST recent lines (e.g. a status message
+  // right after a diff) instead of showing them. Flatten to visual rows
+  // first, then slice by rendered row count so the tail is always what's
+  // visible. Pre-slice raw entries generously first so this stays cheap on
+  // long sessions instead of flattening the whole history every render.
+  const recentEntries = log.slice(-Math.max(logHeight * 5, 50));
+  const visualRows = recentEntries.flatMap((line) =>
+    line.kind === "diff"
+      ? // Diff text carries its own embedded ANSI color codes (added/removed
+        // lines), so render it raw instead of through Ink's `color` prop,
+        // which would wrap (and clash with) the codes already inside it.
+        line.text.split("\n").map((rawLine, i) => <Text key={`${line.id}-${i}`}>{rawLine}</Text>)
+      : [
+          <Text
+            key={line.id}
+            color={line.kind === "assistant" ? "white" : line.kind === "tool" ? "magenta" : "gray"}
+          >
+            {line.kind === "user" ? "> " : ""}
+            {line.text}
+          </Text>,
+        ]
+  );
+
   return (
     <Box flexDirection="column" height={rows}>
       <Box flexDirection="column" height={logHeight} overflow="hidden">
-        {log.slice(-logHeight).flatMap((line) =>
-          line.kind === "diff"
-            ? // Diff text carries its own embedded ANSI color codes (added/removed
-              // lines), so render it raw instead of through Ink's `color` prop,
-              // which would wrap (and clash with) the codes already inside it.
-              line.text.split("\n").map((rawLine, i) => <Text key={`${line.id}-${i}`}>{rawLine}</Text>)
-            : [
-                <Text
-                  key={line.id}
-                  color={line.kind === "assistant" ? "white" : line.kind === "tool" ? "magenta" : "gray"}
-                >
-                  {line.kind === "user" ? "> " : ""}
-                  {line.text}
-                </Text>,
-              ]
-        )}
+        {visualRows.slice(-logHeight)}
       </Box>
 
       <Box borderStyle="single" borderColor="gray" />

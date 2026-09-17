@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 /** Machine-parseable state written right before compaction runs (PROMPT.md §2.2).
@@ -50,7 +50,9 @@ export async function readCheckpoint(projectRoot: string): Promise<Checkpoint | 
   }
 }
 
-/** Clears the checkpoint once its work has been successfully resumed and verified. */
+/** Clears the checkpoint once its work has been successfully resumed and verified.
+ *  Deletes the file outright (not an empty write) so a subsequent readCheckpoint()
+ *  correctly returns null via its ENOENT path instead of failing to parse "". */
 export async function clearCheckpoint(projectRoot: string): Promise<void> {
-  await writeFile(checkpointPath(projectRoot), "", "utf8").catch(() => {});
+  await rm(checkpointPath(projectRoot), { force: true });
 }

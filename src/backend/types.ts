@@ -58,4 +58,12 @@ export interface ModelBackend {
   ): Promise<ChatCompletionResponse>;
 
   listModels(): Promise<string[]>;
+
+  /** llama.cpp-server-specific `/tokenize` endpoint — not part of the
+   *  OpenAI Chat Completions spec, so it's optional. Callers must fall back
+   *  to an approximation (see compaction/compactor.ts estimateTokens) when
+   *  this is absent or throws, since a generic OpenAI-compatible endpoint
+   *  (e.g. real OpenAI, or another server that doesn't implement it) won't
+   *  have it. Returns the exact token count for the given text. */
+  tokenize?(text: string): Promise<number>;
 }
