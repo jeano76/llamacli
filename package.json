@@ -7,10 +7,11 @@
     "llamacli": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/skills/builtin && cp src/skills/builtin/*.md dist/skills/builtin/",
     "dev": "tsx src/index.tsx",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
     "ink": "^4.4.1",

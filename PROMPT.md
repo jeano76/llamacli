@@ -94,6 +94,14 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
 - 파괴적 명령(삭제, force-push 등) 전 확인
 - 보안 기본기(입력 검증, 시크릿 하드코딩 금지 등)
 을 시스템 프롬프트 레벨에서 내장한다.
+- **모든 코드는 유닛테스트로 검증·유지관리되어야 한다** — 새 로직을 추가할 때
+  `*.test.ts`를 함께 작성하고, 변경 시 관련 테스트를 갱신한다(§7의 비기능 요구사항이자
+  이 skill 자체가 요구하는 습관). 순수 로직(파싱, diff, circuit breaker, 트리거 매칭
+  등)은 유닛테스트로, 스트리밍/TUI처럼 실제 구동 검증이 더 실질적인 부분은 통합
+  테스트(실제 서버 대상 스크립트 구동)로 커버한다.
+- 위 항목들은 시스템 프롬프트 텍스트로만 존재하지 않고, `src/skills/builtin/`의
+  구체적인 skill 세트(아키텍처 설계/기획/구현/리뷰/화이트박스·블랙박스 테스트/
+  정적분석/보안)로도 내장되어 트리거 매칭 시 지침이 로드된다 — §5 참고.
 
 ## 5. Skill / Rule 지원
 
@@ -109,12 +117,17 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
     발견되는 것은 전부 합쳐서 로드하고, 하나도 없을 때만 `.llamacli/rules/00-core.md`를
     자동 생성한다.
   - skill: `.llamacli/skills/*.md`(자체 포맷) + `.claude/skills/<name>/SKILL.md`
-    (Claude Code 포맷) — 둘 다 없을 때만 `.llamacli/skills/write-tests.md`를 자동 생성한다.
+    (Claude Code 포맷) — 프로젝트에 있는 것은 전부 합쳐서 로드한다.
 - 프로젝트 루트에서 rule 파일을 자동 탐색해 세션 시작 시 시스템 프롬프트에 주입한다
   (일부 로컬 모델은 이를 자동으로 읽지 않으므로, 명시적으로 프롬프트 앞단에 강제
   주입하는 방식을 취한다).
 - skill은 이름 + 트리거 설명을 가진 인덱스를 먼저 로드하고, 실제 내용은 매칭 시에만
   지연 로딩한다(컨텍스트 절약).
+- **llamacli 자체 빌트인 skill 세트**(`src/skills/builtin/`)는 프로젝트가 무엇을
+  가지고 있든 항상 인덱스에 포함된다(§4): `architecture-design`, `planning`,
+  `implementation`, `code-review`, `whitebox-testing`, `blackbox-testing`,
+  `static-analysis`, `security`. 프로젝트 자체 skill과 동일한 포맷이라 프로젝트
+  쪽에서 같은 이름으로 재정의/추가하는 것도 가능하다.
 
 ## 6. UX / TUI 요구사항 (Claude Code 스타일)
 
@@ -189,6 +202,26 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
 `browser_screenshot` 도구로 구현. 실제 headless Chrome(`--remote-debugging-port`)에
 붙여 탭 목록 조회 → 페이지 이동(로드 완료 대기 확인) → JS 평가(문자열/숫자 반환값
 모두) → 스크린샷 캡처(실제 PNG 렌더링 확인)까지 end-to-end 실기 검증 완료.
+
+### 8.3 추가 항목: 빌트인 skill 세트 + 유닛테스트 (§4)
+
+✅ `src/skills/builtin/`에 architecture-design/planning/implementation/code-review/
+whitebox-testing/blackbox-testing/static-analysis/security 8개 skill을 추가하고,
+`loadSkillIndex`가 프로젝트 상태와 무관하게 항상 이들을 포함하도록 변경(기존의
+"아무것도 없으면 skill 1개 자동생성" 폴백 로직은 제거 — 이제 빌트인이 항상 있으므로
+불필요).
+
+✅ **모든 로직 있는 모듈에 유닛테스트를 붙임** (Node 내장 `node:test`, `tsx --test`로
+구동, 별도 프레임워크 의존성 없음, `npm test`): `tools/diff.ts`, `tools/browser.ts`
+(fake HTTP 서버로 타겟 선택/에러 경로 커버), `hermes/selfHeal.ts`,
+`hermes/selfImprove.ts`(fake `ModelBackend`), `compaction/compactor.ts`,
+`compaction/checkpoint.ts`, `skills/loader.ts` — 총 44개 테스트, 전부 통과.
+**테스트 작성 중 실제 버그를 하나 발견해 수정함**: 브라우저 디버그 포트에 아예
+연결이 안 될 때(`fetch()` 자체가 reject) 안내 메시지 없이 raw `TypeError: fetch
+failed`가 그대로 전파되던 문제 — `listTargets`에서 fetch 실패도 감싸도록 고침.
+에이전트 루프/TUI는 여전히 pty 기반 통합 검증(§8 각 항목의 실기 검증 기록)으로
+커버 — Ink 렌더링을 모킹하는 것보다 실제 구동이 더 신뢰도가 높다고 판단해 의도적으로
+유닛테스트 대상에서 제외.
 
 ---
 *이 문서는 구현을 지시하기 위한 명세서이며, 각 섹션은 별도 이슈/작업 단위로 분리해

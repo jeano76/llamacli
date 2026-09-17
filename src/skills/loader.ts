@@ -1,5 +1,6 @@
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface SkillIndexEntry {
   name: string;
@@ -34,6 +35,11 @@ const OWN_SKILLS_DIR = ".llamacli/skills";
 /** Claude Code's skill convention: one subdirectory per skill, each with a
  *  SKILL.md carrying `name`/`description` YAML frontmatter. */
 const CLAUDE_CODE_SKILLS_DIR = ".claude/skills";
+/** Skills llamacli ships with itself (PROMPT.md §4/§5): a coding agent
+ *  should have these fundamentals built in regardless of what a given
+ *  project provides. Resolved relative to this module so it works the same
+ *  whether running from src/ (tsx) or dist/ (built). */
+const BUILTIN_SKILLS_DIR = join(dirname(fileURLToPath(import.meta.url)), "builtin");
 
 function extractFrontmatterField(content: string, field: string): string {
   const frontmatter = content.match(/^---\n([\s\S]*?)\n---/);
@@ -139,31 +145,40 @@ async function loadClaudeCodeSkillIndex(projectRoot: string): Promise<SkillIndex
   return index;
 }
 
-const DEFAULT_OWN_SKILL = `---
-trigger: user asks to write or update tests for changed code
----
-
-# Write tests for changes
-
-When a code change touches logic (not just docs/comments), check whether
-existing tests cover it. If not, add a focused test for the new behavior
-rather than expanding scope elsewhere. Run the test suite afterward and
-report the result — don't claim success without having run it.
-`;
+/** llamacli's built-in skill set: architecture design, planning,
+ *  implementation, code review, white-box/black-box testing, static
+ *  analysis, security. Always loaded, independent of what the project has —
+ *  these are the "senior engineer fundamentals" PROMPT.md §4 asks for. */
+async function loadBuiltinSkillIndex(): Promise<SkillIndexEntry[]> {
+  const index: SkillIndexEntry[] = [];
+  try {
+    const entries = await readdir(BUILTIN_SKILLS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+      const path = join(BUILTIN_SKILLS_DIR, entry.name);
+      const content = await readFile(path, "utf8");
+      index.push({
+        name: entry.name.replace(/\.md$/, ""),
+        trigger: extractFrontmatterField(content, "trigger"),
+        path,
+      });
+    }
+  } catch {
+    // shouldn't happen (shipped with the package), but don't crash the CLI over it
+  }
+  return index;
+}
 
 /** Skills are lazily loaded: only the name+trigger index is read up front
- *  (§5). Reuses `.llamacli/skills/*.md` and Claude Code's `.claude/skills/`
- *  when present; generates one starter skill of our own only when neither
- *  convention has anything in this project. */
+ *  (§5). Always includes llamacli's built-in skill set, plus whatever the
+ *  project itself provides via `.llamacli/skills/*.md` or Claude Code's
+ *  `.claude/skills/`. */
 export async function loadSkillIndex(projectRoot: string): Promise<SkillIndexEntry[]> {
-  const index = [...(await loadOwnSkillIndex(projectRoot)), ...(await loadClaudeCodeSkillIndex(projectRoot))];
-  if (index.length > 0) return index;
-
-  const dir = join(projectRoot, OWN_SKILLS_DIR);
-  const path = join(dir, "write-tests.md");
-  await mkdir(dir, { recursive: true });
-  await writeFile(path, DEFAULT_OWN_SKILL, "utf8");
-  return [{ name: "write-tests", trigger: "user asks to write or update tests for changed code", path }];
+  return [
+    ...(await loadBuiltinSkillIndex()),
+    ...(await loadOwnSkillIndex(projectRoot)),
+    ...(await loadClaudeCodeSkillIndex(projectRoot)),
+  ];
 }
 
 export async function loadSkillBody(entry: SkillIndexEntry): Promise<string> {

@@ -17,7 +17,9 @@ src/
   hermes/       Self-healing circuit breaker, failure log, self-improvement
                 proposal loop (§3)
   skills/       Lazy skill loading + always-on rule loading, reuses existing
-                CLI conventions (§5)
+                CLI conventions (§5); skills/builtin/ ships architecture,
+                planning, implementation, review, testing, static-analysis,
+                and security skills that are always loaded
   tools/        read_file / write_file / edit_file / run_shell + ANSI-colored
                 diff rendering + browser_* (remote CDP control)
   tui/          Ink-based bottom-anchored UI: input box, status bar, spinner,
@@ -37,7 +39,9 @@ src/
 >   agent/        도구 호출 루프 (컴팩션·자가치유 연동)
 >   compaction/   체크포인트 기록/재개, 컨텍스트 요약 (PROMPT.md §2)
 >   hermes/       자가 치유 회로차단기, 실패 로그, 자가 개선 제안 루프 (§3)
->   skills/       skill 지연 로딩 + rule 상시 로딩, 기존 CLI 컨벤션 재사용 (§5)
+>   skills/       skill 지연 로딩 + rule 상시 로딩, 기존 CLI 컨벤션 재사용 (§5);
+>                 skills/builtin/에 아키텍처·기획·구현·리뷰·테스트·정적분석·보안
+>                 스킬이 있어 프로젝트 상태와 무관하게 항상 로드됨
 >   tools/        read_file / write_file / edit_file / run_shell 도구 + ANSI 컬러 diff 렌더링 + browser_* (원격 CDP 제어)
 >   tui/          Ink 기반 하단 고정 UI: 입력창, 상태바, 스피너, 슬래시 팝업 (§6)
 > .llamacli/
@@ -53,6 +57,8 @@ src/
 npm install
 # set llama.modelPath in .llamacli/config.yaml to a real .gguf path
 npm run dev
+npm test        # unit tests (node:test via tsx, no extra dependency)
+npm run typecheck
 ```
 
 > ## 시작하기
@@ -61,7 +67,58 @@ npm run dev
 > npm install
 > # .llamacli/config.yaml 의 llama.modelPath 를 실제 .gguf 경로로 설정
 > npm run dev
+> npm test        # 유닛테스트 (node:test, tsx로 구동, 별도 의존성 없음)
+> npm run typecheck
 > ```
+
+## Built-in skills
+
+`src/skills/builtin/` ships a fixed skill set that's always loaded regardless
+of what a project provides — the "senior engineer fundamentals" PROMPT.md §4
+calls for, made concrete and triggerable: `architecture-design`, `planning`,
+`implementation`, `code-review`, `whitebox-testing`, `blackbox-testing`,
+`static-analysis`, `security`. Each is a normal skill file (trigger +
+guidance body) using llamacli's own format, so a project can override or add
+to them the same way as any other `.llamacli/skills/*.md` file.
+
+> ## 빌트인 스킬
+>
+> `src/skills/builtin/`은 프로젝트 상태와 무관하게 항상 로드되는 고정 스킬 세트를
+> 제공한다 — PROMPT.md §4가 요구하는 "우수 아키텍처 개발자의 기본기"를 트리거
+> 가능한 형태로 구체화한 것: `architecture-design`, `planning`, `implementation`,
+> `code-review`, `whitebox-testing`, `blackbox-testing`, `static-analysis`,
+> `security`. 각각 일반 skill 파일(trigger + 본문)이며 llamacli 자체 포맷을 쓰므로,
+> 프로젝트에서 다른 `.llamacli/skills/*.md` 파일과 똑같은 방식으로 덮어쓰거나
+> 추가할 수 있다.
+
+## Testing
+
+Every module with real logic (not just glue/IO) has a `*.test.ts` next to it,
+run with `npm test` (Node's built-in `node:test` + `node:assert`, executed
+via `tsx` — no test framework dependency needed). Currently covered:
+`tools/diff.ts`, `tools/browser.ts` (target-selection/error paths, via a fake
+HTTP server — full CDP round-trips were verified manually against real
+headless Chrome, see below), `hermes/selfHeal.ts`, `hermes/selfImprove.ts`
+(with a fake `ModelBackend`), `compaction/compactor.ts`,
+`compaction/checkpoint.ts`, and `skills/loader.ts`. The agent loop and TUI are
+integration-level (tool-call loop, streaming, slash commands) and were
+verified by scripting real keystrokes through a pty against a real running
+llama-server — see the git history for those sessions — rather than unit
+tests, since mocking Ink's terminal rendering buys little over driving the
+real thing.
+
+> ## 테스트
+>
+> 실질적인 로직이 있는 모듈에는 (glue/IO 코드 제외) 전부 옆에 `*.test.ts`가 있고
+> `npm test`로 실행된다(Node 내장 `node:test` + `node:assert`, `tsx`로 구동 —
+> 별도 테스트 프레임워크 의존성 없음). 현재 커버리지: `tools/diff.ts`,
+> `tools/browser.ts`(타겟 선택/에러 경로는 fake HTTP 서버로 — 실제 CDP 왕복은
+> 실제 headless Chrome으로 수동 검증, 아래 참고), `hermes/selfHeal.ts`,
+> `hermes/selfImprove.ts`(fake `ModelBackend` 사용), `compaction/compactor.ts`,
+> `compaction/checkpoint.ts`, `skills/loader.ts`. 에이전트 루프와 TUI는
+> 통합 테스트 성격(도구 호출 루프, 스트리밍, 슬래시 명령)이라 실제 llama-server를
+> 대상으로 pty로 실제 키 입력을 흘려보내며 검증했다(git 히스토리 참고) — Ink 터미널
+> 렌더링을 모킹하는 것보다 실제로 구동해보는 쪽이 더 실질적이라고 판단.
 
 ## Implementation status
 

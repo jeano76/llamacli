@@ -27,7 +27,15 @@ function endpoint(config: BrowserConfig): string {
 }
 
 async function listTargets(config: BrowserConfig): Promise<CdpTarget[]> {
-  const res = await fetch(`${endpoint(config)}/json/list`);
+  let res: Response;
+  try {
+    res = await fetch(`${endpoint(config)}/json/list`);
+  } catch (err: any) {
+    throw new Error(
+      `couldn't reach the browser debug port at ${endpoint(config)} (${err.message}) — ` +
+        `make sure the browser was started with --remote-debugging-port=${config.debugPort}`
+    );
+  }
   if (!res.ok) {
     throw new Error(
       `couldn't reach the browser debug port at ${endpoint(config)} (${res.status}) — ` +
