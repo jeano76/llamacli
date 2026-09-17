@@ -78,15 +78,15 @@ export async function buildResumePrompt(projectRoot: string): Promise<string | n
 
   const remaining = checkpoint.steps.filter((s) => s.status !== "done");
   const lines = [
-    `[컴팩션 재개] 이전 목표: ${checkpoint.goal}`,
+    `[resuming after compaction] previous goal: ${checkpoint.goal}`,
     remaining.length
-      ? `남은 단계:\n${remaining.map((s) => `- (${s.status}) ${s.description}`).join("\n")}`
-      : "모든 단계가 완료된 상태였습니다 — 재검증 후 마무리합니다.",
+      ? `remaining steps:\n${remaining.map((s) => `- (${s.status}) ${s.description}`).join("\n")}`
+      : "All steps were already done — re-verifying before wrapping up.",
     checkpoint.pendingToolCall
-      ? `중단된 도구 호출: ${checkpoint.pendingToolCall.name} (${checkpoint.pendingToolCall.reason})`
+      ? `interrupted tool call: ${checkpoint.pendingToolCall.name} (${checkpoint.pendingToolCall.reason})`
       : "",
     checkpoint.files.length
-      ? `건드린 파일:\n${checkpoint.files.map((f) => `- (${f.status}) ${f.path}`).join("\n")}`
+      ? `files touched:\n${checkpoint.files.map((f) => `- (${f.status}) ${f.path}`).join("\n")}`
       : "",
   ].filter(Boolean);
 

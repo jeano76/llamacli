@@ -82,7 +82,7 @@ export async function proposeImprovement(
   if (!ruleMarkdown) return null;
 
   return {
-    summary: `"${occurrences[0].toolName}" 도구가 같은 패턴으로 ${occurrences.length}회 실패했습니다. rule 추가를 제안합니다.`,
+    summary: `"${occurrences[0].toolName}" failed with the same pattern ${occurrences.length} times. Proposing a new rule.`,
     ruleMarkdown,
     failureCount: occurrences.length,
   };

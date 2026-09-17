@@ -28,7 +28,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuIndex, setMenuIndex] = useState(0);
   // Messages typed while the agent is busy wait here instead of being sent
-  // immediately; /queue inspects this list (PROMPT.md §6 "메시지 큐 입력").
+  // immediately; /queue inspects this list (PROMPT.md §6 message queue input).
   const [queue, setQueue] = useState<string[]>([]);
   const wasBusyRef = useRef(false);
   // Tracks which log line the currently-streaming assistant message is
@@ -62,7 +62,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     if (wasBusyRef.current && !busy && queue.length > 0) {
       const [next, ...rest] = queue;
       setQueue(rest);
-      pushLine(`[대기열에서 전송] ${next}`, "status");
+      pushLine(`[sending from queue] ${next}`, "status");
       onSubmit(next);
     }
     wasBusyRef.current = busy;
@@ -79,8 +79,8 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         if (item.key === "queue") {
           pushLine(
             queue.length
-              ? `대기열 (${queue.length}개):\n${queue.map((q, i) => `${i + 1}. ${q}`).join("\n")}`
-              : "대기열이 비어 있습니다.",
+              ? `Queue (${queue.length}):\n${queue.map((q, i) => `${i + 1}. ${q}`).join("\n")}`
+              : "The queue is empty.",
             "status"
           );
         } else {
@@ -96,7 +96,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
       if (input.trim().length === 0) return;
       if (busy) {
         setQueue((q) => [...q, input]);
-        pushLine(`[대기열 추가] ${input}`, "status");
+        pushLine(`[queued] ${input}`, "status");
       } else {
         pushLine(input, "user");
         onSubmit(input);

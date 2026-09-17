@@ -105,7 +105,7 @@ export class AgentLoop {
       for (const call of message.tool_calls) {
         const stopReason = this.breaker.shouldStop();
         if (stopReason) {
-          this.opts.onStatus?.(`[중단] 자가치유 회로차단기 발동: ${stopReason}`);
+          this.opts.onStatus?.(`[stopped] self-healing circuit breaker tripped: ${stopReason}`);
           return;
         }
         this.breaker.record({ toolName: call.function.name, argsSignature: call.function.arguments });
@@ -212,7 +212,7 @@ export class AgentLoop {
       partial
     );
     this.messages = messages;
-    this.opts.onStatus?.(`[컴팩션 완료] ${checkpoint.timestamp}`);
+    this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
   }
 
   /** Analyzes the accumulated failure log and, if a pattern recurs often

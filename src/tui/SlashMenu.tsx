@@ -8,14 +8,14 @@ export interface SlashMenuItem {
 }
 
 export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
-  { key: "help", label: "/help", description: "도움말 표시" },
-  { key: "quit", label: "/quit", description: "종료" },
-  { key: "queue", label: "/queue", description: "메시지 큐에 입력 추가" },
-  { key: "compact", label: "/compact", description: "지금 컨텍스트 컴팩션 실행" },
-  { key: "skills", label: "/skills", description: "로드된 skill 목록 보기" },
-  { key: "rules", label: "/rules", description: "로드된 rule 목록 보기" },
-  { key: "improve", label: "/improve", description: "반복 실패 패턴 분석 → rule 개선 제안" },
-  { key: "improve-apply", label: "/improve-apply", description: "직전 제안을 rule 파일로 저장" },
+  { key: "help", label: "/help", description: "Show help" },
+  { key: "quit", label: "/quit", description: "Quit" },
+  { key: "queue", label: "/queue", description: "Add a message to the queue" },
+  { key: "compact", label: "/compact", description: "Run context compaction now" },
+  { key: "skills", label: "/skills", description: "List loaded skills" },
+  { key: "rules", label: "/rules", description: "List loaded rules" },
+  { key: "improve", label: "/improve", description: "Analyze repeated failures → propose a rule" },
+  { key: "improve-apply", label: "/improve-apply", description: "Save the last proposal as a rule file" },
 ];
 
 export interface SlashMenuProps {

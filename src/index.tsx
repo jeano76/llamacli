@@ -9,13 +9,13 @@ import { LlamaServerManager } from "./backend/llamaServer.js";
 import { OpenAICompatibleClient } from "./backend/openaiClient.js";
 import { AgentLoop } from "./agent/loop.js";
 
-const BASE_SYSTEM_PROMPT = `당신은 llamacli, 로컬 llama.cpp 기반 코딩 에이전트입니다.
-우수한 소프트웨어 아키텍트의 기본기(최소 diff, 기존 컨벤션 준수, 검증 없는 변경 금지,
-파괴적 명령 전 확인)를 항상 따르세요.
+const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
+Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
+conventions, never make unverified changes, and confirm before destructive commands.
 
-여러 단계가 필요한 작업을 시작할 때는 update_plan 도구로 단계 목록을 선언하고,
-각 단계를 시작/완료할 때마다 상태(todo/in_progress/done)를 갱신하세요. 이 계획은
-컨텍스트 컴팩션이 발생해도 그대로 보존되어 작업을 정확히 이어갈 수 있게 해줍니다.`;
+When starting a task that needs multiple steps, declare them with the update_plan tool, and
+update each step's status (todo/in_progress/done) as it starts or finishes. This plan survives
+context compaction, so work can resume accurately after it.`;
 
 async function main() {
   const projectRoot = process.cwd();
@@ -84,81 +84,81 @@ async function main() {
               break;
             }
             quitConfirmed = true;
-            ui?.pushStatus("[세션 종료 전 자가 개선 분석 중...]");
+            ui?.pushStatus("[analyzing for self-improvement before quitting...]");
             loop
               .proposeSelfImprovement()
               .then((proposal) => {
                 if (!proposal) {
-                  ui?.pushStatus("반복 실패 패턴이 없어 제안할 rule이 없습니다. /quit을 다시 누르면 종료됩니다.");
+                  ui?.pushStatus("No recurring failure pattern found, nothing to propose. Press /quit again to exit.");
                   return;
                 }
                 ui?.pushStatus(
                   [
-                    `[자가 개선 제안] ${proposal.summary}`,
+                    `[self-improvement proposal] ${proposal.summary}`,
                     "",
                     proposal.ruleMarkdown,
                     "",
-                    "적용하려면 /improve-apply, 무시하고 종료하려면 /quit을 다시 누르세요.",
+                    "Run /improve-apply to save it, or press /quit again to exit without applying it.",
                   ].join("\n")
                 );
               })
-              .catch((err: any) => ui?.pushStatus(`[자가 개선 분석 실패] ${err.message}`));
+              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${err.message}`));
             break;
           }
           case "help": {
             const lines = SLASH_MENU_ITEMS.map((i) => `${i.label.padEnd(10)} ${i.description}`);
             ui?.pushStatus(
               [
-                "사용 가능한 슬래시 명령:",
+                "Available slash commands:",
                 ...lines,
                 "",
-                "컨텍스트가 임계치에 도달하면 자동으로 컴팩션되고, 완료 후 하던 작업을 스스로 이어갑니다.",
+                "When context usage hits the threshold, compaction runs automatically and work resumes on its own afterward.",
               ].join("\n")
             );
             break;
           }
           case "compact":
             ui?.pushStatus(
-              ui?.isBusy?.() ? "[컴팩션 예약됨] 진행 중인 작업이 끝나면 실행됩니다." : "[컴팩션 시작]"
+              ui?.isBusy?.() ? "[compaction scheduled] It will run once the current turn finishes." : "[compaction started]"
             );
             ui?.setBusy(true);
             loop
               .forceCompact()
-              .catch((err: any) => ui?.pushStatus(`[컴팩션 실패] ${err.message}`))
+              .catch((err: any) => ui?.pushStatus(`[compaction failed] ${err.message}`))
               .finally(() => ui?.setBusy(false));
             break;
           case "skills":
             ui?.pushStatus(
               skillIndex.length
-                ? `로드된 skill:\n${skillIndex.map((s) => `- ${s.name}: ${s.trigger}`).join("\n")}`
-                : "등록된 skill이 없습니다 (.llamacli/skills/*.md)."
+                ? `Loaded skills:\n${skillIndex.map((s) => `- ${s.name}: ${s.trigger}`).join("\n")}`
+                : "No skills registered (.llamacli/skills/*.md)."
             );
             break;
           case "rules":
             ui?.pushStatus(
               rules.length
-                ? `로드된 rule:\n${rules.map((r) => `- ${r.path}`).join("\n")}`
-                : "적용된 rule이 없습니다 (.llamacli/rules/ 또는 .clinerules)."
+                ? `Loaded rules:\n${rules.map((r) => `- ${r.path}`).join("\n")}`
+                : "No rules applied (.llamacli/rules/ or .clinerules)."
             );
             break;
           case "improve":
-            ui?.pushStatus("[자가 개선 분석 중...]");
+            ui?.pushStatus("[analyzing for self-improvement...]");
             loop
               .proposeSelfImprovement()
               .then((proposal) => {
                 ui?.pushStatus(
                   proposal
                     ? [
-                        `[자가 개선 제안] ${proposal.summary}`,
+                        `[self-improvement proposal] ${proposal.summary}`,
                         "",
                         proposal.ruleMarkdown,
                         "",
-                        "적용하려면 /improve-apply를 실행하세요 (직접 호출 전까지는 아무 파일도 바뀌지 않습니다).",
+                        "Run /improve-apply to apply it (nothing is written to disk until you do).",
                       ].join("\n")
-                    : "반복되는 실패 패턴이 아직 없어 제안할 rule이 없습니다."
+                    : "No recurring failure pattern yet, nothing to propose."
                 );
               })
-              .catch((err: any) => ui?.pushStatus(`[자가 개선 분석 실패] ${err.message}`));
+              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${err.message}`));
             break;
           case "improve-apply":
             loop
@@ -166,11 +166,11 @@ async function main() {
               .then((path) => {
                 ui?.pushStatus(
                   path
-                    ? `[rule 저장됨] ${path} (다음 세션부터 시스템 프롬프트에 자동 주입됩니다)`
-                    : "적용할 제안이 없습니다. 먼저 /improve를 실행하세요."
+                    ? `[rule saved] ${path} (injected into the system prompt automatically from the next session on)`
+                    : "No pending proposal to apply. Run /improve first."
                 );
               })
-              .catch((err: any) => ui?.pushStatus(`[rule 저장 실패] ${err.message}`));
+              .catch((err: any) => ui?.pushStatus(`[rule save failed] ${err.message}`));
             break;
           // "queue" is handled locally inside App (needs the live queue state).
         }
