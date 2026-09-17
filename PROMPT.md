@@ -92,6 +92,16 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
 - 기존 CLI 도구들과 호환되는 `skill`(작업별 지침 묶음, 트리거 조건 기반 로딩)과
   `rule`(항상 적용되는 프로젝트/전역 규칙, 예: `.llamacli/rules/*.md` 또는
   `.clinerules` 호환) 개념을 지원한다.
+- **기존 AI CLI가 이미 프로젝트에 남겨둔 rule/skill이 있으면 그것을 그대로 활용하고,
+  아무것도 없을 때만 llamacli 자체 기본값을 만든다** — 특정 CLI 하나에 종속되지 않도록
+  가능한 한 많은 알려진 컨벤션을 탐색한다:
+  - rule: `.llamacli/rules/`, `.clinerules`(Cline), `CLAUDE.md`(Claude Code),
+    `GEMINI.md`(Gemini CLI), `.cursorrules`(Cursor), `.windsurfrules`(Windsurf),
+    `AGENTS.md`(범용 컨벤션), `.github/copilot-instructions.md`(GitHub Copilot) —
+    발견되는 것은 전부 합쳐서 로드하고, 하나도 없을 때만 `.llamacli/rules/00-core.md`를
+    자동 생성한다.
+  - skill: `.llamacli/skills/*.md`(자체 포맷) + `.claude/skills/<name>/SKILL.md`
+    (Claude Code 포맷) — 둘 다 없을 때만 `.llamacli/skills/write-tests.md`를 자동 생성한다.
 - 프로젝트 루트에서 rule 파일을 자동 탐색해 세션 시작 시 시스템 프롬프트에 주입한다
   (일부 로컬 모델은 이를 자동으로 읽지 않으므로, 명시적으로 프롬프트 앞단에 강제
   주입하는 방식을 취한다).

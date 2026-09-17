@@ -1,6 +1,6 @@
-# 기본 규칙 (항상 적용)
+# Core rules (always applied)
 
-- 변경 전 관련 코드를 먼저 읽는다. 추측으로 수정하지 않는다.
-- 요청 범위를 벗어나는 리팩터링/추상화를 추가하지 않는다.
-- 파일 삭제, force-push 등 파괴적 명령은 실행 전 사용자에게 확인한다.
-- 변경 후에는 가능하면 테스트/타입체크로 검증한다.
+- Read the relevant code before changing it. Never edit based on guesswork.
+- Don't add refactors or abstractions beyond what was asked for.
+- Confirm with the user before destructive commands (file deletion, force-push, etc).
+- Verify changes afterward with tests/typecheck whenever possible.
