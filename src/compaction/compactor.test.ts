@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
-import type { ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
+import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
 function fakeBackendWithTokenizer(tokensPerCall: number | ((text: string) => number)): ModelBackend {
   return {
@@ -126,3 +126,106 @@ test("buildResumePrompt says all steps were done when nothing remains", async ()
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+/** Simulates a real backend (confirmed against a real llama-server) that
+ *  rejects a completion request whose messages contain any tool_calls or
+ *  role:"tool" entries ("Cannot continue an assistant message that
+ *  contains tool calls"), OR that ends with 2+ consecutive assistant
+ *  messages ("Cannot have 2 or more assistant messages at the end of the
+ *  list") — both were hit in production by the same sanitization gap. */
+function strictNoToolsBackend(): { backend: ModelBackend; lastRequest: () => ChatCompletionRequest | undefined } {
+  let lastRequest: ChatCompletionRequest | undefined;
+  const backend: ModelBackend = {
+    async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+      lastRequest = req;
+      const hasToolArtifact = req.messages.some(
+        (m) => m.role === "tool" || (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0)
+      );
+      if (hasToolArtifact) {
+        throw new Error(
+          '400 {"error":{"code":400,"message":"Cannot continue an assistant message that contains tool calls.","type":"invalid_request_error"}}'
+        );
+      }
+      const msgs = req.messages;
+      if (msgs.length >= 2 && msgs[msgs.length - 1].role === "assistant" && msgs[msgs.length - 2].role === "assistant") {
+        throw new Error(
+          '400 {"error":{"code":400,"message":"Cannot have 2 or more assistant messages at the end of the list.","type":"invalid_request_error"}}'
+        );
+      }
+      return { choices: [{ message: { role: "assistant", content: "summary text" }, finish_reason: "stop" }] };
+    },
+    async listModels() {
+      return [];
+    },
+  };
+  return { backend, lastRequest: () => lastRequest };
+}
+
+test("runCompaction sanitizes tool_calls/tool-role messages so a strict backend never rejects the summary request", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      // Reproduces the exact production scenario: messages.slice(0, -6) cuts
+      // right after an assistant message with tool_calls, leaving its
+      // matching tool-role response in the kept tail — a dangling tool call
+      // at the end of what gets sent for summarization.
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "q1" },
+        { role: "assistant", content: "answer1" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "c1", type: "function", function: { name: "run_shell", arguments: '{"command":"date"}' } }],
+        },
+        { role: "tool", tool_call_id: "c1", content: "Thu Sep 18" },
+        { role: "assistant", content: "answer2" },
+        { role: "user", content: "q2" },
+        { role: "assistant", content: "answer3" },
+        { role: "user", content: "q3" },
+        { role: "assistant", content: "answer4" },
+      ];
+
+      const { backend, lastRequest } = strictNoToolsBackend();
+      const partial = {
+        reason: "manual" as const,
+        goal: "test",
+        steps: [],
+        files: [],
+        pendingToolCall: null,
+        mustPreserve: [],
+      };
+
+      // must not throw — this is the exact bug being fixed
+      const result = await runCompaction(dir, messages, backend, "m", partial);
+
+      const sent = lastRequest();
+      assert.ok(sent);
+      assert.ok(
+        sent!.messages.every((m) => m.role !== "tool" && !(m.tool_calls && m.tool_calls.length > 0)),
+        "summary request must not contain any tool_calls or role:tool messages"
+      );
+      // the tool call's intent is still preserved as readable text, not silently dropped
+      assert.ok(sent!.messages.some((m) => typeof m.content === "string" && m.content.includes("run_shell")));
+      // converting the dangling tool_calls message to role:"assistant" put
+      // it right after another assistant message ("answer1") — must have
+      // been merged into one, not left as 2 consecutive assistant messages
+      // (the injected summarization system prompt + the original system
+      // message are both legitimately role:"system" and untouched by this —
+      // only consecutive *assistant* messages triggered the real 400).
+      for (let i = 1; i < sent!.messages.length; i++) {
+        assert.ok(
+          !(sent!.messages[i].role === "assistant" && sent!.messages[i - 1].role === "assistant"),
+          `messages[${i - 1}] and messages[${i}] are both role "assistant" — should have been merged`
+        );
+      }
+
+      assert.equal(result.messages[0].content, "[Compacted history summary]\nsummary text");
+      // the tool's matching result (index 4) landed in the kept tail (last 6
+      // messages), verbatim and untouched — sanitization only applies to
+      // what's actually sent for summarization, never to the preserved tail
+      assert.ok(result.messages.some((m) => m.role === "tool" && m.content === "Thu Sep 18"));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());

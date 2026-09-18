@@ -43,6 +43,51 @@ export async function shouldCompact(
 }
 
 /**
+ * The summary request is a plain (non-tool) completion call, but
+ * `toSummarize` is an arbitrary slice of the real conversation and can end
+ * — or contain — an assistant message with `tool_calls` that isn't followed
+ * by its matching `tool` role responses (those may have landed in the kept
+ * tail instead). Sending that as-is gets rejected by at least one real
+ * backend with "Cannot continue an assistant message that contains tool
+ * calls" (400). Rather than trying to align the slice to turn boundaries
+ * (fragile — the boundary depends on exact message-count patterns), strip
+ * every tool_calls/tool-role message down to plain describable text so the
+ * summary request never contains anything tool-related to validate.
+ */
+function sanitizeForSummary(messages: ChatMessage[]): ChatMessage[] {
+  const converted = messages.map((m): ChatMessage => {
+    if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
+      const calls = m.tool_calls
+        .map((tc) => `[called tool ${tc.function.name} with ${tc.function.arguments}]`)
+        .join(" ");
+      return { role: "assistant", content: [m.content, calls].filter(Boolean).join(" ") };
+    }
+    if (m.role === "tool") {
+      return { role: "assistant", content: `[tool result] ${m.content ?? ""}` };
+    }
+    return m;
+  });
+
+  // Converting tool_calls/tool messages to role:"assistant" can leave
+  // consecutive assistant messages where there weren't any before (e.g. a
+  // plain assistant reply immediately followed by what used to be a
+  // tool_calls message). At least one real backend also rejects "2 or more
+  // assistant messages at the end of the list" — merge any run of
+  // same-role messages into one so the request's role sequence is never
+  // stricter-than-expected regardless of where in the slice this happens.
+  const merged: ChatMessage[] = [];
+  for (const m of converted) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === m.role && typeof prev.content === "string" && typeof m.content === "string") {
+      prev.content = [prev.content, m.content].filter(Boolean).join("\n");
+    } else {
+      merged.push({ ...m });
+    }
+  }
+  return merged;
+}
+
+/**
  * PROMPT.md §2: write the checkpoint FIRST (before summarizing anything), then
  * ask the model to summarize the older turns, keeping mustPreserve items intact.
  */
@@ -71,7 +116,7 @@ export async function runCompaction(
         "Preserve verbatim any user-stated constraints, decisions, and the following " +
         "must-preserve facts:\n" + checkpoint.mustPreserve.join("\n"),
     },
-    ...toSummarize,
+    ...sanitizeForSummary(toSummarize),
   ];
 
   const res = await backend.chat({ model, messages: summaryRequest, stream: false });

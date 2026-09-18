@@ -409,6 +409,30 @@ response in a narrow (70-column) terminal with several long, retried
 answer rendered completely cleanly with no fragments mixed in. Covered by
 `src/tui/textWidth.test.ts`.
 
+### Compaction crash: a strict backend rejected the summary request
+
+Reported live, mid-session: `[compaction failed] chat failed: 400
+{"error":{"message":"Cannot continue an assistant message that contains
+tool calls."}}`. Root cause: `runCompaction`'s `toSummarize =
+messages.slice(0, -6)` cuts by a fixed count, with no regard for tool-call
+turn boundaries — if the cut lands right after an assistant message with
+`tool_calls` whose matching `tool`-role response ended up in the kept tail
+instead, the summary request (a plain, non-tool completion call) ends with
+a dangling tool call. At least one real backend rejects that outright.
+
+Fixed with `sanitizeForSummary()`: every `tool_calls`/`tool`-role message
+going into the summary request is converted to plain describable text
+(e.g. `[called tool run_shell with {"command":"date"}]`) instead of trying
+to align the slice to turn boundaries, which would be fragile since it
+depends on exact message-count patterns. That surfaced a second real
+constraint from the same backend while testing directly against it — "2 or
+more assistant messages at the end of the list" — since converting a
+tool-call message to role:"assistant" can land it right after another
+assistant message; fixed by merging any run of consecutive same-role
+messages produced by the conversion. Verified against the real backend
+with the exact production message-count pattern that failed. Covered by
+`src/compaction/compactor.test.ts`.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -609,6 +633,27 @@ answer rendered completely cleanly with no fragments mixed in. Covered by
 > 항상 정확하도록 함. 좁은(70컬럼) 터미널에서 여러 번 재시도한 긴 `run_shell` 도구
 > 호출 줄이 여러 행으로 줄바꿈되는 실제 모델 응답으로 검증 — 최종 답변이 잔재 섞임
 > 없이 완전히 깨끗하게 렌더링됨. `src/tui/textWidth.test.ts`로 커버됨.
+>
+> ### 컴팩션 크래시: 엄격한 백엔드가 요약 요청을 거부함
+>
+> 세션 도중 실시간으로 신고됨: `[compaction failed] chat failed: 400
+> {"error":{"message":"Cannot continue an assistant message that contains
+> tool calls."}}`. 근본 원인: `runCompaction`의 `toSummarize =
+> messages.slice(0, -6)`가 tool call 턴 경계를 전혀 고려하지 않고 고정된 개수로
+> 자름 — 자르는 지점이 하필 `tool_calls`를 가진 assistant 메시지 바로 뒤이고, 그에
+> 대응하는 `tool` 역할 응답은 유지된 tail 쪽에 남는 경우, 요약 요청(일반 non-tool
+> completion 호출)이 매달린 tool call로 끝나버림. 최소 한 개의 실제 백엔드가 이걸
+> 그대로 거부함.
+>
+> `sanitizeForSummary()`로 수정: 요약 요청에 들어가는 모든 `tool_calls`/`tool`
+> 역할 메시지를 평범한 서술 텍스트로 변환함(예:
+> `[called tool run_shell with {"command":"date"}]`) — 슬라이스를 턴 경계에 맞추려는
+> 시도는 정확한 메시지 개수 패턴에 의존하므로 취약해서 대신 이 방식을 택함. 실제
+> 백엔드로 직접 테스트하다가 같은 백엔드에서 두 번째 제약도 드러남 — "끝에 assistant
+> 메시지 2개 이상 불가" — tool call 메시지를 role:"assistant"로 변환하면 바로 앞의
+> assistant 메시지 뒤에 붙어버릴 수 있기 때문. 변환으로 생긴 연속된 같은 역할 메시지를
+> 병합해서 수정. 실제로 실패했던 정확한 메시지 개수 패턴으로 실제 백엔드에 대고
+> 재검증함. `src/compaction/compactor.test.ts`로 커버됨.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
