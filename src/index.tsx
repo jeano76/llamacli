@@ -156,7 +156,20 @@ async function main() {
         switch (key) {
           case "quit": {
             if (quitConfirmed || !loop.hasFailureLog()) {
-              unmount();
+              // Requested directly: quitting should save current progress
+              // to disk first, the same way compaction already does
+              // before/after summarizing — so the next launch resumes
+              // where this one left off instead of losing whatever wasn't
+              // already captured by a plan-progress checkpoint. Never lets
+              // a save failure block quitting itself (unmount() always
+              // runs, success or not) — matches the rest of the app's
+              // "an internal failure reports itself, never hangs the
+              // whole thing" approach.
+              ui?.pushStatus("[saving progress before quitting...]");
+              loop
+                .saveStateOnQuit()
+                .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${err.message}] quitting anyway.`))
+                .finally(() => unmount());
               break;
             }
             quitConfirmed = true;

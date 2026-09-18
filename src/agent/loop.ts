@@ -496,6 +496,27 @@ export class AgentLoop {
     await this.enqueue(() => this.compact("manual", null));
   }
 
+  /** Called right before actually quitting (index.tsx's /quit handler) —
+   *  requested directly: "when quitting, write current progress to disk
+   *  immediately so the next launch can pick up where this one left off,
+   *  the same as how compaction already saves state before/after
+   *  summarizing." The plan-progress checkpoint (written on every
+   *  update_plan call) already covers the case where a plan was declared,
+   *  but a session that never called update_plan — plenty of real work
+   *  (tool calls, file reads, exploration) still possible without one —
+   *  had nothing at all saved before this, losing the whole conversation
+   *  the moment the process exited. Runs an actual compaction (the exact
+   *  same mechanism `/compact` uses) so the next launch resumes with a
+   *  real model-generated summary of what was happening, not just
+   *  whatever structured plan steps happen to exist. A no-op when there's
+   *  nothing beyond the initial system prompt to save. */
+  async saveStateOnQuit(): Promise<void> {
+    await this.enqueue(async () => {
+      if (this.messages.length <= 1) return; // nothing but the system prompt — nothing to save
+      await this.compact("manual", null);
+    });
+  }
+
   /** Measures current context usage, reports it to the UI (§2.5), and
    *  compacts if over threshold. Returns whether it compacted, so callers
    *  mid-tool-call-batch know to abandon the rest of the batch. */

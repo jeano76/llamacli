@@ -1165,6 +1165,45 @@ ambiguous two-match case, still edits correctly when the match is unique,
 and still throws its original "not found" error when there's no match at
 all (no regression).
 
+### /quit lost work if a plan was never explicitly declared
+
+Requested directly: "when quitting, write current progress to disk
+immediately so the next launch can pick up where this one left off — the
+same as before/after compaction behavior." The plan-progress checkpoint
+(written on every `update_plan` call, from earlier work) already covered
+sessions that used it, but plenty of real work — tool calls, file reads,
+exploration, actual conversation — happens without the model ever calling
+`update_plan` at all, and quitting one of those sessions saved nothing
+whatsoever: the entire conversation vanished the moment the process
+exited, with nothing for the next launch to resume from.
+
+Added `AgentLoop.saveStateOnQuit()`, wired into `index.tsx`'s `/quit`
+handler right before it actually unmounts: runs the exact same
+compaction mechanism `/compact` already uses (writes a checkpoint,
+gets a real model-generated summary), so the next launch's automatic
+resume gets genuine context about what was happening — not just
+whatever structured plan steps happen to exist, or nothing at all. A
+no-op when there's nothing beyond the initial system prompt to save. A
+save failure is reported but never blocks quitting itself — `unmount()`
+always runs in a `.finally()`, matching the rest of the app's "an
+internal failure reports itself, never hangs the whole thing" approach.
+
+Verified end-to-end against the real backend in a throwaway project: sent
+a real message, quit, confirmed a checkpoint was written with the correct
+goal captured (`reason: "manual"`, matching `/compact`'s own reason) and
+the process exited cleanly in ~4 seconds; relaunched and confirmed it
+resumed automatically with "[resuming after compaction] previous goal:
+..." and the agent picked the task back up on its own initiative (it
+re-ran the original command to double-check its earlier answer before
+continuing). Two earlier live attempts at this same verification
+appeared to hang — turned out to be queueing behind the user's own real,
+concurrently-running session on the shared single-slot backend, not a
+bug; confirmed by re-running once the backend was actually free. Covered
+by 2 new unit tests: a real conversation produces a checkpoint via an
+actual compaction call (and nothing more — the compaction summary
+request itself is confirmed not to trigger a second full agent turn);
+an empty conversation (just the system prompt) is a genuine no-op.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -2018,6 +2057,41 @@ all (no regression).
 > `edit_file`이 모호한 2군데 일치 케이스를 거부하고(파일은 전혀 안
 > 바뀜) 확인, 유일하게 일치할 땐 여전히 정확히 편집되는지, 아예 일치가
 > 없을 땐 원래의 "not found" 에러를 그대로 던지는지(회귀 없음).
+>
+> ### 계획을 명시적으로 선언한 적이 없으면 /quit이 작업 내용을 잃어버림
+>
+> 직접 요청받음: "종료할 때 현재 진행 상황을 즉시 파일에 기록해서 다음
+> 실행 때 이어갈 수 있게 해달라 — 컴팩션 전후 동작과 같은 거다." 이전
+> 작업에서 만든 plan-progress 체크포인트(매 `update_plan` 호출마다 기록됨)는
+> 그걸 쓴 세션은 이미 커버하지만, 모델이 `update_plan`을 한 번도 안 부른
+> 채로도 실제 작업(도구 호출, 파일 읽기, 탐색, 실제 대화)은 얼마든지
+> 일어날 수 있고, 그런 세션에서 종료하면 아무것도 저장이 안 돼서 — 프로세스가
+> 종료되는 순간 대화 전체가 사라지고 다음 실행 때 이어받을 게 아무것도 없었음.
+>
+> `AgentLoop.saveStateOnQuit()`를 추가해서 `index.tsx`의 `/quit` 핸들러가
+> 실제로 unmount하기 직전에 호출하도록 연결함: `/compact`가 이미 쓰는 것과
+> 정확히 같은 컴팩션 메커니즘을 실행함(체크포인트 기록, 실제 모델이 생성한
+> 요약 확보) — 그래서 다음 실행의 자동 재개가 구조화된 계획 단계가 있든
+> 없든, 진짜로 무슨 작업이 진행 중이었는지에 대한 실질적인 맥락을 얻게 됨.
+> 초기 시스템 프롬프트 외에 저장할 게 없으면 아무 동작도 안 함. 저장이
+> 실패해도 보고만 하고 종료 자체는 절대 막지 않음 — `unmount()`는 항상
+> `.finally()` 안에서 실행됨, 이 앱의 나머지 부분이 따르는 "내부 실패는
+> 스스로 보고하고, 절대 전체를 멈추게 하지 않는다"는 방식과 같음.
+>
+> 실제 백엔드로 임시 프로젝트에서 엔드투엔드 검증함: 실제 메시지를 보내고
+> 종료해서, 올바른 목표가 담긴 체크포인트가 기록됐는지(`reason: "manual"`,
+> `/compact` 자체의 reason과 일치) 확인하고 프로세스가 약 4초 만에 깔끔하게
+> 종료되는 것 확인; 재시작해서 "[resuming after compaction] previous
+> goal: ..."로 자동 재개되고 에이전트가 스스로 판단해서(계속하기 전에
+> 원래 명령을 다시 실행해서 이전 답을 재확인함) 작업을 이어받는 것까지
+> 확인함. 같은 검증을 두 번 먼저 시도했을 때는 멈춘 것처럼 보였는데 —
+> 알고 보니 사용자님 본인의 실제 세션이 동시에 같은 단일 슬롯 백엔드를
+> 쓰고 있어서 그 뒤에 대기열로 밀린 것이었고 버그가 아니었음; 백엔드가
+> 실제로 비었을 때 재실행해서 확인함. 새 유닛 테스트 2개로 커버함: 실제
+> 대화가 있으면 진짜 컴팩션 호출을 통해 체크포인트가 생기는지(그 이상은
+> 아님 — 컴팩션 요약 요청 자체가 별도의 전체 에이전트 턴을 일으키지
+> 않는다는 것까지 확인), 빈 대화(시스템 프롬프트만 있음)는 진짜로 아무
+> 동작도 안 하는지.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

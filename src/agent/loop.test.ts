@@ -886,3 +886,53 @@ test("the circuit breaker's 30-minute hard timeout resets each turn, instead of 
       mock.timers.reset();
     }
   }));
+
+// Requested directly: quitting should save current progress to disk
+// immediately, the same way compaction already does before/after
+// summarizing, so the next launch can resume — not just when a plan was
+// explicitly declared (the existing plan-progress checkpoint only covers
+// that case), but for any real conversation at all.
+test("saveStateOnQuit() runs a real compaction (writes a checkpoint, gets a model summary) when there's real conversation", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("here's what I found")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100_000 },
+    });
+
+    await loop.send("investigate the bug"); // real conversation now exists
+    await loop.saveStateOnQuit();
+
+    const checkpoint = await readCheckpoint(dir);
+    assert.ok(checkpoint, "expected a checkpoint to have been written on quit");
+    assert.equal(checkpoint!.reason, "manual");
+    // turnRequests only counts calls WITH tools (the main loop) — the
+    // compaction summary request itself omits tools, so a second entry
+    // here would mean saveStateOnQuit() incorrectly started a whole new
+    // agent turn instead of just compacting the existing one.
+    assert.equal(turnRequests.length, 1);
+  }));
+
+test("saveStateOnQuit() is a no-op when there's nothing but the initial system prompt", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({ turnResponses: [], tokenCounts: [1] });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100_000 },
+    });
+
+    // Never sent anything — should not throw, and should not call the
+    // backend at all (no scripted responses exist, so it would throw if
+    // it tried).
+    await assert.doesNotReject(() => loop.saveStateOnQuit());
+    assert.equal(await readCheckpoint(dir), null, "expected no checkpoint for an empty conversation");
+  }));
