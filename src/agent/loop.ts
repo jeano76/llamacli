@@ -101,13 +101,30 @@ export class AgentLoop {
     while (true) {
       await this.maybeCompact();
 
-      const res = await this.opts.backend.chat(
-        { model: this.opts.model, messages: this.messages, tools: TOOL_DEFS, stream: true },
-        (chunk) => {
-          const delta = chunk.choices[0]?.delta;
-          if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
-        }
-      );
+      let res;
+      try {
+        res = await this.opts.backend.chat(
+          { model: this.opts.model, messages: this.messages, tools: TOOL_DEFS, stream: true },
+          (chunk) => {
+            const delta = chunk.choices[0]?.delta;
+            if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
+          }
+        );
+      } catch (err: any) {
+        // A network/backend failure here must never crash the whole CLI —
+        // this is exactly the crash reproduced when running from a project
+        // with no .llamacli/config.yaml (falls back to an unreachable
+        // default backend URL): report it and end the turn gracefully so
+        // the user can fix config/connectivity and try again.
+        this.opts.onStatus?.(`[error] couldn't reach the model backend: ${err.message}`);
+        logFailure({
+          timestamp: new Date().toISOString(),
+          summary: "backend chat request failed",
+          toolName: "chat",
+          errorMessage: err.message,
+        });
+        return;
+      }
       const message = res.choices[0].message;
       this.messages.push(message);
       this.opts.onAssistantDone?.();
@@ -252,15 +269,31 @@ export class AgentLoop {
       pendingToolCall,
       mustPreserve: [],
     };
-    const { messages, checkpoint } = await runCompaction(
-      this.opts.projectRoot,
-      this.messages,
-      this.opts.backend,
-      this.opts.model,
-      partial
-    );
-    this.messages = messages;
-    this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
+    try {
+      const { messages, checkpoint } = await runCompaction(
+        this.opts.projectRoot,
+        this.messages,
+        this.opts.backend,
+        this.opts.model,
+        partial
+      );
+      this.messages = messages;
+      this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
+    } catch (err: any) {
+      // The checkpoint file itself is already written by this point
+      // (runCompaction writes it before making the summary request), so
+      // nothing is lost — just don't crash, and don't pretend the
+      // conversation was compacted when it wasn't.
+      this.opts.onStatus?.(
+        `[compaction failed] ${err.message} — checkpoint was saved, but the conversation wasn't summarized; continuing with the current context.`
+      );
+      logFailure({
+        timestamp: new Date().toISOString(),
+        summary: "compaction summary request failed",
+        toolName: "compact",
+        errorMessage: err.message,
+      });
+    }
   }
 
   /** Analyzes the accumulated failure log and, if a pattern recurs often

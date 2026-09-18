@@ -183,6 +183,22 @@ All four previously-known TODOs here are now resolved:
 All four are covered by unit tests (`src/agent/loop.test.ts`,
 `src/compaction/checkpoint.test.ts`, `src/compaction/compactor.test.ts`).
 
+### Crash fix: backend/compaction network failures no longer kill the process
+
+Found via a screen recording: running `llamacli` in a directory with no
+`.llamacli/config.yaml` falls back to a default backend URL nothing is
+listening on. The resulting `ECONNREFUSED` was an uncaught exception that
+crashed the whole Node process instead of staying inside the TUI.
+`AgentLoop` now catches both the main chat request and the compaction
+summary request, turning either failure into a `[error]`/`[compaction
+failed]` status line instead of a crash (the compaction checkpoint is
+written to disk *before* the summary request, so nothing is lost even if
+the summary call fails). `index.tsx`'s `onSubmit` and
+`resumeIfCheckpointExists()` call sites also got a defensive try/catch on
+top, as a second line of defense. Reproduced and verified fixed with the
+exact error from the recording, via a real pty run of the built global
+command. Covered by `src/agent/loop.test.ts`.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -207,6 +223,18 @@ All four are covered by unit tests (`src/agent/loop.test.ts`,
 >
 > 4가지 전부 유닛테스트로 커버됨(`src/agent/loop.test.ts`,
 > `src/compaction/checkpoint.test.ts`, `src/compaction/compactor.test.ts`).
+>
+> ### 크래시 수정: 백엔드/컴팩션 네트워크 실패로 프로세스가 죽던 문제
+>
+> 스크린 레코딩으로 발견: `.llamacli/config.yaml`이 없는 디렉토리에서 `llamacli`를
+> 실행하면 아무것도 안 떠 있는 기본 백엔드 URL로 폴백되는데, 이때 `ECONNREFUSED`가
+> 잡히지 않은 예외로 전체 Node 프로세스를 그대로 죽여버렸음. 이제 `AgentLoop`가 메인
+> chat 요청과 컴팩션 요약 요청 양쪽 모두를 캐치해서 크래시 대신 `[error]`/`[compaction
+> failed]` 상태 메시지로 전환한다(체크포인트는 요약 요청 *전에* 이미 디스크에 저장되므로
+> 요약이 실패해도 데이터 손실 없음). `index.tsx`의 `onSubmit`과
+> `resumeIfCheckpointExists()` 호출부에도 이중 방어용 try/catch를 추가함. 영상에 나온
+> 정확한 에러 문구로 재현한 뒤, 빌드된 전역 명령을 실제 pty로 구동해 수정 확인함.
+> `src/agent/loop.test.ts`로 커버됨.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

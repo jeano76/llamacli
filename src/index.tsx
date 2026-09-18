@@ -77,11 +77,17 @@ async function main() {
       cwd={projectRoot}
       model={config.model}
       onSubmit={async (text) => {
-        (globalThis as any).__llamacli_ui?.setBusy(true);
+        const ui = (globalThis as any).__llamacli_ui;
+        ui?.setBusy(true);
         try {
           await loop.send(text);
+        } catch (err: any) {
+          // Defensive: AgentLoop already catches expected backend/compaction
+          // failures internally, but nothing here should ever be allowed to
+          // crash the whole TUI process over an unexpected error.
+          ui?.pushStatus(`[error] ${err.message}`);
         } finally {
-          (globalThis as any).__llamacli_ui?.setBusy(false);
+          ui?.setBusy(false);
         }
       }}
       onSlashCommand={(key) => {
@@ -187,7 +193,11 @@ async function main() {
     />
   );
 
-  await loop.resumeIfCheckpointExists();
+  try {
+    await loop.resumeIfCheckpointExists();
+  } catch (err: any) {
+    (globalThis as any).__llamacli_ui?.pushStatus(`[error] failed to resume from checkpoint: ${err.message}`);
+  }
 }
 
 main().catch((err) => {

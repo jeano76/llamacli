@@ -208,3 +208,81 @@ test("resumeIfCheckpointExists is a no-op when there's no checkpoint", () =>
     await loop.resumeIfCheckpointExists();
     assert.equal(turnRequests.length, 0);
   }));
+
+// Reproduces the crash seen when running llamacli in a directory with no
+// .llamacli/config.yaml: it falls back to a default backend URL nothing is
+// listening on, and the resulting ECONNREFUSED must never crash the whole
+// CLI — it should surface as a status message and end the turn gracefully.
+test("send() does not throw when the backend is unreachable — reports a status message instead", () =>
+  withTempProject(async (dir) => {
+    const backend: ModelBackend = {
+      async chat(): Promise<ChatCompletionResponse> {
+        const err: any = new Error(
+          "request to http://127.0.0.1:8081/v1/chat/completions failed, reason: connect ECONNREFUSED 127.0.0.1:8081"
+        );
+        err.code = "ECONNREFUSED";
+        throw err;
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    // must resolve, not reject — this is the whole point of the fix
+    await assert.doesNotReject(() => loop.send("hello"));
+    assert.ok(statusMessages.some((s) => s.includes("ECONNREFUSED")));
+  }));
+
+test("compaction summary failure doesn't crash the loop — reports a status message and keeps the (uncompacted) context", () =>
+  withTempProject(async (dir) => {
+    const call1 = {
+      id: "c1",
+      type: "function" as const,
+      function: {
+        name: "update_plan",
+        arguments: JSON.stringify({ steps: [{ description: "step1", status: "in_progress" }] }),
+      },
+    };
+    let summaryAttempted = false;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          summaryAttempted = true;
+          throw new Error("connect ECONNREFUSED (summary request)");
+        }
+        return {
+          choices: [{ message: { role: "assistant", content: null, tool_calls: [call1] }, finish_reason: "tool_calls" }],
+        };
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 1000; // always over threshold, forces compaction on the very first check
+      },
+    };
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("hello"));
+    assert.ok(summaryAttempted);
+    assert.ok(statusMessages.some((s) => s.includes("compaction failed")));
+    // the checkpoint must still have been written even though the summary failed
+    assert.ok(await readCheckpoint(dir));
+  }));
