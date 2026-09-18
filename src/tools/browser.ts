@@ -63,10 +63,18 @@ interface CdpSession {
   close(): void;
 }
 
+/** Default timeout for both connecting and each individual CDP command —
+ *  exported so tests can shrink it instead of waiting out the real
+ *  default, same pattern as tools/index.ts's RUN_SHELL_TIMEOUT_MS. */
+export let CDP_TIMEOUT_MS = 15_000;
+export function setCdpTimeoutForTests(ms: number): void {
+  CDP_TIMEOUT_MS = ms;
+}
+
 /** Opens one CDP WebSocket session for the duration of a single tool call —
  *  simple request/response tool calls don't need a pooled/persistent
  *  connection, so each browser_* call opens, does its work, and closes. */
-function openSession(wsUrl: string, timeoutMs = 15_000): Promise<CdpSession> {
+function openSession(wsUrl: string, timeoutMs = CDP_TIMEOUT_MS): Promise<CdpSession> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
     const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
@@ -81,10 +89,33 @@ function openSession(wsUrl: string, timeoutMs = 15_000): Promise<CdpSession> {
     ws.addEventListener("open", () => {
       clearTimeout(openTimer);
       resolve({
+        // No timeout here previously — if the browser tab never sends a
+        // response for this command id (it crashed, hung, navigated away
+        // mid-command, or the connection silently stalled without an
+        // actual WebSocket error event), this promise waited forever,
+        // hanging the entire agent turn indefinitely. Same class of bug
+        // already fixed for run_shell (tools/index.ts) — a tool call must
+        // always fail visibly within a bounded time instead of blocking
+        // the whole loop. Reuses the same timeoutMs the session's own
+        // connect step uses, for a consistent bound across the whole
+        // session lifetime rather than a separate magic number.
         send(method, params = {}) {
           const id = ++nextId;
           return new Promise((res, rej) => {
-            pending.set(id, { resolve: res, reject: rej });
+            const timer = setTimeout(() => {
+              pending.delete(id);
+              rej(new Error(`timed out waiting for a response to ${method} (CDP command id ${id})`));
+            }, timeoutMs);
+            pending.set(id, {
+              resolve: (v) => {
+                clearTimeout(timer);
+                res(v);
+              },
+              reject: (e) => {
+                clearTimeout(timer);
+                rej(e);
+              },
+            });
             ws.send(JSON.stringify({ id, method, params }));
           });
         },

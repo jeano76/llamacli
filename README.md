@@ -1084,6 +1084,27 @@ and completes in well under a second — proving an actual early abort, not
 a lucky fast server — the other confirms an unbounded stream is consumed
 in full when no `max_tokens` is set at all (no regression).
 
+### A hung browser tab could block a tool call — and the whole turn — forever
+
+Asked directly to audit the logs/code for more stability gaps after the
+above. Found by proactively checking `browser.ts` for the same class of
+bug just fixed twice already (`run_shell`'s missing timeout, the
+streaming `max_tokens` gap): a CDP command's response promise
+(`session.send()` in `browser.ts`) had no timeout at all. If the browser
+tab crashed, hung, or the connection otherwise just stopped responding
+mid-session — without an actual WebSocket-level error event, which is
+exactly how a stalled-but-still-open connection behaves — the promise
+never resolved or rejected, hanging that tool call, and the entire agent
+turn waiting on it, forever.
+
+Fixed by giving every CDP command its own timeout (`CDP_TIMEOUT_MS`,
+15s default, exported for tests to shrink), matching the connection-open
+step, which already had one. Covered by a new test using a fake CDP
+WebSocket server (via the `ws` package, added as a devDependency) that
+accepts the connection but deliberately never replies to anything —
+confirming a tool call actually times out near the configured bound
+(verified: fires at ~311ms against a 300ms cap) instead of hanging.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1862,6 +1883,25 @@ in full when no `max_tokens` is set at all (no regression).
 > 우연히 빨랐던 게 아니라 실제로 조기에 중단시켰다는 증거), 다른 하나는
 > `max_tokens`를 아예 안 넣었을 때 무제한 스트림이 끝까지 전부 소비되는지
 > 확인(회귀 없음).
+>
+> ### 멈춘 브라우저 탭이 도구 호출을, 그리고 턴 전체를 영원히 막을 수 있던 문제
+>
+> 위 작업 이후 로그/코드를 더 점검해서 안정성 강화 여지가 있는지 직접
+> 요청받음. 이미 두 번 고친 것과 같은 종류의 버그(`run_shell`의 누락된
+> 타임아웃, 스트리밍 `max_tokens` 갭)가 또 있는지 먼저 확인하다가
+> `browser.ts`에서 발견: CDP 명령의 응답 Promise(`browser.ts`의
+> `session.send()`)에 타임아웃이 전혀 없었음. 브라우저 탭이 크래시하거나
+> 멈추거나, 연결이 그냥 응답을 멈추면(실제 WebSocket 레벨 에러 이벤트 없이 —
+> 멈췄지만 여전히 열려있는 연결이 정확히 이렇게 동작함) 이 Promise는 절대
+> resolve도 reject도 안 되고, 그 도구 호출과 그걸 기다리는 에이전트 턴 전체가
+> 영원히 멈춤.
+>
+> CDP 명령 하나하나에 자체 타임아웃을 부여해서 수정(`CDP_TIMEOUT_MS`, 기본
+> 15초, 테스트에서 줄일 수 있도록 export) — 이미 타임아웃이 있던 연결 시작
+> 단계와 맞춤. 연결은 받아들이지만 무엇에도 절대 응답하지 않는 가짜 CDP
+> WebSocket 서버(`ws` 패키지 사용, devDependency로 추가)를 이용한 새 테스트로
+> 커버함 — 도구 호출이 실제로 설정된 시간 근처에서 타임아웃되는지 확인함
+> (검증: 300ms 상한에 대해 약 311ms에서 발동), 멈추는 대신.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
