@@ -339,6 +339,51 @@ resize to 25×90: `\x1b[21;10H` again matches the recomputed formula exactly.
 Also confirmed `/quit` correctly emits `\x1b[?1049l` to restore the
 original shell screen with nothing left behind.
 
+### The real culprit for THIS bug: the slash menu shifting everything below it
+
+A fifth report zoomed into the actual pixels and found a stray "셀"
+character sitting directly on the input box's border line. Root cause:
+`logHeight` shrank by the menu's height only while it was open, so opening
+it shifted the input box and status bar rows down by ~10 rows in a single
+frame, and closing it shifted them back up — and Ink's incremental diffing
+didn't always fully clear content at the position it shifted *away from*,
+leaving fragments behind exactly where observed.
+
+First attempt: render the menu as a `position="absolute"` overlay so it
+wouldn't affect the log box's height at all. This does **not** work in Ink
+4.x — `position: absolute` only sets the Yoga position type, not an actual
+offset (there's no top/left/right/bottom style in Ink's `Styles` type at
+all, confirmed by reading `node_modules/ink/build/styles.js`). Using
+`marginTop` as a substitute offset pushed the menu's rendered output past
+the `overflow: hidden` boundary instead of being clipped by it, scrolling
+the real terminal — confirmed by direct byte capture showing the menu
+rendered far below the visible screen, past the status bar.
+
+**Final fix**: reserve the menu's full height (`SLASH_MENU_ITEMS.length +
+2`) *permanently* in the layout, whether it's open or not — opening/closing
+it is now purely a content change (render `<SlashMenu>` or nothing) inside
+a box whose size never changes, so nothing below it can ever need to move.
+This costs a visible empty gap between the log area and the input box when
+the menu is closed, which is a real trade-off, but it's the one approach
+that makes the "no ghosting, ever" guarantee unconditional rather than
+dependent on Ink behaving a particular way.
+
+Verified via raw cursor-position bytes: the input box's cursor row (e.g.
+`\x1b[38;...H`) is now byte-for-byte identical before opening the menu,
+while it's open, and after closing it — only the column changes, tracking
+typed characters. Confirmed the post-close frame is completely clean with
+no leftover content anywhere.
+
+### Also fixed: the prompt input wasn't actually inside its own border
+
+Separately reported directly: "the input box is the area inside the drawn
+line box" — pointing out that the visible bordered rectangle was pure
+decoration (an empty `<Box borderStyle="single" />` divider) while the
+actual typed text rendered in an unbordered row below it, not inside the
+box at all. Merged them into one real bordered `Box` that contains the
+spinner and input text as children, so the border now visibly encloses
+where you're typing, matching what it looks like it should do.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -484,6 +529,42 @@ original shell screen with nothing left behind.
 > 공식과 정확히 일치. 25×90으로 실제 리사이즈한 뒤에도 재검증: `\x1b[21;10H`가
 > 다시 재계산된 공식과 정확히 일치함. `/quit`이 `\x1b[?1049l`을 정확히 내보내
 > 원래 셸 화면을 아무것도 남기지 않고 복원하는 것도 확인함.
+>
+> ### 이번 버그의 진짜 범인: 슬래시 메뉴가 아래 요소들을 통째로 밀어냄
+>
+> 다섯 번째 신고에서 실제 픽셀을 확대해보니 "셀"이라는 글자가 입력 박스 테두리 줄에
+> 그대로 남아있었음. 근본 원인: 메뉴가 열려있을 때만 `logHeight`가 메뉴 높이만큼
+> 줄어들었고, 그래서 메뉴를 열면 입력 박스와 상태바 행이 한 프레임 안에서 ~10행씩
+> 아래로 밀렸다가, 닫으면 다시 위로 밀림 — Ink의 증분 diffing이 "밀려나간 자리"의
+> 이전 내용을 항상 완전히 지우지는 못해서, 정확히 관찰된 그 자리에 잔재가 남았던 것.
+>
+> 첫 시도: 메뉴를 `position="absolute"` 오버레이로 그려서 로그 박스 높이에 아예
+> 영향을 안 주게 함. Ink 4.x에서는 이게 **동작하지 않음** — `position: absolute`는
+> Yoga position 타입만 설정할 뿐 실제 오프셋은 전혀 없음(Ink의 `Styles` 타입에
+> top/left/right/bottom 자체가 없음, `node_modules/ink/build/styles.js`를 직접
+> 읽어 확인). 대신 `marginTop`으로 오프셋을 주니 메뉴의 렌더링 결과가
+> `overflow: hidden` 경계에 잘리는 대신 그 밖으로 밀려나가 실제 터미널이 스크롤됨 —
+> raw 바이트 캡처로 메뉴가 상태바보다 훨씬 아래, 화면 밖에 그려지는 걸 직접 확인.
+>
+> **최종 수정**: 메뉴의 전체 높이(`SLASH_MENU_ITEMS.length + 2`)를 열려있든 아니든
+> 레이아웃에 **항상 고정으로 예약**함 — 이제 열고 닫는 건 크기가 절대 안 변하는 박스
+> 안의 콘텐츠 변경(`<SlashMenu>` 렌더링 vs 아무것도 안 그림)일 뿐이라, 그 아래
+> 요소들이 움직일 필요 자체가 없음. 메뉴가 닫혀있을 때 로그 영역과 입력 박스 사이에
+> 빈 공간이 보이는 실제 트레이드오프가 있지만, Ink가 특정 방식으로 동작하길 기대하는
+> 게 아니라 "절대 잔상 없음"을 무조건적으로 보장하는 유일한 방법이었음.
+>
+> raw 커서 위치 바이트로 검증: 입력 박스의 커서 행(예: `\x1b[38;...H`)이 메뉴를
+> 열기 전/열려있는 동안/닫은 후 전부 바이트 단위로 동일함 — 컬럼만 타이핑한 글자를
+> 따라 바뀜. 닫은 후 프레임이 어디에도 잔재 없이 완전히 깨끗한 것도 확인.
+>
+> ### 추가로 고친 것: 입력창이 실제로는 자기 테두리 안에 있지 않았음
+>
+> 별도로 직접 신고받은 내용: "입력창은 선으로 그려진 박스 안의 영역이야" — 화면에
+> 보이는 테두리 사각형이 순전히 장식용(빈 `<Box borderStyle="single" />` 구분선)일
+> 뿐이었고, 실제로 타이핑한 텍스트는 그 박스 안이 아니라 아래의 테두리 없는 별도
+> 행에 그려지고 있었다는 지적. 스피너와 입력 텍스트를 자식으로 갖는 실제 테두리
+> `Box` 하나로 합쳐서, 이제 테두리가 실제로 타이핑하는 자리를 눈에 보이게 감싸도록
+> 고침.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

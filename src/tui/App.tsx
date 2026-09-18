@@ -138,36 +138,44 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // <Text> that's wider than the terminal instead of clipping it, so a long
   // typed line silently grew this row to several — and since the total
   // layout height is fixed (see logHeight below), that overflow scrolled
-  // the real terminal, leaving ghosting when it shrank back down (the same
-  // class of bug the slash menu had). Truncate to what actually fits
-  // instead of ever letting the input Text wrap.
-  const maxInputWidth = Math.max(10, columns - 4); // paddingX(2) + spinner(1) + leading space(1)
+  // the real terminal, leaving ghosting when it shrank back down. Truncate
+  // to what actually fits instead of ever letting the input Text wrap.
+  // Reserves 2 extra columns for the input box's own left+right border
+  // characters (see the bordered Box below) on top of its padding/spinner/space.
+  const maxInputWidth = Math.max(10, columns - 6);
   const visibleInput = tailToWidth(input, maxInputWidth);
 
-  // The slash menu (round border top+bottom + one line per item) adds rows
-  // on top of the normal chrome (divider + input + status bar). Without
-  // accounting for it, total rendered content exceeds the outer Box's fixed
-  // `rows` height while the menu is open, which scrolls the real terminal —
-  // and when the menu closes and the content shrinks back down, that scroll
-  // doesn't cleanly undo, leaving stale content ("잔상") behind (PROMPT.md
-  // §6 explicitly requires no ghosting/leftover artifacts on popup close).
-  const menuHeight = menuOpen ? SLASH_MENU_ITEMS.length + 2 : 0;
-  const logHeight = Math.max(3, rows - 6 - menuHeight);
+  // The slash menu's row budget is now RESERVED PERMANENTLY, whether it's
+  // open or not — rather than only occupying space while open. Two other
+  // approaches were tried and both broke: (1) shrinking logHeight only
+  // while the menu was open shifted everything below it (input box, status
+  // bar) by up to ~10 rows in a single frame, and Ink's incremental diffing
+  // didn't fully clear the old content at the shifted-from position,
+  // leaving stale fragments visible right on the input box's border
+  // (confirmed via a screen recording: a leftover "셀" on the border line
+  // after closing the menu). (2) Rendering it as a `position="absolute"`
+  // overlay to avoid that shift entirely turned out not to work either —
+  // Ink 4.x's `position: absolute` only sets the Yoga position TYPE, not an
+  // actual offset (no top/left/right/bottom style exists), and using
+  // `marginTop` as a substitute pushed the menu's *output* below the
+  // `overflow: hidden` boundary instead of clipping it, scrolling the real
+  // terminal (confirmed by direct byte capture). Reserving fixed,
+  // always-present space is less exciting but is the one approach that
+  // makes "menu open/closed" purely a content change within a box whose
+  // size never changes — nothing else can ever need to move because of it.
+  const menuBoxHeight = SLASH_MENU_ITEMS.length + 2; // round border top+bottom
+  // Fixed chrome below the log area: menu box + input box top border(1) +
+  // content(1) + bottom border(1) + status bar(1).
+  const logHeight = Math.max(3, rows - 4 - menuBoxHeight);
 
-  // Absolute cursor positioning. Earlier attempts moved the cursor
-  // *relative* to wherever Ink's writer happened to leave it, which turned
-  // out to vary by terminal (verified wrong on a real GNOME Terminal
-  // session despite passing a synthetic pty test) — an unreliable
-  // foundation no matter how carefully the offset was measured. This only
-  // works because index.tsx now switches to the terminal's alternate
-  // screen buffer before rendering, giving row 1 a fixed, known meaning —
-  // combined with the app's total height being provably constant at
-  // `rows` every frame (the menu/input/status-bar overflow bugs are all
-  // fixed), the input row's absolute position is fully determined by our
-  // own layout math, not by guessing what Ink left behind.
+  // Absolute cursor positioning, reliable because index.tsx switches to the
+  // terminal's alternate screen buffer before rendering (giving row 1 a
+  // fixed, known meaning) and the app's total height is now provably
+  // constant every frame regardless of menu state.
   useEffect(() => {
-    const inputRow = logHeight + 1 /* divider */ + menuHeight + 1; // 1-indexed
-    const promptColumn = 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
+    const inputRow = logHeight + menuBoxHeight + 1 /* input box top border */ + 1; // 1-indexed content row
+    const promptColumn =
+      1 /* input box left border */ + 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
     process.stdout.write(`\x1b[${inputRow};${promptColumn}H\x1b[?25h`);
   });
 
@@ -203,11 +211,15 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         {visualRows.slice(-logHeight)}
       </Box>
 
-      <Box borderStyle="single" borderColor="gray" />
+      {/* Always present at this fixed height, open or not — see the
+       *  logHeight comment above for why. */}
+      <Box flexDirection="column" height={menuBoxHeight} overflow="hidden">
+        {menuOpen && <SlashMenu selectedIndex={menuIndex} />}
+      </Box>
 
-      {menuOpen && <SlashMenu selectedIndex={menuIndex} />}
-
-      <Box paddingX={1} height={1} overflow="hidden">
+      {/* The prompt input lives INSIDE this bordered box, not below it —
+       *  the border is the visible edge of the actual input area. */}
+      <Box borderStyle="single" borderColor="gray" paddingX={1} height={3} overflow="hidden">
         <Spinner active={busy} />
         <Text> {visibleInput}</Text>
       </Box>
