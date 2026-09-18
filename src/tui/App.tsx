@@ -153,35 +153,42 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   const maxInputWidth = Math.max(10, columns - 6);
   const visibleInput = tailToWidth(input, maxInputWidth);
 
-  // The slash menu's row budget is now RESERVED PERMANENTLY, whether it's
-  // open or not — rather than only occupying space while open. Two other
-  // approaches were tried and both broke: (1) shrinking logHeight only
-  // while the menu was open shifted everything below it (input box, status
-  // bar) by up to ~10 rows in a single frame, and Ink's incremental diffing
-  // didn't fully clear the old content at the shifted-from position,
-  // leaving stale fragments visible right on the input box's border
-  // (confirmed via a screen recording: a leftover "셀" on the border line
-  // after closing the menu). (2) Rendering it as a `position="absolute"`
-  // overlay to avoid that shift entirely turned out not to work either —
-  // Ink 4.x's `position: absolute` only sets the Yoga position TYPE, not an
-  // actual offset (no top/left/right/bottom style exists), and using
-  // `marginTop` as a substitute pushed the menu's *output* below the
-  // `overflow: hidden` boundary instead of clipping it, scrolling the real
-  // terminal (confirmed by direct byte capture). Reserving fixed,
-  // always-present space is less exciting but is the one approach that
-  // makes "menu open/closed" purely a content change within a box whose
-  // size never changes — nothing else can ever need to move because of it.
+  // logHeight is a CONSTANT, independent of menu state — this is the outer
+  // log-area Box's actual `height`, and it must never change, because
+  // changing it is what breaks things: (1) shrinking it only while the
+  // menu was open shifted everything below (input box, status bar) by up
+  // to ~10 rows in one frame, and Ink's incremental diffing didn't fully
+  // clear the old content at the shifted-from position, leaving stale
+  // fragments right on the input box's border (confirmed via a screen
+  // recording: a leftover "셀" there after closing the menu). (2)
+  // Permanently reserving the menu's height as a *separate* fixed box
+  // avoided that, but left a permanent empty gap between the log and the
+  // input box whenever the menu was closed (reported directly: text
+  // "doesn't reach down to the prompt input"). (3) `position="absolute"`
+  // to overlay it doesn't work in Ink 4.x — it only sets the Yoga position
+  // TYPE, not an actual offset (no top/left/right/bottom style exists),
+  // and a `marginTop` substitute pushed the menu's output past the
+  // `overflow: hidden` boundary instead of being clipped, scrolling the
+  // real terminal (confirmed by direct byte capture).
+  //
+  // The fix: keep this Box's height fixed at all times, and instead change
+  // what's rendered *inside* it — when the menu is open, show fewer log
+  // rows and the menu in the space freed up, all within the SAME
+  // never-changing box. The outer box's contribution to the layout is
+  // therefore always exactly `logHeight`, so nothing below it ever needs
+  // to move, and nothing is permanently reserved when the menu is closed.
   const menuBoxHeight = SLASH_MENU_ITEMS.length + 2; // round border top+bottom
-  // Fixed chrome below the log area: menu box + input box top border(1) +
-  // content(1) + bottom border(1) + status bar(1).
-  const logHeight = Math.max(3, rows - 4 - menuBoxHeight);
+  // Fixed chrome below the log area: input box top border(1) + content(1) +
+  // bottom border(1) + status bar(1).
+  const logHeight = Math.max(3, rows - 4);
+  const visibleLogRows = menuOpen ? Math.max(0, logHeight - menuBoxHeight) : logHeight;
 
   // Absolute cursor positioning, reliable because index.tsx switches to the
   // terminal's alternate screen buffer before rendering (giving row 1 a
   // fixed, known meaning) and the app's total height is now provably
   // constant every frame regardless of menu state.
   useEffect(() => {
-    const inputRow = logHeight + menuBoxHeight + 1 /* input box top border */ + 1; // 1-indexed content row
+    const inputRow = logHeight + 1 /* input box top border */ + 1; // 1-indexed content row
     const promptColumn =
       1 /* input box left border */ + 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
     process.stdout.write(`\x1b[${inputRow};${promptColumn}H\x1b[?25h`);
@@ -232,14 +239,12 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
        *  reported directly as text never reaching the bottom area. Anchor
        *  it to the bottom instead, so any leftover blank space sits above
        *  the content (like a normal scrolling terminal/chat view), and new
-       *  lines are always right next to the input box, not far above it. */}
+       *  lines are always right next to the input box, not far above it.
+       *  This box's `height` is always exactly `logHeight`, whether the
+       *  menu is open or not — only `visibleLogRows` (how much of that
+       *  fixed space goes to log content vs. the menu) changes. */}
       <Box flexDirection="column" height={logHeight} overflow="hidden" justifyContent="flex-end">
-        {visualRows.slice(-logHeight)}
-      </Box>
-
-      {/* Always present at this fixed height, open or not — see the
-       *  logHeight comment above for why. */}
-      <Box flexDirection="column" height={menuBoxHeight} overflow="hidden">
+        {visualRows.slice(-visibleLogRows)}
         {menuOpen && <SlashMenu selectedIndex={menuIndex} />}
       </Box>
 

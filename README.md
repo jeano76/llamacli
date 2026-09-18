@@ -508,6 +508,27 @@ so real `<div>`/`<span>`/etc. content a user pastes is left alone. Tests
 use the exact leaked strings captured from the real backend. Covered by
 `src/agent/textSanitize.test.ts` (85 tests total, all passing).
 
+### Reserving space for the menu created a new permanent gap
+
+Reported directly, again about the top-fixed output area: some blank space
+existed and text never reached down to the prompt input. Cause: the
+previous fix for menu-open/close ghosting (see below) permanently reserved
+the slash menu's full height as a *separate* box, always present whether
+the menu was open or not — solving the ghosting, but leaving an ugly
+~10-row gap between the log and the input box any time the menu was
+closed (i.e. almost always).
+
+Fixed properly this time: the log area's outer `Box` keeps a truly constant
+`height={logHeight}` at all times (so nothing below it can ever shift —
+preserving the ghosting fix), but what's rendered *inside* that fixed space
+changes — `visibleLogRows` shrinks by the menu's height only while it's
+open, so the menu and the log content share the same never-resized box
+instead of the menu getting its own permanently-reserved one. Verified via
+pty: log content now sits directly above the input box with no gap when
+the menu is closed, the menu still renders cleanly right above the input
+box when open, and closing it again leaves no ghosting — including a real
+follow-up assistant response rendering correctly right after.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -790,6 +811,23 @@ use the exact leaked strings captured from the real backend. Covered by
 > 사용자가 실제로 붙여넣는 `<div>`/`<span>` 등의 콘텐츠는 건드리지 않음. 테스트는 실제
 > 백엔드에서 캡처한 정확한 leak 문자열을 그대로 사용함. `src/agent/textSanitize.test.ts`
 > 로 커버됨(총 85개 테스트 전부 통과).
+>
+> ### 메뉴 공간 예약이 새로운 영구 공백을 만듦
+>
+> 다시 직접 신고됨(같은 "상단 고정 출력 영역" 관련): 공백이 존재하고 텍스트가
+> 프롬프트 입력까지 내려오지 않는다는 것. 원인: 메뉴 열고 닫을 때 잔상이 생기던
+> 이전 수정(아래 참고)이 슬래시 메뉴의 전체 높이를 **별도의** 박스로 열려있든
+> 아니든 항상 예약해뒀음 — 잔상 문제는 해결했지만, 메뉴가 닫혀있을 때(거의 항상)
+> 로그와 입력 박스 사이에 보기 흉한 ~10줄짜리 공백이 생겨버림.
+>
+> 이번엔 제대로 고침: 로그 영역의 바깥 `Box`는 항상 정확히 `height={logHeight}`로
+> 고정된 채 유지하되(아래에 있는 게 절대 안 움직임 — 잔상 수정은 그대로 보존), 그
+> 고정된 공간 *안에서* 렌더링되는 내용만 바꿈 — `visibleLogRows`가 메뉴가 열려있을
+> 때만 메뉴 높이만큼 줄어들어서, 메뉴가 별도의 영구 예약 공간을 갖는 대신 로그
+> 콘텐츠와 같은, 절대 크기가 안 바뀌는 박스를 공유함. pty로 검증: 메뉴가 닫혀있을 때
+> 로그 콘텐츠가 이제 공백 없이 입력 박스 바로 위에 붙고, 메뉴가 열려있을 때도 입력
+> 박스 바로 위에 깨끗하게 렌더링되며, 다시 닫아도 잔상이 없음 — 그 직후 실제
+> assistant 응답이 정상적으로 렌더링되는 것까지 확인함.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
