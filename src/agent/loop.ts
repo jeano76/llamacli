@@ -57,6 +57,15 @@ export class AgentLoop {
    *  this session, so a still-recurring failure doesn't re-append (and
    *  re-call the model for) the same finding on every new occurrence. */
   private loggedImprovementSignatures = new Set<string>();
+  /** Set whenever a failure is logged during the current turn; checked
+   *  after the turn fully completes (see `send()`) rather than triggering
+   *  the improvement-check model call immediately inside the turn. This
+   *  server only has one inference slot (`-np 1`, confirmed from real
+   *  llama-server logs — llamacli's own background call was racing the
+   *  turn's own next request for that single slot and could delay it),
+   *  so a background analysis call must never fire while a turn is still
+   *  actively in flight. */
+  private hasNewFailuresThisTurn = false;
 
   constructor(private opts: AgentLoopOptions) {
     this.messages = [{ role: "system", content: opts.systemPrompt }];
@@ -85,6 +94,7 @@ export class AgentLoop {
     await this.enqueue(async () => {
       const resumed = await this.injectResumeContextIfPending();
       if (resumed) await this.runUntilIdle();
+      this.checkForRealtimeImprovementAfterTurn();
     });
   }
 
@@ -100,7 +110,17 @@ export class AgentLoop {
       await this.injectResumeContextIfPending();
       this.messages.push({ role: "user", content: userText });
       await this.runUntilIdle();
+      this.checkForRealtimeImprovementAfterTurn();
     });
+  }
+
+  /** Fires the (fire-and-forget) real-time improvement check only after the
+   *  turn has fully finished — never while one is still in flight. See the
+   *  `hasNewFailuresThisTurn` docstring for why. */
+  private checkForRealtimeImprovementAfterTurn(): void {
+    if (!this.hasNewFailuresThisTurn) return;
+    this.hasNewFailuresThisTurn = false;
+    this.triggerRealtimeImprovementCheck();
   }
 
   /** Chains `task` onto the shared queue so it never overlaps a turn or a
@@ -143,7 +163,7 @@ export class AgentLoop {
           toolName: "chat",
           errorMessage: err.message,
         });
-        this.triggerRealtimeImprovementCheck();
+        this.hasNewFailuresThisTurn = true;
         return;
       }
       const message = res.choices[0].message;
@@ -222,7 +242,7 @@ export class AgentLoop {
             toolName: call.function.name,
             errorMessage: err.message,
           });
-          this.triggerRealtimeImprovementCheck();
+          this.hasNewFailuresThisTurn = true;
         }
         this.messages.push({ role: "tool", tool_call_id: call.id, content });
       }
@@ -332,7 +352,7 @@ export class AgentLoop {
         toolName: "compact",
         errorMessage: err.message,
       });
-      this.triggerRealtimeImprovementCheck();
+      this.hasNewFailuresThisTurn = true;
     }
   }
 

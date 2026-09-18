@@ -916,6 +916,23 @@ review flow above. Each recurring pattern (by its grouping signature, not
 its growing occurrence count) is only logged once per session, so a
 still-failing pattern doesn't spam the file on every subsequent occurrence.
 
+**Deferred to after the turn, not fired mid-turn.** Asked directly to
+analyze the real llama-server's own logs (`journalctl --user -u
+llama-server.service`) for improvement points, and found one: this backend
+only has a single inference slot (`-np 1`), and the log showed real cache
+churn (`making room for prompt cache entry, removing oldest entry` — 18
+evictions in an hour, ~38% of slot selections falling back to LRU instead
+of reusing a cached prefix). The original implementation triggered the
+improvement-check call immediately inside the tool-call loop, right after
+logging a failure — meaning it could race the *same turn's own next
+request* for that single slot and delay the user's response. Fixed by only
+checking after the whole turn's `runUntilIdle()` loop has completed
+(`hasNewFailuresThisTurn` flag, checked in `send()`/
+`resumeIfCheckpointExists()`), so the background analysis call never
+competes with an in-flight turn for the one available slot. Verified with
+a test that tracks call ordering and asserts the improvement-check request
+only ever appears after the turn's own final response.
+
 > ## 헤르메스 자가 개선 제안 루프
 >
 > 동일한 도구가 같은 실패 패턴으로 2회 이상 반복되면(`src/hermes/selfImprove.ts`), 모델에게
@@ -942,6 +959,19 @@ still-failing pattern doesn't spam the file on every subsequent occurrence.
 > 만들려면 여전히 위의 `/improve` → `/improve-apply` 검토 절차가 필요하다. 각 반복
 > 패턴은 (계속 늘어나는 발생 횟수가 아니라 그룹핑 시그니처 기준으로) 세션당 한 번만
 > 기록되므로, 계속 실패하는 패턴이 매번 파일을 도배하지 않는다.
+>
+> **턴 도중이 아니라 턴이 끝난 뒤로 미룸.** 실제 llama-server 자체 로그
+> (`journalctl --user -u llama-server.service`)를 직접 분석해서 개선점을 찾아달라는
+> 요청을 받고 하나를 발견함: 이 백엔드는 추론 슬롯이 1개(`-np 1`)뿐인데, 로그에 실제
+> 캐시 스래싱이 보임(`making room for prompt cache entry, removing oldest entry` —
+> 1시간에 18번 제거, 슬롯 선택의 ~38%가 캐시된 prefix 재사용 대신 LRU로 폴백). 원래
+> 구현은 실패를 로그에 남긴 직후 도구 호출 루프 안에서 곧바로 개선 체크 호출을
+> 트리거했음 — 즉 **같은 턴의 다음 요청**과 그 하나뿐인 슬롯을 두고 경쟁해서 사용자
+> 응답을 지연시킬 수 있었음. 턴 전체(`runUntilIdle()` 루프)가 완전히 끝난 뒤에만
+> 체크하도록 수정(`hasNewFailuresThisTurn` 플래그, `send()`/
+> `resumeIfCheckpointExists()`에서 확인) — 이제 백그라운드 분석 호출이 진행 중인 턴과
+> 하나뿐인 슬롯을 두고 절대 경쟁하지 않음. 호출 순서를 추적해서 개선 체크 요청이 항상
+> 턴의 최종 응답 이후에만 나타나는지 확인하는 테스트로 검증함.
 
 ## Remote browser control (Chrome DevTools Protocol)
 
