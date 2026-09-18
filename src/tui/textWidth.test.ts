@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { tailToWidth, wrapToWidth } from "./textWidth.js";
+import { tailToWidth, wrapToWidth, wrapAnsiSafe } from "./textWidth.js";
 
 test("tailToWidth returns the text unchanged when it already fits", () => {
   assert.equal(tailToWidth("hello", 20), "hello");
@@ -91,4 +91,43 @@ test("wrapToWidth round-trips content losslessly (joining wrapped lines reconstr
   const text = "가나다라마바사아자차카타파하".repeat(3);
   const lines = wrapToWidth(text, 6);
   assert.equal(lines.join(""), text);
+});
+
+// wrapAnsiSafe exists because wrapToWidth's plain char-by-char wrapping
+// tears an ANSI escape sequence like `\x1b[32m` into individual characters
+// (each counted as visible width), corrupting both the code and the width
+// budget — this was the reason diff text was previously left entirely
+// unwrapped rather than passed through wrapToWidth.
+test("wrapAnsiSafe never splits an escape sequence across two lines", () => {
+  const colored = "\x1b[32mHello world this is a longer colored line\x1b[0m";
+  const lines = wrapAnsiSafe(colored, 10);
+  for (const line of lines) {
+    // An escape sequence starts with ESC and ends at the first letter
+    // ('m' for SGR codes); a torn sequence would leave a stray lone ESC
+    // with no matching 'm' terminator in that same line.
+    const opens = (line.match(/\x1b\[/g) ?? []).length;
+    const closes = (line.match(/m/g) ?? []).length;
+    assert.ok(closes >= opens, `line has an unterminated escape sequence: ${JSON.stringify(line)}`);
+  }
+});
+
+test("wrapAnsiSafe keeps every wrapped line's visible width within budget, ignoring ANSI codes", () => {
+  const colored = "\x1b[1m\x1b[32mHello world this is a longer bold colored line that must wrap\x1b[0m";
+  const lines = wrapAnsiSafe(colored, 12);
+  for (const line of lines) {
+    assert.ok(stringWidth(line) <= 12, `line exceeds width budget: ${JSON.stringify(line)} (${stringWidth(line)})`);
+  }
+});
+
+test("wrapAnsiSafe preserves the visible text content across the wrap", () => {
+  const colored = "\x1b[32mHello world this is a longer colored line\x1b[0m";
+  const lines = wrapAnsiSafe(colored, 10);
+  // Strip ANSI codes from the rejoined output and compare visible text only.
+  const visible = lines.join("").replace(/\x1b\[[0-9;]*m/g, "");
+  assert.equal(visible, "Hello world this is a longer colored line");
+});
+
+test("wrapAnsiSafe behaves like wrapToWidth for plain text with no ANSI codes", () => {
+  const text = "the quick brown fox jumps over the lazy dog";
+  assert.deepEqual(wrapAnsiSafe(text, 10), wrapToWidth(text, 10));
 });

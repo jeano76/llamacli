@@ -1,4 +1,5 @@
 import stringWidth from "string-width";
+import wrapAnsi from "wrap-ansi";
 
 /** Keeps the END of `text` (matching where a cursor conceptually sits while
  *  typing/where the most relevant tail of a path is) that fits within
@@ -56,6 +57,30 @@ export function wrapToWidth(text: string, maxWidth: number): string[] {
       currentWidth += w;
     }
     out.push(current);
+  }
+  return out;
+}
+
+/**
+ * Same job as `wrapToWidth`, but safe for text carrying embedded ANSI
+ * escape codes (markdown-rendered assistant text, colored diffs) — plain
+ * `wrapToWidth` iterates `Array.from(text)` one *character* at a time,
+ * which tears an escape sequence like `\x1b[32m` into its individual
+ * characters, both corrupting the code itself and miscounting its pieces
+ * as real, visible-width glyphs. `wrap-ansi` understands escape sequences
+ * as zero-width and re-opens whatever style was active at each wrap
+ * point, so color/bold carries across the break instead of leaking into
+ * (or vanishing from) unrelated text after it.
+ */
+export function wrapAnsiSafe(text: string, maxWidth: number): string[] {
+  const width = Math.max(1, maxWidth);
+  const out: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    if (paragraph === "") {
+      out.push("");
+      continue;
+    }
+    out.push(...wrapAnsi(paragraph, width, { hard: true, trim: false }).split("\n"));
   }
   return out;
 }

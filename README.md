@@ -601,6 +601,61 @@ server covering the real response shape, a missing-`n_ctx` response, and a
 non-OK response — all falling back rather than silently returning a bogus
 value.
 
+### Assistant text had no color/formatting, unlike Claude Code's own output
+
+Reported directly: no ANSI color anywhere in assistant text, and no visible
+distinction for fenced code blocks — everything rendered as flat white
+text regardless of what markdown the model actually produced. Fixed by
+rendering assistant messages through `marked` + `marked-terminal`
+(`src/tui/markdown.ts`), giving real headings, bold/italic, syntax-
+highlighted code blocks, and lists in the terminal, matching how Claude
+Code's own CLI output looks.
+
+Two real bugs surfaced while building this, both caught by tests/direct
+verification rather than assumed away:
+
+- `marked-terminal` renders through `chalk`, which decides whether to emit
+  color at the moment it's first imported. Setting `process.env.FORCE_COLOR`
+  *after* a static `import ... from "marked-terminal"` silently did
+  nothing — ES module imports are hoisted, so marked-terminal (and the
+  chalk instance it creates) finish initializing, with color already
+  decided, before any of the importing module's own top-level code runs.
+  Two new tests caught this (asserting the actual output contains ANSI
+  escape codes, not just that rendering doesn't throw). Fixed by forcing
+  the env var first and only then dynamically importing marked-terminal
+  (top-level `await import(...)`), so chalk sees it during its own
+  initialization.
+- Rendering ANSI-carrying text (markdown output, and pre-existing colored
+  diffs) through the log area's existing `wrapToWidth()` corrupts it —
+  that function iterates the text one *character* at a time, which tears
+  an escape sequence like `\x1b[32m` into individual characters, breaking
+  the code and miscounting its pieces as visible glyphs. This is exactly
+  why colored diffs were previously just left unwrapped entirely rather
+  than passed through it (risking their own overflow). Added
+  `wrapAnsiSafe()` (`src/tui/textWidth.ts`, via the `wrap-ansi` package)
+  which treats escape sequences as zero-width and re-opens whatever style
+  was active at each wrap point, and switched both diff and assistant
+  markdown rendering to use it.
+
+A third bug turned up only once real markdown content (with its frequent
+blank-line separators between blocks) started flowing through the log
+area: reported directly as a blank area appearing even when the screen was
+full of text. Root cause, confirmed with a minimal Ink render: an
+empty-string `<Text>` gets **zero** rendered height in Ink — not one row
+like every other line — so a wrapped blank-line entry silently vanished
+from the layout instead of taking up its own row. That made the log box's
+actual rendered height fall short of its fixed `logHeight` budget, and
+since the box is `justifyContent="flex-end"`, the shortfall showed up as a
+gap at the *top* instead of the bottom. This was always a latent risk for
+any multi-line diff/status content with blank lines, just rare enough
+before to not show up — markdown made it routine. Fixed by rendering a
+single space instead of an empty string for blank wrapped lines. Verified
+with a real pty-driven render: filled the log area past capacity with
+markdown content, captured the actual terminal screen with `pyte`, and
+confirmed the log box is genuinely filled edge-to-edge (the one remaining
+blank row in that capture was traced back to a real blank line in the
+source markdown, not a rendering artifact) with color present throughout.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -964,6 +1019,55 @@ value.
 > 서버를 만들어 실제 응답 형태·`n_ctx` 없는 응답·비정상 응답 3가지를
 > 다루는 새 유닛 테스트도 추가함 — 셋 다 엉뚱한 값을 조용히 반환하는
 > 대신 폴백하는지 검증.
+>
+> ### assistant 텍스트에 색상/서식이 전혀 없던 문제 (Claude Code 자체 출력과 달리)
+>
+> 직접 신고됨: assistant 텍스트 어디에도 ANSI 색상이 없고, 코드 블록도 눈에 띄는
+> 구분이 전혀 없음 — 모델이 실제로 어떤 마크다운을 만들었든 전부 흰 평문으로만
+> 렌더링됨. `marked` + `marked-terminal`(`src/tui/markdown.ts`)을 통해 assistant
+> 메시지를 렌더링하도록 고쳐서, 실제 헤딩·굵게/기울임·문법 강조된 코드 블록·리스트가
+> 터미널에 제대로 나오게 함 — Claude Code 자체 CLI 출력과 비슷한 모양.
+>
+> 이걸 만드는 과정에서 실제 버그 2개가 드러났고, 둘 다 그냥 넘어가지 않고
+> 테스트/직접 검증으로 잡음:
+>
+> - `marked-terminal`은 `chalk`를 통해 렌더링하는데, `chalk`는 자신이 처음
+>   import되는 시점에 색상 출력 여부를 결정함. `import ... from "marked-terminal"`
+>   같은 정적 import *다음에* `process.env.FORCE_COLOR`를 설정해도 조용히
+>   아무 효과가 없었음 — ES 모듈 import는 호이스팅되므로, 이 모듈 자신의
+>   최상위 코드가 실행되기 전에 marked-terminal(과 그게 내부적으로 만드는
+>   chalk 인스턴스)이 이미 색상 여부를 결정한 채로 초기화를 끝내버림. 새
+>   테스트 2개가 이걸 바로 잡아냄(렌더링이 그냥 안 죽는지가 아니라, 실제
+>   출력에 ANSI 이스케이프 코드가 포함돼 있는지를 직접 검증). env 변수를
+>   먼저 강제로 설정하고 그 다음에야 marked-terminal을 동적으로 import(최상위
+>   `await import(...)`)하도록 고쳐서, chalk가 자기 초기화 시점에 이 값을
+>   보게 함.
+> - ANSI가 섞인 텍스트(마크다운 출력, 그리고 기존의 색깔 있는 diff)를 로그
+>   영역의 기존 `wrapToWidth()`로 감싸면 내용이 깨짐 — 이 함수는 텍스트를
+>   한 *글자*씩 순회하는데, 이러면 `\x1b[32m` 같은 이스케이프 시퀀스가 낱개
+>   문자로 찢어지면서 코드 자체가 깨지고 그 조각들이 눈에 보이는 글자처럼
+>   폭 계산에 잘못 들어감. 색깔 있는 diff를 예전엔 아예 줄바꿈 없이 그냥
+>   그대로 출력했던 이유가 정확히 이것(대신 diff 자체가 넘칠 위험을 감수함).
+>   `wrap-ansi` 패키지를 써서 이스케이프 시퀀스를 폭 0으로 취급하고 줄바꿈
+>   지점마다 활성 스타일을 다시 열어주는 `wrapAnsiSafe()`(`src/tui/textWidth.ts`)를
+>   추가하고, diff와 assistant 마크다운 렌더링 둘 다 이걸 쓰도록 바꿈.
+>
+> 세 번째 버그는 실제 마크다운 콘텐츠(블록 사이 빈 줄 구분이 잦음)가 로그
+> 영역에 흐르기 시작하고 나서야 드러남: 화면에 글씨가 가득 찼는데도 상단에
+> 공백 영역이 생긴다고 직접 신고됨. 최소 Ink 렌더로 직접 확인한 근본 원인:
+> Ink에서 빈 문자열 `<Text>`는 다른 모든 줄과 달리 렌더링 높이가 **0**임 —
+> 즉 줄바꿈된 빈 줄 항목 하나가 자기 몫의 한 행을 차지하는 대신 레이아웃에서
+> 조용히 사라져버림. 그 결과 로그 박스의 실제 렌더링 높이가 고정된
+> `logHeight` 예산보다 부족해지고, 이 박스가 `justifyContent="flex-end"`라서
+> 그 부족분이 하단이 아니라 *상단* 공백으로 나타남. 이건 원래도 여러 줄짜리
+> diff/상태 메시지에 빈 줄이 섞이면 항상 잠재돼 있던 위험이었는데, 그동안은
+> 드물어서 안 보였을 뿐 — 마크다운이 이걸 일상적으로 만들어버림. 줄바꿈된
+> 빈 줄에 빈 문자열 대신 스페이스 하나를 렌더링하도록 고쳐서 해결. 실제
+> pty로 구동한 렌더로 검증함: 로그 영역 용량을 넘길 만큼 마크다운 콘텐츠를
+> 채운 뒤 `pyte`로 실제 터미널 화면을 캡처해서, 로그 박스가 정말로 끝에서
+> 끝까지 빈틈없이 채워져 있는 것을 확인함(그 캡처에서 유일하게 남아있던
+> 빈 줄 하나는 렌더링 결함이 아니라 원본 마크다운 안의 진짜 빈 줄로 추적
+> 확인됨), 색상도 전체에 걸쳐 제대로 나오는 것까지 확인함.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

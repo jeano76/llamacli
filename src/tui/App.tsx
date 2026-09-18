@@ -4,8 +4,9 @@ import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
-import { tailToWidth, wrapToWidth } from "./textWidth.js";
+import { tailToWidth, wrapToWidth, wrapAnsiSafe } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
+import { renderMarkdown } from "./markdown.js";
 
 export interface AppProps {
   cwd: string;
@@ -215,32 +216,54 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // visible. Pre-slice raw entries generously first so this stays cheap on
   // long sessions instead of flattening the whole history every render.
   const recentEntries = log.slice(-Math.max(logHeight * 5, 50));
-  const visualRows = recentEntries.flatMap((line) =>
-    line.kind === "diff"
-      ? // Diff text carries its own embedded ANSI color codes (added/removed
-        // lines), so render it raw instead of through Ink's `color` prop,
-        // which would wrap (and clash with) the codes already inside it.
-        line.text.split("\n").map((rawLine, i) => <Text key={`${line.id}-${i}`}>{rawLine}</Text>)
-      : // Any other line kind (tool-call JSON, assistant prose, status
-        // messages) can be arbitrarily long — a tool call's full command
-        // string routinely exceeds the terminal width. Wrap it ourselves so
-        // every entry here really is one terminal row, matching what
-        // `logHeight` assumes; otherwise Ink wraps it unaccounted-for,
-        // silently using more real rows than budgeted (the same
-        // overflow-then-ghosting class of bug already fixed for the input
-        // line/status bar/slash menu — this is where it was still hiding).
-        wrapToWidth(
-          (line.kind === "user" ? "> " : "") + line.text,
-          Math.max(10, columns)
-        ).map((wrapped, i) => (
-          <Text
-            key={`${line.id}-${i}`}
-            color={line.kind === "assistant" ? "white" : line.kind === "tool" ? "magenta" : "gray"}
-          >
-            {wrapped}
-          </Text>
-        ))
-  );
+  // Ink/Yoga gives an empty-string <Text> ZERO rendered height — not one
+  // row like every other line — instead of a blank line taking up its own
+  // row. Confirmed directly (a minimal Ink render collapsed blank entries
+  // out of the layout entirely). That silently made the box's actual
+  // rendered height fall short of `logHeight` whenever a wrapped entry
+  // produced a blank line, and since the box is `justifyContent="flex-end"`,
+  // the shortfall showed up as a gap at the TOP instead of the bottom —
+  // reported directly as a blank area appearing even with a full screen of
+  // text. This got much more visible once markdown rendering (below) started
+  // inserting blank-line separators between blocks routinely, but it was
+  // always a latent risk for any multi-line diff/status content too. A
+  // single space renders as a real one-row-tall blank line instead.
+  const asRow = (s: string) => s || " ";
+  const visualRows = recentEntries.flatMap((line) => {
+    const width = Math.max(10, columns);
+    if (line.kind === "diff") {
+      // Diff text carries its own embedded ANSI color codes (added/removed
+      // lines) from formatDiff() — render it raw instead of through Ink's
+      // `color` prop, which would clash with the codes already inside it.
+      // Wrap with wrapAnsiSafe (not wrapToWidth): plain char-by-char
+      // wrapping tears an escape sequence like `\x1b[32m` into individual
+      // characters, corrupting it and miscounting its pieces as visible
+      // glyphs — this was previously just left unwrapped entirely to dodge
+      // that, which meant a long diff line could itself overflow the fixed
+      // layout height (the same class of bug fixed everywhere else).
+      return wrapAnsiSafe(line.text, width).map((wrapped, i) => (
+        <Text key={`${line.id}-${i}`}>{asRow(wrapped)}</Text>
+      ));
+    }
+    if (line.kind === "assistant") {
+      // Reported directly: assistant text had no color/formatting at all,
+      // unlike Claude Code's own terminal output — fenced code blocks,
+      // bold, headings, lists all rendered as flat white text. Render
+      // through marked-terminal for real markdown + syntax-highlighted
+      // code, then wrap ANSI-safely for the same reason as the diff case
+      // above (renderMarkdown's output is full of color codes).
+      return wrapAnsiSafe(renderMarkdown(line.text), width).map((wrapped, i) => (
+        <Text key={`${line.id}-${i}`}>{asRow(wrapped)}</Text>
+      ));
+    }
+    // tool-call JSON, user echo, status messages: plain text, no ANSI of
+    // their own, so the simpler char-width wrap is fine and cheaper.
+    return wrapToWidth((line.kind === "user" ? "> " : "") + line.text, width).map((wrapped, i) => (
+      <Text key={`${line.id}-${i}`} color={line.kind === "tool" ? "magenta" : "gray"}>
+        {asRow(wrapped)}
+      </Text>
+    ));
+  });
 
   return (
     <Box flexDirection="column" height={rows} overflow="hidden">
