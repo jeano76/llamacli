@@ -4,7 +4,7 @@ import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
-import { tailToWidth, wrapToWidth, wrapAnsiSafe } from "./textWidth.js";
+import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
 
@@ -43,6 +43,14 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   const [planProgress, setPlanProgress] = useState<{ done: number; total: number } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuIndex, setMenuIndex] = useState(0);
+  // Rows scrolled up from the live bottom (0 = following the newest output,
+  // like a normal terminal). Requested directly: the alt-screen buffer
+  // (needed for reliable absolute cursor positioning — see index.tsx) also
+  // disables the terminal's own native scrollback as a side effect, so
+  // there was no way at all to look back at anything that had scrolled off
+  // the fixed-height log box. This restores that ability inside the app
+  // itself instead.
+  const [scrollOffset, setScrollOffset] = useState(0);
   // Messages typed while the agent is busy wait here instead of being sent
   // immediately; /queue inspects this list (PROMPT.md §6 message queue input).
   const [queue, setQueue] = useState<string[]>([]);
@@ -51,6 +59,15 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // appending to, so successive deltas mutate one line instead of spawning
   // a new one per chunk.
   const streamingIdRef = useRef<number | null>(null);
+  // How far scrollOffset can go before there's nothing further back to see —
+  // updated every render (see below) rather than recomputed inside the key
+  // handler, which would mean redoing the markdown/wrap rendering work
+  // twice per keystroke just to clamp a scroll position.
+  const maxScrollRef = useRef(0);
+  // Same reasoning as maxScrollRef — needed inside the key handler (for
+  // sizing a Page Up/Down jump) before logHeight is computed later in this
+  // render, so it's carried over from the previous one instead.
+  const logHeightRef = useRef(3);
 
   function pushLine(text: string, kind: LogLine["kind"]) {
     setLog((prev) => [...prev, { id: logIdCounter++, text, kind }]);
@@ -150,6 +167,18 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
       return;
     }
 
+    // Arrow keys are otherwise unused while typing a normal message (Ink
+    // gives an empty `char` for them, so the fallback append-to-input
+    // below is already a harmless no-op for these) — repurposed for
+    // scrollback instead of adding a new dedicated keybinding. PageUp/Down
+    // jump a full screen at a time; plain Up/Down move one line.
+    if (key.pageUp || key.pageDown || key.upArrow || key.downArrow) {
+      const amount = key.pageUp || key.pageDown ? Math.max(1, logHeightRef.current - 1) : 1;
+      const direction = key.pageUp || key.upArrow ? 1 : -1;
+      setScrollOffset((s) => Math.max(0, Math.min(maxScrollRef.current, s + amount * direction)));
+      return;
+    }
+
     if (key.return) {
       if (input.trim().length === 0) return;
       if (busy) {
@@ -160,6 +189,10 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         onSubmit(input);
       }
       setInput("");
+      // A message you just sent should be visible without having to
+      // manually scroll back down for it — snap back to the live tail,
+      // matching how a normal chat/terminal view behaves.
+      setScrollOffset(0);
       return;
     }
     if (key.backspace || key.delete) {
@@ -230,7 +263,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // Fixed chrome below the log area: input box top border(1) + content(1) +
   // bottom border(1) + status bar(1).
   const logHeight = Math.max(3, rows - 4);
-  const visibleLogRows = menuOpen ? Math.max(0, logHeight - menuBoxHeight) : logHeight;
+  logHeightRef.current = logHeight;
 
   // Absolute cursor positioning, reliable because index.tsx switches to the
   // terminal's alternate screen buffer before rendering (giving row 1 a
@@ -288,7 +321,17 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
       // through marked-terminal for real markdown + syntax-highlighted
       // code, then wrap ANSI-safely for the same reason as the diff case
       // above (renderMarkdown's output is full of color codes).
-      return wrapAnsiSafe(renderMarkdown(line.text), width).map((wrapped, i) => (
+      //
+      // `width` is passed through to renderMarkdown itself now (used for
+      // prose reflow — marked-terminal's own `width` option doesn't
+      // actually apply to tables at all, see wrapPreservingTables below),
+      // and the result goes through wrapPreservingTables rather than
+      // plain wrapAnsiSafe — reported directly, with a screenshot: a
+      // markdown table rendered with mangled, disjointed borders. See
+      // wrapPreservingTables's own comment for the root cause; the short
+      // version is that wrapping ANY table row, even ANSI-safely, still
+      // destroys its visual structure, so a table row is clipped instead.
+      return wrapPreservingTables(renderMarkdown(line.text, width), width).map((wrapped, i) => (
         <Text key={`${line.id}-${i}`}>{asRow(wrapped)}</Text>
       ));
     }
@@ -301,6 +344,21 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     ));
   });
 
+  // Content rows available to the log itself (as opposed to the menu, or
+  // the one-row scroll indicator below) — reserving a row for the
+  // indicator ahead of actually being scrolled (rather than only once
+  // scrollOffset > 0) keeps maxScrollRef consistent regardless of current
+  // scroll position, avoiding a circular "how much can I scroll depends on
+  // whether I'm already scrolled" dependency.
+  const scrollableContentRows = menuOpen ? Math.max(0, logHeight - menuBoxHeight) : Math.max(0, logHeight - 1);
+  const maxScroll = Math.max(0, visualRows.length - scrollableContentRows);
+  maxScrollRef.current = maxScroll;
+  const clampedScroll = menuOpen ? 0 : Math.min(scrollOffset, maxScroll);
+  const showScrollIndicator = !menuOpen && clampedScroll > 0;
+  const contentRows = menuOpen ? scrollableContentRows : logHeight - (showScrollIndicator ? 1 : 0);
+  const sliceEnd = visualRows.length - clampedScroll;
+  const sliceStart = Math.max(0, sliceEnd - contentRows);
+
   return (
     <Box flexDirection="column" height={rows} overflow="hidden">
       {/* justifyContent="flex-end": when there's less content than
@@ -312,10 +370,18 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
        *  the content (like a normal scrolling terminal/chat view), and new
        *  lines are always right next to the input box, not far above it.
        *  This box's `height` is always exactly `logHeight`, whether the
-       *  menu is open or not — only `visibleLogRows` (how much of that
-       *  fixed space goes to log content vs. the menu) changes. */}
+       *  menu is open or not — only how much of that fixed space goes to
+       *  log content vs. the menu vs. the scroll indicator changes. */}
       <Box flexDirection="column" height={logHeight} overflow="hidden" justifyContent="flex-end">
-        {visualRows.slice(-visibleLogRows)}
+        {showScrollIndicator && (
+          <Text dimColor>
+            {`── ↑ scrolled up ${clampedScroll} line${clampedScroll === 1 ? "" : "s"} · ↓/PageDown to return to live ──`.slice(
+              0,
+              Math.max(10, columns)
+            )}
+          </Text>
+        )}
+        {visualRows.slice(sliceStart, sliceEnd)}
         {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
       </Box>
 

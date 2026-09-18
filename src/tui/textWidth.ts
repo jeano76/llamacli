@@ -84,3 +84,34 @@ export function wrapAnsiSafe(text: string, maxWidth: number): string[] {
   }
   return out;
 }
+
+/** Any of the box-drawing characters marked-terminal (via cli-table3) uses
+ *  to render a markdown table. A line containing one of these is a table
+ *  border or content row. */
+const TABLE_LINE_CHARS = /[┌┐└┘├┤┬┴┼─│]/;
+
+/**
+ * Like `wrapAnsiSafe`, but a table row is CLIPPED (kept from the left,
+ * whatever doesn't fit is dropped) instead of wrapped onto a second line.
+ *
+ * Reported directly, with a screenshot: a markdown table rendered with
+ * mangled, disjointed borders. Root cause: cli-table3 (which marked-
+ * terminal delegates table rendering to) has no "fit to an overall
+ * terminal width" option — only explicit per-column widths, which would
+ * require knowing each table's actual column count ahead of render time.
+ * A table row wider than the terminal was therefore reaching this wrap
+ * step as one long ANSI-colored line, and wrapping ANY table row —
+ * even correctly, without tearing escape codes — still destroys the
+ * table's visual structure: half a cell's border ends up on one line,
+ * the other half orphaned on the next with nothing lining up, which is
+ * exactly the disjointed-border look in the report. Clipping instead
+ * degrades far more gracefully (missing right-hand columns, but what IS
+ * shown still looks like a real table) than wrapping ever could.
+ */
+export function wrapPreservingTables(text: string, maxWidth: number): string[] {
+  const width = Math.max(1, maxWidth);
+  return text.split("\n").flatMap((line) => {
+    if (!TABLE_LINE_CHARS.test(line)) return wrapAnsiSafe(line, width);
+    return [wrapAnsiSafe(line, width)[0] ?? ""];
+  });
+}

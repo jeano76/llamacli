@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { tailToWidth, wrapToWidth, wrapAnsiSafe } from "./textWidth.js";
+import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 
 test("tailToWidth returns the text unchanged when it already fits", () => {
   assert.equal(tailToWidth("hello", 20), "hello");
@@ -130,4 +130,40 @@ test("wrapAnsiSafe preserves the visible text content across the wrap", () => {
 test("wrapAnsiSafe behaves like wrapToWidth for plain text with no ANSI codes", () => {
   const text = "the quick brown fox jumps over the lazy dog";
   assert.deepEqual(wrapAnsiSafe(text, 10), wrapToWidth(text, 10));
+});
+
+// Reported directly, with a screenshot: a markdown table rendered with
+// mangled, disjointed borders in a real terminal. Root cause: a table row
+// is one long ANSI-colored line, and wrapping it — even ANSI-safely,
+// without tearing escape codes — still destroys its visual structure
+// (half a cell's border on one line, the rest orphaned on the next with
+// nothing lining up). wrapPreservingTables clips an over-wide table row
+// instead of wrapping it onto a second line.
+test("wrapPreservingTables clips an over-wide table row instead of wrapping it onto a second line", () => {
+  const tableRow = "│ some fairly long cell content │ another cell │ a third one │";
+  const result = wrapPreservingTables(tableRow, 20);
+  assert.equal(result.length, 1, `expected exactly one (clipped) line for a table row, got ${result.length}`);
+  assert.ok(stringWidth(result[0]) <= 20);
+});
+
+test("wrapPreservingTables still wraps normal (non-table) prose across multiple lines", () => {
+  const prose = "the quick brown fox jumps over the lazy dog and keeps going for a while longer";
+  const result = wrapPreservingTables(prose, 20);
+  assert.ok(result.length > 1, "expected prose to actually wrap onto multiple lines");
+  for (const line of result) assert.ok(stringWidth(line) <= 20);
+});
+
+test("wrapPreservingTables preserves ANSI color codes on a clipped table row (doesn't tear them)", () => {
+  const tableRow = "\x1b[32m│ colored cell content that is fairly long │\x1b[39m";
+  const result = wrapPreservingTables(tableRow, 15);
+  assert.equal(result.length, 1);
+  // A torn escape sequence would leave a lone ESC with no 'm' terminator.
+  const opens = (result[0].match(/\x1b\[/g) ?? []).length;
+  const closes = (result[0].match(/m/g) ?? []).length;
+  assert.ok(closes >= opens, `line has an unterminated escape sequence: ${JSON.stringify(result[0])}`);
+});
+
+test("wrapPreservingTables leaves a table row that already fits completely unchanged", () => {
+  const tableRow = "│ a │ b │";
+  assert.deepEqual(wrapPreservingTables(tableRow, 80), [tableRow]);
 });

@@ -987,6 +987,63 @@ directly: temporarily disabling the `reset()` calls reproduced the precise
 real error message from the live session, confirming the test actually
 catches the regression, not just that it passes with the fix applied.
 
+### No scrollback, a mangled markdown table, and how the table fix actually works
+
+Two related UI reports. First, directly: no way to scroll back and see
+earlier output — a known, accepted trade-off from switching to the
+terminal's alternate screen buffer (needed for reliable absolute cursor
+positioning) is that it also disables the terminal's own native
+scrollback. Added an in-app scrollback instead (`App.tsx`): Up/Down arrow
+and Page Up/Down (repurposed — both are otherwise unused while typing a
+normal message) scroll the fixed-height log box, with a one-row indicator
+(`── ↑ scrolled up N lines · ↓/PageDown to return to live ──`) appearing
+at the top while scrolled, and automatically snapping back to the live
+tail the moment you send a new message (so you're never left having to
+scroll back down manually to see your own reply). The one-row indicator
+is reserved from the log box's own always-constant `logHeight` — the
+outer box's height still never changes, the same principle every earlier
+layout fix here depends on — not appended past it, which would reopen the
+"total content exceeds the fixed layout height" bug class fixed
+repeatedly before.
+
+Second, reported directly with a screenshot: a markdown table rendered
+with mangled, disjointed borders in a real terminal. Root cause, found by
+reading marked-terminal's own source: its `width` option — which
+`renderMarkdown()` already receives and uses for prose reflow — is never
+actually forwarded to `cli-table3`, the library it delegates table
+rendering to. A table row reaches the wrap step as one long, real-terminal-
+width-unaware ANSI-colored line, and wrapping it — even correctly,
+without tearing escape codes — still destroys a table's visual structure:
+half a cell's border ends up on one line, the rest orphaned on the next
+with nothing lining up, which is exactly the disjointed look in the
+report. `cli-table3` has no "fit to an overall width" option either —
+only explicit per-column widths, which would need knowing each table's
+actual column count ahead of render time.
+
+Fixed with a new `wrapPreservingTables()` (`textWidth.ts`): a table row
+(detected by the presence of any of its box-drawing characters,
+`┌┐└┘├┤┬┴┼─│`) is *clipped* instead of wrapped when it's too wide —
+kept from the left, whatever doesn't fit is dropped — which degrades far
+more gracefully (missing right-hand columns, but what IS shown still
+looks like a real table) than wrapping ever could. Non-table lines still
+wrap normally. `App.tsx`'s assistant-message rendering now uses this
+instead of a plain `wrapAnsiSafe()`.
+
+Verified against the real backend in a throwaway project: asked for a
+real markdown table comparing three languages, confirmed every border
+character lines up correctly across rows in the actual rendered terminal
+screen (captured and replayed through `pyte`), with the table cleanly
+clipped rather than corrupted where it ran past the terminal width. Also
+verified the scrollback itself end-to-end: filled a small (15-row)
+terminal past capacity, confirmed Page Up revealed earlier content with
+the scroll indicator showing the correct line count, and Page Down
+returned exactly to the original live view. Covered by new unit tests for
+both `wrapPreservingTables` (clips a table row, still wraps prose
+normally, preserves ANSI codes on the clip, leaves an already-fitting row
+unchanged) and `renderMarkdown` (still produces valid table output —
+border characters and all cell values — across a range of widths, since
+the actual width constraint now happens one layer up).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1682,6 +1739,53 @@ catches the regression, not just that it passes with the fix applied.
 > 실제 라이브 세션에서 나온 바로 그 에러 메시지가 정확히 재현됐고, 이걸로 이
 > 테스트가 수정을 적용했을 때 통과한다는 것뿐 아니라 회귀를 실제로 잡아낸다는
 > 것까지 확인함.
+>
+> ### 스크롤백이 없던 문제, 깨진 마크다운 테이블, 그리고 테이블 수정이 실제로 작동하는 방식
+>
+> 관련된 UI 신고 두 건. 먼저 직접 신고: 예전 출력으로 되돌아가 볼 스크롤 방법이
+> 없음 — alt-screen buffer로 전환한 것(안정적인 절대 커서 위치 지정에 필요)의
+> 이미 알려진, 받아들인 트레이드오프로 터미널 자체의 네이티브 스크롤백도 같이
+> 꺼지는 부작용이 있었음. 앱 자체 안에 스크롤백을 새로 추가함(`App.tsx`): 위/아래
+> 화살표와 Page Up/Down(둘 다 평범한 메시지를 타이핑하는 동안엔 원래 안 쓰이는
+> 키라 재활용) 키가 고정 높이 로그 박스를 스크롤하고, 스크롤 중일 땐 맨 위에
+> 한 줄짜리 안내(`── ↑ scrolled up N lines · ↓/PageDown to return to live ──`)가
+> 나타나며, 새 메시지를 보내는 순간 자동으로 라이브 하단으로 복귀함(자기가 보낸
+> 메시지 보려고 수동으로 다시 스크롤 내릴 필요 없게). 이 한 줄짜리 안내는 로그
+> 박스 자체의 항상 고정된 `logHeight` 안에서 확보됨 — 바깥 박스 높이는 여전히
+> 절대 안 바뀜, 여기 있는 이전의 모든 레이아웃 수정이 의존하는 것과 같은 원칙 —
+> 그 너머로 추가되는 게 아님(그랬다면 이전에 반복해서 고쳤던 "전체 콘텐츠가
+> 고정 레이아웃 높이를 넘는다" 버그 종류가 다시 열림).
+>
+> 두 번째, 스크린샷과 함께 직접 신고: 실제 터미널에서 마크다운 테이블이 깨지고
+> 흩어진 테두리로 렌더링됨. marked-terminal 자체 소스를 읽어서 찾은 근본 원인:
+> `renderMarkdown()`이 이미 받아서 산문 리플로우에 쓰고 있는 `width` 옵션이,
+> 테이블 렌더링을 위임받는 라이브러리인 `cli-table3`에는 실제로 전혀 전달되지
+> 않고 있었음. 테이블 행 하나가 실제 터미널 너비를 전혀 모르는, 하나의 길고
+> ANSI 색상이 입혀진 줄로 줄바꿈 단계에 도달하고, 그걸 줄바꿈하면 — 이스케이프
+> 코드를 안 찢는 올바른 방식이라 해도 — 테이블의 시각적 구조 자체가 깨짐: 셀
+> 하나의 테두리 절반은 한 줄에, 나머지 절반은 다음 줄에 아무것도 안 맞은 채
+> 고아처럼 남음 — 신고에 나온 것과 정확히 같은 흩어진 모습. `cli-table3`에도
+> "전체 너비에 맞추기" 옵션은 없음 — 명시적인 컬럼별 너비만 있는데, 이건 렌더링
+> 시점 이전에 각 테이블의 실제 컬럼 개수를 알아야 함.
+>
+> 새 `wrapPreservingTables()`(`textWidth.ts`)로 수정: 테이블 행(박스 그리기
+> 문자 `┌┐└┘├┤┬┴┼─│` 중 하나의 존재로 감지)은 너무 넓을 때 줄바꿈되는 대신
+> *잘림* — 왼쪽부터 유지하고 안 맞는 부분은 버림 — 이게 줄바꿈보다 훨씬 더
+> 우아하게 저하됨(오른쪽 컬럼들이 없어지긴 하지만, 보이는 부분은 여전히 진짜
+> 테이블처럼 보임). 테이블이 아닌 줄은 여전히 정상적으로 줄바꿈됨. `App.tsx`의
+> assistant 메시지 렌더링이 이제 단순 `wrapAnsiSafe()` 대신 이걸 씀.
+>
+> 실제 백엔드로 임시 프로젝트에서 검증함: 세 언어를 비교하는 진짜 마크다운
+> 테이블을 요청해서, 실제 렌더링된 터미널 화면(캡처해서 `pyte`로 재생)에서
+> 모든 테두리 문자가 행마다 정확히 맞춰지는 것과, 터미널 너비를 넘는 부분은
+> 깨지는 대신 깔끔하게 잘리는 것까지 확인함. 스크롤백 자체도 엔드투엔드로
+> 검증함: 작은(15행) 터미널을 용량 넘게 채우고, Page Up이 스크롤 인디케이터에
+> 정확한 줄 수를 보여주면서 이전 콘텐츠를 드러내는지, Page Down이 정확히 원래
+> 라이브 화면으로 복귀하는지 확인함. 새 유닛 테스트로 `wrapPreservingTables`
+> (테이블 행을 자름, 산문은 여전히 정상적으로 줄바꿈, 자른 부분에서도 ANSI
+> 코드 보존, 이미 맞는 행은 그대로 둠)와 `renderMarkdown`(실제 너비 제약은
+> 이제 한 단계 위에서 일어나므로, 여러 너비에 걸쳐 여전히 유효한 테이블 출력 —
+> 테두리 문자와 모든 셀 값 — 을 만드는지)를 커버함.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
