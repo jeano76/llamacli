@@ -384,6 +384,31 @@ box at all. Merged them into one real bordered `Box` that contains the
 spinner and input text as children, so the border now visibly encloses
 where you're typing, matching what it looks like it should do.
 
+### One more spot the same overflow bug was hiding: unwrapped log lines
+
+Reported as garbled text in an actual response (`...입니다!m월 %d일 %A\""}`
+appearing glued onto the answer). Traced it by reproducing the exact
+question against the real model directly — its actual streamed content was
+completely clean, ruling out a model-quality issue. The real cause:
+`logHeight`'s row budget always treated every log entry (a tool call's
+JSON arguments, a long assistant paragraph, a status message) as exactly
+one terminal row, but nothing constrained their width — a long line (very
+common for `run_shell` tool-call arguments) wraps in Ink on its own,
+unaccounted for, so the actual row count temporarily exceeded the budget.
+The exact same "total content exceeds the fixed layout height" bug class
+already fixed for the input line, status bar, and slash menu — this was
+the last place it was still hiding.
+
+Fixed with a general-purpose `wrapToWidth()` (`src/tui/textWidth.ts`,
+alongside the existing `tailToWidth()`) that wraps *every* log line kind
+(not just diffs, which already had their own line-splitting) to the real
+terminal width using display-width-aware wrapping, so `logHeight`'s
+per-entry accounting is always accurate. Verified against a real model
+response in a narrow (70-column) terminal with several long, retried
+`run_shell` tool-call lines that wrap across multiple rows — the final
+answer rendered completely cleanly with no fragments mixed in. Covered by
+`src/tui/textWidth.test.ts`.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -565,6 +590,25 @@ where you're typing, matching what it looks like it should do.
 > 행에 그려지고 있었다는 지적. 스피너와 입력 텍스트를 자식으로 갖는 실제 테두리
 > `Box` 하나로 합쳐서, 이제 테두리가 실제로 타이핑하는 자리를 눈에 보이게 감싸도록
 > 고침.
+>
+> ### 같은 오버플로우 버그가 숨어있던 마지막 자리: 줄바꿈 안 된 로그 줄
+>
+> 실제 응답에 이상한 글자가 섞인 것으로 신고됨(`...입니다!m월 %d일 %A\""}`가 답변에
+> 그대로 붙어 나옴). 같은 질문을 실제 모델에 직접 재현해보니 모델이 스트리밍하는
+> 실제 콘텐츠 자체는 완전히 깨끗해서 모델 품질 문제는 배제됨. 진짜 원인: `logHeight`
+> 행 예산이 로그 항목(도구 호출 JSON, 긴 assistant 문단, 상태 메시지) 하나를 항상
+> 정확히 1행으로 취급했지만, 그 폭에는 아무 제한이 없었음 — 긴 줄(`run_shell` 도구
+> 호출 인자에서 아주 흔함)은 Ink가 알아서 줄바꿈하는데 이게 예산 계산에 전혀
+> 반영이 안 돼서, 실제 행 수가 일시적으로 예산을 초과했음. 입력줄/상태바/슬래시
+> 메뉴에서 이미 고쳤던 것과 정확히 같은 "전체 콘텐츠가 고정 레이아웃 높이를 초과"
+> 버그 클래스 — 이게 마지막으로 숨어있던 자리였음.
+>
+> 범용 `wrapToWidth()`(`src/tui/textWidth.ts`, 기존 `tailToWidth()` 옆에 추가)로
+> 수정 — diff(이미 자체 줄 분리 로직이 있었음)뿐 아니라 **모든** 로그 줄 종류를 실제
+> 터미널 폭 기준으로(디스플레이 폭 인식 줄바꿈) 감싸서, `logHeight`의 항목별 계산이
+> 항상 정확하도록 함. 좁은(70컬럼) 터미널에서 여러 번 재시도한 긴 `run_shell` 도구
+> 호출 줄이 여러 행으로 줄바꿈되는 실제 모델 응답으로 검증 — 최종 답변이 잔재 섞임
+> 없이 완전히 깨끗하게 렌더링됨. `src/tui/textWidth.test.ts`로 커버됨.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { tailToWidth } from "./textWidth.js";
+import { tailToWidth, wrapToWidth } from "./textWidth.js";
 
 test("tailToWidth returns the text unchanged when it already fits", () => {
   assert.equal(tailToWidth("hello", 20), "hello");
@@ -42,4 +42,53 @@ test("tailToWidth never returns something wider than maxWidth, across a range of
       );
     }
   }
+});
+
+test("wrapToWidth returns a single line unchanged when it already fits", () => {
+  assert.deepEqual(wrapToWidth("hello", 20), ["hello"]);
+});
+
+test("wrapToWidth splits a long line into multiple lines, each within the width budget", () => {
+  const lines = wrapToWidth("abcdefghij", 4);
+  assert.deepEqual(lines, ["abcd", "efgh", "ij"]);
+});
+
+test("wrapToWidth preserves existing newlines as their own wrap boundaries", () => {
+  const lines = wrapToWidth("short\nlonger line that wraps", 10);
+  assert.equal(lines[0], "short");
+  assert.ok(lines.length > 2); // "short" line + the wrapped continuation lines
+});
+
+test("wrapToWidth never emits a line wider than maxWidth, and never drops content, for a range of inputs", () => {
+  const candidates = [
+    "",
+    "a",
+    "a tool call with a long command: date +\"%Y년 %m월 %d일 %A\"",
+    "안녕하세요 반갑습니다 — 이건 아주 긴 한글 문장으로 줄바꿈을 테스트합니다",
+    "x".repeat(300),
+    "가".repeat(80),
+  ];
+  for (const text of candidates) {
+    for (const maxWidth of [5, 10, 20, 50, 120]) {
+      // maxWidth=1 is excluded: a single double-width (CJK) character can't
+      // be split further, so it's the one unavoidable case where a "line"
+      // exceeds the budget — not a realistic terminal width anyway.
+      const lines = wrapToWidth(text, maxWidth);
+      for (const line of lines) {
+        assert.ok(
+          stringWidth(line) <= maxWidth,
+          `wrapToWidth(${JSON.stringify(text)}, ${maxWidth}) produced a line wider than budget: ${JSON.stringify(line)}`
+        );
+      }
+      // no content lost: concatenating the wrapped pieces (undoing the
+      // inserted breaks) reproduces the original paragraph text exactly
+      assert.equal(lines.join(""), text.replace(/\n/g, ""));
+    }
+  }
+});
+
+test("wrapToWidth round-trips content losslessly (joining wrapped lines reconstructs the original, modulo the inserted wrap breaks)", () => {
+  const text = "가나다라마바사아자차카타파하".repeat(3);
+  const lines = wrapToWidth(text, 6);
+  assert.equal(lines.join(""), text);
 });

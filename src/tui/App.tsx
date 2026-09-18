@@ -4,7 +4,7 @@ import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
-import { tailToWidth } from "./textWidth.js";
+import { tailToWidth, wrapToWidth } from "./textWidth.js";
 
 export interface AppProps {
   cwd: string;
@@ -194,15 +194,25 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         // lines), so render it raw instead of through Ink's `color` prop,
         // which would wrap (and clash with) the codes already inside it.
         line.text.split("\n").map((rawLine, i) => <Text key={`${line.id}-${i}`}>{rawLine}</Text>)
-      : [
+      : // Any other line kind (tool-call JSON, assistant prose, status
+        // messages) can be arbitrarily long — a tool call's full command
+        // string routinely exceeds the terminal width. Wrap it ourselves so
+        // every entry here really is one terminal row, matching what
+        // `logHeight` assumes; otherwise Ink wraps it unaccounted-for,
+        // silently using more real rows than budgeted (the same
+        // overflow-then-ghosting class of bug already fixed for the input
+        // line/status bar/slash menu — this is where it was still hiding).
+        wrapToWidth(
+          (line.kind === "user" ? "> " : "") + line.text,
+          Math.max(10, columns)
+        ).map((wrapped, i) => (
           <Text
-            key={line.id}
+            key={`${line.id}-${i}`}
             color={line.kind === "assistant" ? "white" : line.kind === "tool" ? "magenta" : "gray"}
           >
-            {line.kind === "user" ? "> " : ""}
-            {line.text}
-          </Text>,
-        ]
+            {wrapped}
+          </Text>
+        ))
   );
 
   return (
