@@ -234,6 +234,29 @@ directory with zero prior configuration, it found this machine's actual
 running server and connected to it with no manual setup. Covered by
 `src/backend/detect.test.ts` and `src/config.test.ts`.
 
+### Input-line wrap fix: the same ghosting bug, triggered by a long typed line
+
+A third recording showed the leftover-character ghosting still happening
+even after the slash-menu fix above — this time with the menu never
+opened. Root cause: the input row's `<Text>{input}</Text>` had no width
+constraint, so once typed text got wider than the terminal, Ink wrapped it
+onto multiple rows instead of clipping it. That's the exact same
+"total content exceeds the fixed layout height" overflow as the menu case,
+just triggered by a long line instead of a popup — and shrinking back down
+(backspacing, or wrapping back to one line) left the same stale content
+behind. Fixed by measuring the input with real terminal display width
+(`string-width` — Hangul and other wide characters are 2 columns, not 1,
+so a naive `.length`-based cut would still overflow) and always rendering
+only the tail that fits in one row, prefixed with `…` when truncated,
+exactly like a normal single-line terminal input. The input row is also now
+pinned to `height={1}` with `overflow="hidden"` as a backstop. Verified: a
+210-character line no longer wraps past one row, no matter how long it
+gets or how it's edited. Covered by `src/tui/App.test.ts`.
+
+(While investigating, also removed the unused `uuid` dependency, which had
+an open moderate-severity advisory — it was never actually imported
+anywhere in the codebase.)
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -298,6 +321,24 @@ running server and connected to it with no manual setup. Covered by
 > 알린다(조용히 잘못 찍지 않음). 사전 설정이 전혀 없는 디렉토리에서 실행해
 > 실제로 이 기기의 실행 중인 서버를 찾아 수동 설정 없이 연결되는 것까지 확인함.
 > `src/backend/detect.test.ts`, `src/config.test.ts`로 커버됨.
+>
+> ### 입력줄 줄바꿈 수정: 같은 잔상 버그가 긴 입력줄로도 재현됨
+>
+> 세 번째 영상에서, 슬래시 메뉴를 아예 열지 않았는데도 위와 같은 잔상 버그가 여전히
+> 재현됨. 원인 — 입력줄의 `<Text>{input}</Text>`에 폭 제한이 전혀 없어서, 타이핑한
+> 텍스트가 터미널 폭보다 길어지면 Ink가 잘라내는 대신 여러 줄로 줄바꿈했음. 이건
+> 메뉴 때와 정확히 같은 "전체 콘텐츠가 고정된 레이아웃 높이를 초과" 오버플로우이며,
+> 팝업 대신 긴 한 줄이 트리거였을 뿐임 — 다시 줄어들 때(백스페이스, 혹은 한 줄로
+> 다시 줄어들 때) 같은 방식으로 잔상이 남음. `string-width`로 실제 터미널 표시
+> 폭을 측정해서(한글 등 wide 문자는 1이 아니라 2칸을 차지하므로 단순 `.length` 기준
+> 자르기로는 여전히 넘칠 수 있음) 항상 한 줄에 들어가는 만큼의 꼬리 부분만 렌더링하고,
+> 잘렸으면 앞에 `…`을 붙이도록 수정 — 일반적인 한 줄짜리 터미널 입력창과 동일한 동작.
+> 입력줄 박스에도 `height={1}`과 `overflow="hidden"`을 백스톱으로 추가함. 검증: 210자
+> 짜리 줄도 더 이상 한 줄을 넘지 않음(얼마나 길어지거나 어떻게 편집되든). `src/tui/App.test.ts`로
+> 커버됨.
+>
+> (조사 중 사용되지 않는 `uuid` 의존성도 함께 제거함 — 보안 권고가 열려있었는데 코드
+> 어디서도 실제로 import된 적이 없었음.)
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

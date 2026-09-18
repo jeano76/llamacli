@@ -1,8 +1,28 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput, useStdout } from "ink";
+import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
+
+/** Keeps the END of `text` (matching where a cursor conceptually sits while
+ *  typing) that fits within `maxWidth` terminal columns, prefixed with "…"
+ *  when truncated. Uses real display width (via string-width), not
+ *  `.length`, since wide characters (Hangul, CJK generally) occupy 2
+ *  terminal columns each — a naive length-based cut would still overflow. */
+export function tailToWidth(text: string, maxWidth: number): string {
+  if (stringWidth(text) <= maxWidth) return text;
+  const chars = Array.from(text);
+  let width = 0;
+  let start = chars.length;
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const w = stringWidth(chars[i]);
+    if (width + w > maxWidth - 1) break; // reserve 1 column for the leading "…"
+    width += w;
+    start = i;
+  }
+  return "…" + chars.slice(start).join("");
+}
 
 export interface AppProps {
   cwd: string;
@@ -131,6 +151,16 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   };
 
   const rows = stdout?.rows ?? 24;
+  const columns = stdout?.columns ?? 80;
+  // The input row must always be exactly one terminal row. Ink wraps a
+  // <Text> that's wider than the terminal instead of clipping it, so a long
+  // typed line silently grew this row to several — and since the total
+  // layout height is fixed (see logHeight below), that overflow scrolled
+  // the real terminal, leaving ghosting when it shrank back down (the same
+  // class of bug the slash menu had). Truncate to what actually fits
+  // instead of ever letting the input Text wrap.
+  const maxInputWidth = Math.max(10, columns - 4); // paddingX(2) + spinner(1) + leading space(1)
+  const visibleInput = tailToWidth(input, maxInputWidth);
   // The slash menu (round border top+bottom + one line per item) adds rows
   // on top of the normal chrome (divider + input + status bar). Without
   // accounting for it, total rendered content exceeds the outer Box's fixed
@@ -177,9 +207,9 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
 
       {menuOpen && <SlashMenu selectedIndex={menuIndex} />}
 
-      <Box paddingX={1}>
+      <Box paddingX={1} height={1} overflow="hidden">
         <Spinner active={busy} />
-        <Text> {input}</Text>
+        <Text> {visibleInput}</Text>
       </Box>
 
       <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} />
