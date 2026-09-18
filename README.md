@@ -933,6 +933,60 @@ the process, and confirmed it resumed automatically with the correct
 "resuming previous session" wording, the right remaining steps, and `0/3`
 restored in the status bar.
 
+### Live monitoring found two more real issues: a lax overflow safety margin, and a permanently-tripping circuit breaker
+
+Asked directly to analyze real monitoring data (throughput/accuracy) from
+a live session and check for improvement opportunities. Generation speed
+(~40 t/s), prompt-processing speed (~200 t/s), and error rate (0 in 1,081
+log lines / 102 requests) were all healthy — but the analysis surfaced two
+real, unrelated issues.
+
+**1. `autoTriggerRatio`'s default (0.85) left no real safety margin.**
+Worked out from the numbers, then confirmed against real usage that
+reached 89% of the window in one live turn: the worst case for a single
+turn is `autoTriggerRatio` (when the threshold check last passed) *plus*
+the `max_tokens` fraction of the window a single reply can add before the
+*next* check (loop.ts caps `max_tokens` at 25% of the window). With the
+old default, `0.85 + 0.25 = 1.10` — a single turn could overshoot the real
+context window by up to 10%, relying on the context-overflow auto-retry
+(added earlier) far more than it should need to be relied on. Lowered
+`DEFAULT_CONFIG.compaction.autoTriggerRatio` to `0.70` (`config.ts`),
+leaving `0.70 + 0.25 = 0.95` — real margin under 100% even in the worst
+case. Covered by a test asserting this invariant directly (`autoTriggerRatio
++ 0.25 < 1.0`) rather than just a fixed default value, so a future change
+to either number can't silently reopen the gap.
+
+**2. The self-healing circuit breaker's 30-minute "hard timeout" never
+reset — ever.** Caught live, directly from a real session: after being
+open longer than 30 minutes (completely normal for an interactive coding
+session), the very next tool call hit `[stopped] self-healing circuit
+breaker tripped: hard timeout exceeded (1800000ms)`. Root cause in
+`selfHeal.ts`/`loop.ts`: `CircuitBreaker` is constructed once per
+`AgentLoop` — i.e. once per process — and its `startedAt` timestamp is set
+once, in the constructor, and never touched again anywhere. `shouldStop()`
+measures elapsed time since THAT moment (process/session startup), not
+since the current task began. `reset()` existed on the class but was never
+called from anywhere. The practical effect: once a session had been open
+30+ minutes, literally every subsequent tool call for the rest of that
+process's life would trip the same way — the entire session's ability to
+use tools was permanently broken until restarted, with no recovery except
+quitting. Fixed by calling `this.breaker.reset()` at the start of both
+`send()` and `resumeIfCheckpointExists()` — the intent of a "hard timeout"
+is to catch one runaway task/turn stuck looping for 30+ minutes straight,
+not to cap how long a session itself can stay open, so the clock (and the
+repetitive-call-detection window) now restarts fresh on every new turn.
+
+Covered by a test using `node:test`'s `mock.timers` to simulate 31 minutes
+passing between two turns and assert the second one isn't tripped — and,
+since an earlier version of this same test passed even with the bug still
+present (its scripted backend responses ran out for an unrelated reason
+before ever reaching the second timeout check, silently masking the real
+assertion), it also asserts the exact number of backend calls made, to
+guard against that exact class of vacuous test happening again. Verified
+directly: temporarily disabling the `reset()` calls reproduced the precise
+real error message from the live session, confirming the test actually
+catches the regression, not just that it passes with the fix applied.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1581,6 +1635,53 @@ restored in the status bar.
 > `SIGKILL`로 강제 종료, 체크포인트가 올바른 단계 상태로 디스크에 남아있는지 확인,
 > 프로세스를 재시작해서 "resuming previous session" 문구·올바른 남은 단계·상태
 > 표시줄의 `0/3`이 자동으로 복원되는지까지 확인함.
+>
+> ### 실시간 모니터링에서 진짜 문제 2개를 더 발견함: 느슨한 오버플로우 안전마진, 그리고 영원히 안 풀리는 회로차단기
+>
+> 실제 라이브 세션의 모니터링 데이터(속도/정확도)를 분석하고 개선 여지가 있는지
+> 점검해달라는 직접 요청. 생성 속도(~40 t/s), 프롬프트 처리 속도(~200 t/s), 에러율
+> (로그 1,081줄/요청 102건 중 0건) 전부 건강했음 — 하지만 분석 과정에서 서로 무관한
+> 진짜 문제 2개가 드러남.
+>
+> **1. `autoTriggerRatio` 기본값(0.85)이 실질적인 안전마진을 전혀 남기지 않고 있었음.**
+> 숫자로 계산해보고 실제 사용량이 라이브 세션 한 턴에서 윈도우의 89%까지 올라간 걸로
+> 확인함: 한 턴의 최악의 경우는 `autoTriggerRatio`(마지막으로 임계값 체크를 통과한
+> 시점) *더하기* 다음 체크 전까지 응답 하나가 추가할 수 있는 윈도우 비율
+> (`loop.ts`가 `max_tokens`을 윈도우의 25%로 상한함). 예전 기본값으로는
+> `0.85 + 0.25 = 1.10` — 한 턴이 실제 컨텍스트 윈도우를 최대 10%까지 초과할 수
+> 있었고, (앞서 추가한) 컨텍스트 오버플로우 자동 재시도에 필요 이상으로 의존하게
+> 됨. `DEFAULT_CONFIG.compaction.autoTriggerRatio`를 `0.70`으로 낮춤(`config.ts`),
+> `0.70 + 0.25 = 0.95`로 최악의 경우에도 100% 아래로 실질적인 여유를 둠. 고정된
+> 기본값 하나만 검증하는 대신 이 불변식 자체를 직접 검증하는 테스트로 커버함
+> (`autoTriggerRatio + 0.25 < 1.0`) — 둘 중 하나가 나중에 바뀌어도 이 여유가 조용히
+> 다시 사라지지 않도록.
+>
+> **2. 자가 치유 회로차단기의 30분 "하드 타임아웃"이 한 번도 리셋되지 않고 있었음.**
+> 실제 세션에서 직접 잡아냄: 세션이 30분 넘게 켜져 있으면(대화형 코딩 세션에선
+> 완전히 정상적인 상황) 바로 다음 도구 호출이 `[stopped] self-healing circuit
+> breaker tripped: hard timeout exceeded (1800000ms)`에 걸림. `selfHeal.ts`/`loop.ts`의
+> 근본 원인: `CircuitBreaker`는 `AgentLoop`당 한 번, 즉 프로세스당 한 번만
+> 생성되고, `startedAt` 타임스탬프는 생성자에서 딱 한 번 설정된 뒤 다시는 건드려지지
+> 않음. `shouldStop()`은 *그 시점*(프로세스/세션 시작) 이후 경과 시간을 재는 거지,
+> 현재 작업이 시작된 시점 이후가 아님. `reset()` 메서드는 클래스에 존재했지만
+> 어디서도 호출되지 않고 있었음. 실제 효과: 세션이 30분 넘게 켜져 있으면 그 뒤로
+> 남은 프로세스 수명 동안 문자 그대로 모든 후속 도구 호출이 똑같이 걸림 — 세션의
+> 도구 사용 능력 전체가 재시작 전까지 영구적으로 망가지고, 종료 외엔 복구 방법이
+> 없었음. `send()`와 `resumeIfCheckpointExists()` 시작 부분에서 각각
+> `this.breaker.reset()`을 호출하도록 수정 — "하드 타임아웃"의 원래 의도는 도구
+> 호출 하나/턴 하나가 30분 넘게 계속 루프를 도는 걸 잡는 것이지 세션 자체가 얼마나
+> 오래 켜져 있을 수 있는지를 제한하는 게 아니므로, 이제 매 새 턴마다 시계(그리고
+> 반복 호출 감지 윈도우)가 새로 시작됨.
+>
+> `node:test`의 `mock.timers`로 두 턴 사이에 31분이 지나는 걸 시뮬레이션하고 두
+> 번째 턴이 걸리지 않는지 검증하는 테스트로 커버함 — 그리고 이 테스트의 이전
+> 버전은 버그가 그대로 있어도 통과했었기 때문에(스크립트된 백엔드 응답이 두 번째
+> 타임아웃 체크에 도달하기 전에 무관한 이유로 바닥나서 실제 검증을 조용히
+> 무력화시킴), 정확한 백엔드 호출 횟수까지 검증해서 같은 종류의 공허한 테스트가
+> 다시 생기지 않도록 막음. 직접 검증함: `reset()` 호출을 일시적으로 비활성화하니
+> 실제 라이브 세션에서 나온 바로 그 에러 메시지가 정확히 재현됐고, 이걸로 이
+> 테스트가 수정을 적용했을 때 통과한다는 것뿐 아니라 회귀를 실제로 잡아낸다는
+> 것까지 확인함.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

@@ -137,6 +137,8 @@ export class AgentLoop {
    *  resume automatically — no user input required. */
   async resumeIfCheckpointExists(): Promise<void> {
     await this.enqueue(async () => {
+      // See send()'s reset() call below for why this matters.
+      this.breaker.reset();
       const resumed = await this.injectResumeContextIfPending();
       if (resumed) await this.runUntilIdle();
       this.checkForRealtimeImprovementAfterTurn();
@@ -145,6 +147,21 @@ export class AgentLoop {
 
   async send(userText: string): Promise<void> {
     await this.enqueue(async () => {
+      // The circuit breaker is created once per AgentLoop (i.e. once per
+      // process) and never reset anywhere before this — its 30-minute
+      // "hard timeout" was measured from PROCESS STARTUP, not from the
+      // start of whatever task is actually running. Caught live: a real
+      // session open longer than 30 minutes (completely normal for an
+      // interactive coding session) hit "[stopped] self-healing circuit
+      // breaker tripped: hard timeout exceeded" on its very next tool
+      // call — and since nothing ever reset it, EVERY subsequent tool
+      // call for the rest of that process's life would trip the same way,
+      // permanently breaking the session until restarted. The timeout is
+      // meant to catch one runaway task/turn stuck looping for 30+
+      // minutes straight, not to cap how long a session can stay open —
+      // reset it at the start of each new turn so the clock (and the
+      // repetitive-call detection window) restarts fresh every time.
+      this.breaker.reset();
       // A compaction can also fire *mid-session* (not just be left over
       // from a previous process) and abandon work — e.g. mid-tool-call-loop
       // below. Previously that resume context only ever got folded in on a

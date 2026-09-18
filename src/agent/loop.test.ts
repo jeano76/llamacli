@@ -825,3 +825,64 @@ test("a plan-progress checkpoint (no compaction involved) resumes with its own w
     assert.ok(!statusMessages.some((s) => s.includes("resuming after compaction")));
     assert.ok(progressEvents.some((e) => e.done === 1 && e.total === 2), `expected a (1, 2) progress event, got: ${JSON.stringify(progressEvents)}`);
   }));
+
+test("the circuit breaker's 30-minute hard timeout resets each turn, instead of permanently tripping once a session has been open that long", () =>
+  withTempProject(async (dir) => {
+    // Caught live: a real session open longer than 30 minutes (completely
+    // normal) hit "[stopped] self-healing circuit breaker tripped: hard
+    // timeout exceeded" on its very next tool call — the breaker is
+    // created once per AgentLoop (once per process) and, before this fix,
+    // was never reset, so its timer measured time since PROCESS STARTUP
+    // rather than since the current task began. Without a reset, every
+    // subsequent tool call for the rest of the process's life would trip
+    // the same way, permanently breaking the session.
+    const { mock } = await import("node:test");
+    mock.timers.enable({ apis: ["Date"] });
+    try {
+      const call = {
+        id: "c1",
+        type: "function" as const,
+        function: { name: "read_file", arguments: JSON.stringify({ path: join(dir, "missing.txt") }) },
+      };
+      // Each turn needs TWO scripted responses: the tool_calls message
+      // (where shouldStop() is actually checked, per call, before it
+      // runs) and a follow-up plain response that ends the turn — an
+      // earlier version of this test only scripted one response per
+      // "turn", so the second send() failed for an unrelated reason
+      // (scripted responses exhausted) before ever reaching a second
+      // shouldStop() check, and the test passed even with the underlying
+      // bug still present. turnRequests.length is asserted at the end to
+      // guard against that exact class of silently-vacuous test again.
+      const { backend, turnRequests } = scriptedBackend({
+        turnResponses: [assistantMessage(null, [call]), assistantMessage("turn 1 done"), assistantMessage(null, [call]), assistantMessage("turn 2 done")],
+        tokenCounts: [1],
+      });
+      const statusMessages: string[] = [];
+      const loop = new AgentLoop({
+        projectRoot: dir,
+        model: "m",
+        backend,
+        systemPrompt: "sys",
+        thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100_000 },
+        onStatus: (s) => statusMessages.push(s),
+      });
+
+      await loop.send("do something");
+      assert.ok(
+        !statusMessages.some((s) => s.includes("circuit breaker tripped")),
+        "should not trip on the very first turn"
+      );
+
+      mock.timers.tick(31 * 60_000); // simulate the session staying open 31 minutes
+      statusMessages.length = 0;
+      await loop.send("do something else");
+
+      assert.ok(
+        !statusMessages.some((s) => s.includes("circuit breaker tripped")),
+        `a new turn must reset the hard-timeout clock, not inherit process-startup time: ${statusMessages.join(" | ")}`
+      );
+      assert.equal(turnRequests.length, 4, "expected both turns to run their full two-call script, not fail early for an unrelated reason");
+    } finally {
+      mock.timers.reset();
+    }
+  }));

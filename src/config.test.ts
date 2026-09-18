@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { loadConfig, DEFAULT_CONFIG } from "./config.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
@@ -72,3 +72,17 @@ test("loadConfig is idempotent: a second call after auto-generation reads the fi
     assert.equal(second.setupMessage, undefined);
     assert.deepEqual(second.config, first.config);
   }));
+
+// Found via real monitoring data: the worst case for a single turn is
+// autoTriggerRatio (compaction threshold) + the max_tokens fraction of the
+// window a single reply can add before the NEXT threshold check (see
+// loop.ts's max_tokens cap, 25% of the window) — if that sum exceeds 1.0,
+// a single turn can overshoot the real context window even with
+// compaction "working correctly", relying on the overflow-retry safety
+// net (loop.ts) far more than necessary. Observed directly: usage reached
+// 89% of a real window in one live turn under the old 0.85 default.
+test("DEFAULT_CONFIG's autoTriggerRatio leaves real headroom under the max_tokens fraction it can be followed by", () => {
+  const MAX_TOKENS_FRACTION_OF_WINDOW = 0.25; // kept in sync with loop.ts's own constant by this assertion
+  const worstCase = DEFAULT_CONFIG.compaction.autoTriggerRatio + MAX_TOKENS_FRACTION_OF_WINDOW;
+  assert.ok(worstCase < 1.0, `autoTriggerRatio (${DEFAULT_CONFIG.compaction.autoTriggerRatio}) + max_tokens fraction leaves no safety margin: ${worstCase}`);
+});

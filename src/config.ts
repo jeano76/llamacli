@@ -32,7 +32,17 @@ export interface LlamacliConfig {
 export const DEFAULT_CONFIG: LlamacliConfig = {
   backend: "local-llama",
   model: "local-model",
-  compaction: { autoTriggerRatio: 0.85 },
+  // Found via real monitoring data: with the previous 0.85, the worst case
+  // (a max_tokens-length reply landing right after the threshold check
+  // passes) is 0.85 + 0.25 (max_tokens' own fraction of the window, see
+  // loop.ts) = 1.10 — i.e. a single turn could overshoot the REAL context
+  // window by up to 10%, which is exactly the failure the context-overflow
+  // auto-retry (loop.ts) exists to recover from. Observed directly: usage
+  // reached 89% of the window in one real turn. Lowering to 0.70 (0.70 +
+  // 0.25 = 0.95) keeps a real margin under 100% even in that worst case,
+  // so the overflow-retry safety net is rarely needed rather than routinely
+  // relied on. Trades slightly more frequent compaction for that.
+  compaction: { autoTriggerRatio: 0.7 },
   llama: {
     binPath: "llama-server",
     modelPath: "",
