@@ -251,11 +251,43 @@ only the tail that fits in one row, prefixed with `…` when truncated,
 exactly like a normal single-line terminal input. The input row is also now
 pinned to `height={1}` with `overflow="hidden"` as a backstop. Verified: a
 210-character line no longer wraps past one row, no matter how long it
-gets or how it's edited. Covered by `src/tui/App.test.ts`.
+gets or how it's edited. Covered by `src/tui/textWidth.test.ts`.
 
 (While investigating, also removed the unused `uuid` dependency, which had
 an open moderate-severity advisory — it was never actually imported
 anywhere in the codebase.)
+
+### Real root cause found: the terminal cursor was never moved to the input line
+
+The user reported it plainly: typed characters weren't landing in the
+prompt area — they appeared at the bottom-left of the screen. Captured the
+*raw* bytes Ink writes (not just the visible rendering) and found the
+actual cause behind all three ghosting reports above: **Ink never
+repositions the real terminal cursor after a render.** Every frame, Ink
+writes the whole UI top-to-bottom and finishes with the cursor sitting on a
+blank line just below the last row (StatusBar) — never back up at the
+input line where the user is actually typing. Desktop input methods
+(fcitx/ibus for Hangul and other CJK input) anchor their composition popup
+to the *real* cursor position, not to anything Ink renders — so composed
+characters appeared to land at the bottom-left the whole time, exactly as
+described, regardless of the earlier overflow/ghosting fixes.
+
+Also found in the same raw capture: `StatusBar` had the identical
+unconstrained-width bug as the input line and slash menu — a long
+cwd/model combination wrapped it onto a second row, which was throwing off
+the fixed row-distance the cursor fix depends on. Extracted the truncation
+logic into a shared `src/tui/textWidth.ts` and applied it to `StatusBar`
+too (`src/tui/StatusBar.tsx`'s `statusBarFieldWidth`), so it's now
+guaranteed to stay exactly one row.
+
+The fix: after every render, move the cursor 2 rows up (past the blank
+trailer and the now-guaranteed-single-row StatusBar) and to the exact
+column right after the visible input text, then show it there
+(`\x1b[2A\x1b[<col>G\x1b[?25h`). Verified directly in raw output: typing "안"
+(a 2-column-wide Hangul syllable) now ends every frame with exactly
+`\x1b[2A\x1b[6G\x1b[?25h` — column 6 is precisely one past where "안" is
+rendered (1 padding + 1 spinner + 1 space + 2 width + 1 = 6). Covered by
+`src/tui/StatusBar.test.ts` and `src/tui/textWidth.test.ts`.
 
 > ## 구현 상태
 >
@@ -334,11 +366,37 @@ anywhere in the codebase.)
 > 자르기로는 여전히 넘칠 수 있음) 항상 한 줄에 들어가는 만큼의 꼬리 부분만 렌더링하고,
 > 잘렸으면 앞에 `…`을 붙이도록 수정 — 일반적인 한 줄짜리 터미널 입력창과 동일한 동작.
 > 입력줄 박스에도 `height={1}`과 `overflow="hidden"`을 백스톱으로 추가함. 검증: 210자
-> 짜리 줄도 더 이상 한 줄을 넘지 않음(얼마나 길어지거나 어떻게 편집되든). `src/tui/App.test.ts`로
+> 짜리 줄도 더 이상 한 줄을 넘지 않음(얼마나 길어지거나 어떻게 편집되든). `src/tui/textWidth.test.ts`로
 > 커버됨.
 >
 > (조사 중 사용되지 않는 `uuid` 의존성도 함께 제거함 — 보안 권고가 열려있었는데 코드
 > 어디서도 실제로 import된 적이 없었음.)
+>
+> ### 진짜 근본 원인 발견: 렌더링 후 터미널 커서가 입력줄로 이동하지 않고 있었음
+>
+> 사용자가 말로 직접 알려준 것: 타이핑한 글자가 프롬프트 영역이 아니라 화면 좌측
+> 하단에 나타난다는 것. Ink가 쓰는 *raw 바이트*를(보이는 렌더링 결과가 아니라) 직접
+> 캡처해서 위 세 번의 잔상 버그 신고 뒤에 숨어있던 진짜 원인을 찾음:
+> **Ink는 렌더링 후 실제 터미널 커서를 절대 되돌리지 않는다.** 매 프레임마다 Ink는
+> 전체 UI를 위에서 아래로 쓰고, 마지막 줄(StatusBar) 바로 아래의 빈 줄에 커서를 그대로
+> 남겨둔다 — 사용자가 실제로 타이핑하고 있는 입력줄로 다시 올라가지 않는다. 한글 등
+> CJK 입력을 담당하는 데스크톱 IME(fcitx/ibus)는 자신의 조합 팝업을 Ink가 그린 화면이
+> 아니라 *실제* 커서 위치에 앵커링하므로, 이전의 오버플로우/잔상 수정과 무관하게
+> 조합 중인 글자가 계속 화면 좌측 하단에 나타난 것 — 정확히 신고하신 그대로.
+>
+> 같은 raw 캡처에서 추가로 발견: `StatusBar`도 입력줄/슬래시 메뉴와 똑같이 폭 제한이
+> 없는 버그가 있었음 — cwd/model 조합이 길면 2번째 줄로 줄바꿈되면서, 커서 수정이
+> 의존하는 "고정된 행 간격" 가정 자체가 깨지고 있었음. 잘라내기 로직을 공용
+> `src/tui/textWidth.ts`로 분리해서 `StatusBar`(`src/tui/StatusBar.tsx`의
+> `statusBarFieldWidth`)에도 적용해 이제 항상 정확히 한 줄로 고정됨.
+>
+> 수정 내용: 매 렌더링 후 커서를 2줄 위로(빈 트레일러 줄 + 이제 한 줄로 고정된
+> StatusBar 줄) 올리고, 화면에 보이는 입력 텍스트 바로 뒤 정확한 컬럼으로 이동시킨
+> 뒤 그 자리에 표시함(`\x1b[2A\x1b[<col>G\x1b[?25h`). raw 출력으로 직접 검증: "안"
+> (터미널 2칸을 차지하는 한글 음절)을 입력하면 매 프레임이 정확히
+> `\x1b[2A\x1b[6G\x1b[?25h`로 끝남 — 컬럼 6은 "안"이 그려지는 위치 바로 다음
+> 칸과 정확히 일치(패딩 1 + 스피너 1 + 공백 1 + 폭 2 + 1 = 6). `src/tui/StatusBar.test.ts`,
+> `src/tui/textWidth.test.ts`로 커버됨.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

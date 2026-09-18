@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { tailToWidth } from "./App.js";
+import { tailToWidth } from "./textWidth.js";
 
 test("tailToWidth returns the text unchanged when it already fits", () => {
   assert.equal(tailToWidth("hello", 20), "hello");

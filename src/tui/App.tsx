@@ -4,25 +4,7 @@ import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
-
-/** Keeps the END of `text` (matching where a cursor conceptually sits while
- *  typing) that fits within `maxWidth` terminal columns, prefixed with "…"
- *  when truncated. Uses real display width (via string-width), not
- *  `.length`, since wide characters (Hangul, CJK generally) occupy 2
- *  terminal columns each — a naive length-based cut would still overflow. */
-export function tailToWidth(text: string, maxWidth: number): string {
-  if (stringWidth(text) <= maxWidth) return text;
-  const chars = Array.from(text);
-  let width = 0;
-  let start = chars.length;
-  for (let i = chars.length - 1; i >= 0; i--) {
-    const w = stringWidth(chars[i]);
-    if (width + w > maxWidth - 1) break; // reserve 1 column for the leading "…"
-    width += w;
-    start = i;
-  }
-  return "…" + chars.slice(start).join("");
-}
+import { tailToWidth } from "./textWidth.js";
 
 export interface AppProps {
   cwd: string;
@@ -161,6 +143,22 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // instead of ever letting the input Text wrap.
   const maxInputWidth = Math.max(10, columns - 4); // paddingX(2) + spinner(1) + leading space(1)
   const visibleInput = tailToWidth(input, maxInputWidth);
+
+  // Ink finishes every render with the real terminal cursor sitting on a
+  // blank line just below the last row it wrote (StatusBar) — it never
+  // repositions the cursor back to where the user is actually typing. Since
+  // desktop input methods (fcitx/ibus for Hangul, etc.) anchor their
+  // composition popup to the REAL cursor position, not to anything Ink
+  // renders, this left composed/typed characters appearing to land at the
+  // bottom-left of the screen instead of in the prompt row. Move the cursor
+  // back up onto the input row and to the exact column after the visible
+  // text, and make sure it's shown, after every render.
+  useEffect(() => {
+    const promptColumn = 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
+    // 2 rows up: 1 for StatusBar's own row, 1 for the blank trailer line
+    // Ink's last write always ends on.
+    process.stdout.write(`\x1b[2A\x1b[${promptColumn}G\x1b[?25h`);
+  });
   // The slash menu (round border top+bottom + one line per item) adds rows
   // on top of the normal chrome (divider + input + status bar). Without
   // accounting for it, total rendered content exceeds the outer Box's fixed
@@ -212,7 +210,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         <Text> {visibleInput}</Text>
       </Box>
 
-      <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} />
+      <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} columns={columns} />
     </Box>
   );
 }
