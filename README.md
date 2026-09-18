@@ -1044,6 +1044,46 @@ unchanged) and `renderMarkdown` (still produces valid table output —
 border characters and all cell values — across a range of widths, since
 the actual width constraint now happens one layer up).
 
+### max_tokens silently ignored for streaming requests — a runaway response pinned the slot for 17 minutes
+
+Caught live, watching a real session's logs: a real request with
+`max_tokens: 16384` kept streaming anyway, past 45,000 tokens, only
+stopping once it physically ran out of the entire 65,536-token context
+window (`truncated = 1`) — nearly 17 minutes pinning the single inference
+slot on one response, during which every other request queued behind it
+indefinitely.
+
+This looked at first like the earlier `max_tokens` fix (capping every
+request at 25% of the window — see above) hadn't actually worked, but
+direct reproduction narrowed it further: a `stream: false` request with
+the identical `max_tokens` correctly stopped with `finish_reason:
+"length"`; the exact same request with `stream: true` did not. `max_tokens`
+genuinely isn't honored for **streaming** requests on this llama.cpp
+build — a streaming-only gap in the backend itself, not something
+adjustable from llamacli's side, and not a case of the earlier fix being
+wrong; the cap being sent was always correct, the server just wasn't
+respecting it for this request shape.
+
+Since the backend can't be trusted to stop on its own, `openaiClient.ts`'s
+`streamChat()` now enforces `max_tokens` itself: it counts streamed delta
+events as a token-count proxy (llama.cpp emits one SSE chunk per generated
+token in the normal case), and once that count reaches `max_tokens`, calls
+`AbortController.abort()` on the request — ending the connection outright
+rather than continuing to wait — and reports `finish_reason: "length"` to
+match what a real cap would have produced, so nothing downstream needs to
+know the server itself didn't enforce it.
+
+Verified directly against the real backend, live: a prompt designed to
+run away (count to 100,000) with `max_tokens: 20` now stops at exactly 20
+streamed deltas in under 2 seconds, instead of running unbounded; a normal
+short reply still completes correctly with `finish_reason: "stop"` (not
+tripping the cap). Covered by 2 new unit tests against a fake server that
+streams indefinitely until the client disconnects: one confirms the
+response is cut at exactly `max_tokens` deltas, `finish_reason: "length"`,
+and completes in well under a second — proving an actual early abort, not
+a lucky fast server — the other confirms an unbounded stream is consumed
+in full when no `max_tokens` is set at all (no regression).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1786,6 +1826,42 @@ the actual width constraint now happens one layer up).
 > 코드 보존, 이미 맞는 행은 그대로 둠)와 `renderMarkdown`(실제 너비 제약은
 > 이제 한 단계 위에서 일어나므로, 여러 너비에 걸쳐 여전히 유효한 테이블 출력 —
 > 테두리 문자와 모든 셀 값 — 을 만드는지)를 커버함.
+>
+> ### 스트리밍 요청에서 max_tokens가 조용히 무시됨 — 폭주 응답 하나가 17분간 슬롯을 독점함
+>
+> 실제 세션 로그를 지켜보다가 직접 잡아냄: `max_tokens: 16384`로 보낸 실제
+> 요청이 그래도 계속 스트리밍을 이어가서 45,000토큰을 넘겼고, 65,536토큰
+> 컨텍스트 윈도우 전체를 물리적으로 다 채우고서야(`truncated = 1`) 멈춤 —
+> 응답 하나에 단일 추론 슬롯이 거의 17분 동안 묶여있었고, 그동안 다른 모든
+> 요청이 무기한 대기열에 쌓임.
+>
+> 처음엔 앞서 했던 `max_tokens` 수정(모든 요청을 윈도우의 25%로 상한하는 것 —
+> 위 참고)이 실제로는 안 먹힌 것처럼 보였는데, 직접 재현해보니 범위가 더
+> 좁혀짐: 똑같은 `max_tokens`를 넣은 `stream: false` 요청은 정확히
+> `finish_reason: "length"`로 멈췄는데, 똑같은 요청을 `stream: true`로만
+> 바꾸면 안 멈췄음. 이 llama.cpp 빌드에서 `max_tokens`가 **스트리밍** 요청에서는
+> 정말로 지켜지지 않음 — 백엔드 자체의 스트리밍 전용 결함이라 llamacli 쪽에서
+> 조정할 수 있는 부분이 아니고, 앞선 수정이 잘못됐던 것도 아님; 보낸 상한값
+> 자체는 항상 맞았고, 서버가 이 요청 형태에서만 그걸 안 지켰던 것.
+>
+> 백엔드가 스스로 멈춘다고 믿을 수 없으므로, `openaiClient.ts`의
+> `streamChat()`이 이제 `max_tokens`를 직접 강제함: 스트리밍되는 delta
+> 이벤트 수를 토큰 수의 대용치로 셈(llama.cpp는 보통 생성 토큰 하나당 SSE
+> 청크 하나를 보냄), 그 수가 `max_tokens`에 도달하면 요청에
+> `AbortController.abort()`를 호출함 — 계속 기다리는 대신 연결 자체를 끊음 —
+> 그리고 실제 상한이 적용됐을 때와 똑같이 `finish_reason: "length"`로
+> 보고해서, 아래쪽 코드는 서버가 실제로 이걸 지켰는지 몰라도 되게 함.
+>
+> 실제 백엔드로 직접 라이브 검증함: 폭주하도록 설계한 프롬프트(10만까지
+> 세기)를 `max_tokens: 20`으로 보내니 무제한으로 계속되는 대신 정확히 20개
+> 스트리밍 delta에서 2초도 안 돼 멈춤; 평범한 짧은 답변은 여전히
+> `finish_reason: "stop"`으로 정상 완료됨(상한에 안 걸림). 클라이언트가
+> 연결을 끊을 때까지 무한정 스트리밍하는 가짜 서버를 상대로 한 새 유닛
+> 테스트 2개로 커버함: 하나는 응답이 정확히 `max_tokens`개의 delta에서
+> 잘리고 `finish_reason: "length"`이며 1초 훨씬 안에 완료되는지 확인(서버가
+> 우연히 빨랐던 게 아니라 실제로 조기에 중단시켰다는 증거), 다른 하나는
+> `max_tokens`를 아예 안 넣었을 때 무제한 스트림이 끝까지 전부 소비되는지
+> 확인(회귀 없음).
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

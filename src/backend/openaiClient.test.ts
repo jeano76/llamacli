@@ -112,3 +112,90 @@ test("a normal SSE stream with no error chunks still completes successfully (no 
       assert.equal(res.choices[0].message.content, "hello");
     }
   ));
+
+/** A server that keeps streaming SSE chunks indefinitely (well past any
+ *  reasonable cap) until the client disconnects — simulating exactly what
+ *  the real llama.cpp backend was caught doing: never stopping on its
+ *  own for a streaming request, regardless of max_tokens. `onChunkSent`
+ *  fires after each one so the test can see how many the server actually
+ *  got to send before the client aborted. */
+async function withUnboundedSSEServer(
+  totalChunksIfNeverStopped: number,
+  onChunkSent: (n: number) => void,
+  fn: (baseUrl: string) => Promise<void>
+): Promise<void> {
+  const server: Server = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    let sent = 0;
+    const interval = setInterval(() => {
+      if (sent >= totalChunksIfNeverStopped || res.destroyed) {
+        clearInterval(interval);
+        if (!res.destroyed) res.end();
+        return;
+      }
+      sent++;
+      onChunkSent(sent);
+      res.write(`data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n`);
+    }, 5);
+    req.on("close", () => clearInterval(interval));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (typeof address !== "object" || address === null) throw new Error("no server address");
+  try {
+    await fn(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+// Caught live: a real request with max_tokens: 16384 kept streaming anyway,
+// all the way past 45,000 tokens, only stopping once it physically ran out
+// of the 65,536-token context window — nearly 17 minutes pinning the
+// single inference slot on one response. A direct curl reproduction
+// confirmed max_tokens genuinely isn't honored for STREAMING requests on
+// that llama.cpp build (a stream: false request with the same field
+// correctly stopped). The client must not simply trust the server to stop.
+test("chat() enforces max_tokens itself by aborting the stream, even if the server never stops on its own", () =>
+  withUnboundedSSEServer(
+    500, // "never stops on its own" within any reasonable test timeout
+    () => {},
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const deltas: string[] = [];
+      const start = Date.now();
+      const res = await client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 5 },
+        (chunk) => {
+          if (chunk.choices[0]?.delta.content) deltas.push(chunk.choices[0].delta.content as string);
+        }
+      );
+      const elapsed = Date.now() - start;
+
+      assert.equal(deltas.length, 5, `expected exactly 5 streamed deltas (the cap), got ${deltas.length}`);
+      assert.equal(res.choices[0].finish_reason, "length");
+      assert.equal(res.choices[0].message.content, "xxxxx");
+      // 500 chunks at 5ms apart would take ~2.5s if the client waited for
+      // the server to finish on its own — this proves it actually cut the
+      // connection early rather than happening to still be fast.
+      assert.ok(elapsed < 1000, `expected an early abort (well under 1s), took ${elapsed}ms`);
+    }
+  ));
+
+test("chat() does not cap the stream at all when max_tokens isn't set (no regression)", () =>
+  withUnboundedSSEServer(
+    10,
+    () => {},
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const deltas: string[] = [];
+      const res = await client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
+        (chunk) => {
+          if (chunk.choices[0]?.delta.content) deltas.push(chunk.choices[0].delta.content as string);
+        }
+      );
+      assert.equal(deltas.length, 10, "expected the full (bounded, in this test) stream to be consumed");
+      assert.equal(res.choices[0].message.content, "x".repeat(10));
+    }
+  ));
