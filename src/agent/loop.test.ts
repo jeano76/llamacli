@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
-import { readCheckpoint, writeCheckpoint } from "../compaction/checkpoint.js";
+import { readCheckpoint, writeCheckpoint, Checkpoint } from "../compaction/checkpoint.js";
 import { clearFailureLog } from "../hermes/selfHeal.js";
 import type {
   ChatCompletionRequest,
@@ -632,4 +632,196 @@ test("a context-overflow error that persists because compaction makes no further
 
     assert.equal(turnCallCount, 1, "the very first compaction attempt already makes no progress, so it should give up immediately");
     assert.ok(statusMessages.some((s) => s.includes("[error]")));
+  }));
+
+test("update_plan persists a checkpoint immediately, independent of compaction, so a hard kill mid-task doesn't lose it", () =>
+  withTempProject(async (dir) => {
+    // Requested directly: before this, a checkpoint only ever got written
+    // when a compaction happened — a process killed mid-task (Ctrl-C at
+    // the OS level, a crash) with no compaction yet lost the whole plan
+    // with nothing to resume from. autoTriggerRatio here is 0.99 with a
+    // huge window, so compaction never triggers in this test at all —
+    // proving the checkpoint comes purely from update_plan itself.
+    //
+    // Checked mid-turn (from inside the backend's own second call, before
+    // the turn's own final response), not just after send() resolves —
+    // that's exactly the "killed mid-task" moment the fix is for, and
+    // it's the only way to observe it without racing a real process kill.
+    // An array, not a reassigned `let` — TS's flow analysis for a plain
+    // `let` mutated only inside an async closure still treats it as its
+    // literal initial value at any point in the enclosing function it
+    // can't prove runs after that mutation, which narrows the later
+    // assert.ok(...) check down to `never` and fails to typecheck.
+    const checkpointsDuringTurn: Checkpoint[] = [];
+    const call = {
+      id: "c1",
+      type: "function" as const,
+      function: {
+        name: "update_plan",
+        arguments: JSON.stringify({
+          steps: [
+            { description: "step one", status: "done" },
+            { description: "step two", status: "in_progress" },
+          ],
+        }),
+      },
+    };
+    let turnCallCount = 0;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        turnCallCount++;
+        if (turnCallCount === 1) return assistantMessage(null, [call]);
+        const cp = await readCheckpoint(dir);
+        if (cp) checkpointsDuringTurn.push(cp);
+        return assistantMessage("still working on step two");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100_000 },
+    });
+
+    await loop.send("start the task");
+
+    assert.equal(checkpointsDuringTurn.length, 1, "expected a checkpoint to already exist mid-turn, before the turn even finished");
+    assert.equal(checkpointsDuringTurn[0].reason, "plan-progress");
+    assert.equal(checkpointsDuringTurn[0].steps.length, 2);
+  }));
+
+test("a plan left incomplete at the end of a turn stays on disk for the next process to resume", () =>
+  withTempProject(async (dir) => {
+    const call = {
+      id: "c1",
+      type: "function" as const,
+      function: {
+        name: "update_plan",
+        arguments: JSON.stringify({
+          steps: [
+            { description: "step one", status: "done" },
+            { description: "step two", status: "todo" },
+          ],
+        }),
+      },
+    };
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call]), assistantMessage("I'll continue this next time")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100_000 },
+    });
+
+    await loop.send("start the task");
+    const checkpoint = await readCheckpoint(dir);
+    assert.ok(checkpoint, "expected the checkpoint to survive since step two is still incomplete");
+    assert.equal(checkpoint!.reason, "plan-progress");
+    assert.equal(checkpoint!.steps.length, 2);
+    assert.equal(
+      checkpoint!.steps.find((s) => s.description === "step two")?.status,
+      "todo"
+    );
+  }));
+
+test("onPlanProgress reports done/total as the plan updates, and (0, 0) once everything is done", () =>
+  withTempProject(async (dir) => {
+    const call1 = {
+      id: "c1",
+      type: "function" as const,
+      function: {
+        name: "update_plan",
+        arguments: JSON.stringify({
+          steps: [
+            { description: "step one", status: "in_progress" },
+            { description: "step two", status: "todo" },
+          ],
+        }),
+      },
+    };
+    const call2 = {
+      id: "c2",
+      type: "function" as const,
+      function: {
+        name: "update_plan",
+        arguments: JSON.stringify({
+          steps: [
+            { description: "step one", status: "done" },
+            { description: "step two", status: "done" },
+          ],
+        }),
+      },
+    };
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call1]), assistantMessage(null, [call2]), assistantMessage("all done")],
+      tokenCounts: [1],
+    });
+    const progressEvents: Array<{ done: number; total: number }> = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100_000 },
+      onPlanProgress: (done, total) => progressEvents.push({ done, total }),
+    });
+
+    await loop.send("do the multi-step task");
+
+    assert.deepEqual(progressEvents, [
+      { done: 0, total: 2 }, // after call1
+      { done: 2, total: 2 }, // after call2
+      { done: 0, total: 0 }, // turn ended with everything done — indicator cleared
+    ]);
+  }));
+
+test("a plan-progress checkpoint (no compaction involved) resumes with its own wording, not \"after compaction\"", () =>
+  withTempProject(async (dir) => {
+    // Write directly, simulating a process that got killed right after an
+    // update_plan call with real remaining work — this is the checkpoint
+    // shape applyStateTool() now produces.
+    await writeCheckpoint(dir, {
+      version: 1,
+      timestamp: new Date().toISOString(),
+      reason: "plan-progress",
+      goal: "refactor the auth module",
+      steps: [
+        { description: "extract helper", status: "done" },
+        { description: "update call sites", status: "todo" },
+      ],
+      files: [],
+      pendingToolCall: null,
+      mustPreserve: [],
+    });
+
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("continuing")],
+      tokenCounts: [1],
+    });
+    const statusMessages: string[] = [];
+    const progressEvents: Array<{ done: number; total: number }> = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100_000 },
+      onStatus: (s) => statusMessages.push(s),
+      onPlanProgress: (done, total) => progressEvents.push({ done, total }),
+    });
+
+    await loop.resumeIfCheckpointExists();
+
+    assert.ok(statusMessages.some((s) => s.includes("resuming previous session")));
+    assert.ok(!statusMessages.some((s) => s.includes("resuming after compaction")));
+    assert.ok(progressEvents.some((e) => e.done === 1 && e.total === 2), `expected a (1, 2) progress event, got: ${JSON.stringify(progressEvents)}`);
   }));

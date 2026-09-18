@@ -6,7 +6,14 @@ import { dirname, join } from "node:path";
 export interface Checkpoint {
   version: 1;
   timestamp: string;
-  reason: "auto-threshold" | "manual";
+  // "plan-progress": written on every update_plan call, independent of
+  // compaction — requested directly, so a plan/todo list survives a hard
+  // kill (Ctrl-C at the OS level, crash, power loss) at any point, not
+  // only when a compaction happened to have already run. Before this,
+  // this file only ever existed after a compaction, so a session killed
+  // mid-task with no compaction yet lost its whole plan with nothing to
+  // resume from.
+  reason: "auto-threshold" | "manual" | "plan-progress";
   /** One-line restatement of what the user originally asked for. */
   goal: string;
   steps: Array<{

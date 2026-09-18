@@ -190,8 +190,13 @@ export async function buildResumePrompt(projectRoot: string): Promise<string | n
   if (!checkpoint) return null;
 
   const remaining = checkpoint.steps.filter((s) => s.status !== "done");
+  // A checkpoint can now exist without any compaction ever having run
+  // (see checkpoint.ts's "plan-progress" reason) — saying "after
+  // compaction" for that case would be actively misleading about why the
+  // agent seems to be picking up mid-task.
+  const resumeReasonText = checkpoint.reason === "plan-progress" ? "resuming previous session" : "resuming after compaction";
   const lines = [
-    `[resuming after compaction] previous goal: ${checkpoint.goal}`,
+    `[${resumeReasonText}] previous goal: ${checkpoint.goal}`,
     remaining.length
       ? `remaining steps:\n${remaining.map((s) => `- (${s.status}) ${s.description}`).join("\n")}`
       : "All steps were already done — re-verifying before wrapping up.",

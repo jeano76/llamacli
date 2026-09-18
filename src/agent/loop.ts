@@ -4,7 +4,7 @@ import { CircuitBreaker } from "../hermes/selfHeal.js";
 import { logFailure, getFailureLog } from "../hermes/selfHeal.js";
 import { proposeImprovement, writeProposedRule, appendImprovementLog, ImprovementProposal } from "../hermes/selfImprove.js";
 import { runCompaction, estimateTokens, buildResumePrompt, CompactionThresholds } from "../compaction/compactor.js";
-import { clearCheckpoint } from "../compaction/checkpoint.js";
+import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
 import { stripToolCallTemplateLeak } from "./textSanitize.js";
 
@@ -57,6 +57,12 @@ export interface AgentLoopOptions {
    *  battery gauge can reflect real usage (PROMPT.md §2.5) instead of being
    *  disconnected from the agent loop. */
   onContextUsage?: (usedTokens: number, totalTokens: number) => void;
+  /** Fires whenever the model declares/updates its plan via `update_plan`,
+   *  and once more with (0, 0) when a plan completes (every step "done")
+   *  or a fresh turn starts with none — requested directly, so progress
+   *  ("step 3 of 7") is visible somewhere persistent (the status bar)
+   *  instead of only scrolling by once in the log. */
+  onPlanProgress?: (done: number, total: number) => void;
 }
 
 /**
@@ -113,6 +119,15 @@ export class AgentLoop {
     if (!resumeText) return false;
     this.opts.onStatus?.(resumeText);
     this.messages.push({ role: "system", content: resumeText });
+    // Restore the plan/progress too, not just the text summary — otherwise
+    // the status bar's progress indicator (PLAN_PROGRESS_WIDTH) shows
+    // nothing until the model happens to call update_plan again, even
+    // though a resumed checkpoint may already record real remaining steps.
+    const checkpoint = await readCheckpoint(this.opts.projectRoot);
+    if (checkpoint && checkpoint.steps.length > 0) {
+      this.plan = checkpoint.steps;
+      this.opts.onPlanProgress?.(checkpoint.steps.filter((s) => s.status === "done").length, checkpoint.steps.length);
+    }
     await clearCheckpoint(this.opts.projectRoot);
     return true;
   }
@@ -289,6 +304,22 @@ export class AgentLoop {
       this.opts.onAssistantDone?.();
 
       if (!message.tool_calls || message.tool_calls.length === 0) {
+        // The turn ended cleanly (not interrupted by compaction — that
+        // exits through a different path below). If every declared step
+        // is done (or nothing was ever declared), there's nothing left to
+        // resume — clear the plan-progress checkpoint and hide the
+        // progress indicator, rather than leaving a stale "5/5" (or a
+        // fully-resolved plan) sitting around for a completely unrelated
+        // next task to inherit. A plan with real remaining steps is left
+        // on disk on purpose, so a crash right after this point can still
+        // resume it.
+        if (this.plan.length === 0 || this.plan.every((s) => s.status === "done")) {
+          if (this.plan.length > 0) {
+            this.plan = [];
+            await clearCheckpoint(this.opts.projectRoot);
+          }
+          this.opts.onPlanProgress?.(0, 0);
+        }
         return; // assistant is done, control returns to the prompt
       }
 
@@ -329,7 +360,7 @@ export class AgentLoop {
         this.opts.onToolCall?.(call.function.name, call.function.arguments);
 
         if (AGENT_STATE_TOOLS.has(call.function.name)) {
-          const result = this.applyStateTool(call.function.name, call.function.arguments);
+          const result = await this.applyStateTool(call.function.name, call.function.arguments);
           this.messages.push({ role: "tool", tool_call_id: call.id, content: result });
           continue;
         }
@@ -359,11 +390,35 @@ export class AgentLoop {
   }
 
   /** Handles a tool call that mutates loop state rather than the filesystem/shell. */
-  private applyStateTool(name: string, argsJson: string): string {
+  private async applyStateTool(name: string, argsJson: string): Promise<string> {
     if (name === "update_plan") {
       try {
         const { steps } = JSON.parse(argsJson) as { steps: Checkpoint["steps"] };
         this.plan = steps;
+        // Persist immediately, independent of compaction — requested
+        // directly: a plan should survive a hard kill (Ctrl-C at the OS
+        // level, crash) at ANY point, not only if a compaction happened to
+        // have already run first. Before this, a checkpoint only ever
+        // existed after compaction, so a session killed mid-task lost the
+        // whole plan with nothing to resume from. Best-effort: a failure
+        // here must never break the actual tool-call response the model
+        // is waiting on.
+        try {
+          await writeCheckpoint(this.opts.projectRoot, {
+            version: 1,
+            timestamp: new Date().toISOString(),
+            reason: "plan-progress",
+            goal: this.currentGoalSummary(),
+            steps,
+            files: this.currentFiles(),
+            pendingToolCall: null,
+            mustPreserve: [],
+          });
+        } catch {
+          // best-effort — the in-memory plan (this.plan) still works for
+          // the rest of THIS process's lifetime either way.
+        }
+        this.opts.onPlanProgress?.(steps.filter((s) => s.status === "done").length, steps.length);
         return `plan updated (${steps.length} steps)`;
       } catch (err: any) {
         return `ERROR: invalid update_plan arguments: ${err.message}`;

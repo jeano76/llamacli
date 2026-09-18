@@ -40,6 +40,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
   const [contextUsedRatio, setContextUsedRatio] = useState(0);
+  const [planProgress, setPlanProgress] = useState<{ done: number; total: number } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuIndex, setMenuIndex] = useState(0);
   // Messages typed while the agent is busy wait here instead of being sent
@@ -185,6 +186,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     setBusy,
     isBusy: () => busy,
     setContextUsedRatio,
+    setPlanProgress: (done: number, total: number) => setPlanProgress(total > 0 ? { done, total } : null),
   };
 
   const rows = stdout?.rows ?? 24;
@@ -324,7 +326,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         <Text> {visibleInput}</Text>
       </Box>
 
-      <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} columns={columns} />
+      <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} planProgress={planProgress} columns={columns} />
     </Box>
   );
 }

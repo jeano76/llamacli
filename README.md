@@ -875,6 +875,64 @@ menu to just `/quit` and `/queue` (both genuinely contain "qu") with the
 menu box still exactly 8 rows tall, and pressing Enter on the top match
 exited cleanly (exit code 0).
 
+### Plan/todo progress now persists on every update, and shows live in the status bar
+
+Proposed directly: write a todo list before starting a multi-step task,
+check items off as work proceeds, show progress ("step N of M")
+persistently, and — the actual concern behind the proposal — make sure a
+force-killed session doesn't lose that list, and that starting a new task
+doesn't silently wipe one still in progress.
+
+The infrastructure for this already existed (`checkpoint.json`,
+`steps: [{description, status}]`, `buildResumePrompt()`) but had a real
+gap: it was only ever written when a *compaction* happened
+(`compact()` → `runCompaction()` → `writeCheckpoint()`). A session that
+called `update_plan` and was then killed — Ctrl-C at the OS level, a
+crash, a power loss — before any compaction ever triggered lost the whole
+plan with nothing to resume from, exactly the scenario raised.
+
+Fixed in `loop.ts`: `applyStateTool()`'s `update_plan` handler now writes
+a checkpoint immediately on every call (`reason: "plan-progress"`, a new
+`Checkpoint` reason alongside `"auto-threshold"`/`"manual"`), independent
+of compaction — best-effort, so a write failure there can't break the
+tool-call response the model is waiting on. It's cleared automatically
+once every step is `"done"` (checked at the natural end of a turn with no
+further tool calls) rather than lingering to confuse an unrelated future
+task; a plan left genuinely incomplete stays on disk on purpose, for the
+next process to pick up. `buildResumePrompt()` now distinguishes *why*
+it's resuming — `"resuming previous session"` for a plain plan-progress
+checkpoint vs. the existing `"resuming after compaction"` — since saying
+"after compaction" for a session that was just killed mid-task would be
+actively misleading about why the agent seems to be picking up
+mid-conversation.
+
+A `done, total` count is now surfaced through a new `onPlanProgress`
+callback, wired through to a small fixed-width slot in the status bar
+(`StatusBar.tsx`) — "3/7" persists there for as long as the plan is
+active, instead of the plan only ever being visible as one line that
+scrolls by in the log. It's reserved space regardless of whether a plan
+is active (a blank slot, not an absent one) so starting/finishing a plan
+mid-session never shifts the cwd/model fields next to it — the same
+"layout must never change based on transient state" principle behind
+`App.tsx`'s fixed `logHeight`. On a narrow terminal (<60 columns) the slot
+is hidden entirely instead, rather than forcing cwd/model to squeeze for
+it (caught directly by a test: reserving it unconditionally pushed a
+40-column terminal's real total row width past 40).
+
+Covered by 5 new `AgentLoop` tests (a checkpoint exists mid-turn with no
+compaction ever having triggered; an incomplete plan survives to the end
+of a turn; progress events fire correctly including the final `(0, 0)` on
+completion; a plan-progress checkpoint resumes with its own wording) and 3
+new `StatusBar` tests (the "N/M" formatting, falling back to blank instead
+of overflowing the reserved slot for a pathological plan, and the narrow-
+terminal slot-hiding threshold). Verified end-to-end against the real
+backend in a throwaway project: declared a 3-step plan (status bar showed
+`0/3`), hard-killed the process with `SIGKILL` (not a graceful `/quit`) mid-task,
+confirmed the checkpoint survived on disk with the right steps, restarted
+the process, and confirmed it resumed automatically with the correct
+"resuming previous session" wording, the right remaining steps, and `0/3`
+restored in the status bar.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1474,6 +1532,55 @@ exited cleanly (exit code 0).
 > 추가함: `/qu`를 타이핑하면 정확히 `/quit`과 `/queue`로만 좁혀지고(둘 다
 > 진짜로 "qu"를 포함함) 메뉴 박스는 여전히 정확히 8행을 유지하며, 최상단
 > 일치 항목에서 Enter를 누르면 깔끔하게 종료됨(exit code 0).
+>
+> ### 계획/todo 진행 상황이 이제 매번 업데이트마다 저장되고, 상태 표시줄에 실시간으로 나옴
+>
+> 직접 제안받음: 여러 단계짜리 작업을 시작하기 전에 todo 리스트를 먼저 작성하고,
+> 진행하면서 항목을 체크해나가고, 진행 상황("N번째/전체 M개")을 계속 보이는 곳에
+> 표시하고 — 제안의 실제 요지는 — 강제 종료된 세션이 그 목록을 잃어버리지 않게
+> 하고, 새 작업이 시작될 때 진행 중이던 목록이 조용히 지워지지 않게 하는 것.
+>
+> 이걸 위한 인프라는 이미 존재했음(`checkpoint.json`, `steps: [{description, status}]`,
+> `buildResumePrompt()`) — 하지만 진짜 공백이 있었음: 이게 *컴팩션*이 일어날 때만
+> 기록됐음(`compact()` → `runCompaction()` → `writeCheckpoint()`). `update_plan`을
+> 호출한 세션이 컴팩션이 한 번도 발동하기 전에 종료되면(OS 레벨 Ctrl-C, 크래시,
+> 정전) 계획 전체를 잃어버리고 재개할 게 아무것도 없었음 — 정확히 이 제안이
+> 짚은 상황.
+>
+> `loop.ts`에서 수정: `applyStateTool()`의 `update_plan` 핸들러가 이제 호출될
+> 때마다 즉시 체크포인트를 기록함(`reason: "plan-progress"`, 기존
+> `"auto-threshold"`/`"manual"` 옆에 추가된 새 `Checkpoint` reason), 컴팩션과
+> 무관하게 — best-effort 방식이라 여기서 쓰기가 실패해도 모델이 기다리고 있는
+> 도구 호출 응답 자체는 깨지지 않음. 모든 단계가 `"done"`이 되면(도구 호출 없이
+> 턴이 자연스럽게 끝나는 시점에 체크) 자동으로 지워져서 관련 없는 다음 작업에
+> 잘못 물려 들어가지 않도록 함; 진짜로 아직 안 끝난 계획은 의도적으로 디스크에
+> 남겨서 다음 프로세스가 이어받을 수 있게 함. `buildResumePrompt()`는 이제 재개하는
+> *이유*를 구분함 — 순수 plan-progress 체크포인트는 "resuming previous session",
+> 기존의 "resuming after compaction"은 그대로 — 작업 중간에 강제 종료된 세션에게
+> "컴팩션 이후"라고 말하면 왜 대화 중간부터 이어받는 것처럼 보이는지에 대해
+> 실제로 오해를 살 수 있기 때문.
+>
+> `done, total` 카운트가 이제 새 `onPlanProgress` 콜백을 통해 나오고, 상태
+> 표시줄(`StatusBar.tsx`)의 작은 고정폭 슬롯에 연결됨 — "3/7"이 계획이 활성
+> 상태인 동안 계속 거기 남아있음, 로그에서 한 번 스크롤되고 사라지는 한 줄로만
+> 보이는 대신. 계획이 활성인지 여부와 무관하게 항상 공간이 예약됨(빈 슬롯이지
+> 없는 슬롯이 아님)이라서 세션 도중 계획이 시작되거나 끝나도 옆의 cwd/model
+> 필드가 절대 밀리지 않음 — `App.tsx`의 고정된 `logHeight` 뒤에 있는 것과 같은
+> "레이아웃은 일시적인 상태에 따라 절대 바뀌면 안 된다"는 원칙. 좁은 터미널
+> (60컬럼 미만)에서는 이 슬롯을 아예 숨김 — cwd/model이 이걸 위해 억지로
+> 쪼그라들게 하는 대신(테스트로 직접 잡아냄: 무조건 예약하면 40컬럼 터미널의
+> 실제 전체 행 너비가 40을 넘어버림).
+>
+> 새 `AgentLoop` 테스트 5개로 커버함(컴팩션이 한 번도 발동하지 않은 채로 턴
+> 중간에 체크포인트가 존재하는지, 미완료 계획이 턴이 끝날 때까지 살아남는지,
+> 진행 이벤트가 올바르게 발생하고 완료 시 마지막에 `(0, 0)`이 오는지, plan-progress
+> 체크포인트가 자기만의 문구로 재개되는지), 새 `StatusBar` 테스트 3개(“N/M” 포맷팅,
+> 비정상적으로 큰 계획일 때 예약된 슬롯을 넘치는 대신 빈 값으로 폴백하는지, 좁은
+> 터미널에서 슬롯을 숨기는 임계값). 실제 백엔드로 임시 프로젝트에서 엔드투엔드
+> 검증함: 3단계 계획을 선언(상태 표시줄에 `0/3` 표시됨), 작업 도중 `/quit`이 아니라
+> `SIGKILL`로 강제 종료, 체크포인트가 올바른 단계 상태로 디스크에 남아있는지 확인,
+> 프로세스를 재시작해서 "resuming previous session" 문구·올바른 남은 단계·상태
+> 표시줄의 `0/3`이 자동으로 복원되는지까지 확인함.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
