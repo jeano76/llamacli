@@ -25,7 +25,7 @@ and never try to launch one yourself.`;
 
 async function main() {
   const projectRoot = process.cwd();
-  const config = await loadConfig(projectRoot);
+  const { config, setupMessage } = await loadConfig(projectRoot);
   const rules = await loadRules(projectRoot);
   const skillIndex = await loadSkillIndex(projectRoot);
   const systemPrompt = injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT, rules);
@@ -192,6 +192,8 @@ async function main() {
       }}
     />
   );
+
+  if (setupMessage) (globalThis as any).__llamacli_ui?.pushStatus(setupMessage);
 
   try {
     await loop.resumeIfCheckpointExists();

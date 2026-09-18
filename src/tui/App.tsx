@@ -131,7 +131,15 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   };
 
   const rows = stdout?.rows ?? 24;
-  const logHeight = Math.max(3, rows - 6);
+  // The slash menu (round border top+bottom + one line per item) adds rows
+  // on top of the normal chrome (divider + input + status bar). Without
+  // accounting for it, total rendered content exceeds the outer Box's fixed
+  // `rows` height while the menu is open, which scrolls the real terminal —
+  // and when the menu closes and the content shrinks back down, that scroll
+  // doesn't cleanly undo, leaving stale content ("잔상") behind (PROMPT.md
+  // §6 explicitly requires no ghosting/leftover artifacts on popup close).
+  const menuHeight = menuOpen ? SLASH_MENU_ITEMS.length + 2 : 0;
+  const logHeight = Math.max(3, rows - 6 - menuHeight);
 
   // Slicing `log` itself by logHeight is wrong: a single multi-line diff
   // entry expands into several rendered rows, so a naive slice can hand the
@@ -160,7 +168,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   );
 
   return (
-    <Box flexDirection="column" height={rows}>
+    <Box flexDirection="column" height={rows} overflow="hidden">
       <Box flexDirection="column" height={logHeight} overflow="hidden">
         {visualRows.slice(-logHeight)}
       </Box>

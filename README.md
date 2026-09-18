@@ -199,6 +199,41 @@ top, as a second line of defense. Reproduced and verified fixed with the
 exact error from the recording, via a real pty run of the built global
 command. Covered by `src/agent/loop.test.ts`.
 
+### Layout fix: the slash menu overflowed the fixed-height screen and left ghosting behind
+
+Found via a second screen recording: opening the slash menu on a fresh
+launch left a stray character visible below the app's own status bar,
+outside the box it should be confined to. Root cause — `App.tsx`'s outer
+`Box` is pinned to a fixed `height={rows}`, but `logHeight` was computed as
+a constant (`rows - 6`) that never accounted for the slash menu's own rows
+(a rounded border top+bottom plus one line per item, ~10 rows). With the
+menu open, total content exceeded `rows`, which scrolled the real terminal;
+when the menu closed and content shrank back down, that scroll didn't
+cleanly undo, leaving stale content on screen (exactly the "no ghosting on
+popup close" requirement PROMPT.md §6 calls for). Fixed by shrinking
+`logHeight` by the menu's actual height while it's open, and adding
+`overflow="hidden"` to the outer `Box` itself as a defensive backstop so
+total content can never exceed the terminal height even if this math is
+ever slightly off again.
+
+### Backend auto-detection: stopped guessing a dead default port
+
+The same recording also showed a real message never reaching any model:
+with no `.llamacli/config.yaml`, the CLI fell back to a hardcoded default
+backend URL (127.0.0.1:8081) that's usually nothing — even on a machine
+that had a real server running on a different port the whole time.
+`loadConfig()` now follows the same pattern already used for rules/skills
+(§5): when no config exists yet, it probes common local ports (see
+`src/backend/detect.ts` — llama-server's typical 8080, the old default
+8081, Ollama's 11434) for a real OpenAI-compatible `/v1/models` responder,
+and if it finds one, generates `.llamacli/config.yaml` pointing at it
+automatically, with a `[setup]` status message announcing what it found.
+If nothing answers, it still writes a placeholder config and says so
+clearly, instead of silently guessing. Verified end-to-end: run from a
+directory with zero prior configuration, it found this machine's actual
+running server and connected to it with no manual setup. Covered by
+`src/backend/detect.test.ts` and `src/config.test.ts`.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -235,6 +270,34 @@ command. Covered by `src/agent/loop.test.ts`.
 > `resumeIfCheckpointExists()` 호출부에도 이중 방어용 try/catch를 추가함. 영상에 나온
 > 정확한 에러 문구로 재현한 뒤, 빌드된 전역 명령을 실제 pty로 구동해 수정 확인함.
 > `src/agent/loop.test.ts`로 커버됨.
+>
+> ### 레이아웃 수정: 슬래시 메뉴가 화면을 넘쳐서 잔상이 남던 문제
+>
+> 두 번째 스크린 레코딩으로 발견: 처음 실행 후 슬래시 메뉴를 열면, 앱의 상태바
+> 아래쪽 박스 바깥에 글자 하나가 잔상처럼 남아 보였음. 원인 — `App.tsx`의 바깥
+> `Box`는 `height={rows}`로 고정돼 있지만 `logHeight`는 상수(`rows - 6`)로 계산돼
+> 슬래시 메뉴 자체가 차지하는 행 수(둥근 테두리 위+아래 + 항목당 1줄, 약 10줄)를
+> 전혀 반영하지 않았음. 메뉴가 열리면 전체 콘텐츠가 `rows`를 초과해 실제 터미널이
+> 스크롤되고, 메뉴가 닫혀 콘텐츠가 다시 줄어들어도 그 스크롤이 깔끔히 복구되지
+> 않아 잔상이 남음(PROMPT.md §6이 요구하는 "팝업 닫히면 잔상 없이 복구" 요건과
+> 정확히 충돌). 메뉴가 열려있을 때 `logHeight`를 메뉴의 실제 높이만큼 줄이고,
+> 바깥 `Box`에도 `overflow="hidden"`을 추가해 이 계산이 다시 조금이라도 어긋나도
+> 전체 콘텐츠가 터미널 높이를 절대 넘지 않도록 이중 안전장치를 걸어 수정.
+>
+> ### 백엔드 자동 감지: 죽은 기본 포트를 그냥 찍던 문제 해결
+>
+> 같은 영상에서 메시지를 보내도 어떤 모델에도 도달하지 못하는 것도 확인됨:
+> `.llamacli/config.yaml`이 없으면 하드코딩된 기본 백엔드 URL(127.0.0.1:8081)로
+> 폴백하는데, 실제로 다른 포트에 서버가 떠 있는 이 기기에서조차 그 포트엔 아무것도
+> 없었음. 이제 `loadConfig()`가 rule/skill에 이미 쓰던 것과 같은 패턴(§5)을 따른다:
+> 설정이 없으면 흔한 로컬 포트(`src/backend/detect.ts` 참고 — llama-server의 기본
+> 8080, 예전 기본값 8081, Ollama의 11434)를 탐색해 실제 OpenAI 호환
+> `/v1/models`에 응답하는 서버를 찾고, 찾으면 그걸 가리키는
+> `.llamacli/config.yaml`을 자동 생성하며 무엇을 찾았는지 `[setup]` 상태 메시지로
+> 알려준다. 아무 데도 없으면 여전히 플레이스홀더 설정을 쓰고 그 사실을 명확히
+> 알린다(조용히 잘못 찍지 않음). 사전 설정이 전혀 없는 디렉토리에서 실행해
+> 실제로 이 기기의 실행 중인 서버를 찾아 수동 설정 없이 연결되는 것까지 확인함.
+> `src/backend/detect.test.ts`, `src/config.test.ts`로 커버됨.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
