@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
@@ -448,4 +448,68 @@ test("the real-time improvement check never fires until the turn's own loop has 
       idxCheck > idxSecondTurnCall,
       `expected the improvement check strictly after the turn finished, got order: ${events.join(", ")}`
     );
+  }));
+
+test("every chat request sent to the backend caps max_tokens instead of leaving it unbounded", () =>
+  withTempProject(async (dir) => {
+    // Found live via the real backend's GET /slots: a request with no
+    // max_tokens set (llama-server default -1, unbounded) generated past
+    // 22k tokens with no end in sight, pinning the single inference slot.
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 8000 },
+    });
+
+    await loop.send("hello");
+
+    assert.equal(turnRequests.length, 1);
+    assert.equal(turnRequests[0].max_tokens, 2000); // 25% of the 8000-token context window
+  }));
+
+test("an oversized tool result is truncated before it's sent to the backend, not passed through raw", () =>
+  withTempProject(async (dir) => {
+    // Nothing previously capped a single tool result's size — a large
+    // read_file (or noisy shell output) went straight from executeTool()
+    // into `this.messages` and from there, uncapped, into the next request
+    // body sent to llama.cpp. Write a file well past the cap and assert the
+    // "tool" message that actually reaches the backend is bounded.
+    const bigPath = join(dir, "big.txt");
+    const bigContent = "x".repeat(50_000);
+    await writeFile(bigPath, bigContent, "utf8");
+
+    const call = {
+      id: "c1",
+      type: "function" as const,
+      function: { name: "read_file", arguments: JSON.stringify({ path: bigPath }) },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100 },
+    });
+
+    await loop.send("read the big file");
+
+    // The second turn request is the one that includes the tool result from
+    // the first call — check what was actually sent, not what executeTool()
+    // produced internally.
+    const secondRequest = turnRequests[1];
+    const toolMessage = secondRequest.messages.find((m) => m.role === "tool");
+    assert.ok(toolMessage, "expected a tool-role message in the follow-up request");
+    const sentContent = toolMessage!.content as string;
+    assert.ok(sentContent.length < bigContent.length, "the sent tool content should be shorter than the raw file");
+    assert.match(sentContent, /truncated/);
   }));

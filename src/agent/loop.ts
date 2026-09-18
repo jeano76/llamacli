@@ -8,6 +8,25 @@ import { clearCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
 import { stripToolCallTemplateLeak } from "./textSanitize.js";
 
+// A single tool result (e.g. read_file on a large or binary-ish file, a
+// noisy shell command's stdout) had no size limit before this was added —
+// its full raw content went straight into `this.messages` and from there,
+// uncapped, into the next request body sent to llama.cpp. One oversized
+// result could balloon a single request by itself, on top of accumulated
+// history, well past what's reasonable to send in one shot. Cap it at the
+// message level (as opposed to relying on each individual tool to self-limit)
+// so nothing ever reaches the backend request unbounded, no matter which
+// tool produced it. ~4 chars/token, so this keeps any one tool result to
+// roughly 6k tokens — generous for a single file/command, small next to the
+// 64k+ context window in real use.
+const TOOL_RESULT_CHAR_CAP = 24_000;
+
+function capToolResult(content: string): string {
+  if (content.length <= TOOL_RESULT_CHAR_CAP) return content;
+  const omitted = content.length - TOOL_RESULT_CHAR_CAP;
+  return `${content.slice(0, TOOL_RESULT_CHAR_CAP)}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane]`;
+}
+
 export interface AgentLoopOptions {
   projectRoot: string;
   model: string;
@@ -144,7 +163,22 @@ export class AgentLoop {
       let res;
       try {
         res = await this.opts.backend.chat(
-          { model: this.opts.model, messages: this.messages, tools: TOOL_DEFS, stream: true },
+          {
+            model: this.opts.model,
+            messages: this.messages,
+            tools: TOOL_DEFS,
+            stream: true,
+            // Never leave this unset: without it llama-server defaults to
+            // n_predict=-1 (unbounded), and a degenerate generation (no
+            // stop token reached, e.g. a repetition loop) runs forever,
+            // pinning the single inference slot and blocking every other
+            // request indefinitely instead of failing visibly. Caught live
+            // via GET /slots showing n_decoded climbing past 22k with
+            // max_tokens/n_predict both -1. Cap well under the context
+            // window so a runaway reply still leaves room to be seen and
+            // recovered from rather than silently consuming it all.
+            max_tokens: Math.max(512, Math.floor(this.opts.thresholds.contextWindowTokens * 0.25)),
+          },
           (chunk) => {
             const delta = chunk.choices[0]?.delta;
             if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
@@ -228,7 +262,7 @@ export class AgentLoop {
         let content: string;
         try {
           const result = await executeTool(call.function.name, call.function.arguments);
-          content = result.content;
+          content = capToolResult(result.content);
           if (result.diff) {
             this.opts.onDiff?.(this.summarizeArgs(call.function.arguments), result.diff);
           }

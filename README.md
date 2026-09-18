@@ -545,6 +545,36 @@ to exit. Verified via pty: the process stays alive and fully responsive
 presses, with no stray characters left in the input line; `/quit` still
 exits cleanly afterward.
 
+### Requests to llama.cpp were never bounded in size
+
+Found live, mid-session, while analyzing the real llama-server's own logs
+(per a direct request to keep doing that): `GET /slots` showed a request
+stuck generating past 22,000 tokens with no end in sight, pinning the
+single inference slot (`-np 1`) and blocking every other request
+indefinitely. Two compounding gaps, both fixed in `loop.ts`:
+
+- Every chat request sent to the backend was missing `max_tokens` entirely.
+  llama-server's own default for that is `-1` (unbounded), and with
+  `repeat_penalty` effectively off, nothing stopped a degenerate generation
+  (no stop token reached) from running forever instead of failing visibly.
+  Now every request caps `max_tokens` at 25% of the configured context
+  window (minimum 512) — generous for one reply, but never unbounded.
+- A single tool result (e.g. `read_file` on a large file, a noisy shell
+  command's stdout) had no size limit either — its full raw content went
+  straight from `executeTool()` into the message history and from there,
+  uncapped, into the next request body. `capToolResult()` now truncates any
+  one tool result past ~24,000 characters (roughly 6k tokens) before it's
+  pushed, with an explicit `[...truncated: N more characters omitted]`
+  marker so the model knows content was cut rather than silently seeing
+  less than what's actually there.
+
+Verified against the real backend's `/slots` endpoint (confirmed the
+runaway request's `max_tokens`/`n_predict` were both `-1`), plus new unit
+tests: one asserting the request body's `max_tokens` field, one writing a
+50,000-character file and asserting the tool-result message that actually
+reaches the backend is shorter than the raw file and carries the
+truncation marker.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -857,6 +887,34 @@ exits cleanly afterward.
 > pty로 검증: Ctrl-C를 연속 3번 눌러도 프로세스가 살아있고 완전히 정상 동작함(새
 > 입력 받고 메시지 전송도 됨), 입력줄에 이상한 문자도 안 남음; 이후 `/quit`도
 > 여전히 깔끔하게 종료됨.
+>
+> ### llama.cpp로 보내는 요청 크기에 상한이 전혀 없던 문제
+>
+> 실제 llama-server 로그를 계속 실시간 분석해달라는 요청에 따라 작업하던 중
+> 세션 도중에 직접 발견함: `GET /slots`를 확인하니 요청 하나가 22,000토큰을
+> 넘도록 끝날 기미 없이 계속 생성 중이었고, 단일 추론 슬롯(`-np 1`)을 계속
+> 점유해서 다른 모든 요청을 무기한 막고 있었음. 겹쳐진 원인 두 가지를
+> `loop.ts`에서 모두 수정:
+>
+> - 백엔드로 보내는 모든 채팅 요청에 `max_tokens`가 아예 지정되지 않고 있었음.
+>   llama-server의 기본값은 `-1`(무제한)이고, `repeat_penalty`도 사실상
+>   꺼져있어서 정지 토큰을 못 만나면 생성이 눈에 띄게 실패하는 대신 그냥
+>   영원히 계속됨. 이제 모든 요청이 설정된 컨텍스트 윈도우의 25%(최소
+>   512)로 `max_tokens`를 상한함 — 한 번의 응답치고는 넉넉하지만 절대
+>   무제한은 아님.
+> - 도구 실행 결과 하나(예: 큰 파일의 `read_file`, 출력이 많은 셸 명령) 역시
+>   크기 제한이 없어서, `executeTool()`의 원본 전체 내용이 그대로 메시지
+>   기록에 들어가고 거기서 다시 상한 없이 다음 요청 본문에 그대로 실림.
+>   이제 `capToolResult()`가 도구 결과 하나를 약 24,000자(대략 6천 토큰)를
+>   넘으면 잘라내고, `[...truncated: N more characters omitted]` 표시를
+>   명시적으로 남겨서 모델이 실제보다 적은 내용을 본 것처럼 조용히 속지
+>   않게 함.
+>
+> 실제 백엔드의 `/slots` 엔드포인트로 확인함(폭주 중이던 요청의
+> `max_tokens`/`n_predict`가 둘 다 `-1`이었음 확인), 새 유닛 테스트 2개도
+> 추가함: 요청 본문의 `max_tokens` 필드를 검증하는 것 하나, 50,000자짜리
+> 파일을 만들어 백엔드로 실제 전달되는 도구 결과 메시지가 원본보다 짧고
+> truncated 표시를 담고 있는지 검증하는 것 하나.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
