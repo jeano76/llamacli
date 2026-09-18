@@ -33,32 +33,44 @@ function messageText(m: ChatMessage): string {
   return toolCalls ? `${content}\n${toolCalls}` : content;
 }
 
-function charBasedEstimate(messages: ChatMessage[]): number {
-  const chars = messages.reduce((sum, m) => sum + messageText(m).length, 0);
+function charBasedEstimate(messages: ChatMessage[], extraText: string): number {
+  const chars = messages.reduce((sum, m) => sum + messageText(m).length, 0) + extraText.length;
   return Math.ceil(chars / 4);
 }
 
 /** Uses the backend's real tokenizer (llama.cpp `/tokenize`) when available;
  *  falls back to a chars/4 approximation when the backend has no tokenizer
- *  or the call fails (e.g. a generic OpenAI-compatible endpoint without it). */
-export async function estimateTokens(messages: ChatMessage[], backend?: ModelBackend): Promise<number> {
+ *  or the call fails (e.g. a generic OpenAI-compatible endpoint without it).
+ *
+ *  `extraText` covers request payload that isn't part of `messages` at all
+ *  but is still sent, and still costs real tokens — specifically the tool
+ *  definitions schema (`TOOL_DEFS` in loop.ts), sent on every main-loop
+ *  request. Found live: real usage (per llama-server's own reported
+ *  n_tokens) kept running measurably past this project's compaction
+ *  threshold before a compaction ever fired. Measured directly: the tool
+ *  schema JSON alone tokenizes to 626 real tokens — sent on every single
+ *  request, and never counted here at all before this, silently
+ *  undercounting every threshold check by that much. Callers that don't
+ *  send tools (the compaction summary request itself) simply omit this. */
+export async function estimateTokens(messages: ChatMessage[], backend?: ModelBackend, extraText = ""): Promise<number> {
   if (backend?.tokenize) {
     try {
-      const text = messages.map(messageText).join("\n");
+      const text = [...messages.map(messageText), extraText].join("\n");
       return await backend.tokenize(text);
     } catch {
       // tokenizer unavailable/errored — fall through to the approximation
     }
   }
-  return charBasedEstimate(messages);
+  return charBasedEstimate(messages, extraText);
 }
 
 export async function shouldCompact(
   messages: ChatMessage[],
   thresholds: CompactionThresholds,
-  backend?: ModelBackend
+  backend?: ModelBackend,
+  extraText = ""
 ): Promise<boolean> {
-  const used = await estimateTokens(messages, backend);
+  const used = await estimateTokens(messages, backend, extraText);
   return used >= thresholds.contextWindowTokens * thresholds.autoTriggerRatio;
 }
 

@@ -1105,6 +1105,36 @@ accepts the connection but deliberately never replies to anything —
 confirming a tool call actually times out near the configured bound
 (verified: fires at ~311ms against a 300ms cap) instead of hanging.
 
+### Compaction threshold silently ignored the tool schema's own token cost
+
+Kept watching real session logs at the user's request. Real usage (per
+llama-server's own reported `n_tokens`) kept running measurably past this
+project's compaction threshold (45,875 tokens at the current 0.70 ratio)
+before a compaction ever fired — reaching 47,078 with no compaction in
+sight. Root cause in `compactor.ts`'s `estimateTokens()`: it only ever
+summed `this.messages` — never the `tools` field, which the main loop
+(`loop.ts`) sends as `TOOL_DEFS` on every single request, completely
+separate from the message list. Measured directly against the real
+backend: that schema JSON alone tokenizes to **626 real tokens**, sent on
+every request and never counted at all — silently undercounting every
+single threshold check by that much, which is most of the gap actually
+observed live.
+
+Fixed by adding an `extraText` parameter to `estimateTokens()`/
+`shouldCompact()`, and threading `JSON.stringify(TOOL_DEFS)` (computed
+once — it's static) through every real call site in `loop.ts`
+(`maybeCompact()`, and both sides of the overflow-retry's before/after
+progress check). The compaction summary request itself correctly stays
+unaffected — it never sends `tools` at all, so nothing is passed there.
+
+Verified directly against the real backend: `estimateTokens()` with the
+real tool schema included now returns exactly 626 tokens higher than
+without it, matching the schema's actual tokenized size measured
+independently. Covered by 2 new unit tests (`estimateTokens` counts
+`extraText` in addition to the messages; `shouldCompact` correctly flips
+from false to true once `extraText` pushes the total over threshold, even
+though the messages alone didn't).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1902,6 +1932,33 @@ confirming a tool call actually times out near the configured bound
 > WebSocket 서버(`ws` 패키지 사용, devDependency로 추가)를 이용한 새 테스트로
 > 커버함 — 도구 호출이 실제로 설정된 시간 근처에서 타임아웃되는지 확인함
 > (검증: 300ms 상한에 대해 약 311ms에서 발동), 멈추는 대신.
+>
+> ### 컴팩션 임계값이 도구 스키마 자체의 토큰 비용을 조용히 빠뜨리고 있었음
+>
+> 사용자 요청으로 실제 세션 로그를 계속 지켜보다가 발견함: 실제 사용량
+> (llama-server 자체가 보고하는 `n_tokens` 기준)이 이 프로젝트의 컴팩션
+> 임계값(현재 0.70 비율에서 45,875토큰)을 컴팩션이 한 번도 안 뜬 채로 눈에
+> 띄게 넘어서고 있었음 — 컴팩션 기미 없이 47,078까지 도달. `compactor.ts`의
+> `estimateTokens()`가 근본 원인: `this.messages`만 합산했지, 메인 루프
+> (`loop.ts`)가 매 요청마다 `TOOL_DEFS`로 보내는 `tools` 필드는 메시지
+> 목록과 완전히 별개인데 전혀 계산에 안 들어가고 있었음. 실제 백엔드로
+> 직접 측정해보니 그 스키마 JSON 하나만으로도 **실제 626토큰**이고, 이게
+> 매 요청마다 전송되는데도 전혀 안 세어지고 있었음 — 매번의 임계값 체크가
+> 조용히 딱 그만큼 과소평가되고 있었고, 이게 실제로 관찰된 격차의 대부분을
+> 설명함.
+>
+> `estimateTokens()`/`shouldCompact()`에 `extraText` 매개변수를 추가하고,
+> `JSON.stringify(TOOL_DEFS)`(정적이라 한 번만 계산)를 `loop.ts`의 실제
+> 호출 지점 전부(`maybeCompact()`, 그리고 오버플로우 재시도의 전후 진행
+> 체크 양쪽)에 흘려보내도록 고침. 컴팩션 요약 요청 자체는 원래부터
+> `tools`를 전혀 안 보내므로 영향 없이 그대로 둠.
+>
+> 실제 백엔드로 직접 검증함: 실제 도구 스키마를 포함한 `estimateTokens()`가
+> 이제 포함 안 했을 때보다 정확히 626토큰 더 많이 반환함 — 독립적으로
+> 측정한 스키마의 실제 토큰 크기와 정확히 일치. 새 유닛 테스트 2개로
+> 커버함(`estimateTokens`가 메시지 외에 `extraText`도 세는지, 메시지만으로는
+> 임계값을 못 넘어도 `extraText`가 더해지면 `shouldCompact`가 정확히
+> false에서 true로 바뀌는지).
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

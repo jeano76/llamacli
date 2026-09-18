@@ -8,6 +8,18 @@ import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/
 import type { Checkpoint } from "../compaction/checkpoint.js";
 import { stripToolCallTemplateLeak } from "./textSanitize.js";
 
+// Sent as the `tools` field on every main-loop request (never on the
+// compaction summary request, which omits tools entirely) — computed once
+// since TOOL_DEFS is static, not per-call. Threaded into every
+// estimateTokens() call below as `extraText` so the threshold check
+// reflects what's actually being sent, not just `this.messages`. Found
+// live: real usage (per llama-server's own reported n_tokens) kept
+// running measurably past this project's compaction threshold before a
+// compaction ever fired — measured directly, this JSON alone tokenizes to
+// 626 real tokens, sent on every single request and previously never
+// counted at all.
+const TOOL_DEFS_JSON = JSON.stringify(TOOL_DEFS);
+
 // A single tool result (e.g. read_file on a large or binary-ish file, a
 // noisy shell command's stdout) had no size limit before this was added —
 // its full raw content went straight into `this.messages` and from there,
@@ -266,9 +278,9 @@ export class AgentLoop {
           this.opts.onStatus?.(
             `[context overflow] request exceeded the context window — forcing compaction and retrying (${overflowRetries}/${MAX_OVERFLOW_RETRIES}).`
           );
-          const before = await estimateTokens(this.messages, this.opts.backend);
+          const before = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
           await this.compact("auto-threshold", null);
-          const after = await estimateTokens(this.messages, this.opts.backend);
+          const after = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
           // A compaction that didn't actually shrink anything (e.g. the
           // remaining "must keep" tail — the resume context, the latest
           // pending tool call — is itself already too large to fit on its
@@ -488,7 +500,7 @@ export class AgentLoop {
    *  compacts if over threshold. Returns whether it compacted, so callers
    *  mid-tool-call-batch know to abandon the rest of the batch. */
   private async maybeCompact(pendingToolCall: Checkpoint["pendingToolCall"] = null): Promise<boolean> {
-    const used = await estimateTokens(this.messages, this.opts.backend);
+    const used = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
     this.opts.onContextUsage?.(used, this.opts.thresholds.contextWindowTokens);
     if (used >= this.opts.thresholds.contextWindowTokens * this.opts.thresholds.autoTriggerRatio) {
       await this.compact("auto-threshold", pendingToolCall);

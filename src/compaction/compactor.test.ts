@@ -351,3 +351,25 @@ test("runCompaction's kept tail always includes at least the single most recent 
       await rm(dir, { recursive: true, force: true });
     }
   })());
+
+// Found live: real usage (per llama-server's own reported n_tokens) kept
+// running measurably past this project's compaction threshold before a
+// compaction ever fired. Root cause: the tools schema JSON (TOOL_DEFS in
+// loop.ts, sent as the `tools` field on every main-loop request) tokenizes
+// to hundreds of real tokens on its own — sent on every single request,
+// and never counted at all before this, silently undercounting every
+// threshold check by that much.
+test("estimateTokens counts extraText (the tools schema payload) in addition to the messages themselves", async () => {
+  const messages: ChatMessage[] = [{ role: "user", content: "a".repeat(40) }];
+  const withoutExtra = await estimateTokens(messages);
+  const withExtra = await estimateTokens(messages, undefined, "x".repeat(400));
+  assert.equal(withoutExtra, 10); // 40/4
+  assert.equal(withExtra, 110); // (40+400)/4
+});
+
+test("shouldCompact accounts for extraText too — a request that fits without it can still be over threshold with it included", async () => {
+  const thresholds = { autoTriggerRatio: 0.5, contextWindowTokens: 100 };
+  const messages: ChatMessage[] = [{ role: "user", content: "x".repeat(4 * 30) }]; // 30 tokens alone, < 50
+  assert.equal(await shouldCompact(messages, thresholds), false);
+  assert.equal(await shouldCompact(messages, thresholds, undefined, "y".repeat(4 * 30)), true); // 30+30=60 >= 50
+});
