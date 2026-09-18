@@ -66,4 +66,13 @@ export interface ModelBackend {
    *  (e.g. real OpenAI, or another server that doesn't implement it) won't
    *  have it. Returns the exact token count for the given text. */
   tokenize?(text: string): Promise<number>;
+
+  /** llama.cpp-server-specific `/props` endpoint. Returns the server's
+   *  actual running context size (`n_ctx`), so compaction thresholds can be
+   *  based on what the backend is really configured with instead of a
+   *  static config value that can silently drift out of sync with it (seen
+   *  live: config said 8192, the running server was actually -c 65536 —
+   *  compaction fired 8x too eagerly, interrupting every single turn in a
+   *  loop). Optional and may throw for non-llama.cpp backends. */
+  getContextSize?(): Promise<number>;
 }

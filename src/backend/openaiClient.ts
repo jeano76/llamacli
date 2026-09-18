@@ -44,6 +44,17 @@ export class OpenAICompatibleClient implements ModelBackend {
     return json.tokens.length;
   }
 
+  /** llama.cpp-server-specific endpoint — callers must be ready for this to
+   *  throw and fall back to the configured value. */
+  async getContextSize(): Promise<number> {
+    const res = await fetch(`${this.baseUrl}/props`, { headers: this.headers() });
+    if (!res.ok) throw new Error(`getContextSize failed: ${res.status} ${await res.text()}`);
+    const json = (await res.json()) as { default_generation_settings?: { n_ctx?: number }; n_ctx?: number };
+    const n_ctx = json.default_generation_settings?.n_ctx ?? json.n_ctx;
+    if (!n_ctx) throw new Error("getContextSize: /props response had no n_ctx field");
+    return n_ctx;
+  }
+
   async chat(
     req: ChatCompletionRequest,
     onDelta?: (chunk: ChatCompletionChunk) => void

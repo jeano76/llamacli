@@ -575,6 +575,32 @@ tests: one asserting the request body's `max_tokens` field, one writing a
 reaches the backend is shorter than the raw file and carries the
 truncation marker.
 
+### Compaction fired on every single turn: config drifted out of sync with the real server
+
+Reported live via a pasted real session: `[compaction complete]` followed
+immediately by `[turn ended] Compaction interrupted this task` — repeating
+turn after turn, never letting any actual work finish. Root cause: the
+project's `.llamacli/config.yaml` had `contextSize: 8192`, but the real
+`llama-server` it was talking to was actually running with `-c 65536` —
+eight times larger. `AgentLoop` had no way to know that; it trusted the
+config value completely, so `autoTriggerRatio: 0.85` was being evaluated
+against a context window 8x too small, tripping compaction almost
+immediately on nearly every turn instead of only when actually needed.
+
+Fixed two ways: corrected the stale config value for the immediate fix, and
+— since a config file can always drift out of sync with whatever the
+server actually ends up running as again — added
+`OpenAICompatibleClient.getContextSize()`, which reads the real `n_ctx`
+from llama.cpp's own `/props` endpoint
+(`default_generation_settings.n_ctx`). `index.tsx` now prefers this live
+value over the static config at startup, falling back to config (then
+8192) only for backends that don't expose it. Verified directly against
+the real running server (`getContextSize()` correctly returned `65536`,
+matching `/props` output), plus 3 new unit tests against a fake `/props`
+server covering the real response shape, a missing-`n_ctx` response, and a
+non-OK response — all falling back rather than silently returning a bogus
+value.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -915,6 +941,29 @@ truncation marker.
 > 추가함: 요청 본문의 `max_tokens` 필드를 검증하는 것 하나, 50,000자짜리
 > 파일을 만들어 백엔드로 실제 전달되는 도구 결과 메시지가 원본보다 짧고
 > truncated 표시를 담고 있는지 검증하는 것 하나.
+>
+> ### 매 턴마다 컴팩션이 발동하던 문제: 설정 파일이 실제 서버와 어긋나 있었음
+>
+> 실제 세션 출력을 그대로 붙여넣은 신고로 발견함: `[compaction complete]`
+> 바로 다음에 `[turn ended] Compaction interrupted this task`가 턴마다
+> 계속 반복되고, 실제 작업은 하나도 끝나지 못함. 근본 원인: 프로젝트의
+> `.llamacli/config.yaml`에 `contextSize: 8192`로 박혀있었는데, 실제로
+> 대화하고 있던 `llama-server`는 `-c 65536`로 떠 있었음 — 8배 차이.
+> `AgentLoop`는 이걸 알 방법이 없어서 설정값을 그대로 믿었고, 그 결과
+> `autoTriggerRatio: 0.85`가 실제보다 8배 작은 컨텍스트 윈도우 기준으로
+> 평가되면서 거의 매 턴마다 컴팩션이 필요하지도 않은데 즉시 발동해버림.
+>
+> 두 가지로 수정: 우선 당장은 설정값 자체를 바로잡았고, 설정 파일이
+> 나중에 또 실제 서버와 어긋날 수 있으므로 — `OpenAICompatibleClient`에
+> `getContextSize()`를 추가해서 llama.cpp 자체의 `/props` 엔드포인트
+> (`default_generation_settings.n_ctx`)에서 실제 값을 읽어오게 함.
+> `index.tsx`는 이제 시작 시 이 실제 값을 정적 설정값보다 우선하고,
+> 이 엔드포인트가 없는 백엔드에서만 설정값(그다음 8192)으로 폴백함.
+> 실제로 돌고 있는 서버로 직접 검증함(`getContextSize()`가 실제
+> `/props` 출력과 일치하는 `65536`을 정확히 반환함), 가짜 `/props`
+> 서버를 만들어 실제 응답 형태·`n_ctx` 없는 응답·비정상 응답 3가지를
+> 다루는 새 유닛 테스트도 추가함 — 셋 다 엉뚱한 값을 조용히 반환하는
+> 대신 폴백하는지 검증.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

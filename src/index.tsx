@@ -86,6 +86,20 @@ async function main() {
     backend = new OpenAICompatibleClient(config.baseUrl ?? "http://127.0.0.1:8081", config.apiKey);
   }
 
+  // Prefer the backend's own reported context size over the static config
+  // value whenever possible — a config file can silently drift out of sync
+  // with whatever the server is actually running (seen live: config said
+  // 8192, the real server was -c 65536, so compaction fired 8x too eagerly
+  // and interrupted every single turn in an endless compact/resume loop).
+  // Falls back to config (then 8192) for backends that don't expose this.
+  let contextWindowTokens = config.llama?.contextSize ?? 8192;
+  try {
+    const reported = await backend.getContextSize?.();
+    if (reported) contextWindowTokens = reported;
+  } catch {
+    // Non-llama.cpp backend, or /props unavailable — config value stands.
+  }
+
   const loop = new AgentLoop({
     projectRoot,
     model: config.model,
@@ -93,7 +107,7 @@ async function main() {
     systemPrompt,
     thresholds: {
       autoTriggerRatio: config.compaction.autoTriggerRatio,
-      contextWindowTokens: config.llama?.contextSize ?? 8192,
+      contextWindowTokens,
     },
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
     onAssistantDone: () => (globalThis as any).__llamacli_ui?.finalizeAssistant(),
