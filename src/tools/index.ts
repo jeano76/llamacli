@@ -174,7 +174,20 @@ export interface ToolResult {
   diff?: string;
 }
 
-export async function executeTool(name: string, argsJson: string): Promise<ToolResult> {
+/** How long a single `run_shell` call is allowed to block before it's
+ *  killed. Exported so tests can shrink it instead of waiting out the real
+ *  default. There was previously no timeout at all — found via a scenario
+ *  test simulating many long developer sessions: a command that blocks
+ *  (network stall, something waiting on stdin, a genuinely long-running
+ *  build/test command) hung the entire agent loop forever with no way to
+ *  recover, which lines up with multiple "seems stuck?" reports earlier —
+ *  those were plausibly this, not the other bugs already found and fixed. */
+export let RUN_SHELL_TIMEOUT_MS = 60_000;
+export function setRunShellTimeoutForTests(ms: number): void {
+  RUN_SHELL_TIMEOUT_MS = ms;
+}
+
+export async function executeTool(name: string, argsJson: string, projectRoot: string = process.cwd()): Promise<ToolResult> {
   const args = JSON.parse(argsJson || "{}");
   switch (name) {
     case "read_file":
@@ -194,7 +207,16 @@ export async function executeTool(name: string, argsJson: string): Promise<ToolR
       return { content: `edited ${args.path}`, diff: formatDiff(args.path, original, updated) };
     }
     case "run_shell": {
-      const { stdout, stderr } = await execAsync(args.command, { cwd: process.cwd() });
+      // cwd was previously always process.cwd() — the whole CLI process's
+      // own working directory, not necessarily the project actually being
+      // worked on (it only happened to match in normal single-project use
+      // because llamacli is launched from inside the project). Use the
+      // real project root explicitly instead of relying on that
+      // coincidence. `timeout` means a command that blocks forever (stuck
+      // on network, waiting on stdin, a runaway build) gets killed and
+      // reported as a tool error instead of hanging the entire agent loop
+      // with no way to recover — see RUN_SHELL_TIMEOUT_MS above.
+      const { stdout, stderr } = await execAsync(args.command, { cwd: projectRoot, timeout: RUN_SHELL_TIMEOUT_MS });
       return { content: stdout || stderr };
     }
     case "browser_list_tabs":

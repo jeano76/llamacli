@@ -791,6 +791,49 @@ runs afterward (60 developers × 40 turns, ~6.5s) once both fixes landed —
 and stays in the suite going forward as a standing regression net, not a
 one-off.
 
+### Scenario test extended across languages and program types — found a real hang risk
+
+Asked directly to extend the scenario to cover many different languages
+and program types, not just uniform `.txt` content — the scenario now
+assigns each simulated developer one of six real profiles (Python/Flask
+API, Go gRPC service, Rust CLI, TypeScript/Node web server, Java Spring
+service, Ruby batch pipeline), each with its own file extension, sample
+source, and *real* toolchain commands (`python3 -m py_compile`, `go vet`,
+`cargo test`, `java -version`, etc.) actually executed via `run_shell`.
+
+Running it immediately surfaced a real hang risk: `run_shell`'s
+`execAsync()` call had **no timeout at all**. In production, that means
+any command the model asks it to run that blocks — a network stall, a
+process waiting on stdin, a genuinely long-running build/test — hangs the
+*entire agent loop* forever with no way to recover. This is very plausibly
+the actual explanation behind more than one earlier "seems stuck?" report
+in this project, not just the other, already-diagnosed bugs. Separately
+(found while fixing the above and confirming what `run_shell` actually
+runs against): its `cwd` was hardcoded to `process.cwd()` — the whole CLI
+process's own working directory, not necessarily the project actually
+being worked on. It only ever happened to line up correctly because
+`llamacli` is conventionally launched from inside the project directory;
+nothing actually guaranteed it.
+
+Fixed both in `tools/index.ts`: `run_shell` now passes a `timeout`
+(`RUN_SHELL_TIMEOUT_MS`, 60s default, overridable for tests) to
+`execAsync`, so a blocked command is killed and reported as a normal tool
+error instead of hanging forever; and `executeTool()` now takes the real
+`projectRoot` explicitly (threaded from `AgentLoop`) and uses it as `cwd`
+instead of the implicit, coincidental `process.cwd()`. Covered by 3 new
+focused unit tests: a genuinely blocking command (`sleep 30`) gets killed
+near the configured timeout rather than the test hanging; a normal fast
+command still completes correctly (no regression); and a command's actual
+working directory is verified (via `pwd`) to be the passed project root,
+not wherever the test process itself happens to run from.
+
+The scenario test's own scale was tuned down afterward (24 developers × 20
+turns, ~17s) — the earlier 60×40 scale passed correctly too (confirmed
+directly, ~82s) but that slowdown came from real concurrent subprocess
+spawning (JVM startups, etc.) under this many simultaneous real toolchain
+calls, not a bug — the smaller scale keeps the suite fast for routine runs
+while still exercising every language profile several times over.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1319,6 +1362,42 @@ one-off.
 > 항상 유지되는지. 시나리오 테스트 자체는 두 수정이 모두 반영된 뒤 반복 실행에서
 > 깨끗하게 통과함(개발자 60명 × 40턴, 약 6.5초) — 그리고 일회성이 아니라 앞으로도
 > 회귀를 막는 상시 테스트로 스위트에 계속 남음.
+>
+> ### 시나리오 테스트를 여러 언어/프로그램 종류로 확장 — 실제 행 위험 발견
+>
+> 균일한 `.txt` 콘텐츠만이 아니라 여러 언어와 프로그램 종류를 다루도록 시나리오를
+> 확장해달라는 직접 요청. 이제 시뮬레이션되는 개발자마다 6개의 실제 프로필 중
+> 하나를 배정받음(Python/Flask API, Go gRPC 서비스, Rust CLI, TypeScript/Node
+> 웹 서버, Java Spring 서비스, Ruby 배치 파이프라인) — 각자 자기 파일 확장자,
+> 샘플 소스 코드, 그리고 `run_shell`을 통해 실제로 실행되는 진짜 툴체인 명령
+> (`python3 -m py_compile`, `go vet`, `cargo test`, `java -version` 등)을 가짐.
+>
+> 실행하자마자 진짜 행(hang) 위험을 바로 찾아냄: `run_shell`의 `execAsync()`
+> 호출에 **타임아웃이 전혀 없었음**. 실제 운영에서 이건, 모델이 실행을 요청한
+> 명령이 뭔가에 막히면(네트워크 지연, stdin 대기 중인 프로세스, 진짜로 오래
+> 걸리는 빌드/테스트) 에이전트 루프 *전체*가 복구할 방법 없이 영원히 멈춘다는
+> 뜻임. 이건 이 프로젝트에서 앞서 나온 "멈춘 거 같은데?" 신고들 중 하나 이상의
+> 실제 원인이었을 개연성이 매우 큼 — 이미 진단해서 고친 다른 버그들만이 아니라.
+> 별개로(위 수정을 고치면서 `run_shell`이 실제로 무엇을 대상으로 실행되는지
+> 확인하다가 발견함): `cwd`가 `process.cwd()`로 하드코딩돼 있었음 — CLI 프로세스
+> 자체의 작업 디렉토리이지, 실제로 작업 중인 프로젝트가 아님. `llamacli`가 관례상
+> 프로젝트 디렉토리 안에서 실행되기 때문에 우연히 맞아떨어졌을 뿐, 실제로 보장된
+> 적은 없었음.
+>
+> `tools/index.ts`에서 둘 다 수정: `run_shell`이 이제 `execAsync`에 `timeout`
+> (`RUN_SHELL_TIMEOUT_MS`, 기본 60초, 테스트에서 오버라이드 가능)을 넘겨서, 막힌
+> 명령은 영원히 멈추는 대신 죽여서 평범한 도구 에러로 보고함. `executeTool()`은
+> 이제 실제 `projectRoot`를 명시적으로 받아서(`AgentLoop`에서 전달) `cwd`로 쓰지,
+> 암묵적이고 우연적인 `process.cwd()`를 쓰지 않음. 새 유닛 테스트 3개로 커버함:
+> 진짜로 막히는 명령(`sleep 30`)이 설정된 타임아웃 근처에서 죽는지(테스트 자체가
+> 멈추지 않고), 평범하고 빠른 명령은 여전히 정상적으로 완료되는지(회귀 없음),
+> 명령의 실제 작업 디렉토리가(`pwd`로) 전달된 프로젝트 루트인지 검증.
+>
+> 시나리오 테스트 자체 규모는 이후 하향 조정함(개발자 24명 × 20턴, 약 17초) —
+> 앞서의 60×40 규모도 정상적으로 통과하긴 했음(직접 확인, 약 82초)이지만 그
+> 느려짐은 이만큼 많은 실제 툴체인 호출을 동시에 실행할 때의 실제 동시 서브프로세스
+> 생성 부하(JVM 기동 등) 때문이지 버그가 아니었음 — 더 작은 규모로도 각 언어
+> 프로필을 여러 번 돌리면서 일상적인 실행에서는 스위트를 빠르게 유지함.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

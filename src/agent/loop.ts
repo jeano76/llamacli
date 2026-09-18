@@ -336,7 +336,7 @@ export class AgentLoop {
 
         let content: string;
         try {
-          const result = await executeTool(call.function.name, call.function.arguments);
+          const result = await executeTool(call.function.name, call.function.arguments, this.opts.projectRoot);
           content = capToolResult(result.content, this.opts.thresholds.contextWindowTokens);
           if (result.diff) {
             this.opts.onDiff?.(this.summarizeArgs(call.function.arguments), result.diff);

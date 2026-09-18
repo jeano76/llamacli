@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
 import { clearFailureLog } from "../hermes/selfHeal.js";
+import { setRunShellTimeoutForTests } from "../tools/index.js";
 import type { ChatCompletionRequest, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
 /**
@@ -33,6 +34,89 @@ async function withTempProject(fn: (dir: string) => Promise<void>): Promise<void
   }
 }
 
+/** A language/program-type profile a simulated developer works in. Bugs
+ *  found earlier only ever surfaced from generic .txt content — real
+ *  sessions span many languages and program shapes (a web API's request
+ *  handler looks nothing like a CLI's argument parser or a data
+ *  pipeline's batch script), with different file extensions, build/test
+ *  commands, and source syntax (which matters for markdown-fenced code in
+ *  assistant replies, and for tool_calls arguments containing real
+ *  language-specific quoting/escaping). Requested directly: exercise a
+ *  spread of these instead of one uniform shape. */
+interface LanguageProfile {
+  name: string;
+  programType: string;
+  ext: string;
+  sourceFile: string;
+  sampleSource: string;
+  buildCommand: string;
+  testCommand: string;
+  lintFailCommand: string;
+}
+
+const LANGUAGE_PROFILES: LanguageProfile[] = [
+  {
+    name: "Python",
+    programType: "a Flask REST API",
+    ext: "py",
+    sourceFile: "app.py",
+    sampleSource: "def handler(request):\n    return {\"status\": \"ok\"}\n",
+    buildCommand: "python3 -m py_compile app.py",
+    testCommand: "python3 -m pytest -q || true",
+    lintFailCommand: "python3 -c \"import sys; sys.exit(1)\"",
+  },
+  {
+    name: "Go",
+    programType: "a gRPC microservice",
+    ext: "go",
+    sourceFile: "main.go",
+    sampleSource: 'package main\n\nfunc main() {\n\tprintln("ok")\n}\n',
+    buildCommand: "go version",
+    testCommand: "go vet ./... || true",
+    lintFailCommand: "sh -c 'exit 1'",
+  },
+  {
+    name: "Rust",
+    programType: "a CLI tool",
+    ext: "rs",
+    sourceFile: "main.rs",
+    sampleSource: 'fn main() {\n    println!("ok");\n}\n',
+    buildCommand: "rustc --version",
+    testCommand: "cargo test 2>/dev/null || true",
+    lintFailCommand: "sh -c 'exit 1'",
+  },
+  {
+    name: "TypeScript",
+    programType: "a Node.js web server",
+    ext: "ts",
+    sourceFile: "server.ts",
+    sampleSource: "export function handler(req: Request): Response {\n  return new Response(\"ok\");\n}\n",
+    buildCommand: "node --version",
+    testCommand: "npx --no-install jest 2>/dev/null || true",
+    lintFailCommand: "sh -c 'exit 1'",
+  },
+  {
+    name: "Java",
+    programType: "a Spring Boot service",
+    ext: "java",
+    sourceFile: "Main.java",
+    sampleSource: "public class Main {\n  public static void main(String[] args) {\n    System.out.println(\"ok\");\n  }\n}\n",
+    buildCommand: "java -version",
+    testCommand: "sh -c 'echo running tests'",
+    lintFailCommand: "sh -c 'exit 1'",
+  },
+  {
+    name: "Ruby",
+    programType: "a batch data-processing pipeline",
+    ext: "rb",
+    sourceFile: "pipeline.rb",
+    sampleSource: "def process(record)\n  record[:status] = 'ok'\nend\n",
+    buildCommand: "ruby --version",
+    testCommand: "sh -c 'echo running tests'",
+    lintFailCommand: "sh -c 'exit 1'",
+  },
+];
+
 function assistantToolCall(name: string, args: Record<string, unknown>): ChatCompletionResponse {
   return {
     choices: [
@@ -58,9 +142,16 @@ function assistantDone(text: string): ChatCompletionResponse {
  *  across developers to exercise a spread of tool combinations, sizes, and
  *  the two known-tricky failure shapes (mid-stream error, oversized output)
  *  at different points in each one's history. */
-function fakeDeveloperBackend(devIndex: number, projectDir: string, contextWindowTokens: number): ModelBackend {
+function fakeDeveloperBackend(
+  devIndex: number,
+  projectDir: string,
+  contextWindowTokens: number,
+  profile: LanguageProfile
+): ModelBackend {
   let step = 0;
-  const bigFile = join(projectDir, "generated-big.txt");
+  const bigFile = join(projectDir, `generated-big.${profile.ext}`);
+  const scratchFile = join(projectDir, `scratch-${devIndex}.${profile.ext}`);
+  const sourcePath = join(projectDir, profile.sourceFile);
   // A real backend rejection only happens when the request is genuinely
   // too big — tying the injected failure to an arbitrary step count
   // instead of actual accumulated size (an earlier version of this
@@ -98,18 +189,21 @@ function fakeDeveloperBackend(devIndex: number, projectDir: string, contextWindo
 
       switch (cycle) {
         case 0:
-          return assistantToolCall("read_file", { path: join(projectDir, "README.md") });
+          return assistantToolCall("read_file", { path: sourcePath });
         case 1:
           // Some real, some deliberately failing (nonexistent file/bad
           // command) — real tool errors are a normal part of long
           // sessions, not something to special-case away in the scenario.
+          // Uses the language's own real toolchain command (compiler
+          // version check, linter, etc.), not a generic echo — argument
+          // quoting/escaping varies genuinely by language/shell idiom.
           return step % 7 === 1
-            ? assistantToolCall("run_shell", { command: "exit 1" })
-            : assistantToolCall("run_shell", { command: `echo "dev ${devIndex} step ${step}"` });
+            ? assistantToolCall("run_shell", { command: profile.lintFailCommand })
+            : assistantToolCall("run_shell", { command: step % 2 === 0 ? profile.buildCommand : profile.testCommand });
         case 2:
           return assistantToolCall("write_file", {
-            path: join(projectDir, `scratch-${devIndex}.txt`),
-            content: `content from dev ${devIndex} at step ${step}\n`.repeat(5),
+            path: scratchFile,
+            content: `// dev ${devIndex} (${profile.name}, ${profile.programType}) step ${step}\n${profile.sampleSource}`.repeat(3),
           });
         case 3:
           // Every ~4th time this case comes up, make it genuinely huge —
@@ -118,7 +212,7 @@ function fakeDeveloperBackend(devIndex: number, projectDir: string, contextWindo
           if (step % 20 === 3) {
             return assistantToolCall("write_file", {
               path: bigFile,
-              content: "x".repeat(50_000),
+              content: profile.sampleSource.repeat(2000),
             });
           }
           if (step % 9 === 3) {
@@ -126,17 +220,17 @@ function fakeDeveloperBackend(devIndex: number, projectDir: string, contextWindo
             // routine real failure (the model misremembering file
             // contents), not an edge case to avoid.
             return assistantToolCall("edit_file", {
-              path: join(projectDir, `scratch-${devIndex}.txt`),
+              path: scratchFile,
               old_text: "this text was never actually written",
               new_text: "replacement",
             });
           }
-          return assistantToolCall("read_file", { path: join(projectDir, `scratch-${devIndex}.txt`) });
+          return assistantToolCall("read_file", { path: scratchFile });
         case 4:
           return assistantToolCall("update_plan", {
             steps: [
-              { description: "investigate", status: "done" },
-              { description: `apply change ${step}`, status: "in_progress" },
+              { description: `investigate ${profile.programType}`, status: "done" },
+              { description: `apply change ${step} to ${profile.sourceFile}`, status: "in_progress" },
             ],
           });
         default:
@@ -156,12 +250,12 @@ function fakeDeveloperBackend(devIndex: number, projectDir: string, contextWindo
                 {
                   message: {
                     role: "assistant",
-                    content: "Let me check the file first.",
+                    content: `Let me check ${profile.sourceFile} first.`,
                     tool_calls: [
                       {
                         id: `c${Math.random().toString(36).slice(2)}`,
                         type: "function",
-                        function: { name: "read_file", arguments: JSON.stringify({ path: join(projectDir, "README.md") }) },
+                        function: { name: "read_file", arguments: JSON.stringify({ path: sourcePath }) },
                       },
                     ],
                   },
@@ -170,7 +264,7 @@ function fakeDeveloperBackend(devIndex: number, projectDir: string, contextWindo
               ],
             };
           }
-          return assistantDone(`done with step ${step} for dev ${devIndex}`);
+          return assistantDone(`done with step ${step} for dev ${devIndex} (${profile.name})`);
       }
     },
     async listModels() {
@@ -183,16 +277,22 @@ function fakeDeveloperBackend(devIndex: number, projectDir: string, contextWindo
 }
 
 async function runOneDeveloper(devIndex: number, turnsPerDeveloper: number): Promise<{ dir: string; turnErrors: string[] }> {
+  const profile = LANGUAGE_PROFILES[devIndex % LANGUAGE_PROFILES.length];
   const dir = await mkdtemp(join(tmpdir(), `llamacli-scenario-dev${devIndex}-`));
-  await writeFileFs(join(dir, "README.md"), `# dev ${devIndex} project\n\nSome initial content.\n`.repeat(20), "utf8");
+  await writeFileFs(
+    join(dir, "README.md"),
+    `# dev ${devIndex} project (${profile.name})\n\nThis is ${profile.programType}, written in ${profile.name}.\n`.repeat(20),
+    "utf8"
+  );
+  await writeFileFs(join(dir, profile.sourceFile), profile.sampleSource, "utf8");
 
   const CONTEXT_WINDOW_TOKENS = 6000;
   const statusMessages: string[] = [];
   const loop = new AgentLoop({
     projectRoot: dir,
     model: "fake-model",
-    backend: fakeDeveloperBackend(devIndex, dir, CONTEXT_WINDOW_TOKENS),
-    systemPrompt: `You are a coding agent for developer ${devIndex}'s project.`,
+    backend: fakeDeveloperBackend(devIndex, dir, CONTEXT_WINDOW_TOKENS, profile),
+    systemPrompt: `You are a coding agent working on developer ${devIndex}'s project: ${profile.programType} written in ${profile.name}.`,
     thresholds: { autoTriggerRatio: 0.7, contextWindowTokens: CONTEXT_WINDOW_TOKENS },
     onStatus: (s) => statusMessages.push(s),
   });
@@ -210,12 +310,18 @@ async function runOneDeveloper(devIndex: number, turnsPerDeveloper: number): Pro
 }
 
 test(
-  "many concurrent long-running developer sessions against a fake backend never produce an unhandled crash",
+  "many concurrent long-running developer sessions, across different languages and program types, never produce an unhandled crash",
   { timeout: 60_000 },
   async () => {
     clearFailureLog();
-    const DEVELOPERS = 60; // "수십명의 개발자" (dozens of developers)
-    const TURNS_PER_DEVELOPER = 40; // long-running, not a single request
+    // Real toolchain commands (go/rustc/java/etc.) aren't necessarily
+    // installed in this environment, and this scenario runs many of them
+    // for real, concurrently, across many developers — keep any one call
+    // bounded well below the test's own timeout instead of at the
+    // (production-appropriate, but too long for a test) 60s default.
+    setRunShellTimeoutForTests(5_000);
+    const DEVELOPERS = 24; // "수십명의 개발자" (dozens of developers) — 4 per language profile
+    const TURNS_PER_DEVELOPER = 20; // long-running, not a single request
 
     const dirs: string[] = [];
     try {
@@ -234,7 +340,8 @@ test(
       // Sanity: the real filesystem side effects actually happened for at
       // least one developer (proves tools genuinely executed, not just
       // that the loop quietly no-op'd through every turn).
-      const scratch = await readFileFs(join(dirs[0], "scratch-0.txt"), "utf8").catch(() => null);
+      const dev0Ext = LANGUAGE_PROFILES[0 % LANGUAGE_PROFILES.length].ext;
+      const scratch = await readFileFs(join(dirs[0], `scratch-0.${dev0Ext}`), "utf8").catch(() => null);
       assert.ok(scratch, "expected at least one developer's write_file calls to have actually landed on disk");
     } finally {
       await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
