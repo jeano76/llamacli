@@ -226,8 +226,13 @@ test("runCompaction sanitizes tool_calls/tool-role messages so a strict backend 
         mustPreserve: [],
       };
 
-      // must not throw — this is the exact bug being fixed
-      const result = await runCompaction(dir, messages, backend, "m", partial);
+      // must not throw — this is the exact bug being fixed. contextWindowTokens
+      // chosen so the size-based kept-tail selection lands on the same
+      // boundary the old fixed "last 6 messages" rule did for this fixture
+      // (cutting right after the tool_calls message) — a smaller window
+      // would keep even less, a much larger one would keep more of the
+      // (here, deliberately tiny) history than intended.
+      const result = await runCompaction(dir, messages, backend, "m", partial, 30);
 
       const sent = lastRequest();
       assert.ok(sent);
@@ -255,6 +260,93 @@ test("runCompaction sanitizes tool_calls/tool-role messages so a strict backend 
       // messages), verbatim and untouched — sanitization only applies to
       // what's actually sent for summarization, never to the preserved tail
       assert.ok(result.messages.some((m) => m.role === "tool" && m.content === "Thu Sep 18"));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+// Found by a scenario test simulating many long, tool-heavy developer
+// sessions: the previous "keep the last 6 messages" rule was a fixed
+// COUNT, not a size budget. If those 6 happen to be individually large
+// (routine in a tool-heavy turn — sizable tool_calls arguments and tool
+// results), the kept tail alone could already fill the entire context
+// window, so compaction never actually shrank the conversation no matter
+// how aggressively older history got summarized away — turns failed
+// permanently instead of recovering. The tail must be sized against the
+// real configured context window instead.
+test("runCompaction sizes the kept tail against the real context window, not a fixed message count", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      // 10 messages, each ~2000 chars — under the old fixed rule, all 6
+      // of the last messages (12,000 chars) would be kept verbatim
+      // regardless of how small the configured window is.
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        ...Array.from({ length: 9 }, (_, i): ChatMessage => ({ role: i % 2 === 0 ? "user" : "assistant", content: "x".repeat(2000) })),
+      ];
+      const { backend } = strictNoToolsBackend();
+      const partial = {
+        reason: "manual" as const,
+        goal: "test",
+        steps: [],
+        files: [],
+        pendingToolCall: null,
+        mustPreserve: [],
+      };
+
+      // A small window (500 tokens ~= 2000 chars budget at the 40% ratio)
+      // can't afford to keep 6 such messages verbatim (12,000 chars) —
+      // the kept tail should come back much smaller than that.
+      const smallWindowResult = await runCompaction(dir, messages, backend, "m", partial, 500);
+      const smallTailChars = smallWindowResult.messages
+        .slice(1) // skip the injected "[Compacted history summary]" message
+        .reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0);
+      assert.ok(smallTailChars < 12_000, `expected a small window to keep a much smaller tail, got ${smallTailChars} chars`);
+
+      // A large window should be able to afford keeping most/all of the
+      // same messages — proving the tail size actually tracks the window,
+      // not some other unrelated fixed limit.
+      const largeWindowResult = await runCompaction(dir, messages, backend, "m", partial, 50_000);
+      const largeTailChars = largeWindowResult.messages
+        .slice(1)
+        .reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0);
+      assert.ok(
+        largeTailChars > smallTailChars,
+        `expected a larger window to keep a larger tail (small=${smallTailChars}, large=${largeTailChars})`
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("runCompaction's kept tail always includes at least the single most recent message, even if it alone exceeds the window budget", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "q" },
+        { role: "assistant", content: "x".repeat(10_000) }, // alone, already way past a tiny window
+      ];
+      const { backend } = strictNoToolsBackend();
+      const partial = {
+        reason: "manual" as const,
+        goal: "test",
+        steps: [],
+        files: [],
+        pendingToolCall: null,
+        mustPreserve: [],
+      };
+
+      // Tiny window (10 tokens) — nothing meaningfully "fits", but the
+      // result must still be usable (a turn with zero kept context isn't),
+      // not an empty tail or a thrown error.
+      const result = await runCompaction(dir, messages, backend, "m", partial, 10);
+      assert.ok(
+        result.messages.some((m) => typeof m.content === "string" && m.content.includes("x".repeat(100))),
+        "expected the single most recent message to still be kept even though it alone exceeds the budget"
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

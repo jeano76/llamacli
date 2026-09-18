@@ -514,27 +514,44 @@ test("an oversized tool result is truncated before it's sent to the backend, not
     assert.match(sentContent, /truncated/);
   }));
 
-test("a context-overflow error forces compaction and retries once instead of just ending the turn", () =>
+test("a context-overflow error forces compaction and retries instead of just ending the turn", () =>
   withTempProject(async (dir) => {
     // Found live: two consecutive real turns both failed with the backend's
     // own "exceeds the available context size" 400, back to back, because
     // nothing had shrunk the history in between (the estimate said there
-    // was still room). Simulate that exact backend error on the first turn
-    // call and verify the loop compacts and retries on its own instead of
-    // reporting a plain error and leaving the next message to hit the same
-    // wall again.
+    // was still room). Simulate that exact backend error and verify the
+    // loop compacts and retries on its own instead of reporting a plain
+    // error and leaving the next message to hit the same wall again.
+    //
+    // No `tokenize()` on this fake backend — deliberately, so estimateTokens
+    // falls back to the real char-based estimate against real message
+    // content instead of a constant test stub, since the retry logic now
+    // depends on compaction *genuinely* shrinking the history (a stub like
+    // `async tokenize() { return 1 }` would make every compaction look like
+    // zero progress and immediately trip the give-up path below).
     let turnCallCount = 0;
     let compactionCallCount = 0;
     const statusMessages: string[] = [];
     const backend: ModelBackend = {
       async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
         if (!req.tools) {
-          // compactor.ts's internal summary request
+          // compactor.ts's internal summary request — short, so it
+          // actually shrinks the bulky history built up below.
           compactionCallCount++;
           return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
         }
         turnCallCount++;
-        if (turnCallCount === 1) {
+        if (turnCallCount <= 10) {
+          // Build up real, compactable bulk first — a couple-message test
+          // fixture has nothing for compaction to actually shrink, which
+          // isn't representative of when this real bug occurs (a long
+          // session with real accumulated history). Needs to be enough
+          // that even a size-based kept tail (see compactor.ts
+          // selectKeptTail) still leaves genuine older content to
+          // summarize away, not just re-keep almost everything verbatim.
+          return assistantMessage("y".repeat(2000));
+        }
+        if (turnCallCount === 11) {
           const err: any = new Error(
             'chat stream failed: 400 {"error":{"code":400,"message":"request (65636 tokens) exceeds the available context size (65536 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":65636,"n_ctx":65536}}'
           );
@@ -545,29 +562,38 @@ test("a context-overflow error forces compaction and retries once instead of jus
       async listModels() {
         return [];
       },
-      async tokenize() {
-        return 1;
-      },
     };
     const loop = new AgentLoop({
       projectRoot: dir,
       model: "m",
       backend,
       systemPrompt: "sys",
-      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100 },
+      // Big enough that proactive auto-compaction never kicks in while
+      // building up history below (0.99 * 8000 tokens ~= 31,680 chars,
+      // comfortably above the ~20,000 chars built up) — the overflow below
+      // is injected directly by the fake backend regardless of real size,
+      // and the point of this test is what happens on the FORCED
+      // compaction once that hits, not the ordinary auto-trigger path. But
+      // NOT so big that the forced compaction's own size-based kept-tail
+      // budget (40% of the window) just re-keeps the entire built-up
+      // history verbatim, which would show zero progress and immediately
+      // (and correctly, for that hypothetical) trip the give-up path this
+      // test isn't exercising.
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 8_000 },
       onStatus: (s) => statusMessages.push(s),
     });
 
+    for (let i = 0; i < 10; i++) await loop.send(`build up history ${i}`);
     await assert.doesNotReject(() => loop.send("do something"));
 
-    assert.equal(turnCallCount, 2, "expected exactly one retry after the overflow, not zero or a loop");
+    assert.equal(turnCallCount, 12, "expected exactly one retry after the overflow, not zero or a loop");
     assert.equal(compactionCallCount, 1, "expected exactly one forced compaction");
     assert.ok(statusMessages.some((s) => s.includes("context overflow")));
     // Must not also report this as a generic unrecovered error once the retry succeeded.
     assert.ok(!statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
   }));
 
-test("a context-overflow error that persists after the forced retry is reported, not retried forever", () =>
+test("a context-overflow error that persists because compaction makes no further progress is reported, not retried forever", () =>
   withTempProject(async (dir) => {
     let turnCallCount = 0;
     const statusMessages: string[] = [];
@@ -580,6 +606,10 @@ test("a context-overflow error that persists after the forced retry is reported,
     const backend: ModelBackend = {
       async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
         if (!req.tools) {
+          // Always returns the exact same short summary — after the first
+          // compaction, later ones have nothing further to shrink, so
+          // estimateTokens sees no progress and the loop should give up
+          // rather than retrying up to the hard cap pointlessly.
           return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
         }
         turnCallCount++;
@@ -587,9 +617,6 @@ test("a context-overflow error that persists after the forced retry is reported,
       },
       async listModels() {
         return [];
-      },
-      async tokenize() {
-        return 1;
       },
     };
     const loop = new AgentLoop({
@@ -603,6 +630,6 @@ test("a context-overflow error that persists after the forced retry is reported,
 
     await assert.doesNotReject(() => loop.send("do something"));
 
-    assert.equal(turnCallCount, 2, "expected the one allowed retry, then a stop — not an unbounded loop");
-    assert.ok(statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
+    assert.equal(turnCallCount, 1, "the very first compaction attempt already makes no progress, so it should give up immediately");
+    assert.ok(statusMessages.some((s) => s.includes("[error]")));
   }));

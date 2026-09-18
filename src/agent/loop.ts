@@ -13,18 +13,29 @@ import { stripToolCallTemplateLeak } from "./textSanitize.js";
 // its full raw content went straight into `this.messages` and from there,
 // uncapped, into the next request body sent to llama.cpp. One oversized
 // result could balloon a single request by itself, on top of accumulated
-// history, well past what's reasonable to send in one shot. Cap it at the
-// message level (as opposed to relying on each individual tool to self-limit)
-// so nothing ever reaches the backend request unbounded, no matter which
-// tool produced it. ~4 chars/token, so this keeps any one tool result to
-// roughly 6k tokens — generous for a single file/command, small next to the
-// 64k+ context window in real use.
-const TOOL_RESULT_CHAR_CAP = 24_000;
+// history, well past what's reasonable to send in one shot.
+//
+// The cap itself must scale with the *actual configured* context window,
+// not be a fixed absolute constant — found by a scenario test simulating
+// many long developer sessions against a smaller (6k-token) context
+// window: a flat 24,000-char (~6k token) cap can by itself equal the
+// entire budget on a smaller model/config, so a single big tool result
+// permanently fills the whole window on its own. No amount of compacting
+// older messages can ever recover from that — the conversation becomes
+// unrecoverable forever the moment one such result lands, which defeats
+// the whole point of having a cap. Scale it to a fraction of the real
+// window instead, with the previous 24k as an upper bound for the common
+// case of a large (64k+) real context, and a floor so it's never
+// pathologically tiny for a very small window either.
+function toolResultCharCap(contextWindowTokens: number): number {
+  return Math.max(2_000, Math.min(24_000, Math.floor(contextWindowTokens * 4 * 0.15)));
+}
 
-function capToolResult(content: string): string {
-  if (content.length <= TOOL_RESULT_CHAR_CAP) return content;
-  const omitted = content.length - TOOL_RESULT_CHAR_CAP;
-  return `${content.slice(0, TOOL_RESULT_CHAR_CAP)}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane]`;
+function capToolResult(content: string, contextWindowTokens: number): string {
+  const cap = toolResultCharCap(contextWindowTokens);
+  if (content.length <= cap) return content;
+  const omitted = content.length - cap;
+  return `${content.slice(0, cap)}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane]`;
 }
 
 export interface AgentLoopOptions {
@@ -160,14 +171,28 @@ export class AgentLoop {
     // Defense in depth against the estimate in maybeCompact() ever still
     // being wrong (e.g. a future backend field it doesn't account for):
     // the backend's own hard rejection is ground truth and should trigger
-    // an immediate forced compaction and one retry, rather than ending the
+    // an immediate forced compaction and retry, rather than ending the
     // turn and leaving the *next* message to walk into the exact same
     // oversized history again. Seen live: two consecutive user turns both
     // failed with "exceeds the available context size" at ~65,636 and
     // ~65,648 tokens — nothing had shrunk in between because the estimate
-    // (now fixed separately) said there was still room. Capped at one
-    // retry per turn so a persistently-too-large single message can't loop.
-    let retriedAfterOverflow = false;
+    // (now fixed separately) said there was still room.
+    //
+    // Retries are bounded by *compaction actually shrinking the history*,
+    // not a flat one-shot count — a single long tool-calling turn (many
+    // chained tool calls before the model finally stops and answers) can
+    // legitimately hit this more than once before the turn ends, and each
+    // time compaction genuinely works and frees up room again. A flat
+    // one-retry cap treated that completely normal, working recovery as
+    // exhausted and permanently failed the turn on the second occurrence
+    // even though nothing was actually stuck — caught by a scenario test
+    // simulating many long multi-tool-call developer sessions. Only give
+    // up when a compaction attempt fails to actually reduce the estimated
+    // size (a real stuck state, e.g. one message alone is too large to
+    // ever fit), with a hard cap as a last-resort safety net against any
+    // other unforeseen loop.
+    const MAX_OVERFLOW_RETRIES = 8;
+    let overflowRetries = 0;
     while (true) {
       await this.maybeCompact();
 
@@ -201,10 +226,38 @@ export class AgentLoop {
           }
         );
       } catch (err: any) {
-        if (!retriedAfterOverflow && /exceeds the available context size|exceed_context_size_error/i.test(err.message)) {
-          retriedAfterOverflow = true;
-          this.opts.onStatus?.("[context overflow] request exceeded the context window — forcing compaction and retrying once.");
+        if (
+          overflowRetries < MAX_OVERFLOW_RETRIES &&
+          /exceeds the available context size|exceed_context_size_error/i.test(err.message)
+        ) {
+          overflowRetries++;
+          this.opts.onStatus?.(
+            `[context overflow] request exceeded the context window — forcing compaction and retrying (${overflowRetries}/${MAX_OVERFLOW_RETRIES}).`
+          );
+          const before = await estimateTokens(this.messages, this.opts.backend);
           await this.compact("auto-threshold", null);
+          const after = await estimateTokens(this.messages, this.opts.backend);
+          // A compaction that didn't actually shrink anything (e.g. the
+          // remaining "must keep" tail — the resume context, the latest
+          // pending tool call — is itself already too large to fit on its
+          // own) would otherwise retry the exact same oversized request
+          // forever within the retry bound above. Only keep retrying while
+          // it's genuinely making progress; stop immediately once a
+          // compaction stops helping instead of burning the rest of the
+          // retry budget on a request that can't succeed.
+          if (after >= before) {
+            this.opts.onStatus?.(
+              "[error] the conversation no longer fits the context window even after compaction — some content is too large to keep."
+            );
+            logFailure({
+              timestamp: new Date().toISOString(),
+              summary: "backend chat request failed",
+              toolName: "chat",
+              errorMessage: err.message,
+            });
+            this.hasNewFailuresThisTurn = true;
+            return;
+          }
           continue;
         }
         // A network/backend failure here must never crash the whole CLI —
@@ -284,7 +337,7 @@ export class AgentLoop {
         let content: string;
         try {
           const result = await executeTool(call.function.name, call.function.arguments);
-          content = capToolResult(result.content);
+          content = capToolResult(result.content, this.opts.thresholds.contextWindowTokens);
           if (result.diff) {
             this.opts.onDiff?.(this.summarizeArgs(call.function.arguments), result.diff);
           }
@@ -390,7 +443,8 @@ export class AgentLoop {
         this.messages,
         this.opts.backend,
         this.opts.model,
-        partial
+        partial,
+        this.opts.thresholds.contextWindowTokens
       );
       this.messages = messages;
       this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);

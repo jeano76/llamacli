@@ -108,6 +108,36 @@ function sanitizeForSummary(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
+ * Picks how much of the recent conversation to keep verbatim (unsummarized)
+ * based on an actual SIZE budget, not a fixed message count. A hardcoded
+ * "keep the last 6 messages" (the previous approach) can itself already be
+ * at or past the entire context window if those 6 happen to be large (a
+ * tool-heavy turn with sizable tool_calls/results — routine, not an edge
+ * case) — found via a scenario test simulating many long developer
+ * sessions: compaction kept reporting "no progress" because the kept tail
+ * alone didn't shrink no matter how aggressively older history got
+ * summarized away, permanently failing turns that should have recovered.
+ * Always keeps at least the single most recent message (there's no better
+ * option if even that alone is oversized — the tool_calls-aware size cap
+ * upstream in loop.ts is what actually bounds any one message).
+ */
+function selectKeptTail(
+  messages: ChatMessage[],
+  contextWindowTokens: number
+): { keepTail: ChatMessage[]; toSummarize: ChatMessage[] } {
+  const budgetChars = Math.max(1, Math.floor(contextWindowTokens * 4 * 0.4));
+  let used = 0;
+  let cutIndex = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const len = messageText(messages[i]).length;
+    if (cutIndex < messages.length && used + len > budgetChars) break;
+    used += len;
+    cutIndex = i;
+  }
+  return { keepTail: messages.slice(cutIndex), toSummarize: messages.slice(0, cutIndex) };
+}
+
+/**
  * PROMPT.md §2: write the checkpoint FIRST (before summarizing anything), then
  * ask the model to summarize the older turns, keeping mustPreserve items intact.
  */
@@ -116,7 +146,8 @@ export async function runCompaction(
   messages: ChatMessage[],
   backend: ModelBackend,
   model: string,
-  partialCheckpoint: Omit<Checkpoint, "version" | "timestamp">
+  partialCheckpoint: Omit<Checkpoint, "version" | "timestamp">,
+  contextWindowTokens: number
 ): Promise<CompactionResult> {
   const checkpoint: Checkpoint = {
     version: 1,
@@ -125,8 +156,7 @@ export async function runCompaction(
   };
   await writeCheckpoint(projectRoot, checkpoint);
 
-  const keepTail = messages.slice(-6); // keep the most recent turns verbatim
-  const toSummarize = messages.slice(0, -6);
+  const { keepTail, toSummarize } = selectKeptTail(messages, contextWindowTokens);
 
   const summaryRequest: ChatMessage[] = [
     {

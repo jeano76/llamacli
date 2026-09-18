@@ -726,6 +726,71 @@ normal partial delta followed by a mid-stream error chunk, asserting
 (not the previous opaque crash); one confirming a normal, error-free SSE
 stream still completes and assembles correctly (no regression).
 
+### Scenario stress test: simulating dozens of developers, long-running
+
+Every bug documented above was found live, one at a time, by a real person
+hitting it. Asked directly why there were so many, and to build a
+synthetic scenario testing many long-running developer sessions against a
+fake (not real llama.cpp) backend instead — `src/agent/scenario.test.ts`
+runs 60 concurrent simulated "developers" (independent `AgentLoop`
+instances, each with their own temp project directory), 40 turns each,
+against a fake backend cycling through realistic tool usage: `read_file`,
+`run_shell` (including deliberately failing commands), `write_file`,
+`edit_file` (including against text that was never actually there —
+a routine real failure, not an edge case), `update_plan`, an unconfigured
+`browser_list_tabs` call, replies carrying both `content` and `tool_calls`
+at once, and a genuinely oversized (50,000-char) tool result — plus a
+realistic (size-triggered, not arbitrary) injected context-overflow error
+partway through. Real tools execute for real against each developer's own
+directory; only the model is fake. The assertion: none of this should ever
+produce an unhandled crash, and every injected overflow should be fully
+auto-recovered, not reported as a final error.
+
+It immediately found two more real bugs, neither previously reported live:
+
+- The forced-compaction retry (added above) capped itself at exactly one
+  retry per turn. A single long tool-calling turn — many chained tool
+  calls before the model finally stops and answers, which is completely
+  normal — can legitimately hit context overflow *more than once* before
+  the turn ends, with compaction genuinely succeeding each time. The flat
+  one-retry cap treated the second occurrence as if the mechanism had
+  failed and permanently ended the turn, even though nothing was actually
+  stuck. Fixed by retrying based on whether compaction is *measurably
+  shrinking* the conversation (checked directly via `estimateTokens`
+  before/after each forced compaction) rather than a fixed count, with a
+  generous hard cap (8) purely as a last-resort safety net.
+- `capToolResult`'s cap (24,000 characters, ~6k tokens) was a fixed
+  absolute constant, independent of the actual configured context window.
+  On a smaller-context deployment, a single large tool result could by
+  itself equal or exceed the *entire* window, making that conversation
+  permanently unrecoverable — no amount of compacting older messages can
+  ever free up room a single current message already fully occupies.
+  Scaled the cap to a fraction of the real context window instead
+  (`toolResultCharCap()`), keeping the previous 24k as an upper bound for
+  the common large-context case.
+- A related, deeper structural bug the above led straight to:
+  `runCompaction`'s "kept tail" (the most recent messages, kept verbatim
+  instead of summarized) was `messages.slice(-6)` — a fixed *message
+  count*, not a size budget. If those 6 happen to be individually large
+  (routine in a tool-heavy turn), the tail alone can already be at or past
+  the entire window, so compaction could summarize away every single
+  older message and still show *zero* measurable progress — silently
+  defeating the entire compaction mechanism regardless of how much older
+  history there was to reclaim. Replaced with `selectKeptTail()`, which
+  walks back from the most recent message accumulating real size against
+  a budget (40% of the context window) instead of a fixed count — always
+  keeping at least the single most recent message even if it alone
+  exceeds the budget (there's no better option at that point).
+
+Two new focused unit tests cover the tail-sizing fix directly: kept-tail
+size actually shrinks under a small window vs. a large one (proving it
+tracks the real budget, not some unrelated fixed limit), and the tail
+always includes at least the most recent message even when that alone
+blows the budget. The scenario test itself passed cleanly across repeated
+runs afterward (60 developers × 40 turns, ~6.5s) once both fixes landed —
+and stays in the suite going forward as a standing regression net, not a
+one-off.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1200,6 +1265,60 @@ stream still completes and assembles correctly (no regression).
 > 아니라) 실제 백엔드 에러 텍스트를 담은 메시지로 reject되는지 검증하는 것 하나,
 > 에러 없는 정상 SSE 스트림은 여전히 정상적으로 완료되고 조립되는지(회귀 없음) 검증하는
 > 것 하나.
+>
+> ### 시나리오 스트레스 테스트: 수십 명의 개발자가 장기 프로그래밍하는 상황 가상 시뮬레이션
+>
+> 위에 문서화된 버그들은 전부 실제 사람이 한 번에 하나씩 실제로 겪어서 발견된
+> 것들임. "왜 이렇게 버그가 많냐"는 직접적인 질문과 함께, 실제 llama.cpp가 아닌
+> 가상의(fake) 백엔드로 여러 개발자의 장기 세션을 시뮬레이션하는 테스트를
+> 만들어달라는 요청을 받음 — `src/agent/scenario.test.ts`는 독립된 `AgentLoop`
+> 인스턴스(각자 자기 임시 프로젝트 디렉토리를 가진) 60개를 동시에("수십 명의
+> 개발자") 40턴씩("장기 프로그래밍") 돌리며, 가짜 백엔드가 현실적인 도구 사용을
+> 순환시킴: `read_file`, `run_shell`(일부러 실패하는 명령 포함), `write_file`,
+> `edit_file`(실제로 쓰인 적 없는 텍스트를 대상으로 하는 것도 포함 — 엣지 케이스가
+> 아니라 흔한 실제 실패), `update_plan`, 설정 안 된 `browser_list_tabs` 호출,
+> `content`와 `tool_calls`를 동시에 담은 응답, 그리고 진짜로 거대한(50,000자)
+> 도구 결과까지 — 여기에 (임의가 아니라 실제 크기에 맞춰 발동하는) 컨텍스트
+> 오버플로우도 중간중간 주입함. 도구는 각 개발자의 실제 디렉토리에서 진짜로
+> 실행됨 — 가짜인 건 모델뿐. 검증 기준: 이 중 무엇도 처리되지 않은 크래시로
+> 이어지면 안 되고, 주입된 모든 오버플로우가 최종 에러로 보고되는 대신 전부
+> 자동 복구돼야 함.
+>
+> 실제로 이전에 신고된 적 없는 진짜 버그 2개를 바로 찾아냄:
+>
+> - (위에서 추가한) 강제 컴팩션 재시도가 턴당 정확히 1회로 상한돼 있었음. 모델이
+>   결국 멈추고 답하기 전까지 도구 호출을 여러 번 연쇄하는 하나의 긴 턴은(완전히
+>   정상적인 상황) 그 턴이 끝나기 전에 컨텍스트 오버플로우를 한 번 이상 정당하게
+>   겪을 수 있고, 그때마다 컴팩션은 실제로 제대로 성공함. 고정된 1회 재시도
+>   상한은 아무것도 실제로 막힌 게 없는데도 두 번째 발생을 마치 복구 메커니즘이
+>   소진된 것처럼 취급해서 턴을 영구적으로 끝내버림. 고정 횟수 대신 컴팩션이
+>   *실제로 측정 가능하게 줄어들고 있는지*(각 강제 컴팩션 전후로 `estimateTokens`를
+>   직접 비교)를 기준으로 재시도하도록 고침, 순전히 최후의 안전장치로 넉넉한
+>   하드 캡(8회)을 둠.
+> - `capToolResult`의 상한(24,000자, ~6천 토큰)이 실제 설정된 컨텍스트 윈도우와
+>   무관한 고정 절대값이었음. 더 작은 컨텍스트로 배포된 경우, 도구 결과 하나가
+>   그 자체로 전체 윈도우와 맞먹거나 넘어설 수 있어서, 그 대화는 영구적으로
+>   복구 불가능해짐 — 현재 메시지 하나가 이미 통째로 차지하고 있는 공간은 오래된
+>   메시지를 아무리 압축해도 되찾을 수 없음. 실제 컨텍스트 윈도우의 일정 비율로
+>   상한을 스케일링하도록 고침(`toolResultCharCap()`), 큰 컨텍스트(대부분의 실제
+>   상황)에서는 기존 24k를 상한값으로 그대로 유지.
+> - 위에서 바로 이어진, 더 근본적인 구조적 버그 하나: `runCompaction`의 "유지되는
+>   꼬리"(요약하지 않고 그대로 남기는 최근 메시지들)가 `messages.slice(-6)` —
+>   고정된 *메시지 개수*였지 크기 예산이 아니었음. 이 6개가 개별적으로 크면(도구
+>   호출이 많은 턴에서는 흔함) 꼬리 자체만으로도 이미 전체 윈도우와 맞먹거나
+>   넘어설 수 있어서, 오래된 메시지를 전부 요약해서 없애더라도 측정 가능한 진전이
+>   *전혀* 없는 것처럼 보일 수 있음 — 되찾을 오래된 대화 기록이 얼마나 있든
+>   상관없이 컴팩션 메커니즘 전체를 조용히 무력화시킴. `selectKeptTail()`로
+>   교체함 — 가장 최근 메시지부터 거꾸로 훑으면서 고정 개수가 아니라 실제 크기를
+>   예산(컨텍스트 윈도우의 40%)과 비교해서 누적함, 단 가장 최근 메시지 하나는
+>   그것만으로 예산을 넘더라도 항상 유지함(그 시점에서는 더 나은 선택지가 없으므로).
+>
+> 새 유닛 테스트 2개로 꼬리-크기 조정 수정을 직접 커버함: 작은 윈도우 vs 큰
+> 윈도우에서 유지되는 꼬리 크기가 실제로 달라지는지(엉뚱한 고정 한계가 아니라
+> 진짜 예산을 따라가는지 증명), 가장 최근 메시지 하나가 예산을 그 자체로 넘더라도
+> 항상 유지되는지. 시나리오 테스트 자체는 두 수정이 모두 반영된 뒤 반복 실행에서
+> 깨끗하게 통과함(개발자 60명 × 40턴, 약 6.5초) — 그리고 일회성이 아니라 앞으로도
+> 회귀를 막는 상시 테스트로 스위트에 계속 남음.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
