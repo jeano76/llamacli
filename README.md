@@ -481,6 +481,33 @@ terminal's regular scrollback. llamacli doesn't currently have its own
 in-app scrollback (Page Up/Down) to compensate; that would be a genuine new
 feature, not a bug fix, and is a reasonable follow-up if wanted.)
 
+### Raw tool-calling template tags leaking into responses
+
+Reported live, mid-session: a response ended with literal
+`</parameter>\n</function>\n</tool_call>` text visible in the log.
+Reproduced directly against the real backend (bypassing llamacli entirely)
+with a moderately complex `run_shell` request — the *raw* API response
+already contained the leaked tags in `message.content`, confirming this
+isn't a bug in llamacli's own SSE parsing. It's the model occasionally
+failing to trigger llama-server's grammar-constrained tool-calling mode and
+instead emitting a fragment of its own fine-tuning chat template as plain
+text. It's intermittent — the exact same prompt reproduced it once and then
+came back clean three times in a row — and two different tag vocabularies
+were observed across attempts (Hermes-style `tool_call`/`function`/
+`parameter`, and Anthropic-style `invoke`/`parameter`), so this can't be
+fixed by changing how the SSE stream is parsed.
+
+Mitigated with `stripToolCallTemplateLeak()` (`src/agent/textSanitize.ts`):
+strips a narrow, tool-calling-specific tag vocabulary from both the live
+streaming display (`App.tsx`, re-run over the *cumulative* text on every
+chunk, since a tag can arrive split across several small chunks) and the
+final message stored in conversation history (`AgentLoop`, so a leaked tag
+doesn't linger in context and reinforce the same pattern on a later turn).
+Deliberately scoped to known tool-calling tag names, not generic XML/HTML,
+so real `<div>`/`<span>`/etc. content a user pastes is left alone. Tests
+use the exact leaked strings captured from the real backend. Covered by
+`src/agent/textSanitize.test.ts` (85 tests total, all passing).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -741,6 +768,28 @@ feature, not a bug fix, and is a reasonable follow-up if wanted.)
 > 정의상 터미널의 일반 스크롤백에 포함되지 않기 때문. llamacli는 현재 이를 보완할
 > 자체 인앱 스크롤백(Page Up/Down)이 없음 — 이건 버그 수정이 아니라 진짜 새 기능이라,
 > 원하시면 후속 작업으로 진행할 만함.)
+>
+> ### tool-call 템플릿 태그가 원본 응답에 새는 문제
+>
+> 세션 도중 실시간으로 신고됨: 응답 끝에 `</parameter>\n</function>\n</tool_call>`라는
+> 리터럴 텍스트가 그대로 보임. llamacli를 완전히 우회해서 실제 백엔드로 직접 재현 —
+> 적당히 복잡한 `run_shell` 요청을 보내니 **원시** API 응답 자체에 이미 leak된 태그가
+> `message.content`에 들어있어서, llamacli 자체의 SSE 파싱 버그가 아님을 확인함. 모델이
+> 가끔 llama-server의 그래머 제약 tool-calling 모드를 제대로 트리거하지 못하고, 대신
+> 자기 파인튜닝 챗 템플릿의 일부를 평범한 텍스트로 그대로 뱉어내는 것. 확률적으로
+> 발생함 — 똑같은 프롬프트가 한 번은 재현됐다가 연속 세 번은 깨끗하게 나옴 — 그리고
+> 시도마다 다른 두 종류의 태그 어휘가 관찰됨(Hermes 스타일
+> `tool_call`/`function`/`parameter`, Anthropic 스타일 `invoke`/`parameter`) — 그래서
+> SSE 스트림 파싱 방식을 바꿔서 고칠 수 있는 문제가 아님.
+>
+> `stripToolCallTemplateLeak()`(`src/agent/textSanitize.ts`)로 완화: 실시간 스트리밍
+> 표시(`App.tsx`, 매 청크마다 *누적* 텍스트 전체에 다시 적용 — 태그가 여러 개의 작은
+> 청크로 쪼개져 도착할 수 있으므로)와 대화 기록에 저장되는 최종 메시지(`AgentLoop`,
+> 새어나간 태그가 문맥에 남아 다음 턴에서 같은 패턴을 강화하지 않도록) 양쪽에서 좁은,
+> tool-calling 전용 태그 어휘만 제거함. 일반 XML/HTML이 아니라 의도적으로 좁게 잡아서,
+> 사용자가 실제로 붙여넣는 `<div>`/`<span>` 등의 콘텐츠는 건드리지 않음. 테스트는 실제
+> 백엔드에서 캡처한 정확한 leak 문자열을 그대로 사용함. `src/agent/textSanitize.test.ts`
+> 로 커버됨(총 85개 테스트 전부 통과).
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

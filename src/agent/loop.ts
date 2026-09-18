@@ -6,6 +6,7 @@ import { proposeImprovement, writeProposedRule, appendImprovementLog, Improvemen
 import { runCompaction, estimateTokens, buildResumePrompt, CompactionThresholds } from "../compaction/compactor.js";
 import { clearCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
+import { stripToolCallTemplateLeak } from "./textSanitize.js";
 
 export interface AgentLoopOptions {
   projectRoot: string;
@@ -146,6 +147,15 @@ export class AgentLoop {
         return;
       }
       const message = res.choices[0].message;
+      // Some models occasionally leak raw tool-calling template tags into
+      // plain content when llama-server's grammar-constrained tool-call
+      // mode doesn't trigger cleanly (confirmed against the real backend —
+      // see textSanitize.ts). Clean it out of what's stored in history too,
+      // not just what's displayed, so a leaked tag doesn't linger in
+      // context and reinforce the same pattern on a later turn.
+      if (typeof message.content === "string") {
+        message.content = stripToolCallTemplateLeak(message.content);
+      }
       this.messages.push(message);
       this.opts.onAssistantDone?.();
 

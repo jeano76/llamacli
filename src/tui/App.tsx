@@ -5,6 +5,7 @@ import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth } from "./textWidth.js";
+import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 
 export interface AppProps {
   cwd: string;
@@ -46,12 +47,19 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     setLog((prev) => {
       if (streamingIdRef.current !== null) {
         return prev.map((line) =>
-          line.id === streamingIdRef.current ? { ...line, text: line.text + text } : line
+          line.id === streamingIdRef.current
+            ? // Re-sanitize the whole cumulative text each time, not just
+              // the new chunk — a leaked tool-call template tag (see
+              // src/agent/textSanitize.ts) can arrive split across several
+              // small streaming chunks, so it's only ever complete (and
+              // therefore matchable) once appended to what came before.
+              { ...line, text: stripToolCallTemplateLeak(line.text + text) }
+            : line
         );
       }
       const id = logIdCounter++;
       streamingIdRef.current = id;
-      return [...prev, { id, text, kind: "assistant" }];
+      return [...prev, { id, text: stripToolCallTemplateLeak(text), kind: "assistant" }];
     });
   }
 
