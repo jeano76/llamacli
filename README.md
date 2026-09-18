@@ -61,6 +61,23 @@ npm test        # unit tests (node:test via tsx, no extra dependency)
 npm run typecheck
 ```
 
+### Installing the `llamacli` command globally
+
+```bash
+npm run build   # compiles to dist/ (bin points here, so build before linking)
+npm link        # symlinks `llamacli` into your global npm bin (npm prefix)
+llamacli         # now runs from any directory
+```
+
+Each project gets its own `.llamacli/config.yaml`/`rules/`/`skills/` based on
+its current working directory — the global command is just the entry point;
+per-project state still lives in that project. Verified running both inside
+this repo and from an unrelated directory (`cwd` in the status bar reflects
+wherever you launched it from, and it auto-generates its own default rule
+file there if the project has no rule/skill convention yet — see the
+Skill/Rule section above). To undo: `npm unlink -g llamacli` (from anywhere)
+or `npm rm --global llamacli`.
+
 > ## 시작하기
 >
 > ```bash
@@ -70,6 +87,22 @@ npm run typecheck
 > npm test        # 유닛테스트 (node:test, tsx로 구동, 별도 의존성 없음)
 > npm run typecheck
 > ```
+>
+> ### `llamacli` 명령을 전역으로 설치하기
+>
+> ```bash
+> npm run build   # dist/로 컴파일 (bin이 dist를 가리키므로 link 전에 반드시 빌드)
+> npm link        # 전역 npm bin(prefix)에 `llamacli`를 심볼릭 링크로 등록
+> llamacli         # 이제 어느 디렉토리에서든 실행 가능
+> ```
+>
+> 프로젝트마다 실행 시점의 작업 디렉토리를 기준으로 각자의
+> `.llamacli/config.yaml`/`rules`/`skills`를 갖는다 — 전역 명령은 진입점일 뿐,
+> 프로젝트별 상태는 그대로 해당 프로젝트에 남는다. 이 저장소 내부와 무관한 디렉토리
+> (`/tmp`) 양쪽에서 실행해 검증함(상태바의 cwd가 실행한 위치를 정확히 반영하고,
+> 프로젝트에 rule/skill 컨벤션이 없으면 그 자리에 자체 기본 rule을 자동 생성함 —
+> 위 Skill/Rule 섹션 참고). 되돌리려면: 아무 위치에서나 `npm unlink -g llamacli`
+> 또는 `npm rm --global llamacli`.
 
 ## Built-in skills
 
