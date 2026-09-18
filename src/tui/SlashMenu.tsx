@@ -19,6 +19,10 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
 ];
 
 export interface SlashMenuProps {
+  /** The items left after typing-to-filter (a subset of SLASH_MENU_ITEMS,
+   *  in the same relative order) — not necessarily all of them. */
+  items: SlashMenuItem[];
+  /** Index into `items` (the filtered list), not into SLASH_MENU_ITEMS. */
   selectedIndex: number;
 }
 
@@ -27,14 +31,35 @@ export interface SlashMenuProps {
  * needs manual buffer save/restore (PROMPT.md §6) — it simply isn't in the
  * tree once `visible` is false, and the surrounding layout re-paints clean.
  * It's a self-contained Box, so it never reaches into or overwrites siblings.
+ *
+ * Always renders exactly `SLASH_MENU_ITEMS.length` rows — regardless of how
+ * many `items` actually matched the typed filter — padding with blank rows
+ * when fewer. App.tsx's `menuBoxHeight` (the fixed space reserved for this
+ * box) is sized against the *full* list length; letting this box's real
+ * height shrink with the filter would reintroduce the exact "menu height
+ * changing shifts everything below it" ghosting bug that was fixed before
+ * typing-to-filter existed (see App.tsx's `logHeight` comment) — filtering
+ * down to 1 match must look identical, layout-wise, to showing all 8.
  */
-export function SlashMenu({ selectedIndex }: SlashMenuProps) {
+export function SlashMenu({ items, selectedIndex }: SlashMenuProps) {
+  const blankRows = Math.max(0, SLASH_MENU_ITEMS.length - Math.max(items.length, 1));
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
-      {SLASH_MENU_ITEMS.map((item, i) => (
-        <Text key={item.key} inverse={i === selectedIndex}>
-          {item.label.padEnd(10)} {item.description}
-        </Text>
+      {items.length === 0 ? (
+        <Text dimColor>No matching commands</Text>
+      ) : (
+        items.map((item, i) => (
+          <Text key={item.key} inverse={i === selectedIndex}>
+            {item.label.padEnd(10)} {item.description}
+          </Text>
+        ))
+      )}
+      {/* A blank-string <Text> renders at ZERO height in Ink instead of a
+       *  real blank row (confirmed directly — see App.tsx's `asRow` for the
+       *  same issue with log lines), so a lone space is used here instead
+       *  to actually reserve the row. */}
+      {Array.from({ length: blankRows }, (_, i) => (
+        <Text key={`blank-${i}`}> </Text>
       ))}
     </Box>
   );

@@ -834,6 +834,47 @@ spawning (JVM startups, etc.) under this many simultaneous real toolchain
 calls, not a bug — the smaller scale keeps the suite fast for routine runs
 while still exercising every language profile several times over.
 
+### Slash menu could only be navigated with arrow keys, not typed
+
+Found while restarting a real session end-to-end to re-verify everything
+above: `/quit` typed as literal text (`/`, `q`, `u`, `i`, `t`, Enter)
+didn't quit — pressing `/` opens the menu, and every key while it's open
+went to a branch that only handled up/down/return/escape, silently
+dropping every other keystroke. So the letters `q`/`u`/`i`/`t` did
+nothing, and Enter selected whatever the arrow position already was
+(index 0, `/help`), not `/quit`. Confirmed directly with a real pty
+session against the live backend. Arrow-navigating to the right item
+still worked correctly (this is how the earlier Ctrl-C fix's `/quit`
+verification passed), but typing the command name — the obvious first
+thing anyone would try — was a dead end.
+
+Added real typing-to-filter, requested directly: any character typed
+while the menu is open now filters `SLASH_MENU_ITEMS` by a case-
+insensitive substring match against the command's name (`filterMenuItems()`
+in `App.tsx`), resetting the highlighted selection to the top match;
+backspace narrows/widens the filter (or closes the menu entirely once it
+backspaces past the leading `/`); Enter selects whatever's currently
+highlighted *within the filtered list*, and does nothing if nothing
+matches, rather than crashing on an out-of-range index.
+
+The one layout constraint this had to respect: the menu box's real
+rendered height must stay exactly constant (`SLASH_MENU_ITEMS.length`
+rows) no matter how many items the filter leaves — letting it shrink
+would reintroduce the exact "menu height changing shifts everything below
+it" ghosting bug fixed earlier, before typing-to-filter existed.
+`SlashMenu.tsx` now always renders the full row count, padding with blank
+rows (a single space, not an empty string — the empty-string-collapses-to-
+zero-height bug from the markdown work applies here too) when fewer items
+match.
+
+Covered by 6 new unit tests on `filterMenuItems()` (empty query returns
+everything, exact/partial/substring/case-insensitive matches, no match
+returns empty rather than falling back to all commands), plus direct pty
+verification against the real backend: typing `/qu` correctly narrowed the
+menu to just `/quit` and `/queue` (both genuinely contain "qu") with the
+menu box still exactly 8 rows tall, and pressing Enter on the top match
+exited cleanly (exit code 0).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1398,6 +1439,41 @@ while still exercising every language profile several times over.
 > 느려짐은 이만큼 많은 실제 툴체인 호출을 동시에 실행할 때의 실제 동시 서브프로세스
 > 생성 부하(JVM 기동 등) 때문이지 버그가 아니었음 — 더 작은 규모로도 각 언어
 > 프로필을 여러 번 돌리면서 일상적인 실행에서는 스위트를 빠르게 유지함.
+>
+> ### 슬래시 메뉴가 화살표로만 탐색 가능했고 타이핑은 안 됐던 문제
+>
+> 위 수정 사항들을 전부 다시 검증하려고 실제 세션을 처음부터 재시작하는 과정에서
+> 발견함: `/quit`를 글자 그대로 타이핑하면(`/`, `q`, `u`, `i`, `t`, Enter) 종료가
+> 안 됨 — `/`를 누르면 메뉴가 열리고, 메뉴가 열려있는 동안의 모든 키 입력은
+> 위/아래/엔터/이스케이프만 처리하는 분기로 가서 나머지는 전부 조용히 무시됨.
+> 그래서 `q`/`u`/`i`/`t` 글자들은 아무 효과도 없었고, Enter를 누르면 그 시점의
+> 화살표 위치(기본값 인덱스 0, `/help`)가 선택됐지 `/quit`이 선택되는 게 아니었음.
+> 실제 백엔드로 pty 세션을 직접 띄워서 확인함. 화살표로 정확한 항목까지 탐색하는
+> 건 정상 동작했음(이전 Ctrl-C 수정에서 `/quit` 검증이 통과했던 이유), 하지만
+> 누구나 가장 먼저 시도할 법한 "명령어 이름을 그냥 타이핑하기"는 막다른 길이었음.
+>
+> 직접 요청받아 진짜 타이핑 필터링 기능을 추가함: 메뉴가 열려있는 동안 입력하는
+> 모든 문자가 이제 `SLASH_MENU_ITEMS`를 명령어 이름 기준 대소문자 구분 없는
+> 부분 문자열 매칭으로 필터링함(`App.tsx`의 `filterMenuItems()`), 선택 강조는
+> 매번 최상단 일치 항목으로 리셋됨. 백스페이스는 필터를 좁히거나 넓힘(또는 맨
+> 앞의 `/`까지 지우면 메뉴 자체를 닫음). Enter는 *필터링된 목록 안에서* 현재
+> 강조된 항목을 선택하고, 아무것도 일치하지 않으면 범위 밖 인덱스로 죽는 대신
+> 그냥 아무 동작도 하지 않음.
+>
+> 지켜야 했던 레이아웃 제약 하나: 메뉴 박스의 실제 렌더링 높이는 필터로 몇 개가
+> 남든 정확히 고정(`SLASH_MENU_ITEMS.length`행)이어야 함 — 줄어들게 놔두면
+> 타이핑 필터링이 생기기 전에 고쳤던 "메뉴 높이가 바뀌면 아래 요소들이 전부
+> 밀린다"는 잔상 버그가 그대로 재발함. `SlashMenu.tsx`는 이제 일치 항목이
+> 몇 개든 항상 전체 행 수를 렌더링하고, 부족한 만큼 빈 행(빈 문자열이 아니라
+> 스페이스 하나 — 마크다운 작업에서 나온 "빈 문자열은 높이 0으로 붕괴" 버그가
+> 여기도 그대로 적용됨)으로 채움.
+>
+> 새 유닛 테스트 6개로 `filterMenuItems()`를 커버함(빈 쿼리는 전체 반환,
+> 정확히/부분적으로/부분 문자열로/대소문자 무시하고 일치, 일치하는 게 없으면
+> 전체로 폴백하는 대신 빈 목록 반환), 여기에 실제 백엔드로 직접 pty 검증도
+> 추가함: `/qu`를 타이핑하면 정확히 `/quit`과 `/queue`로만 좁혀지고(둘 다
+> 진짜로 "qu"를 포함함) 메뉴 박스는 여전히 정확히 8행을 유지하며, 최상단
+> 일치 항목에서 Enter를 누르면 깔끔하게 종료됨(exit code 0).
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

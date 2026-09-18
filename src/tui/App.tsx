@@ -3,7 +3,7 @@ import { Box, Text, useInput, useStdout } from "ink";
 import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
-import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
+import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
@@ -22,6 +22,17 @@ interface LogLine {
 }
 
 let logIdCounter = 0;
+
+/** `input` is the raw text box content, which starts with "/" while the
+ *  menu is open — everything after that is the filter query. Matches
+ *  against the command's key (e.g. "improve-apply"), not its "/"-prefixed
+ *  label, so typing "imp" also finds "/improve-apply" via a plain
+ *  substring check — simple and predictable over fuzzier matching. */
+export function filterMenuItems(input: string): SlashMenuItem[] {
+  const query = input.slice(1).toLowerCase();
+  if (!query) return SLASH_MENU_ITEMS;
+  return SLASH_MENU_ITEMS.filter((item) => item.key.toLowerCase().includes(query));
+}
 
 export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   const { stdout } = useStdout();
@@ -93,10 +104,18 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     }
 
     if (menuOpen) {
+      // Reported directly: the menu could only be driven with arrow keys —
+      // typing the rest of a command's name (the obvious first thing to
+      // try after "/") did nothing at all, since this branch previously
+      // handled only up/down/return/escape and fell through to `return`
+      // for everything else. Filter-as-you-type now works like a normal
+      // command palette instead.
+      const filtered = filterMenuItems(input);
       if (key.upArrow) setMenuIndex((i) => Math.max(0, i - 1));
-      else if (key.downArrow) setMenuIndex((i) => Math.min(SLASH_MENU_ITEMS.length - 1, i + 1));
+      else if (key.downArrow) setMenuIndex((i) => Math.min(Math.max(0, filtered.length - 1), i + 1));
       else if (key.return) {
-        const item = SLASH_MENU_ITEMS[menuIndex];
+        const item = filtered[menuIndex];
+        if (!item) return; // no match under the current filter — nothing to select
         setMenuOpen(false);
         setInput("");
         if (item.key === "queue") {
@@ -111,6 +130,21 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         }
       } else if (key.escape) {
         setMenuOpen(false);
+        setInput("");
+      } else if (key.backspace || key.delete) {
+        // Backspacing the "/" itself closes the menu — matches typing "/"
+        // to open it being the exact inverse action, rather than leaving
+        // an empty, command-less menu open.
+        if (input.length <= 1) {
+          setMenuOpen(false);
+          setInput("");
+        } else {
+          setInput((s) => s.slice(0, -1));
+          setMenuIndex(0); // narrower/wider filter — re-highlight the top match
+        }
+      } else if (char && !key.ctrl && !key.meta) {
+        setInput((s) => s + char);
+        setMenuIndex(0);
       }
       return;
     }
@@ -280,7 +314,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
        *  fixed space goes to log content vs. the menu) changes. */}
       <Box flexDirection="column" height={logHeight} overflow="hidden" justifyContent="flex-end">
         {visualRows.slice(-visibleLogRows)}
-        {menuOpen && <SlashMenu selectedIndex={menuIndex} />}
+        {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
       </Box>
 
       {/* The prompt input lives INSIDE this bordered box, not below it —
