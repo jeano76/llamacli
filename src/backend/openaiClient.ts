@@ -104,6 +104,21 @@ export class OpenAICompatibleClient implements ModelBackend {
         if (data === "[DONE]") continue;
 
         const parsed = JSON.parse(data) as ChatCompletionChunk;
+        // The initial HTTP response can be 200 OK (so the `res.ok` check
+        // above passes) with the actual failure only showing up later, as
+        // an SSE data chunk shaped like `{"error": {...}}` with no
+        // `choices` field at all — e.g. llama-server discovering mid-
+        // generation that it's now over the context window, after having
+        // already started streaming tokens. Reported live: this crashed
+        // with "Cannot read properties of undefined (reading '0')" from
+        // blindly indexing `.choices[0]` on a chunk that had no `choices`.
+        // Surface it as a real, readable error instead of letting an
+        // unrelated line of code choke on the malformed shape.
+        if ((parsed as any).error) {
+          const errBody = (parsed as any).error;
+          throw new Error(`chat stream error: ${errBody.message ?? JSON.stringify(errBody)}`);
+        }
+        if (!Array.isArray(parsed.choices)) continue;
         onDelta(parsed);
 
         const choice = parsed.choices[0];

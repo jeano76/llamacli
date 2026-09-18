@@ -696,6 +696,36 @@ one forced compaction and one retry that then succeeds, and one asserting
 a *persistent* overflow (still fails after the retry) is reported rather
 than retried forever.
 
+### Streaming crashed with "Cannot read properties of undefined (reading '0')"
+
+Reported live, right in the middle of otherwise-normal work: a plain,
+unreadable crash. Root cause in `openaiClient.ts`'s `streamChat()`: the
+initial HTTP response can be a perfectly normal `200 OK` (so the existing
+`res.ok` check passes) even though the request eventually fails — llama-
+server can start streaming tokens normally and only *later* discover
+mid-generation that it's now over the context window (or some other
+runtime failure), at which point it emits an SSE data chunk shaped like
+`{"error": {...}}` with no `choices` field at all. The code unconditionally
+indexed `parsed.choices[0]`, which throws exactly this error on a chunk
+that has no `choices`. `loop.ts`'s own delta callback had the same
+unguarded assumption one level up (`chunk.choices[0]?.delta` — the
+optional chaining protects the property read *after* the index, not the
+index into `undefined` itself).
+
+Fixed both: `streamChat()` now recognizes an error-shaped chunk and throws
+a real, readable `Error` with the backend's own message (so it still
+correctly triggers the context-overflow auto-recovery above when that's
+the cause), and skips any chunk that isn't actually array-shaped `choices`
+instead of assuming it always is. `loop.ts`'s callback was hardened
+defensively too (`chunk.choices?.[0]?.delta`), since `ModelBackend` is an
+interface other implementations could satisfy differently.
+
+Covered by two new tests against a fake raw-SSE server: one serving a
+normal partial delta followed by a mid-stream error chunk, asserting
+`chat()` rejects with a message containing the actual backend error text
+(not the previous opaque crash); one confirming a normal, error-free SSE
+stream still completes and assembles correctly (no regression).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1144,6 +1174,32 @@ than retried forever.
 > 한 번이 정확히 강제 컴팩션 1회 + 재시도 1회로 이어지고 그 재시도가
 > 성공하는지 검증하는 턴 단위 테스트 하나, 재시도 후에도 *계속* 오버플로우가
 > 나는 경우 무한 재시도 대신 에러로 보고되는지 검증하는 테스트 하나.
+>
+> ### 스트리밍 중 "Cannot read properties of undefined (reading '0')" 크래시
+>
+> 평범하게 작업하던 도중 직접 신고됨: 무슨 뜻인지 알 수 없는 크래시. `openaiClient.ts`의
+> `streamChat()`의 근본 원인: 초기 HTTP 응답은 완전히 정상적인 `200 OK`일 수 있어서
+> (기존 `res.ok` 체크는 통과함) 요청이 결국 실패하더라도 이건 못 잡음 — llama-server는
+> 토큰 스트리밍을 정상적으로 시작했다가 생성 도중에야 컨텍스트 윈도우를 넘겼다는 걸
+> (또는 다른 런타임 실패를) 뒤늦게 발견하고, 그 시점에 `choices` 필드가 아예 없는
+> `{"error": {...}}` 형태의 SSE 데이터 청크를 보낼 수 있음. 코드가 조건 없이
+> `parsed.choices[0]`을 인덱싱하고 있어서, `choices`가 없는 청크를 받으면 정확히 이
+> 에러가 남. `loop.ts` 자체의 delta 콜백도 한 단계 위에서 같은 무방비 가정을 하고
+> 있었음(`chunk.choices[0]?.delta` — optional chaining은 인덱싱 *다음의* 속성
+> 읽기만 보호하지, `undefined`에 대한 인덱싱 자체는 못 막음).
+>
+> 둘 다 수정: `streamChat()`은 이제 에러 형태의 청크를 인식해서 백엔드 자체 메시지를
+> 담은 진짜 읽을 수 있는 `Error`를 던짐(그래서 원인이 컨텍스트 초과일 때는 위의
+> 자동 복구 로직도 여전히 정상적으로 발동함), 그리고 `choices`가 실제로 배열 형태가
+> 아닌 청크는 항상 그렇다고 가정하는 대신 그냥 건너뜀. `loop.ts`의 콜백도 방어적으로
+> 보강함(`chunk.choices?.[0]?.delta`) — `ModelBackend`는 다른 구현체가 다르게 만족시킬
+> 수 있는 인터페이스이기 때문.
+>
+> 가짜 raw SSE 서버를 상대로 한 새 테스트 2개로 커버함: 정상적인 부분 delta 다음에
+> 스트림 중간 에러 청크가 오는 경우를 흉내 내서 `chat()`이 (예전의 알 수 없는 크래시가
+> 아니라) 실제 백엔드 에러 텍스트를 담은 메시지로 reject되는지 검증하는 것 하나,
+> 에러 없는 정상 SSE 스트림은 여전히 정상적으로 완료되고 조립되는지(회귀 없음) 검증하는
+> 것 하나.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

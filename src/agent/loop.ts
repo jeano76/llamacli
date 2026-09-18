@@ -191,7 +191,12 @@ export class AgentLoop {
             max_tokens: Math.max(512, Math.floor(this.opts.thresholds.contextWindowTokens * 0.25)),
           },
           (chunk) => {
-            const delta = chunk.choices[0]?.delta;
+            // Defensive: `chunk.choices` isn't guaranteed non-empty/present
+            // by every ModelBackend implementation (openaiClient.ts already
+            // filters out non-choices chunks before calling this, but
+            // don't assume every backend does) — a bare `chunk.choices[0]`
+            // throws instead of just skipping the chunk when it's missing.
+            const delta = chunk.choices?.[0]?.delta;
             if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
           }
         );
