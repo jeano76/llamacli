@@ -217,7 +217,15 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
 
   return (
     <Box flexDirection="column" height={rows} overflow="hidden">
-      <Box flexDirection="column" height={logHeight} overflow="hidden">
+      {/* justifyContent="flex-end": when there's less content than
+       *  `logHeight` rows (a short/early conversation), Ink's default
+       *  top-alignment left it stuck at the top of this box with a growing
+       *  gap of blank space below, all the way down to the input box —
+       *  reported directly as text never reaching the bottom area. Anchor
+       *  it to the bottom instead, so any leftover blank space sits above
+       *  the content (like a normal scrolling terminal/chat view), and new
+       *  lines are always right next to the input box, not far above it. */}
+      <Box flexDirection="column" height={logHeight} overflow="hidden" justifyContent="flex-end">
         {visualRows.slice(-logHeight)}
       </Box>
 

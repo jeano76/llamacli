@@ -460,6 +460,27 @@ checking for the `[turn ended]` message, another driving two consecutive
 actually contains the interrupted work's context (74 tests total, all
 passing).
 
+### Log area stuck at the top instead of anchored to the input box
+
+Reported directly: text only appeared near the top of the screen and never
+reached down toward the bottom. Cause: the log `Box` used Ink's default
+top-alignment, so on a short conversation (fewer lines than `logHeight`),
+content clustered at the top with a growing gap of blank space below it,
+all the way down to the input box — the opposite of a normal scrolling
+terminal/chat view, where recent output sits right next to where you type.
+Fixed with `justifyContent="flex-end"` on the log `Box`, so any leftover
+blank space sits *above* the content instead of below it. Verified: after
+sending one short message, it now renders directly above the input box
+instead of stranded near the top of a 40-row terminal.
+
+(Separately: the same message noted the terminal's own right-side scrollbar
+stops working. That's an inherent trade-off of the alternate screen buffer
+switch from the previous fix — vim, htop, and less have exactly the same
+limitation, since a dedicated alt-screen is by definition not part of the
+terminal's regular scrollback. llamacli doesn't currently have its own
+in-app scrollback (Page Up/Down) to compensate; that would be a genuine new
+feature, not a bug fix, and is a reasonable follow-up if wanted.)
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -702,6 +723,24 @@ passing).
 > `src/agent/loop.test.ts`에 새 테스트 2개로 커버됨 — 하나는 `[turn ended]` 메시지
 > 확인, 다른 하나는 연속으로 `send()`를 두 번 호출해서 두 번째 요청이 실제로 중단된
 > 작업의 맥락을 포함하는지 확인(총 74개 테스트 전부 통과).
+>
+> ### 로그 영역이 하단이 아니라 상단에 붙박여 있던 문제
+>
+> 직접 신고됨: 글씨가 화면 상단 근처에만 나타나고 하단까지 전혀 안 내려온다는 것.
+> 원인: 로그 `Box`가 Ink 기본값인 상단 정렬을 쓰고 있어서, 대화가 짧으면(줄 수가
+> `logHeight`보다 적으면) 콘텐츠가 상단에 몰리고 그 아래로 입력 박스까지 이어지는
+> 점점 커지는 빈 공간이 생겼음 — 최근 출력이 입력하는 자리 바로 옆에 있어야 하는
+> 일반적인 스크롤 터미널/채팅 UI와 정반대. 로그 `Box`에 `justifyContent="flex-end"`를
+> 줘서 수정 — 이제 남는 빈 공간이 콘텐츠 *아래*가 아니라 *위*에 생김. 검증: 짧은
+> 메시지 하나를 보내면 이제 40행 터미널 상단 어딘가가 아니라 입력 박스 바로 위에
+> 렌더링됨.
+>
+> (별개로 같은 메시지에서 터미널 자체의 우측 스크롤바가 더 이상 동작하지 않는다는
+> 것도 언급하셨음. 이건 이전 수정에서 켠 alternate screen buffer의 본질적인
+> 트레이드오프임 — vim, htop, less도 정확히 같은 한계가 있는데, 전용 alt-screen은
+> 정의상 터미널의 일반 스크롤백에 포함되지 않기 때문. llamacli는 현재 이를 보완할
+> 자체 인앱 스크롤백(Page Up/Down)이 없음 — 이건 버그 수정이 아니라 진짜 새 기능이라,
+> 원하시면 후속 작업으로 진행할 만함.)
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
@@ -774,6 +813,22 @@ requires the user to review it and approve with a separate command:
   Pressing `/quit` again confirms the exit (applying still requires the
   separate `/improve-apply` — quitting itself never writes a rule).
 
+### Real-time analysis (not just on-demand)
+
+Rather than waiting for `/improve` or session end, `AgentLoop` re-checks the
+failure log immediately after every new tool/backend failure and, the first
+time a pattern crosses the recurrence threshold, appends it to a running,
+append-only journal — `.llamacli/state/improvement-log.md` — with an
+`[auto-improve]` status line pointing at it. This is fire-and-forget
+background analysis (it calls the model, so it must never block the
+tool-call loop it's reacting to) and, critically, **writing to this log file
+never changes agent behavior on its own** — it's a passive record, not a
+rule, and not fed back into the system prompt. Turning a finding into an
+actual rule still always requires the explicit `/improve` → `/improve-apply`
+review flow above. Each recurring pattern (by its grouping signature, not
+its growing occurrence count) is only logged once per session, so a
+still-failing pattern doesn't spam the file on every subsequent occurrence.
+
 > ## 헤르메스 자가 개선 제안 루프
 >
 > 동일한 도구가 같은 실패 패턴으로 2회 이상 반복되면(`src/hermes/selfImprove.ts`), 모델에게
@@ -787,6 +842,19 @@ requires the user to review it and approve with a separate command:
 > - `/quit` — 세션 종료 시 미검토 실패 로그가 있으면 즉시 종료하지 않고 자동으로 제안을
 >   분석해 보여준다. 확인 후 `/quit`을 한 번 더 누르면 종료된다(적용은 별도로 `/improve-apply`
 >   가 필요 — 종료 자체가 rule을 쓰지는 않는다).
+>
+> ### 실시간 분석 (수동 트리거만이 아님)
+>
+> `/improve`나 세션 종료를 기다리지 않고, `AgentLoop`가 새 도구/백엔드 실패가 발생할
+> 때마다 즉시 실패 로그를 다시 확인해서, 어떤 패턴이 반복 임계치를 처음 넘는 순간
+> 실시간·append-only 저널인 `.llamacli/state/improvement-log.md`에 기록하고
+> `[auto-improve]` 상태 메시지로 알려준다. 이건 fire-and-forget 백그라운드 분석이라
+> (모델을 호출하므로 반응 대상인 도구 호출 루프를 절대 막으면 안 됨) — 중요한 건
+> **이 로그 파일에 쓰는 것 자체는 에이전트 동작을 전혀 바꾸지 않는다**는 것. 순수한
+> 기록일 뿐 rule이 아니고 시스템 프롬프트에도 다시 주입되지 않는다. 실제 rule로
+> 만들려면 여전히 위의 `/improve` → `/improve-apply` 검토 절차가 필요하다. 각 반복
+> 패턴은 (계속 늘어나는 발생 횟수가 아니라 그룹핑 시그니처 기준으로) 세션당 한 번만
+> 기록되므로, 계속 실패하는 패턴이 매번 파일을 도배하지 않는다.
 
 ## Remote browser control (Chrome DevTools Protocol)
 
