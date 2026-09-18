@@ -121,6 +121,10 @@ test("AgentLoop captures pendingToolCall when compaction fires mid-batch, and ab
     await loop.send("do the thing");
 
     assert.ok(statusMessages.some((s) => s.includes("compaction complete")));
+    // A mid-batch abandonment must say the turn is over — otherwise it's
+    // indistinguishable from the CLI having hung (reported directly: "진행
+    // 중인지 멈춘건지 모르겠네" / "can't tell if this is still running").
+    assert.ok(statusMessages.some((s) => s.includes("[turn ended]")));
 
     const checkpoint = await readCheckpoint(dir);
     assert.ok(checkpoint, "expected a checkpoint to have been written");
@@ -132,6 +136,54 @@ test("AgentLoop captures pendingToolCall when compaction fires mid-batch, and ab
     // call1 ran (plan has step1) but call2 never did (no step2 in the plan)
     assert.equal(checkpoint!.steps.length, 1);
     assert.equal(checkpoint!.steps[0].description, "step1");
+  }));
+
+test("a checkpoint left by mid-session compaction is picked up automatically by the NEXT send(), not just on process restart", () =>
+  withTempProject(async (dir) => {
+    const call1 = {
+      id: "c1",
+      type: "function" as const,
+      function: { name: "update_plan", arguments: JSON.stringify({ steps: [{ description: "step1", status: "in_progress" }] }) },
+    };
+    const call2 = {
+      id: "c2",
+      type: "function" as const,
+      function: { name: "update_plan", arguments: JSON.stringify({ steps: [{ description: "step2", status: "in_progress" }] }) },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [
+        assistantMessage(null, [call1, call2]), // first send(): abandoned mid-batch by compaction
+        assistantMessage("continuing now"), // second send(): should see the resume context first
+      ],
+      tokenCounts: [1, 1, 1000, 1], // 4th measurement (start of 2nd send's turn) stays low, no further compaction
+    });
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await loop.send("do the thing"); // leaves a checkpoint behind (see previous test)
+    assert.ok(await readCheckpoint(dir), "expected a checkpoint after the first send()");
+
+    statusMessages.length = 0;
+    await loop.send("are you still there?");
+
+    // the resume prompt must have been folded in automatically, with no
+    // separate resumeIfCheckpointExists() call needed
+    assert.ok(statusMessages.some((s) => s.includes("resuming after compaction")));
+    assert.equal(await readCheckpoint(dir), null, "checkpoint should be consumed after being resumed");
+
+    // and the model's second request must actually contain that resume
+    // context (the interrupted tool call), not just a bare "are you still
+    // there?" — buildResumePrompt() reports the pending call's name/reason,
+    // not its raw arguments, so check for that rather than "step2".
+    const secondRequest = turnRequests[1];
+    assert.ok(secondRequest.messages.some((m) => typeof m.content === "string" && m.content.includes("update_plan")));
   }));
 
 test("AgentLoop does not trigger compaction when usage stays under the threshold throughout", () =>

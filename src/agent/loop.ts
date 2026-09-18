@@ -57,27 +57,42 @@ export class AgentLoop {
     this.messages = [{ role: "system", content: opts.systemPrompt }];
   }
 
+  /** Reads back a checkpoint left by a compaction that abandoned work
+   *  mid-batch (see the mid-tool-call-loop comment below) and folds its
+   *  resume prompt into the conversation, so whoever calls this next picks
+   *  the interrupted work back up. Consumes (clears) the checkpoint before
+   *  returning — if a fresh compaction happens later in the same turn,
+   *  that new checkpoint must survive, so clearing afterward would be
+   *  wrong. Returns whether there was anything to resume. */
+  private async injectResumeContextIfPending(): Promise<boolean> {
+    const resumeText = await buildResumePrompt(this.opts.projectRoot);
+    if (!resumeText) return false;
+    this.opts.onStatus?.(resumeText);
+    this.messages.push({ role: "system", content: resumeText });
+    await clearCheckpoint(this.opts.projectRoot);
+    return true;
+  }
+
   /** PROMPT.md §2.4: on startup, if a checkpoint was left behind (compaction
    *  fired in a previous session that then exited/crashed before finishing),
    *  resume automatically — no user input required. */
   async resumeIfCheckpointExists(): Promise<void> {
     await this.enqueue(async () => {
-      const resumeText = await buildResumePrompt(this.opts.projectRoot);
-      if (!resumeText) return;
-
-      this.opts.onStatus?.(resumeText);
-      this.messages.push({ role: "system", content: resumeText });
-      // Consume the checkpoint before running the turn (not after): if this
-      // resumed turn itself triggers a fresh compaction, that new checkpoint
-      // must survive — clearing afterward would wipe it out along with the
-      // one we just consumed.
-      await clearCheckpoint(this.opts.projectRoot);
-      await this.runUntilIdle();
+      const resumed = await this.injectResumeContextIfPending();
+      if (resumed) await this.runUntilIdle();
     });
   }
 
   async send(userText: string): Promise<void> {
     await this.enqueue(async () => {
+      // A compaction can also fire *mid-session* (not just be left over
+      // from a previous process) and abandon work — e.g. mid-tool-call-loop
+      // below. Previously that resume context only ever got folded in on a
+      // fresh process restart, so typing a new message in the same running
+      // session silently dropped it instead of picking the interrupted work
+      // back up, even though a checkpoint was sitting on disk the whole
+      // time. Check every time, not just at startup.
+      await this.injectResumeContextIfPending();
       this.messages.push({ role: "user", content: userText });
       await this.runUntilIdle();
     });
@@ -156,6 +171,14 @@ export class AgentLoop {
             reason: "compaction threshold hit before this call could run",
           })
         ) {
+          // Without an explicit message here, the turn just stops with no
+          // visible signal beyond whatever compact() already logged (which,
+          // on failure, doesn't say the turn is over) — indistinguishable
+          // from the CLI having hung. Say so plainly: this is a real stop,
+          // not the agent still thinking.
+          this.opts.onStatus?.(
+            "[turn ended] Compaction interrupted this task. It'll pick back up automatically with your next message."
+          );
           return;
         }
 

@@ -433,6 +433,33 @@ messages produced by the conversion. Verified against the real backend
 with the exact production message-count pattern that failed. Covered by
 `src/compaction/compactor.test.ts`.
 
+### Unclear whether the agent had stopped or was still working
+
+Follow-up report, quoting the compaction-failure output above: "진행중인지
+멈춘건지 모르겠네" (can't tell if this is still running or stopped). Real
+gap: when compaction interrupts a tool-call batch mid-turn (whether the
+compaction itself succeeded or failed), the turn just ends — the only
+message shown was whatever `compact()` logged, which on failure doesn't
+say the turn is over. From the outside that's indistinguishable from a
+hang.
+
+Also found while looking into it: the checkpoint left behind by a
+mid-session compaction was previously only ever picked back up by
+`resumeIfCheckpointExists()`, which only runs once at process startup —
+typing a new message in the *same* running session silently dropped the
+interrupted work's context instead of resuming it, even though the
+checkpoint was sitting on disk the whole time.
+
+Fixed both: an explicit `[turn ended] Compaction interrupted this task.
+It'll pick back up automatically with your next message.` status line
+whenever a batch is abandoned this way, and `send()` now checks for a
+pending checkpoint and folds its resume context in *every* time, not just
+at startup. Covered by two new tests in `src/agent/loop.test.ts` — one
+checking for the `[turn ended]` message, another driving two consecutive
+`send()` calls and confirming the second one's request to the model
+actually contains the interrupted work's context (74 tests total, all
+passing).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -654,6 +681,27 @@ with the exact production message-count pattern that failed. Covered by
 > assistant 메시지 뒤에 붙어버릴 수 있기 때문. 변환으로 생긴 연속된 같은 역할 메시지를
 > 병합해서 수정. 실제로 실패했던 정확한 메시지 개수 패턴으로 실제 백엔드에 대고
 > 재검증함. `src/compaction/compactor.test.ts`로 커버됨.
+>
+> ### 에이전트가 멈춘 건지 계속 진행 중인 건지 알 수 없음
+>
+> 위 컴팩션 실패 출력을 그대로 인용하며 후속 신고됨: "진행중인지 멈춘건지
+> 모르겠네". 실제 공백: 컴팩션이 턴 도중 도구 호출 배치를 중단시키면(컴팩션 자체가
+> 성공했든 실패했든) 턴이 그냥 끝나버림 — 유일하게 표시되는 메시지는 `compact()`가
+> 남긴 것뿐인데, 실패 시에는 "턴이 끝났다"는 말이 전혀 없음. 바깥에서 보면 멈춰버린
+> 것과 구분이 안 됨.
+>
+> 조사하다가 추가로 발견: 세션 도중 컴팩션이 남긴 체크포인트는 지금까지
+> `resumeIfCheckpointExists()`(프로세스 시작 시 딱 한 번만 실행)로만 다시 집어드는
+> 구조였음 — 같은 세션 안에서 새 메시지를 입력하면, 체크포인트가 디스크에 그대로
+> 있는데도 중단됐던 작업의 맥락이 조용히 사라져버렸음.
+>
+> 둘 다 수정: 이런 식으로 배치가 중단될 때마다 `[turn ended] Compaction
+> interrupted this task. It'll pick back up automatically with your next
+> message.`라는 명시적 상태 메시지를 추가했고, `send()`가 이제 시작 시점뿐 아니라
+> **매번** 대기 중인 체크포인트를 확인해서 재개 맥락을 끼워 넣도록 함.
+> `src/agent/loop.test.ts`에 새 테스트 2개로 커버됨 — 하나는 `[turn ended]` 메시지
+> 확인, 다른 하나는 연속으로 `send()`를 두 번 호출해서 두 번째 요청이 실제로 중단된
+> 작업의 맥락을 포함하는지 확인(총 74개 테스트 전부 통과).
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
