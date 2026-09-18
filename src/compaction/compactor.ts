@@ -13,8 +13,28 @@ export interface CompactionResult {
   checkpoint: Checkpoint;
 }
 
+/** The text that actually counts toward a message's size in the real
+ *  request. An assistant message requesting tool calls has `content: null`
+ *  — the real payload sent to the backend lives entirely in
+ *  `tool_calls[].function.{name,arguments}` instead, which every estimator
+ *  here previously ignored completely (treated as ""). In a tool-heavy
+ *  session (this agent calls run_shell/read_file/etc. constantly) that's
+ *  not a rounding error — it undercounts a large fraction of the real
+ *  conversation, so `shouldCompact` kept saying "plenty of room" right up
+ *  until the backend hard-rejected the request with `exceeds the available
+ *  context size` (seen live: 65,636 real tokens against a 65,536 window,
+ *  repeating on retry since nothing had actually shrunk). Include tool call
+ *  name+arguments so the estimate reflects what's actually being sent. */
+function messageText(m: ChatMessage): string {
+  const content = typeof m.content === "string" ? m.content : "";
+  const toolCalls = (m.tool_calls ?? [])
+    .map((tc) => `${tc.function.name}(${tc.function.arguments})`)
+    .join("\n");
+  return toolCalls ? `${content}\n${toolCalls}` : content;
+}
+
 function charBasedEstimate(messages: ChatMessage[]): number {
-  const chars = messages.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0);
+  const chars = messages.reduce((sum, m) => sum + messageText(m).length, 0);
   return Math.ceil(chars / 4);
 }
 
@@ -24,7 +44,7 @@ function charBasedEstimate(messages: ChatMessage[]): number {
 export async function estimateTokens(messages: ChatMessage[], backend?: ModelBackend): Promise<number> {
   if (backend?.tokenize) {
     try {
-      const text = messages.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+      const text = messages.map(messageText).join("\n");
       return await backend.tokenize(text);
     } catch {
       // tokenizer unavailable/errored — fall through to the approximation

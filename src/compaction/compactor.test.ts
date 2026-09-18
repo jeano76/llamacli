@@ -29,9 +29,39 @@ test("estimateTokens approximates chars/4 across all messages when no tokenizer 
   assert.equal(await estimateTokens(messages), 15); // (40+20)/4
 });
 
-test("estimateTokens ignores non-string content (e.g. tool_calls-only messages)", async () => {
+test("estimateTokens counts 0 for a message with neither string content nor tool_calls", async () => {
   const messages: ChatMessage[] = [{ role: "assistant", content: null as any }];
   assert.equal(await estimateTokens(messages), 0);
+});
+
+// Found live: two consecutive real turns both failed with "exceeds the
+// available context size" at ~65,636 tokens against a 65,536-token window,
+// in a tool-heavy session (run_shell/read_file calls throughout) —
+// shouldCompact() kept saying there was room right up until the backend
+// hard-rejected the request. Root cause: an assistant message requesting
+// tool calls has `content: null`; the real payload sent to the backend
+// lives in `tool_calls[].function.arguments` instead, which the estimate
+// was treating as empty, undercounting a large fraction of the real
+// conversation in exactly this kind of session.
+test("estimateTokens counts tool_calls arguments, not just string content — this is what silently let real usage exceed the context window", async () => {
+  const withoutToolCalls: ChatMessage[] = [{ role: "assistant", content: null as any }];
+  const withToolCalls: ChatMessage[] = [
+    {
+      role: "assistant",
+      content: null as any,
+      tool_calls: [
+        {
+          id: "c1",
+          type: "function",
+          function: { name: "run_shell", arguments: "x".repeat(400) },
+        },
+      ],
+    },
+  ];
+  const withoutCount = await estimateTokens(withoutToolCalls);
+  const withCount = await estimateTokens(withToolCalls);
+  assert.equal(withoutCount, 0);
+  assert.ok(withCount >= 100, `expected the 400-char tool_calls argument to be counted, got ${withCount}`); // 400/4
 });
 
 test("estimateTokens uses the backend's real tokenizer when one is available", async () => {

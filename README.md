@@ -656,6 +656,46 @@ confirmed the log box is genuinely filled edge-to-edge (the one remaining
 blank row in that capture was traced back to a real blank line in the
 source markdown, not a rendering artifact) with color present throughout.
 
+### Token estimate silently ignored tool_calls, so real usage exceeded the context window
+
+Reported live via a pasted real session in a tool-heavy project: two
+consecutive turns both failed with the backend's own `400
+exceed_context_size_error` — `request (65,636 tokens) exceeds the
+available context size (65,536 tokens)`, then again at 65,648 right after.
+Nothing had shrunk in between, so the same oversized history was sent
+twice in a row and failed both times — indistinguishable from the app
+being stuck.
+
+Root cause in `compaction/compactor.ts`: `estimateTokens()`/`shouldCompact()`
+only ever looked at `message.content`. An assistant message that's
+requesting tool calls has `content: null` — the actual payload sent to the
+backend lives entirely in `tool_calls[].function.arguments` instead
+(`{"command": "..."}` for `run_shell`, `{"path": "..."}` for `read_file`,
+etc.), which the estimate was silently treating as empty. In a session
+that calls tools constantly (exactly this kind of session), that's not a
+rounding error — it undercounts a large fraction of the real conversation,
+so `shouldCompact()` kept reporting plenty of headroom right up until the
+backend's own hard limit disagreed. Fixed by including tool call
+name+arguments in both the tokenizer-backed and the chars/4 fallback
+estimate (`messageText()`).
+
+Also added a second, independent layer of defense: since any estimate can
+still be wrong (a future backend field it doesn't account for, a
+tokenizer quirk), `AgentLoop.runUntilIdle()` now treats the backend's own
+`exceed_context_size_error` as authoritative — on that specific error it
+forces an immediate compaction and retries the request once (capped at
+one retry per turn, so a single message that's still too large after
+compacting reports an error instead of looping). This means even a
+still-inaccurate estimate can no longer repeat the same failure turn
+after turn the way it just did live.
+
+Covered by new tests: `estimateTokens` correctly counting a tool_calls
+message's arguments (vs. one with neither content nor tool_calls, which
+stays 0), one turn-level test asserting a single overflow triggers exactly
+one forced compaction and one retry that then succeeds, and one asserting
+a *persistent* overflow (still fails after the retry) is reported rather
+than retried forever.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1068,6 +1108,42 @@ source markdown, not a rendering artifact) with color present throughout.
 > 끝까지 빈틈없이 채워져 있는 것을 확인함(그 캡처에서 유일하게 남아있던
 > 빈 줄 하나는 렌더링 결함이 아니라 원본 마크다운 안의 진짜 빈 줄로 추적
 > 확인됨), 색상도 전체에 걸쳐 제대로 나오는 것까지 확인함.
+>
+> ### 토큰 추정이 tool_calls를 조용히 무시해서 실제 사용량이 컨텍스트 윈도우를 넘던 문제
+>
+> 도구 호출이 많은 실제 프로젝트 세션을 그대로 붙여넣은 신고로 발견함: 연속된
+> 두 턴이 둘 다 백엔드 자체의 `400 exceed_context_size_error`로 실패함 —
+> `request (65,636 tokens) exceeds the available context size (65,536
+> tokens)`, 바로 다음 턴에도 65,648에서 똑같이 실패. 그 사이에 아무것도
+> 줄어들지 않아서 같은 크기의 과도한 대화 기록이 연달아 두 번 그대로
+> 전송되고 둘 다 실패함 — 앱이 멈춘 것과 구분이 안 되는 상황.
+>
+> `compaction/compactor.ts`의 근본 원인: `estimateTokens()`/`shouldCompact()`가
+> `message.content`만 보고 있었음. 도구 호출을 요청하는 assistant 메시지는
+> `content: null`이고, 백엔드로 실제 전송되는 내용은 전부
+> `tool_calls[].function.arguments`에 있음(`run_shell`이면
+> `{"command": "..."}`, `read_file`이면 `{"path": "..."}` 등) — 이걸
+> 추정치가 그냥 빈 값처럼 조용히 취급하고 있었음. 도구를 계속 호출하는
+> 세션(정확히 이런 세션)에서는 이게 반올림 오차 수준이 아니라 실제 대화의
+> 상당 부분을 통째로 못 세는 것이라서, 백엔드 자체의 하드 리밋이 반박할
+> 때까지 `shouldCompact()`는 계속 "아직 여유 있음"이라고 보고함. tool_calls의
+> 이름+인자를 토크나이저 기반 추정과 chars/4 폴백 추정 둘 다에 포함하도록
+> 고침(`messageText()`).
+>
+> 독립적인 두 번째 방어층도 추가함: 어떤 추정치든 여전히 틀릴 수 있으므로(
+> 나중에 추정에 반영 안 된 백엔드 필드, 토크나이저의 특이 케이스 등),
+> `AgentLoop.runUntilIdle()`이 이제 백엔드 자체의 `exceed_context_size_error`를
+> 정답으로 취급함 — 이 에러를 만나면 즉시 강제 컴팩션을 한 번 실행하고
+> 요청을 한 번만 재시도함(턴당 재시도 1회로 제한해서, 컴팩션 후에도 여전히
+> 너무 큰 메시지 하나가 무한 반복되지 않고 에러로 보고됨). 이제 추정치가
+> 여전히 부정확하더라도 방금 실제로 겪은 것처럼 턴마다 같은 실패가 반복되진
+> 않음.
+>
+> 새 테스트로 커버함: `estimateTokens`가 tool_calls 메시지의 인자를 제대로
+> 세는지(content도 tool_calls도 없는 메시지는 여전히 0인 것과 대비), 오버플로우
+> 한 번이 정확히 강제 컴팩션 1회 + 재시도 1회로 이어지고 그 재시도가
+> 성공하는지 검증하는 턴 단위 테스트 하나, 재시도 후에도 *계속* 오버플로우가
+> 나는 경우 무한 재시도 대신 에러로 보고되는지 검증하는 테스트 하나.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

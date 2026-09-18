@@ -513,3 +513,96 @@ test("an oversized tool result is truncated before it's sent to the backend, not
     assert.ok(sentContent.length < bigContent.length, "the sent tool content should be shorter than the raw file");
     assert.match(sentContent, /truncated/);
   }));
+
+test("a context-overflow error forces compaction and retries once instead of just ending the turn", () =>
+  withTempProject(async (dir) => {
+    // Found live: two consecutive real turns both failed with the backend's
+    // own "exceeds the available context size" 400, back to back, because
+    // nothing had shrunk the history in between (the estimate said there
+    // was still room). Simulate that exact backend error on the first turn
+    // call and verify the loop compacts and retries on its own instead of
+    // reporting a plain error and leaving the next message to hit the same
+    // wall again.
+    let turnCallCount = 0;
+    let compactionCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          // compactor.ts's internal summary request
+          compactionCallCount++;
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          const err: any = new Error(
+            'chat stream failed: 400 {"error":{"code":400,"message":"request (65636 tokens) exceeds the available context size (65536 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":65636,"n_ctx":65536}}'
+          );
+          throw err;
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 1;
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.equal(turnCallCount, 2, "expected exactly one retry after the overflow, not zero or a loop");
+    assert.equal(compactionCallCount, 1, "expected exactly one forced compaction");
+    assert.ok(statusMessages.some((s) => s.includes("context overflow")));
+    // Must not also report this as a generic unrecovered error once the retry succeeded.
+    assert.ok(!statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
+  }));
+
+test("a context-overflow error that persists after the forced retry is reported, not retried forever", () =>
+  withTempProject(async (dir) => {
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const overflowError = () => {
+      const err: any = new Error(
+        'chat stream failed: 400 {"error":{"code":400,"message":"request (99999 tokens) exceeds the available context size (65536 tokens)","type":"exceed_context_size_error"}}'
+      );
+      return err;
+    };
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnCallCount++;
+        throw overflowError();
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 1;
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.equal(turnCallCount, 2, "expected the one allowed retry, then a stop — not an unbounded loop");
+    assert.ok(statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
+  }));

@@ -157,6 +157,17 @@ export class AgentLoop {
   }
 
   private async runUntilIdle(): Promise<void> {
+    // Defense in depth against the estimate in maybeCompact() ever still
+    // being wrong (e.g. a future backend field it doesn't account for):
+    // the backend's own hard rejection is ground truth and should trigger
+    // an immediate forced compaction and one retry, rather than ending the
+    // turn and leaving the *next* message to walk into the exact same
+    // oversized history again. Seen live: two consecutive user turns both
+    // failed with "exceeds the available context size" at ~65,636 and
+    // ~65,648 tokens — nothing had shrunk in between because the estimate
+    // (now fixed separately) said there was still room. Capped at one
+    // retry per turn so a persistently-too-large single message can't loop.
+    let retriedAfterOverflow = false;
     while (true) {
       await this.maybeCompact();
 
@@ -185,6 +196,12 @@ export class AgentLoop {
           }
         );
       } catch (err: any) {
+        if (!retriedAfterOverflow && /exceeds the available context size|exceed_context_size_error/i.test(err.message)) {
+          retriedAfterOverflow = true;
+          this.opts.onStatus?.("[context overflow] request exceeded the context window — forcing compaction and retrying once.");
+          await this.compact("auto-threshold", null);
+          continue;
+        }
         // A network/backend failure here must never crash the whole CLI —
         // this is exactly the crash reproduced when running from a project
         // with no .llamacli/config.yaml (falls back to an unreachable
