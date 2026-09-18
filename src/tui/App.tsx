@@ -79,6 +79,18 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   }, [busy]);
 
   useInput((char, key) => {
+    // Ink's default Ctrl-C-exits-the-app behavior is disabled in index.tsx
+    // (exitOnCtrlC: false) specifically so this reaches here instead —
+    // reported directly: some terminals/users treat Ctrl-C as copy, not an
+    // interrupt, and it shouldn't kill llamacli either way. Make it an
+    // explicit no-op (not inserted into the input, doesn't touch the
+    // menu) rather than falling through to the generic "append this
+    // character" branch, which would otherwise insert the raw control
+    // byte into whatever you were typing. /quit is still the only way out.
+    if (key.ctrl && char.toLowerCase() === "c") {
+      return;
+    }
+
     if (menuOpen) {
       if (key.upArrow) setMenuIndex((i) => Math.max(0, i - 1));
       else if (key.downArrow) setMenuIndex((i) => Math.min(SLASH_MENU_ITEMS.length - 1, i + 1));

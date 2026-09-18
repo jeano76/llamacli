@@ -111,6 +111,14 @@ async function main() {
   let quitConfirmed = false;
 
   const { unmount } = render(
+    // exitOnCtrlC: false — Ink's default behavior kills the whole process
+    // the instant Ctrl-C is pressed, which conflicts with terminals/users
+    // that treat Ctrl-C as copy (reported directly). Raw mode disables the
+    // TTY's normal SIGINT generation for Ctrl-C, so with this off, the
+    // keystroke reaches App.tsx's own useInput handler like any other key —
+    // where it's explicitly treated as a no-op (see App.tsx) rather than
+    // being inserted into the input or exiting. /quit remains the only way
+    // to exit the app; Ctrl-C no longer does anything inside it at all.
     <App
       cwd={projectRoot}
       model={config.model}
@@ -228,7 +236,8 @@ async function main() {
           // "queue" is handled locally inside App (needs the live queue state).
         }
       }}
-    />
+    />,
+    { exitOnCtrlC: false }
   );
 
   if (setupMessage) (globalThis as any).__llamacli_ui?.pushStatus(setupMessage);

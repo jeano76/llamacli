@@ -529,6 +529,22 @@ the menu is closed, the menu still renders cleanly right above the input
 box when open, and closing it again leaves no ghosting — including a real
 follow-up assistant response rendering correctly right after.
 
+### Ctrl-C exited the whole app instead of doing nothing
+
+Reported directly: some terminals/users treat Ctrl-C as copy, not an
+interrupt, and it shouldn't kill llamacli either way it's configured. Cause:
+Ink's `render()` defaults to `exitOnCtrlC: true` — the instant Ctrl-C is
+pressed, Ink tears the whole app down itself, independent of anything the
+app's own code does. Fixed by passing `{ exitOnCtrlC: false }` to `render()`
+in `index.tsx`, and explicitly handling `Ctrl-C` as a no-op in `App.tsx`'s
+`useInput` (rather than letting it fall through to the generic
+"append this character" branch, which would otherwise insert the raw
+control byte into whatever you were typing). `/quit` remains the only way
+to exit. Verified via pty: the process stays alive and fully responsive
+(accepts new input, submits messages) after three consecutive Ctrl-C
+presses, with no stray characters left in the input line; `/quit` still
+exits cleanly afterward.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -828,6 +844,19 @@ follow-up assistant response rendering correctly right after.
 > 로그 콘텐츠가 이제 공백 없이 입력 박스 바로 위에 붙고, 메뉴가 열려있을 때도 입력
 > 박스 바로 위에 깨끗하게 렌더링되며, 다시 닫아도 잔상이 없음 — 그 직후 실제
 > assistant 응답이 정상적으로 렌더링되는 것까지 확인함.
+>
+> ### Ctrl-C가 앱 전체를 종료시키던 문제
+>
+> 직접 신고됨: 일부 터미널/사용자에게는 Ctrl-C가 인터럽트가 아니라 복사이고,
+> 어느 쪽이든 llamacli를 죽이면 안 됨. 원인: Ink의 `render()`가 기본값으로
+> `exitOnCtrlC: true`를 씀 — Ctrl-C를 누르는 순간 앱 자체 코드와 무관하게 Ink가
+> 스스로 앱 전체를 무너뜨림. `index.tsx`의 `render()`에 `{ exitOnCtrlC: false }`를
+> 넘기고, `App.tsx`의 `useInput`에서 `Ctrl-C`를 명시적으로 아무것도 안 하도록
+> 처리해서 수정(일반 "이 문자를 추가" 분기로 흘러가게 두면 타이핑 중이던 내용에
+> raw 제어 바이트가 그대로 삽입되어버림). `/quit`이 여전히 유일한 종료 방법임.
+> pty로 검증: Ctrl-C를 연속 3번 눌러도 프로세스가 살아있고 완전히 정상 동작함(새
+> 입력 받고 메시지 전송도 됨), 입력줄에 이상한 문자도 안 남음; 이후 `/quit`도
+> 여전히 깔끔하게 종료됨.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 
