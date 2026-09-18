@@ -280,14 +280,30 @@ logic into a shared `src/tui/textWidth.ts` and applied it to `StatusBar`
 too (`src/tui/StatusBar.tsx`'s `statusBarFieldWidth`), so it's now
 guaranteed to stay exactly one row.
 
-The fix: after every render, move the cursor 2 rows up (past the blank
-trailer and the now-guaranteed-single-row StatusBar) and to the exact
-column right after the visible input text, then show it there
-(`\x1b[2A\x1b[<col>G\x1b[?25h`). Verified directly in raw output: typing "안"
-(a 2-column-wide Hangul syllable) now ends every frame with exactly
-`\x1b[2A\x1b[6G\x1b[?25h` — column 6 is precisely one past where "안" is
-rendered (1 padding + 1 spinner + 1 space + 2 width + 1 = 6). Covered by
-`src/tui/StatusBar.test.ts` and `src/tui/textWidth.test.ts`.
+The first attempted fix: after every render, move the cursor 2 rows up
+(past the blank trailer and the now-single-row StatusBar) and to the exact
+column after the visible input text (`\x1b[2A\x1b[<col>G\x1b[?25h`). This
+verified correctly in a synthetic pty test — but a follow-up recording on a
+**real** GNOME Terminal session showed it landing one row too low, visibly
+overlapping the StatusBar's cwd text. The "N rows up from wherever Ink's
+writer happens to end" assumption isn't portable across terminals/Ink's
+internal write patterns, so guessing a fixed offset was the wrong strategy
+regardless of how carefully the offset was measured in one environment.
+
+**Replaced with a terminal-agnostic fix**: instead of moving the real
+cursor, render an explicit cursor as part of Ink's own output — an
+inverse-video space appended right after the visible input text
+(`<Text inverse> </Text>`). Wherever Ink actually draws that character *is*
+the input position, by construction, in every terminal, with no guessing
+about rows Ink might or might not have left below it. Verified in raw
+output: typing "hello" now ends the input row with exactly
+`hello\x1b[7m \x1b[27m` — the inverse-video block sits directly after the
+typed text. This doesn't fix IME composition-popup anchoring (a deeper,
+terminal/IME-level limitation outside an app's control), but it does give
+an always-correct answer to "where is my typing going," which is what was
+actually being asked. Also verified correct immediately after a live
+terminal resize (SIGWINCH). Covered by `src/tui/StatusBar.test.ts` and
+`src/tui/textWidth.test.ts`.
 
 > ## 구현 상태
 >
@@ -390,12 +406,22 @@ rendered (1 padding + 1 spinner + 1 space + 2 width + 1 = 6). Covered by
 > `src/tui/textWidth.ts`로 분리해서 `StatusBar`(`src/tui/StatusBar.tsx`의
 > `statusBarFieldWidth`)에도 적용해 이제 항상 정확히 한 줄로 고정됨.
 >
-> 수정 내용: 매 렌더링 후 커서를 2줄 위로(빈 트레일러 줄 + 이제 한 줄로 고정된
-> StatusBar 줄) 올리고, 화면에 보이는 입력 텍스트 바로 뒤 정확한 컬럼으로 이동시킨
-> 뒤 그 자리에 표시함(`\x1b[2A\x1b[<col>G\x1b[?25h`). raw 출력으로 직접 검증: "안"
-> (터미널 2칸을 차지하는 한글 음절)을 입력하면 매 프레임이 정확히
-> `\x1b[2A\x1b[6G\x1b[?25h`로 끝남 — 컬럼 6은 "안"이 그려지는 위치 바로 다음
-> 칸과 정확히 일치(패딩 1 + 스피너 1 + 공백 1 + 폭 2 + 1 = 6). `src/tui/StatusBar.test.ts`,
+> 1차 시도: 매 렌더링 후 커서를 2줄 위로(빈 트레일러 줄 + 한 줄로 고정된 StatusBar 줄)
+> 올리고 입력 텍스트 바로 뒤 컬럼으로 이동시킴(`\x1b[2A\x1b[<col>G\x1b[?25h`). 합성 pty
+> 테스트에서는 정확히 맞았지만, 이어진 **실제** GNOME Terminal 녹화에서는 한 줄 아래로
+> 어긋나서 StatusBar의 cwd 텍스트와 눈에 띄게 겹쳐버림. "Ink의 writer가 어디서 끝나든
+> 거기서 N줄 위로"라는 가정 자체가 터미널/Ink 내부 쓰기 패턴에 따라 이식성이 없었던
+> 것 — 한 환경에서 아무리 정확히 측정해도 고정 오프셋을 추측하는 전략 자체가 틀렸음.
+>
+> **터미널과 무관하게 항상 맞는 방식으로 교체**: 실제 커서를 옮기는 대신, Ink 자신의
+> 출력 일부로 커서를 명시적으로 그린다 — 입력 텍스트 바로 뒤에 반전 비디오 공백을
+> 추가(`<Text inverse> </Text>`). Ink가 그 문자를 실제로 그리는 자리가 곧 입력 위치이며,
+> 이는 구조적으로 항상 맞다 — Ink가 아래에 몇 줄을 남기든 추측할 필요가 없음. raw
+> 출력으로 검증: "hello"를 입력하면 입력줄이 정확히 `hello\x1b[7m \x1b[27m`로 끝남 —
+> 반전 비디오 블록이 타이핑한 텍스트 바로 뒤에 붙음. IME 조합 팝업의 앵커링 문제(앱
+> 차원에서 손댈 수 없는 더 깊은 터미널/IME 차원의 한계)까지 고치진 못하지만, 실제로
+> 물어본 "내가 타이핑한 게 어디로 가는가"에는 항상 정확한 답을 줌. 실제 터미널 리사이즈
+> (SIGWINCH) 직후에도 정확한 것 확인함. `src/tui/StatusBar.test.ts`,
 > `src/tui/textWidth.test.ts`로 커버됨.
 
 ## Skill / Rule — reusing existing AI CLI conventions

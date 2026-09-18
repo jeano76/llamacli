@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput, useStdout } from "ink";
-import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
@@ -141,24 +140,9 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // the real terminal, leaving ghosting when it shrank back down (the same
   // class of bug the slash menu had). Truncate to what actually fits
   // instead of ever letting the input Text wrap.
-  const maxInputWidth = Math.max(10, columns - 4); // paddingX(2) + spinner(1) + leading space(1)
+  const maxInputWidth = Math.max(10, columns - 5); // paddingX(2) + spinner(1) + leading space(1) + cursor block(1)
   const visibleInput = tailToWidth(input, maxInputWidth);
 
-  // Ink finishes every render with the real terminal cursor sitting on a
-  // blank line just below the last row it wrote (StatusBar) — it never
-  // repositions the cursor back to where the user is actually typing. Since
-  // desktop input methods (fcitx/ibus for Hangul, etc.) anchor their
-  // composition popup to the REAL cursor position, not to anything Ink
-  // renders, this left composed/typed characters appearing to land at the
-  // bottom-left of the screen instead of in the prompt row. Move the cursor
-  // back up onto the input row and to the exact column after the visible
-  // text, and make sure it's shown, after every render.
-  useEffect(() => {
-    const promptColumn = 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
-    // 2 rows up: 1 for StatusBar's own row, 1 for the blank trailer line
-    // Ink's last write always ends on.
-    process.stdout.write(`\x1b[2A\x1b[${promptColumn}G\x1b[?25h`);
-  });
   // The slash menu (round border top+bottom + one line per item) adds rows
   // on top of the normal chrome (divider + input + status bar). Without
   // accounting for it, total rendered content exceeds the outer Box's fixed
@@ -208,6 +192,18 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
       <Box paddingX={1} height={1} overflow="hidden">
         <Spinner active={busy} />
         <Text> {visibleInput}</Text>
+        {/* Fake cursor: moving the REAL terminal cursor to track this row
+         *  turned out to be unreliable across terminal emulators — verified
+         *  wrong on a real GNOME Terminal session even though it worked in
+         *  a synthetic pty test, since it depends on exactly how many
+         *  trailing rows Ink's writer leaves below the last content, which
+         *  isn't consistent. Rendering the cursor as part of Ink's own
+         *  layout is unconditionally correct instead: wherever Ink actually
+         *  draws this character IS the input position, by construction, in
+         *  every terminal. Doesn't fix IME composition-popup anchoring (a
+         *  deeper, terminal/IME-level limitation), but gives the user an
+         *  always-accurate visual answer to "where is my typing going". */}
+        <Text inverse> </Text>
       </Box>
 
       <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} columns={columns} />
