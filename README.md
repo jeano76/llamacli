@@ -1135,6 +1135,36 @@ independently. Covered by 2 new unit tests (`estimateTokens` counts
 from false to true once `extraText` pushes the total over threshold, even
 though the messages alone didn't).
 
+### write_file couldn't create a new directory; edit_file could silently edit the wrong spot
+
+Continued auditing `tools/index.ts` for the same class of gap already
+found twice (`run_shell`'s missing timeout, `browser.ts`'s missing CDP
+timeout) — found two more, this time correctness rather than hangs:
+
+- `write_file` never created missing parent directories. Writing a
+  brand-new file into a directory that doesn't exist yet — routine for
+  "create a new module/handler" — threw `ENOENT` instead of just working,
+  since `writeFile()` doesn't do this on its own.
+- `edit_file` used `.replace()`, which only ever touches the *first*
+  match. The existing `.includes()` check only confirmed `old_text`
+  appears *somewhere* in the file, never that it's the *unique* location
+  intended — genuinely common with similar-looking functions or repeated
+  boilerplate. An ambiguous `old_text` could silently edit the wrong
+  (earlier, unrelated) occurrence with no warning at all.
+
+Fixed both: `write_file` now calls `mkdir(dirname(path), { recursive:
+true })` first. `edit_file` now counts occurrences of `old_text` and
+throws a clear "matches N places — ambiguous, add more context" error
+when there's more than one, instead of guessing — leaving the file
+completely untouched rather than editing the wrong spot.
+
+Covered by 6 new unit tests: `write_file` creates missing nested
+directories and still works normally for an already-existing one (no
+regression); `edit_file` refuses (and makes zero changes for) an
+ambiguous two-match case, still edits correctly when the match is unique,
+and still throws its original "not found" error when there's no match at
+all (no regression).
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -1959,6 +1989,35 @@ though the messages alone didn't).
 > 커버함(`estimateTokens`가 메시지 외에 `extraText`도 세는지, 메시지만으로는
 > 임계값을 못 넘어도 `extraText`가 더해지면 `shouldCompact`가 정확히
 > false에서 true로 바뀌는지).
+>
+> ### write_file이 새 디렉토리를 못 만들었고, edit_file은 엉뚱한 곳을 조용히 고칠 수 있었음
+>
+> 이미 두 번(`run_shell`의 누락된 타임아웃, `browser.ts`의 누락된 CDP
+> 타임아웃) 찾은 것과 같은 종류의 공백이 있는지 `tools/index.ts`를 계속
+> 점검하다가 두 개 더 찾음 — 이번엔 멈춤이 아니라 정확성 문제:
+>
+> - `write_file`이 없는 상위 디렉토리를 전혀 만들지 않았음. 아직 없는
+>   디렉토리에 새 파일을 쓰는 것 — "새 모듈/핸들러 만들기"에서 흔함 — 이
+>   그냥 되는 대신 `ENOENT`로 실패했음, `writeFile()`이 이걸 알아서
+>   안 해주기 때문.
+> - `edit_file`이 `.replace()`를 썼는데, 이건 항상 *첫 번째* 일치만
+>   건드림. 기존의 `.includes()` 체크는 `old_text`가 파일 *어딘가에*
+>   있다는 것만 확인했지, 그게 의도한 *유일한* 위치라는 건 확인 안 했음 —
+>   비슷하게 생긴 함수나 반복되는 보일러플레이트에서 실제로 흔한 상황.
+>   모호한 `old_text`는 경고 없이 엉뚱한(이전의, 관련 없는) 위치를 조용히
+>   고칠 수 있었음.
+>
+> 둘 다 수정: `write_file`이 이제 먼저 `mkdir(dirname(path), { recursive:
+> true })`를 호출함. `edit_file`은 이제 `old_text`가 몇 번 나타나는지
+> 세서, 2번 이상이면 추측하는 대신 "N곳에서 일치 — 모호함, 컨텍스트를
+> 더 추가하라"는 명확한 에러를 던짐 — 엉뚱한 곳을 고치는 대신 파일을
+> 아예 안 건드린 채로 둠.
+>
+> 새 유닛 테스트 6개로 커버함: `write_file`이 없는 중첩 디렉토리를
+> 만드는지, 이미 있는 디렉토리에서는 여전히 정상 동작하는지(회귀 없음);
+> `edit_file`이 모호한 2군데 일치 케이스를 거부하고(파일은 전혀 안
+> 바뀜) 확인, 유일하게 일치할 땐 여전히 정확히 편집되는지, 아예 일치가
+> 없을 땐 원래의 "not found" 에러를 그대로 던지는지(회귀 없음).
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

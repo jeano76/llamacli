@@ -1,6 +1,6 @@
 import { exec } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ToolDef } from "../backend/types.js";
 import { formatDiff } from "./diff.js";
@@ -194,13 +194,35 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
       return { content: await readFile(args.path, "utf8") };
     case "write_file": {
       const before = await readFile(args.path, "utf8").catch(() => "");
+      // Found auditing for the same class of gap as run_shell/CDP's
+      // missing timeouts: writing a brand-new file in a directory that
+      // doesn't exist yet — routine for "create a new module/handler" —
+      // threw ENOENT instead of just working, since writeFile() never
+      // creates parent directories on its own.
+      await mkdir(dirname(args.path), { recursive: true });
       await writeFile(args.path, args.content, "utf8");
       return { content: `wrote ${args.path}`, diff: formatDiff(args.path, before, args.content) };
     }
     case "edit_file": {
       const original = await readFile(args.path, "utf8");
-      if (!original.includes(args.old_text)) {
+      // `.replace()` only ever touches the FIRST match, silently, even
+      // when old_text also appears elsewhere in the file — a genuinely
+      // common case (similar-looking functions, repeated boilerplate).
+      // The previous `.includes()` check only confirmed "at least one
+      // match exists," not that it's the RIGHT (unique) one, so an
+      // ambiguous old_text could silently edit an unrelated earlier
+      // occurrence instead of the one actually intended, with no warning
+      // at all. Require a unique match instead — same principle as the
+      // other tools here refusing to guess and fail silently.
+      const occurrences = original.split(args.old_text).length - 1;
+      if (occurrences === 0) {
         throw new Error(`old_text not found in ${args.path}`);
+      }
+      if (occurrences > 1) {
+        throw new Error(
+          `old_text matches ${occurrences} places in ${args.path} — ambiguous. ` +
+            `Include more surrounding context so it uniquely identifies the one location to edit.`
+        );
       }
       const updated = original.replace(args.old_text, args.new_text);
       await writeFile(args.path, updated, "utf8");
