@@ -7,7 +7,7 @@
  * 절대 위임 금지"). The proposal is always a *new* file, never an edit to an
  * existing rule, so approving it can never silently destroy prior rules.
  */
-import { mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChatMessage, ModelBackend } from "../backend/types.js";
 import type { FailureLogEntry } from "./selfHeal.js";
@@ -18,6 +18,10 @@ export interface ImprovementProposal {
   /** The rule file content itself (markdown), ready to write if approved. */
   ruleMarkdown: string;
   failureCount: number;
+  /** The grouping key this proposal was drafted from — stable across repeat
+   *  occurrences of the same pattern (unlike `summary`, whose count changes
+   *  each time), so callers can dedupe "already logged this one" cheaply. */
+  signature: string;
 }
 
 const MIN_FAILURES_TO_PROPOSE = 2;
@@ -54,7 +58,7 @@ export async function proposeImprovement(
   const worst = [...groups.entries()].sort((a, b) => b[1].length - a[1].length)[0];
   if (!worst || worst[1].length < MIN_FAILURES_TO_PROPOSE) return null;
 
-  const [, occurrences] = worst;
+  const [signature, occurrences] = worst;
   const examples = occurrences
     .slice(0, 5)
     .map((e) => `- [${e.timestamp}] ${e.toolName}: ${e.errorMessage}`)
@@ -85,6 +89,7 @@ export async function proposeImprovement(
     summary: `"${occurrences[0].toolName}" failed with the same pattern ${occurrences.length} times. Proposing a new rule.`,
     ruleMarkdown,
     failureCount: occurrences.length,
+    signature,
   };
 }
 
@@ -96,5 +101,29 @@ export async function writeProposedRule(projectRoot: string, proposal: Improveme
   const filename = `hermes-proposed-${Date.now()}.md`;
   const path = join(dir, filename);
   await writeFile(path, proposal.ruleMarkdown + "\n", "utf8");
+  return path;
+}
+
+/**
+ * Real-time analysis journal: a running, append-only Markdown log of every
+ * recurring pattern Hermes noticed during the session, written as soon as
+ * it's detected — not just when the user runs /improve or quits. This is
+ * purely a *record*, never auto-loaded as a rule and never fed back into
+ * the system prompt, so appending to it doesn't change agent behavior on
+ * its own (that still always requires the explicit /improve-apply
+ * approval step — see the module docstring). Safe to call repeatedly;
+ * callers should dedupe on `ImprovementProposal.signature` themselves
+ * (e.g. AgentLoop only logs a given signature once per session) so a
+ * still-recurring pattern doesn't spam the file on every new occurrence.
+ */
+export async function appendImprovementLog(projectRoot: string, proposal: ImprovementProposal): Promise<string> {
+  const dir = join(projectRoot, ".llamacli", "state");
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, "improvement-log.md");
+  const entry =
+    `## ${new Date().toISOString()}\n\n` +
+    `${proposal.summary}\n\n` +
+    `${proposal.ruleMarkdown}\n\n---\n\n`;
+  await appendFile(path, entry, "utf8");
   return path;
 }

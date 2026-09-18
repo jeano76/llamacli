@@ -72,3 +72,10 @@ export function logFailure(entry: FailureLogEntry): void {
 export function getFailureLog(): readonly FailureLogEntry[] {
   return failureLog;
 }
+
+/** Exposed mainly for tests: this log is module-level (shared across every
+ *  AgentLoop in the process), so tests that assert on it need a clean
+ *  slate rather than accumulating entries left behind by earlier tests. */
+export function clearFailureLog(): void {
+  failureLog.length = 0;
+}

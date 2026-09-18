@@ -2,7 +2,7 @@ import type { ChatMessage, ModelBackend } from "../backend/types.js";
 import { AGENT_STATE_TOOLS, FILE_TOOLS, TOOL_DEFS, executeTool } from "../tools/index.js";
 import { CircuitBreaker } from "../hermes/selfHeal.js";
 import { logFailure, getFailureLog } from "../hermes/selfHeal.js";
-import { proposeImprovement, writeProposedRule, ImprovementProposal } from "../hermes/selfImprove.js";
+import { proposeImprovement, writeProposedRule, appendImprovementLog, ImprovementProposal } from "../hermes/selfImprove.js";
 import { runCompaction, estimateTokens, buildResumePrompt, CompactionThresholds } from "../compaction/compactor.js";
 import { clearCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
@@ -52,6 +52,10 @@ export class AgentLoop {
   /** Last self-improvement proposal shown to the user but not yet applied
    *  (§3: never write a proposed rule without explicit approval). */
   private pendingImprovement: ImprovementProposal | null = null;
+  /** Pattern signatures already written to the real-time improvement log
+   *  this session, so a still-recurring failure doesn't re-append (and
+   *  re-call the model for) the same finding on every new occurrence. */
+  private loggedImprovementSignatures = new Set<string>();
 
   constructor(private opts: AgentLoopOptions) {
     this.messages = [{ role: "system", content: opts.systemPrompt }];
@@ -138,6 +142,7 @@ export class AgentLoop {
           toolName: "chat",
           errorMessage: err.message,
         });
+        this.triggerRealtimeImprovementCheck();
         return;
       }
       const message = res.choices[0].message;
@@ -207,6 +212,7 @@ export class AgentLoop {
             toolName: call.function.name,
             errorMessage: err.message,
           });
+          this.triggerRealtimeImprovementCheck();
         }
         this.messages.push({ role: "tool", tool_call_id: call.id, content });
       }
@@ -316,7 +322,35 @@ export class AgentLoop {
         toolName: "compact",
         errorMessage: err.message,
       });
+      this.triggerRealtimeImprovementCheck();
     }
+  }
+
+  /**
+   * PROMPT.md §3 real-time extension: rather than waiting for the user to
+   * run /improve or for the session to end, re-check the failure log right
+   * after every new failure and — if a pattern is now recurring — append it
+   * to `.llamacli/state/improvement-log.md` immediately. This is
+   * fire-and-forget on purpose: analysis calls the model, which must never
+   * block the tool-call loop it's reacting to, and a failure here is
+   * itself just logged, never surfaced as a hard error (it's best-effort
+   * background journaling, not part of the main task). Writing to the log
+   * file is purely a *record* — never auto-loaded as a rule, so this can
+   * never change agent behavior on its own; only /improve-apply can.
+   */
+  private triggerRealtimeImprovementCheck(): void {
+    proposeImprovement(getFailureLog(), this.opts.backend, this.opts.model)
+      .then(async (proposal) => {
+        if (!proposal || this.loggedImprovementSignatures.has(proposal.signature)) return;
+        this.loggedImprovementSignatures.add(proposal.signature);
+        const path = await appendImprovementLog(this.opts.projectRoot, proposal);
+        this.opts.onStatus?.(
+          `[auto-improve] Noticed a recurring pattern — logged to ${path}. Run /improve to review, /improve-apply to turn it into a rule.`
+        );
+      })
+      .catch(() => {
+        // best-effort background analysis — never let it surface as a hard failure
+      });
   }
 
   /** Analyzes the accumulated failure log and, if a pattern recurs often

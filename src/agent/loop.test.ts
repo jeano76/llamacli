@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
 import { readCheckpoint, writeCheckpoint } from "../compaction/checkpoint.js";
+import { clearFailureLog } from "../hermes/selfHeal.js";
 import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
@@ -337,4 +338,57 @@ test("compaction summary failure doesn't crash the loop — reports a status mes
     assert.ok(statusMessages.some((s) => s.includes("compaction failed")));
     // the checkpoint must still have been written even though the summary failed
     assert.ok(await readCheckpoint(dir));
+  }));
+
+/** Fire-and-forget background work (the real-time improvement check) has
+ *  no promise the test can await directly — poll for its effect instead
+ *  of a blind sleep, so the test is both fast and not flaky under load. */
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitUntil: condition never became true");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+test("a repeated real tool failure triggers a real-time improvement-log entry, not just on /improve", () =>
+  withTempProject(async (dir) => {
+    // getFailureLog() is module-level, shared across every AgentLoop in
+    // the process — without clearing it, an unrelated failure another
+    // test logged earlier could outrank this test's own pattern and this
+    // test would assert on the wrong recurring failure.
+    clearFailureLog();
+    // Two read_file calls on paths that don't exist — a real fs failure,
+    // not a scripted one, so this exercises the actual executeTool() catch
+    // path in runUntilIdle() that calls triggerRealtimeImprovementCheck().
+    const call1 = {
+      id: "c1",
+      type: "function" as const,
+      function: { name: "read_file", arguments: JSON.stringify({ path: join(dir, "missing-a.txt") }) },
+    };
+    const call2 = {
+      id: "c2",
+      type: "function" as const,
+      function: { name: "read_file", arguments: JSON.stringify({ path: join(dir, "missing-b.txt") }) },
+    };
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call1, call2]), assistantMessage("done")],
+      tokenCounts: [1], // never crosses the compaction threshold — isolates this to the improvement check
+    });
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await loop.send("read two files");
+
+    await waitUntil(() => statusMessages.some((s) => s.includes("[auto-improve]")));
+    const logPath = join(dir, ".llamacli", "state", "improvement-log.md");
+    const content = await readFile(logPath, "utf8");
+    assert.match(content, /read_file/);
   }));

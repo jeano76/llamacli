@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { proposeImprovement, writeProposedRule } from "./selfImprove.js";
+import { proposeImprovement, writeProposedRule, appendImprovementLog } from "./selfImprove.js";
 import type { FailureLogEntry } from "./selfHeal.js";
 import type { ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -46,6 +46,17 @@ test("proposeImprovement drafts a rule once a pattern recurs, using the model's 
   assert.equal(result!.ruleMarkdown, ruleText);
   assert.match(result!.summary, /edit_file/);
   assert.match(result!.summary, /3/);
+  assert.match(result!.signature, /edit_file/);
+});
+
+test("proposeImprovement's signature stays stable as the same pattern recurs more times (for dedup)", async () => {
+  const base = [failure("edit_file", "old_text not found in /a.ts"), failure("edit_file", "old_text not found in /b.ts")];
+  const withOneMore = [...base, failure("edit_file", "old_text not found in /c.ts")];
+
+  const first = await proposeImprovement(base, fakeBackend("# rule"), "m");
+  const second = await proposeImprovement(withOneMore, fakeBackend("# rule"), "m");
+  assert.ok(first && second);
+  assert.equal(first!.signature, second!.signature);
 });
 
 test("proposeImprovement normalizes paths/numbers so near-identical errors group together", async () => {
@@ -82,9 +93,53 @@ test("writeProposedRule writes a new timestamped file under .llamacli/rules/ and
       summary: "test",
       ruleMarkdown: "# Rule content\n",
       failureCount: 2,
+      signature: "edit_file:old_text not found",
     });
     assert.match(path, /\.llamacli[/\\]rules[/\\]hermes-proposed-\d+\.md$/);
     assert.equal(await readFile(path, "utf8"), "# Rule content\n\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("appendImprovementLog writes to .llamacli/state/improvement-log.md, not the rules directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+  try {
+    const path = await appendImprovementLog(dir, {
+      summary: "edit_file failed 3 times",
+      ruleMarkdown: "# Read before edit\n\nAlways read first.",
+      failureCount: 3,
+      signature: "edit_file:old_text not found",
+    });
+    assert.match(path, /\.llamacli[/\\]state[/\\]improvement-log\.md$/);
+    const content = await readFile(path, "utf8");
+    assert.match(content, /edit_file failed 3 times/);
+    assert.match(content, /Read before edit/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("appendImprovementLog appends (doesn't overwrite) on repeated calls, preserving prior entries", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+  try {
+    const path = await appendImprovementLog(dir, {
+      summary: "first finding",
+      ruleMarkdown: "# First\n",
+      failureCount: 2,
+      signature: "sig-1",
+    });
+    await appendImprovementLog(dir, {
+      summary: "second finding",
+      ruleMarkdown: "# Second\n",
+      failureCount: 2,
+      signature: "sig-2",
+    });
+    const content = await readFile(path, "utf8");
+    assert.match(content, /first finding/);
+    assert.match(content, /second finding/);
+    // first entry still appears before the second — nothing was clobbered
+    assert.ok(content.indexOf("first finding") < content.indexOf("second finding"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
