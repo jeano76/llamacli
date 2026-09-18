@@ -305,6 +305,40 @@ actually being asked. Also verified correct immediately after a live
 terminal resize (SIGWINCH). Covered by `src/tui/StatusBar.test.ts` and
 `src/tui/textWidth.test.ts`.
 
+### Alternate screen buffer: fixing the *actual* foundational issue
+
+A follow-up report described it precisely: "the prompt starts from the
+bottom-left shell corner, and typed characters land below the input box."
+That pointed at something more fundamental than a cursor-offset bug — Ink
+was never switching to a dedicated screen, so it drew starting from
+whatever row the shell's cursor happened to be on (wherever the terminal's
+scrollback was at launch), not the top of the visible viewport. Without a
+stable origin, *any* absolute-position math is unreliable, and even
+relative math (as the previous fix used) has no fixed ground truth to
+measure from.
+
+Fixed properly this time: `index.tsx` now switches to the terminal's
+**alternate screen buffer** (`\x1b[?1049h`, the same mechanism vim/htop/less
+use) before rendering, and restores the original screen on every exit path
+(`/quit`, Ctrl-C, uncaught errors, normal process exit) via a single
+`process.on("exit", ...)` handler plus signal handlers. This guarantees row
+1 is always a fixed, known origin. Combined with the app's total rendered
+height now being provably constant every frame (the menu/input/status-bar
+overflow bugs are all fixed above), the input row's position is fully
+*computable* from the app's own layout math — no longer something to
+observe-and-guess from wherever Ink's writer ends up. Replaced the
+inverse-video fake cursor with real **absolute** positioning
+(`\x1b[<row>;<col>H`) derived directly from that layout math.
+
+Verified end-to-end via raw output: typing "hi" in a 40-row terminal
+produces exactly `\x1b[36;6H\x1b[?25h` — row 36 matches
+`logHeight(34) + divider(1) + 1` and column 6 matches
+`padding(1) + spinner(1) + space(1) + width("hi")=2 + 1`, computed
+independently and landing exactly on the formula. Re-verified after a live
+resize to 25×90: `\x1b[21;10H` again matches the recomputed formula exactly.
+Also confirmed `/quit` correctly emits `\x1b[?1049l` to restore the
+original shell screen with nothing left behind.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -423,6 +457,33 @@ terminal resize (SIGWINCH). Covered by `src/tui/StatusBar.test.ts` and
 > 물어본 "내가 타이핑한 게 어디로 가는가"에는 항상 정확한 답을 줌. 실제 터미널 리사이즈
 > (SIGWINCH) 직후에도 정확한 것 확인함. `src/tui/StatusBar.test.ts`,
 > `src/tui/textWidth.test.ts`로 커버됨.
+>
+> ### Alternate screen buffer: 진짜 근본적인 문제를 마침내 고침
+>
+> 후속 신고 내용이 정확했다: "프롬프트가 좌측 하단 쉘 구석에서 시작해서, 타이핑한
+> 글자가 입력 상자 아래에 찍힌다." 이건 단순 커서 오프셋 버그보다 더 근본적인 걸
+> 가리켰음 — Ink가 전용 화면으로 전환한 적이 없어서, 터미널 뷰포트의 맨 위가 아니라
+> 셸 커서가 launch 시점에 우연히 있던 그 행에서부터 그리고 있었음. 고정된 원점이
+> 없으면 *어떤* 절대 좌표 계산도 신뢰할 수 없고, 이전 수정이 썼던 상대 좌표 계산조차
+> 측정할 고정 기준점이 없었던 것.
+>
+> 이번엔 제대로 고침: `index.tsx`가 렌더링 전에 터미널의 **alternate screen
+> buffer**(`\x1b[?1049h`, vim/htop/less가 쓰는 것과 같은 메커니즘)로 전환하고,
+> 모든 종료 경로(`/quit`, Ctrl-C, 처리 안 된 에러, 정상 종료)에서 단일
+> `process.on("exit", ...)` 핸들러 + 시그널 핸들러로 원래 화면을 복원함. 이제 1행이
+> 항상 고정되고 알려진 원점이 됨을 보장함. 앱의 전체 렌더링 높이가 매 프레임 확실히
+> 일정하다는 사실(위에서 메뉴/입력줄/상태바 오버플로우 버그를 전부 고쳤으므로)과
+> 결합하면, 입력줄의 위치는 이제 Ink의 writer가 어디서 끝나는지 관찰해서 추측할
+> 대상이 아니라 앱 자체의 레이아웃 계산으로 완전히 *계산 가능*해짐. 반전 비디오
+> 가짜 커서를 그 레이아웃 계산에서 직접 나온 진짜 **절대** 좌표
+> (`\x1b[<row>;<col>H`)로 교체함.
+>
+> raw 출력으로 end-to-end 검증: 40행 터미널에서 "hi"를 입력하면 정확히
+> `\x1b[36;6H\x1b[?25h`가 나옴 — 36행은 `logHeight(34) + 구분선(1) + 1`과,
+> 6번째 컬럼은 `패딩(1) + 스피너(1) + 공백(1) + "hi"폭(2) + 1`과 독립적으로 계산한
+> 공식과 정확히 일치. 25×90으로 실제 리사이즈한 뒤에도 재검증: `\x1b[21;10H`가
+> 다시 재계산된 공식과 정확히 일치함. `/quit`이 `\x1b[?1049l`을 정확히 내보내
+> 원래 셸 화면을 아무것도 남기지 않고 복원하는 것도 확인함.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

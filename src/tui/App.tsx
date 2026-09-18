@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput, useStdout } from "ink";
+import stringWidth from "string-width";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS } from "./SlashMenu.js";
@@ -140,7 +141,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // the real terminal, leaving ghosting when it shrank back down (the same
   // class of bug the slash menu had). Truncate to what actually fits
   // instead of ever letting the input Text wrap.
-  const maxInputWidth = Math.max(10, columns - 5); // paddingX(2) + spinner(1) + leading space(1) + cursor block(1)
+  const maxInputWidth = Math.max(10, columns - 4); // paddingX(2) + spinner(1) + leading space(1)
   const visibleInput = tailToWidth(input, maxInputWidth);
 
   // The slash menu (round border top+bottom + one line per item) adds rows
@@ -152,6 +153,23 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // §6 explicitly requires no ghosting/leftover artifacts on popup close).
   const menuHeight = menuOpen ? SLASH_MENU_ITEMS.length + 2 : 0;
   const logHeight = Math.max(3, rows - 6 - menuHeight);
+
+  // Absolute cursor positioning. Earlier attempts moved the cursor
+  // *relative* to wherever Ink's writer happened to leave it, which turned
+  // out to vary by terminal (verified wrong on a real GNOME Terminal
+  // session despite passing a synthetic pty test) — an unreliable
+  // foundation no matter how carefully the offset was measured. This only
+  // works because index.tsx now switches to the terminal's alternate
+  // screen buffer before rendering, giving row 1 a fixed, known meaning —
+  // combined with the app's total height being provably constant at
+  // `rows` every frame (the menu/input/status-bar overflow bugs are all
+  // fixed), the input row's absolute position is fully determined by our
+  // own layout math, not by guessing what Ink left behind.
+  useEffect(() => {
+    const inputRow = logHeight + 1 /* divider */ + menuHeight + 1; // 1-indexed
+    const promptColumn = 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
+    process.stdout.write(`\x1b[${inputRow};${promptColumn}H\x1b[?25h`);
+  });
 
   // Slicing `log` itself by logHeight is wrong: a single multi-line diff
   // entry expands into several rendered rows, so a naive slice can hand the
@@ -192,18 +210,6 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
       <Box paddingX={1} height={1} overflow="hidden">
         <Spinner active={busy} />
         <Text> {visibleInput}</Text>
-        {/* Fake cursor: moving the REAL terminal cursor to track this row
-         *  turned out to be unreliable across terminal emulators — verified
-         *  wrong on a real GNOME Terminal session even though it worked in
-         *  a synthetic pty test, since it depends on exactly how many
-         *  trailing rows Ink's writer leaves below the last content, which
-         *  isn't consistent. Rendering the cursor as part of Ink's own
-         *  layout is unconditionally correct instead: wherever Ink actually
-         *  draws this character IS the input position, by construction, in
-         *  every terminal. Doesn't fix IME composition-popup anchoring (a
-         *  deeper, terminal/IME-level limitation), but gives the user an
-         *  always-accurate visual answer to "where is my typing going". */}
-        <Text inverse> </Text>
       </Box>
 
       <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} columns={columns} />

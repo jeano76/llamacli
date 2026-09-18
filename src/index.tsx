@@ -23,7 +23,45 @@ You can also remotely control a browser the user already has running with
 browser_screenshot. These attach to an existing tab only — never assume a browser is running,
 and never try to launch one yourself.`;
 
+/**
+ * Switches to the terminal's alternate screen buffer (the same mechanism
+ * vim/htop/less use) so the app always starts drawing at a stable (1,1)
+ * origin, instead of wherever the shell's cursor happened to be when it
+ * launched — a user reported the prompt appearing to "start from the
+ * bottom-left shell corner," which traces back to this: without a
+ * dedicated screen, Ink's layout is anchored to whatever row the terminal
+ * was already scrolled to, not the top of the visible viewport. This also
+ * makes ABSOLUTE cursor positioning (used in App.tsx to place the real
+ * cursor exactly on the input line) reliable, since row 1 is now a fixed,
+ * known reference point rather than an unknown offset into scrollback.
+ * The original screen is restored on exit so nothing is left behind.
+ */
+function enterAltScreen(): void {
+  process.stdout.write("\x1b[?1049h");
+}
+
+function exitAltScreen(): void {
+  process.stdout.write("\x1b[?25h\x1b[?1049l");
+}
+
 async function main() {
+  enterAltScreen();
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    exitAltScreen();
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+
   const projectRoot = process.cwd();
   const { config, setupMessage } = await loadConfig(projectRoot);
   const rules = await loadRules(projectRoot);
@@ -203,6 +241,7 @@ async function main() {
 }
 
 main().catch((err) => {
+  exitAltScreen(); // otherwise this error is drawn into the alt-screen and lost when it's torn down
   console.error(err);
   process.exit(1);
 });
