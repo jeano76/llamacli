@@ -936,3 +936,63 @@ test("saveStateOnQuit() is a no-op when there's nothing but the initial system p
     await assert.doesNotReject(() => loop.saveStateOnQuit());
     assert.equal(await readCheckpoint(dir), null, "expected no checkpoint for an empty conversation");
   }));
+
+// Requested directly: the "[compaction complete] ..." log line got pushed
+// out of view by later scrolling activity before it was ever actually
+// noticed — onCompactionStatus exists so the UI can show a persistent
+// indicator (the status bar) instead of relying on the scrolling log.
+test("onCompactionStatus fires running then complete for a successful compaction, with a real ISO timestamp", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [1000], // over threshold immediately
+    });
+    const events: Array<{ status: string; timestamp: string }> = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onCompactionStatus: (status, timestamp) => events.push({ status, timestamp }),
+    });
+
+    await loop.send("do something");
+
+    assert.equal(events.length, 2);
+    assert.equal(events[0].status, "running");
+    assert.equal(events[1].status, "complete");
+    for (const e of events) assert.match(e.timestamp, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  }));
+
+test("onCompactionStatus fires running then failed when the compaction summary request itself fails", () =>
+  withTempProject(async (dir) => {
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) throw new Error("summary request failed");
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 1000; // over threshold immediately
+      },
+    };
+    const events: Array<{ status: string }> = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onCompactionStatus: (status) => events.push({ status }),
+    });
+
+    await loop.send("do something");
+
+    assert.deepEqual(
+      events.map((e) => e.status),
+      ["running", "failed"]
+    );
+  }));

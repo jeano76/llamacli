@@ -11,6 +11,11 @@ export interface StatusBarProps {
    *  still visible long after `update_plan` was last called. `null` means
    *  no active plan (nothing declared yet, or the last one finished). */
   planProgress: { done: number; total: number } | null;
+  /** Requested directly: the "[compaction complete] ..." log line got
+   *  pushed out of view by later scrolling activity (a long tool-call
+   *  batch, a slow prompt-processing wait) before it was ever actually
+   *  noticed. `null` means no compaction has happened yet this session. */
+  compactionStatus: { state: "running" | "complete" | "failed"; timestamp: string } | null;
   /** Terminal width, used to keep this bar to exactly one row — an
    *  unconstrained cwd/model string wraps onto a second row otherwise,
    *  which is the same overflow-then-ghosting bug the input line and slash
@@ -43,6 +48,29 @@ export function hasRoomForPlanSlot(columns: number): boolean {
   return columns >= MIN_COLUMNS_FOR_PLAN_SLOT;
 }
 
+// "✓ HH:MM:SS" / "✗ HH:MM:SS" / "compacting" are all exactly 10 chars.
+const COMPACTION_STATUS_WIDTH = 10;
+// Same reasoning as MIN_COLUMNS_FOR_PLAN_SLOT, but this slot's own width
+// added on top of it — narrow terminals drop this one first (it's the
+// less critical of the two: plan progress reflects a real to-do list,
+// this is a point-in-time event notice).
+const MIN_COLUMNS_FOR_COMPACTION_SLOT = 80;
+
+export function hasRoomForCompactionSlot(columns: number): boolean {
+  return columns >= MIN_COLUMNS_FOR_COMPACTION_SLOT;
+}
+
+/** Formats the compaction indicator text, always exactly
+ *  `COMPACTION_STATUS_WIDTH` characters (or "" for no compaction yet) so
+ *  it never shifts anything next to it regardless of which state it's in. */
+export function formatCompactionStatus(status: { state: "running" | "complete" | "failed"; timestamp: string } | null): string {
+  if (!status) return "";
+  if (status.state === "running") return "compacting";
+  const hhmmss = status.timestamp.slice(11, 19); // ISO 8601 "...THH:MM:SS.sssZ"
+  const glyph = status.state === "complete" ? "✓" : "✗";
+  return `${glyph} ${hhmmss}`;
+}
+
 /** Renders a small bar-animation battery gauge for context usage (PROMPT.md §6). */
 function renderGauge(ratio: number): string {
   const filled = Math.round(Math.max(0, Math.min(1, ratio)) * GAUGE_WIDTH);
@@ -61,7 +89,8 @@ function gaugeColor(ratio: number): string {
  *  path/model id gets. */
 export function statusBarFieldWidth(columns: number): number {
   const planSlotWidth = hasRoomForPlanSlot(columns) ? 1 /* space before it */ + PLAN_PROGRESS_WIDTH : 0;
-  const fixedWidth = 2 /* paddingX */ + GAUGE_WIDTH + 5 /* " 100%" */ + planSlotWidth + 4 /* inter-field gaps */;
+  const compactionSlotWidth = hasRoomForCompactionSlot(columns) ? 1 /* space before it */ + COMPACTION_STATUS_WIDTH : 0;
+  const fixedWidth = 2 /* paddingX */ + GAUGE_WIDTH + 5 /* " 100%" */ + planSlotWidth + compactionSlotWidth + 4 /* inter-field gaps */;
   return Math.max(8, Math.floor((columns - fixedWidth) / 2));
 }
 
@@ -76,9 +105,11 @@ export function formatPlanProgress(planProgress: { done: number; total: number }
   return text.length <= PLAN_PROGRESS_WIDTH ? text : "";
 }
 
-export function StatusBar({ cwd, model, contextUsedRatio, planProgress, columns }: StatusBarProps) {
+export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns }: StatusBarProps) {
   const fieldWidth = statusBarFieldWidth(columns);
   const planText = formatPlanProgress(planProgress);
+  const compactionText = formatCompactionStatus(compactionStatus);
+  const compactionColor = compactionStatus?.state === "failed" ? "red" : compactionStatus?.state === "running" ? "yellow" : "green";
 
   return (
     <Box justifyContent="space-between" paddingX={1} height={1} overflow="hidden">
@@ -94,6 +125,16 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, columns 
         {hasRoomForPlanSlot(columns) && (
           <>
             <Text dimColor>{planText.padStart(PLAN_PROGRESS_WIDTH)}</Text>
+            <Text> </Text>
+          </>
+        )}
+        {/* Same fixed-width-slot approach as plan progress, one level
+         *  narrower before it's dropped — see hasRoomForCompactionSlot. */}
+        {hasRoomForCompactionSlot(columns) && (
+          <>
+            <Text color={compactionText ? compactionColor : undefined} dimColor={!compactionText}>
+              {compactionText.padStart(COMPACTION_STATUS_WIDTH)}
+            </Text>
             <Text> </Text>
           </>
         )}

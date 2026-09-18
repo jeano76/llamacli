@@ -6,6 +6,28 @@ import type {
   ModelBackend,
 } from "./types.js";
 
+// Found auditing for the same class of bug already fixed three times
+// (run_shell's missing timeout, browser.ts's missing CDP timeout, the
+// streaming max_tokens gap): every fetch() call in this file had no
+// timeout at all. `tokenize()` in particular is called on EVERY turn
+// (compactor.ts's estimateTokens(), via maybeCompact() before every
+// single request) — a hang there freezes the entire agent loop
+// permanently, with no recovery short of killing the process. Lightweight
+// metadata endpoints (models/tokenize/props) don't need the shared
+// inference slot on a real llama.cpp server, so they should always be
+// fast; a generous bound still catches a genuinely stuck connection
+// instead of waiting forever. Exported so tests can shrink them.
+export let LIGHTWEIGHT_FETCH_TIMEOUT_MS = 30_000;
+// Chat requests DO compete for the single inference slot and can
+// legitimately queue behind other work for a while — a much longer bound,
+// but still a bound, since "still queued" and "the connection itself is
+// dead" must eventually be distinguishable from the caller's side.
+export let CHAT_FETCH_TIMEOUT_MS = 120_000;
+export function setFetchTimeoutsForTests(lightweightMs: number, chatMs: number): void {
+  LIGHTWEIGHT_FETCH_TIMEOUT_MS = lightweightMs;
+  CHAT_FETCH_TIMEOUT_MS = chatMs;
+}
+
 /**
  * Any OpenAI-compatible /v1 endpoint: a locally spawned llama.cpp `llama-server`,
  * a remote llama-server, vLLM, LM Studio, or a real OpenAI-compatible account.
@@ -24,8 +46,23 @@ export class OpenAICompatibleClient implements ModelBackend {
     return h;
   }
 
+  /** Wraps fetch() with a real timeout — plain fetch() waits forever by
+   *  default, which is exactly the gap described above. */
+  private async fetchWithTimeout(url: string, options: Record<string, unknown>, timeoutMs: number, label: string) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal as any });
+    } catch (err: any) {
+      if (err?.name === "AbortError") throw new Error(`${label} timed out after ${timeoutMs}ms`);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async listModels(): Promise<string[]> {
-    const res = await fetch(`${this.baseUrl}/v1/models`, { headers: this.headers() });
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/v1/models`, { headers: this.headers() }, LIGHTWEIGHT_FETCH_TIMEOUT_MS, "listModels");
     if (!res.ok) throw new Error(`listModels failed: ${res.status} ${await res.text()}`);
     const json = (await res.json()) as { data: Array<{ id: string }> };
     return json.data.map((m) => m.id);
@@ -34,11 +71,12 @@ export class OpenAICompatibleClient implements ModelBackend {
   /** llama.cpp-server-specific endpoint (not all OpenAI-compatible servers
    *  have it) — callers must be ready for this to throw and fall back. */
   async tokenize(text: string): Promise<number> {
-    const res = await fetch(`${this.baseUrl}/tokenize`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ content: text }),
-    });
+    const res = await this.fetchWithTimeout(
+      `${this.baseUrl}/tokenize`,
+      { method: "POST", headers: this.headers(), body: JSON.stringify({ content: text }) },
+      LIGHTWEIGHT_FETCH_TIMEOUT_MS,
+      "tokenize"
+    );
     if (!res.ok) throw new Error(`tokenize failed: ${res.status} ${await res.text()}`);
     const json = (await res.json()) as { tokens: unknown[] };
     return json.tokens.length;
@@ -47,7 +85,7 @@ export class OpenAICompatibleClient implements ModelBackend {
   /** llama.cpp-server-specific endpoint — callers must be ready for this to
    *  throw and fall back to the configured value. */
   async getContextSize(): Promise<number> {
-    const res = await fetch(`${this.baseUrl}/props`, { headers: this.headers() });
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/props`, { headers: this.headers() }, LIGHTWEIGHT_FETCH_TIMEOUT_MS, "getContextSize");
     if (!res.ok) throw new Error(`getContextSize failed: ${res.status} ${await res.text()}`);
     const json = (await res.json()) as { default_generation_settings?: { n_ctx?: number }; n_ctx?: number };
     const n_ctx = json.default_generation_settings?.n_ctx ?? json.n_ctx;
@@ -60,11 +98,12 @@ export class OpenAICompatibleClient implements ModelBackend {
     onDelta?: (chunk: ChatCompletionChunk) => void
   ): Promise<ChatCompletionResponse> {
     if (!req.stream || !onDelta) {
-      const res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify({ ...req, stream: false }),
-      });
+      const res = await this.fetchWithTimeout(
+        `${this.baseUrl}/v1/chat/completions`,
+        { method: "POST", headers: this.headers(), body: JSON.stringify({ ...req, stream: false }) },
+        CHAT_FETCH_TIMEOUT_MS,
+        "chat"
+      );
       if (!res.ok) throw new Error(`chat failed: ${res.status} ${await res.text()}`);
       return (await res.json()) as ChatCompletionResponse;
     }
@@ -93,12 +132,28 @@ export class OpenAICompatibleClient implements ModelBackend {
     onDelta: (chunk: ChatCompletionChunk) => void
   ): Promise<ChatCompletionResponse> {
     const controller = new AbortController();
-    const res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ ...req, stream: true }),
-      signal: controller.signal as any, // node-fetch's AbortSignal type predates the global one
-    });
+    // Guards only the CONNECTION phase (no response at all yet) — once
+    // streaming genuinely starts, a real generation can legitimately run
+    // long, and that's what the max_tokens-triggered abort further below
+    // (reusing this same controller) is already responsible for bounding.
+    // Requests do compete for the single inference slot and can queue for
+    // a while under load, hence the longer CHAT_FETCH_TIMEOUT_MS bound
+    // rather than the lightweight one.
+    const connectTimer = setTimeout(() => controller.abort(), CHAT_FETCH_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({ ...req, stream: true }),
+        signal: controller.signal as any, // node-fetch's AbortSignal type predates the global one
+      });
+    } catch (err: any) {
+      if (err?.name === "AbortError") throw new Error(`chat stream connection timed out after ${CHAT_FETCH_TIMEOUT_MS}ms`);
+      throw err;
+    } finally {
+      clearTimeout(connectTimer);
+    }
     if (!res.ok || !res.body) {
       throw new Error(`chat stream failed: ${res.status} ${await res.text()}`);
     }
@@ -114,9 +169,26 @@ export class OpenAICompatibleClient implements ModelBackend {
     // which is what relying solely on the server did.
     let deltaCount = 0;
     let clientCapped = false;
+    // Separate from the connection-phase timer above: once streaming
+    // genuinely starts, this guards against the body just going silent —
+    // no more chunks, no error, no [DONE], never reaching max_tokens
+    // either — which would otherwise leave the `for await` loop waiting
+    // forever. Re-armed on every chunk received, so a normal (even slow)
+    // generation that's still actively producing output is never cut off.
+    let idleTimedOut = false;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const armIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true;
+        controller.abort();
+      }, CHAT_FETCH_TIMEOUT_MS);
+    };
+    armIdleTimer();
 
     try {
       for await (const chunk of res.body as unknown as AsyncIterable<Buffer>) {
+        armIdleTimer();
         buffer += chunk.toString("utf8");
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
@@ -173,11 +245,16 @@ export class OpenAICompatibleClient implements ModelBackend {
         }
       }
     } catch (err: any) {
-      // AbortError from our own controller.abort() just above is the
-      // expected way this loop ends when the cap is hit mid-chunk — not a
-      // real failure. Anything else (a genuine network error) still
-      // propagates normally.
+      // AbortError from our own controller.abort() is expected in two
+      // cases: the max_tokens cap was hit mid-chunk (clientCapped), or the
+      // stream went idle too long (idleTimedOut) — neither is a real
+      // failure in the network sense. Anything else still propagates.
+      if (err?.name === "AbortError" && idleTimedOut) {
+        throw new Error(`chat stream went idle (no new data) for over ${CHAT_FETCH_TIMEOUT_MS}ms`);
+      }
       if (!(clientCapped && err?.name === "AbortError")) throw err;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
     }
 
     const tool_calls = Object.values(toolCalls).map((tc) => ({

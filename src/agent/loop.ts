@@ -75,6 +75,14 @@ export interface AgentLoopOptions {
    *  ("step 3 of 7") is visible somewhere persistent (the status bar)
    *  instead of only scrolling by once in the log. */
   onPlanProgress?: (done: number, total: number) => void;
+  /** Fires when compaction starts/completes/fails — requested directly:
+   *  the "[compaction complete] ..." line lived only in the scrolling log,
+   *  and got pushed out of view by later activity (a long tool-call batch,
+   *  a big prompt-processing wait) before it was ever actually noticed.
+   *  Meant for a persistent indicator (the status bar) that survives
+   *  exactly that kind of scroll, the same reasoning behind
+   *  `onPlanProgress`. */
+  onCompactionStatus?: (status: "running" | "complete" | "failed", timestamp: string) => void;
 }
 
 /**
@@ -534,6 +542,7 @@ export class AgentLoop {
     reason: Checkpoint["reason"],
     pendingToolCall: Checkpoint["pendingToolCall"]
   ): Promise<void> {
+    this.opts.onCompactionStatus?.("running", new Date().toISOString());
     const partial: Omit<Checkpoint, "version" | "timestamp"> = {
       reason,
       goal: this.currentGoalSummary(),
@@ -553,6 +562,7 @@ export class AgentLoop {
       );
       this.messages = messages;
       this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
+      this.opts.onCompactionStatus?.("complete", checkpoint.timestamp);
     } catch (err: any) {
       // The checkpoint file itself is already written by this point
       // (runCompaction writes it before making the summary request), so
@@ -561,6 +571,7 @@ export class AgentLoop {
       this.opts.onStatus?.(
         `[compaction failed] ${err.message} — checkpoint was saved, but the conversation wasn't summarized; continuing with the current context.`
       );
+      this.opts.onCompactionStatus?.("failed", new Date().toISOString());
       logFailure({
         timestamp: new Date().toISOString(),
         summary: "compaction summary request failed",

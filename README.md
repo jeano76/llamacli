@@ -1204,6 +1204,87 @@ actual compaction call (and nothing more — the compaction summary
 request itself is confirmed not to trigger a second full agent turn);
 an empty conversation (just the system prompt) is a genuine no-op.
 
+### Every backend call except the two already fixed could still hang forever
+
+Continued the log-watching audit — the same class of bug already fixed
+three times (`run_shell`'s missing timeout, `browser.ts`'s missing CDP
+timeout, the streaming `max_tokens` gap) turned out to apply to
+`openaiClient.ts` itself: every one of its `fetch()` calls had no timeout
+at all. `tokenize()` is the most consequential — it's called on *every
+single turn* (`compactor.ts`'s `estimateTokens()`, via `maybeCompact()`
+before every request), so a hang there freezes the entire agent loop
+permanently, with no recovery short of killing the process. `listModels()`,
+`getContextSize()`, and the non-streaming `chat()` path (used for the
+compaction summary request) had the identical gap.
+
+Fixed with a shared `fetchWithTimeout()` helper: lightweight metadata
+endpoints (`/v1/models`, `/tokenize`, `/props`) get a 30s bound —
+generous, since a real llama.cpp server serves these without touching the
+shared inference slot, so they should always be fast — and chat requests
+get 120s, since those genuinely do compete for the single slot and can
+legitimately queue behind other work for a while. Both exported
+(`LIGHTWEIGHT_FETCH_TIMEOUT_MS`/`CHAT_FETCH_TIMEOUT_MS`) so tests can
+shrink them.
+
+The streaming path (`streamChat()`) needed two *separate* timeouts, not
+one: a connection-phase timeout (no response at all yet — reuses the same
+120s chat bound), and a distinct **idle watchdog** re-armed on every
+chunk received, guarding against the case where the connection opens and
+streams some data, then just goes silent forever — no error, no `[DONE]`,
+never reaching `max_tokens` either. Without that second timeout, a stalled
+(but not closed) connection would still leave the `for await` loop waiting
+on it forever even with the connection-phase timeout already fixed. Both
+reuse the same `AbortController` the `max_tokens` cap already uses, with
+separate flags (`clientCapped` vs. a new `idleTimedOut`) so each abort
+reason gets its own readable error message instead of one generic
+"aborted."
+
+Covered by 6 new unit tests against a real HTTP/SSE server, not a mock: a
+server that accepts the connection but never responds at all (confirms
+`tokenize()`/`getContextSize()`/`listModels()`/non-streaming `chat()`/the
+streaming connection phase all time out near their configured bound, not
+hang), and a separate server that sends exactly one SSE chunk and then
+goes silent forever (confirms the idle watchdog specifically, distinct
+from the connection-phase one). Verified directly against the real
+backend afterward that normal operation is unaffected: `tokenize()`,
+`getContextSize()`, and a real streaming chat all still complete
+correctly.
+
+### The compaction notice got scrolled out of view before it was ever noticed
+
+Reported directly: a real session showed "`[compaction complete]`"
+followed by activity that kept the agent busy for a while (a long
+tool-call batch, a slow prompt-processing wait) — by the time anything
+was visible again, that line had scrolled well up out of easy view, and
+it looked like the app might have just stopped. The line itself was
+always correct and present in the log; it just isn't the kind of thing a
+one-off scrolling entry is good at communicating, the same underlying
+reasoning that motivated the plan-progress status bar indicator earlier.
+
+Added a new `onCompactionStatus` callback (`"running" | "complete" |
+"failed"`, with a real ISO timestamp), fired from `compact()` in
+`loop.ts` at the same two points the existing `onStatus` log line already
+fires from, wired through to a persistent status-bar slot
+(`StatusBar.tsx`) next to the plan-progress one: `compacting` while it's
+running, `✓ HH:MM:SS` on success (green), `✗ HH:MM:SS` on failure (red).
+Same fixed-width-slot, narrow-terminal-hides-first approach as plan
+progress, one level narrower before it's dropped (compaction status is a
+point-in-time notice, plan progress reflects an actual to-do list — the
+less critical of the two goes first on a cramped terminal).
+
+Verified end-to-end against the real backend: triggered `/compact`,
+confirmed the status bar showed `compacting` while it ran and `✓
+HH:MM:SS` once it finished; then sent several more real messages so the
+"[compaction complete]" log line scrolled well up out of the visible log
+area — confirmed the status bar indicator was still showing the exact
+same timestamp, unaffected by any of that scrolling. Covered by new unit
+tests: `onCompactionStatus` fires `running` then `complete` for a real
+successful compaction (with a genuine ISO-formatted timestamp) and
+`running` then `failed` when the summary request itself fails; the
+status bar's formatting/width-budget/narrow-terminal-hiding logic for the
+new slot, matching the same invariants already established for plan
+progress.
+
 > ## 구현 상태
 >
 > 이전까지 남아있던 TODO 4개는 모두 해결됨:
@@ -2092,6 +2173,78 @@ an empty conversation (just the system prompt) is a genuine no-op.
 > 아님 — 컴팩션 요약 요청 자체가 별도의 전체 에이전트 턴을 일으키지
 > 않는다는 것까지 확인), 빈 대화(시스템 프롬프트만 있음)는 진짜로 아무
 > 동작도 안 하는지.
+>
+> ### 이미 두 번 고친 것과 같은 종류 — 두 개 더 있었음(타임아웃 전부 누락)
+>
+> 로그 감시 감사를 계속하다가, 이미 세 번 고친 것과 같은 종류의 버그
+> (`run_shell`의 누락된 타임아웃, `browser.ts`의 누락된 CDP 타임아웃,
+> 스트리밍 `max_tokens` 갭)가 `openaiClient.ts` 자체에도 있는 걸로 드러남:
+> 그 안의 `fetch()` 호출 전부에 타임아웃이 전혀 없었음. `tokenize()`가
+> 가장 영향이 큼 — *매 턴마다* 호출됨(`compactor.ts`의 `estimateTokens()`,
+> 매 요청 전 `maybeCompact()`를 통해) — 여기서 멈추면 프로세스를 죽이는
+> 것 말고는 복구 방법 없이 에이전트 루프 전체가 영구적으로 멈춤.
+> `listModels()`, `getContextSize()`, non-streaming `chat()` 경로(컴팩션
+> 요약 요청에 쓰임)도 똑같은 공백이 있었음.
+>
+> 공유 `fetchWithTimeout()` 헬퍼로 수정: 가벼운 메타데이터 엔드포인트
+> (`/v1/models`, `/tokenize`, `/props`)는 30초 상한 — 실제 llama.cpp
+> 서버에서 이것들은 공유 추론 슬롯을 안 쓰니 항상 빨라야 함, 넉넉하게
+> 잡음 — 채팅 요청은 120초, 이건 실제로 단일 슬롯을 두고 경쟁하고
+> 다른 작업 뒤에 한동안 정당하게 대기열에 밀릴 수 있기 때문. 둘 다
+> export함(`LIGHTWEIGHT_FETCH_TIMEOUT_MS`/`CHAT_FETCH_TIMEOUT_MS`)라
+> 테스트에서 줄일 수 있음.
+>
+> 스트리밍 경로(`streamChat()`)는 하나가 아니라 *두 개*의 별도 타임아웃이
+> 필요했음: 연결 단계 타임아웃(아직 응답이 전혀 없음 — 같은 120초 채팅
+> 상한 재사용), 그리고 매 청크마다 다시 재장전되는 별도의 **유휴
+> 워치독** — 연결이 열리고 데이터를 좀 스트리밍하다가 그냥 영원히
+> 조용해지는 경우를 지킴(에러도, `[DONE]`도, `max_tokens` 도달도 없이).
+> 이 두 번째 타임아웃이 없었다면, 연결 단계 타임아웃을 고쳐도 멈춘(닫히진
+> 않은) 연결이 `for await` 루프를 여전히 영원히 기다리게 만들었을 것.
+> 둘 다 `max_tokens` 상한이 이미 쓰는 같은 `AbortController`를 재사용하되,
+> 별도 플래그(`clientCapped` vs 새로 만든 `idleTimedOut`)로 각 중단 사유가
+> 하나의 뭉뚱그린 "aborted" 대신 자기만의 읽을 수 있는 에러 메시지를
+> 갖게 함.
+>
+> 목(mock)이 아니라 진짜 HTTP/SSE 서버를 상대로 한 새 유닛 테스트 6개로
+> 커버함: 연결은 받아들이지만 아예 응답을 안 하는 서버(`tokenize()`/
+> `getContextSize()`/`listModels()`/non-streaming `chat()`/스트리밍 연결
+> 단계 전부가 멈추는 대신 설정된 상한 근처에서 타임아웃되는지 확인),
+> 그리고 SSE 청크 딱 하나만 보내고 영원히 조용해지는 별도 서버(연결
+> 단계와 구분되는 유휴 워치독 자체를 확인). 이후 실제 백엔드로 직접
+> 검증해서 평상시 동작에 영향 없는지 확인함: `tokenize()`, `getContextSize()`,
+> 실제 스트리밍 채팅 전부 여전히 정상적으로 완료됨.
+>
+> ### 컴팩션 알림이 다시 보기 전에 스크롤로 밀려서 안 보였음
+>
+> 직접 신고받음: 실제 세션에서 "`[compaction complete]`"가 나온 뒤 에이전트가
+> 한동안 바쁜 활동(긴 도구 호출 배치, 느린 프롬프트 처리 대기)을 계속해서 —
+> 다시 뭔가 보일 때쯤엔 그 줄이 이미 한참 위로 밀려나 있었고, 앱이 그냥
+> 멈춘 것처럼 보였음. 그 줄 자체는 항상 맞았고 로그에 남아있었음 — 단지
+> 한 번 스크롤되고 마는 로그 항목이 전달하기에 적합한 종류의 정보가
+> 아니었을 뿐, 앞서 plan-progress 상태 표시줄 인디케이터를 만들게 한
+> 것과 같은 근본 이유임.
+>
+> 새 `onCompactionStatus` 콜백을 추가함(`"running" | "complete" | "failed"`,
+> 진짜 ISO 타임스탬프 포함), `loop.ts`의 `compact()`에서 기존 `onStatus`
+> 로그 줄이 나가는 바로 그 두 지점에서 함께 발생시킴, plan-progress
+> 슬롯 옆의 새 상태 표시줄 슬롯(`StatusBar.tsx`)에 연결함: 실행 중엔
+> `compacting`, 성공하면 `✓ HH:MM:SS`(초록), 실패하면 `✗ HH:MM:SS`(빨강).
+> plan progress와 같은 고정폭 슬롯·좁은 터미널에서 먼저 숨김 방식을
+> 쓰되, 한 단계 더 좁을 때 먼저 숨겨짐(컴팩션 상태는 한 시점의 알림이고,
+> plan progress는 실제 할 일 목록을 반영함 — 좁은 터미널에선 덜 중요한
+> 쪽이 먼저 빠짐).
+>
+> 실제 백엔드로 엔드투엔드 검증함: `/compact`를 발동시켜서 실행 중엔
+> 상태 표시줄에 `compacting`이, 끝나면 `✓ HH:MM:SS`가 뜨는지 확인; 그
+> 다음 실제 메시지를 여러 개 더 보내서 "[compaction complete]" 로그 줄이
+> 화면 밖으로 한참 밀려나게 만듦 — 상태 표시줄 인디케이터는 그 스크롤과
+> 무관하게 정확히 같은 타임스탬프를 계속 보여주고 있는 것 확인함. 새
+> 유닛 테스트로 커버함: `onCompactionStatus`가 실제 성공적인 컴팩션에서
+> `running` 다음 `complete`(진짜 ISO 포맷 타임스탬프와 함께)를, 요약
+> 요청 자체가 실패할 때 `running` 다음 `failed`를 발생시키는지; 새
+> 슬롯의 포맷팅/너비 예산/좁은 터미널 숨김 로직이 plan progress에서
+> 이미 확립된 것과 같은 불변식을 따르는지.
 
 ## Skill / Rule — reusing existing AI CLI conventions
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { OpenAICompatibleClient } from "./openaiClient.js";
+import { OpenAICompatibleClient, setFetchTimeoutsForTests } from "./openaiClient.js";
 
 async function withFakeServer(
   handler: (path: string) => { status: number; body: unknown },
@@ -197,5 +197,133 @@ test("chat() does not cap the stream at all when max_tokens isn't set (no regres
       );
       assert.equal(deltas.length, 10, "expected the full (bounded, in this test) stream to be consumed");
       assert.equal(res.choices[0].message.content, "x".repeat(10));
+    }
+  ));
+
+/** A server that accepts the connection but never sends any response at
+ *  all — simulating a genuinely dead/stuck backend, not just a slow one. */
+async function withDeadServer(fn: (baseUrl: string) => Promise<void>): Promise<void> {
+  const server: Server = createServer(() => {
+    // never call res.write()/res.end() — the connection just hangs
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (typeof address !== "object" || address === null) throw new Error("no server address");
+  try {
+    await fn(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+// Found auditing for the same class of bug already fixed three times
+// (run_shell, browser.ts's CDP commands, the streaming max_tokens gap):
+// every fetch() call here had no timeout at all. tokenize() in particular
+// is called on every single turn (compactor.ts's estimateTokens(), via
+// maybeCompact() before every request) — a hang there freezes the entire
+// agent loop permanently.
+test("tokenize() times out instead of hanging forever against a dead server", () =>
+  withDeadServer(async (baseUrl) => {
+    setFetchTimeoutsForTests(200, 200);
+    try {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const start = Date.now();
+      await assert.rejects(() => client.tokenize("hello"), /timed out/);
+      assert.ok(Date.now() - start < 3000, "expected the timeout to fire near 200ms");
+    } finally {
+      setFetchTimeoutsForTests(30_000, 120_000);
+    }
+  }));
+
+test("getContextSize() times out instead of hanging forever against a dead server", () =>
+  withDeadServer(async (baseUrl) => {
+    setFetchTimeoutsForTests(200, 200);
+    try {
+      const client = new OpenAICompatibleClient(baseUrl);
+      await assert.rejects(() => client.getContextSize(), /timed out/);
+    } finally {
+      setFetchTimeoutsForTests(30_000, 120_000);
+    }
+  }));
+
+test("listModels() times out instead of hanging forever against a dead server", () =>
+  withDeadServer(async (baseUrl) => {
+    setFetchTimeoutsForTests(200, 200);
+    try {
+      const client = new OpenAICompatibleClient(baseUrl);
+      await assert.rejects(() => client.listModels(), /timed out/);
+    } finally {
+      setFetchTimeoutsForTests(30_000, 120_000);
+    }
+  }));
+
+test("a non-streaming chat() call times out instead of hanging forever against a dead server", () =>
+  withDeadServer(async (baseUrl) => {
+    setFetchTimeoutsForTests(200, 200);
+    try {
+      const client = new OpenAICompatibleClient(baseUrl);
+      await assert.rejects(
+        () => client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: false }),
+        /timed out/
+      );
+    } finally {
+      setFetchTimeoutsForTests(30_000, 120_000);
+    }
+  }));
+
+test("a streaming chat() call times out on connection instead of hanging forever against a dead server", () =>
+  withDeadServer(async (baseUrl) => {
+    setFetchTimeoutsForTests(200, 200);
+    try {
+      const client = new OpenAICompatibleClient(baseUrl);
+      await assert.rejects(
+        () => client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true }, () => {}),
+        /timed out/
+      );
+    } finally {
+      setFetchTimeoutsForTests(30_000, 120_000);
+    }
+  }));
+
+/** Sends exactly one SSE chunk, then leaves the connection open forever —
+ *  no more data, no error, no [DONE] — simulating a stream that genuinely
+ *  goes silent mid-response rather than one that (even slowly) eventually
+ *  finishes on its own. */
+async function withStalledSSEServer(fn: (baseUrl: string) => Promise<void>): Promise<void> {
+  const server: Server = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n`);
+    // deliberately never write again or call res.end()
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (typeof address !== "object" || address === null) throw new Error("no server address");
+  try {
+    await fn(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+// Distinct from the connection-timeout case above: the connection opens
+// and streams SOME data, then just goes silent forever — no error, no
+// [DONE], never reaching max_tokens either. Without a re-armed idle
+// watchdog, the `for await` loop in streamChat() would wait on that
+// forever.
+test("a streaming chat() call times out when the body goes idle mid-stream, not just on connect", () =>
+  withStalledSSEServer(
+    async (baseUrl) => {
+      setFetchTimeoutsForTests(30_000, 200); // generous connect bound, tight idle bound
+      try {
+        const client = new OpenAICompatibleClient(baseUrl);
+        const start = Date.now();
+        await assert.rejects(
+          () => client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true }, () => {}),
+          /idle/
+        );
+        assert.ok(Date.now() - start < 3000, "expected the idle timeout to fire near 200ms after the last chunk");
+      } finally {
+        setFetchTimeoutsForTests(30_000, 120_000);
+      }
     }
   ));

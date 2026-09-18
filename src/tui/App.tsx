@@ -41,6 +41,13 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   const [busy, setBusy] = useState(false);
   const [contextUsedRatio, setContextUsedRatio] = useState(0);
   const [planProgress, setPlanProgress] = useState<{ done: number; total: number } | null>(null);
+  // Requested directly: the "[compaction complete] ..." log line got
+  // pushed out of view by later scrolling activity before it was ever
+  // actually noticed. A persistent status-bar indicator instead — same
+  // reasoning as planProgress above.
+  const [compactionStatus, setCompactionStatus] = useState<{ state: "running" | "complete" | "failed"; timestamp: string } | null>(
+    null
+  );
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuIndex, setMenuIndex] = useState(0);
   // Rows scrolled up from the live bottom (0 = following the newest output,
@@ -220,6 +227,7 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     isBusy: () => busy,
     setContextUsedRatio,
     setPlanProgress: (done: number, total: number) => setPlanProgress(total > 0 ? { done, total } : null),
+    setCompactionStatus: (state: "running" | "complete" | "failed", timestamp: string) => setCompactionStatus({ state, timestamp }),
   };
 
   const rows = stdout?.rows ?? 24;
@@ -392,7 +400,14 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         <Text> {visibleInput}</Text>
       </Box>
 
-      <StatusBar cwd={cwd} model={model} contextUsedRatio={contextUsedRatio} planProgress={planProgress} columns={columns} />
+      <StatusBar
+        cwd={cwd}
+        model={model}
+        contextUsedRatio={contextUsedRatio}
+        planProgress={planProgress}
+        compactionStatus={compactionStatus}
+        columns={columns}
+      />
     </Box>
   );
 }

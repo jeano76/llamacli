@@ -1,15 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { statusBarFieldWidth, formatPlanProgress, hasRoomForPlanSlot } from "./StatusBar.js";
+import {
+  statusBarFieldWidth,
+  formatPlanProgress,
+  hasRoomForPlanSlot,
+  formatCompactionStatus,
+  hasRoomForCompactionSlot,
+} from "./StatusBar.js";
 import { tailToWidth } from "./textWidth.js";
 
-test("statusBarFieldWidth never lets cwd+model+gauge(+plan-progress, when shown) exceed the terminal width", () => {
+test("statusBarFieldWidth never lets cwd+model+gauge(+plan-progress+compaction-status, when shown) exceed the terminal width", () => {
   for (const columns of [40, 60, 80, 100, 120, 200]) {
     const fieldWidth = statusBarFieldWidth(columns);
     const planSlot = hasRoomForPlanSlot(columns) ? 7 + 1 : 0; // slot + its leading space
+    const compactionSlot = hasRoomForCompactionSlot(columns) ? 10 + 1 : 0; // slot + its leading space
     // Simulate the worst case: both fields maxed out at fieldWidth.
-    const totalUsed = 2 /* paddingX */ + fieldWidth + fieldWidth + planSlot + 12 /* gauge */ + 5 /* " 100%" */ + 4 /* gaps */;
+    const totalUsed =
+      2 /* paddingX */ + fieldWidth + fieldWidth + planSlot + compactionSlot + 12 /* gauge */ + 5 /* " 100%" */ + 4 /* gaps */;
     assert.ok(totalUsed <= columns + 4, `columns=${columns}, fieldWidth=${fieldWidth}, totalUsed=${totalUsed}`);
   }
 });
@@ -21,6 +29,32 @@ test("statusBarFieldWidth never lets cwd+model+gauge(+plan-progress, when shown)
 test("the plan-progress slot is hidden below MIN_COLUMNS_FOR_PLAN_SLOT rather than forcing cwd/model to squeeze for it", () => {
   assert.equal(hasRoomForPlanSlot(40), false);
   assert.equal(hasRoomForPlanSlot(200), true);
+});
+
+test("the compaction-status slot is hidden below MIN_COLUMNS_FOR_COMPACTION_SLOT rather than forcing cwd/model to squeeze for it", () => {
+  assert.equal(hasRoomForCompactionSlot(40), false);
+  assert.equal(hasRoomForCompactionSlot(60), false); // room for plan progress, but not both slots at once
+  assert.equal(hasRoomForCompactionSlot(200), true);
+});
+
+// Requested directly: the "[compaction complete] ..." log line got pushed
+// out of view by later scrolling activity before it was ever actually
+// noticed — a persistent status-bar indicator instead, same reasoning as
+// plan progress.
+test("formatCompactionStatus returns \"\" when no compaction has happened yet", () => {
+  assert.equal(formatCompactionStatus(null), "");
+});
+
+test("formatCompactionStatus shows a fixed 'compacting' label while running", () => {
+  assert.equal(formatCompactionStatus({ state: "running", timestamp: "2026-09-18T18:01:31.059Z" }), "compacting");
+});
+
+test("formatCompactionStatus shows a checkmark and the real time-of-day on success", () => {
+  assert.equal(formatCompactionStatus({ state: "complete", timestamp: "2026-09-18T18:01:31.059Z" }), "✓ 18:01:31");
+});
+
+test("formatCompactionStatus shows a cross and the real time-of-day on failure", () => {
+  assert.equal(formatCompactionStatus({ state: "failed", timestamp: "2026-09-18T09:05:00.000Z" }), "✗ 09:05:00");
 });
 
 // Requested directly: show plan/todo progress persistently in the status

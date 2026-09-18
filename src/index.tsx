@@ -117,6 +117,7 @@ async function main() {
     onContextUsage: (used, total) =>
       (globalThis as any).__llamacli_ui?.setContextUsedRatio(total > 0 ? Math.min(1, used / total) : 0),
     onPlanProgress: (done, total) => (globalThis as any).__llamacli_ui?.setPlanProgress(done, total),
+    onCompactionStatus: (status, timestamp) => (globalThis as any).__llamacli_ui?.setCompactionStatus(status, timestamp),
   });
 
   // Session-end self-improvement gate (PROMPT.md §3): if failures were
