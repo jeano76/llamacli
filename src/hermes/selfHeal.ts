@@ -24,7 +24,13 @@ export const DEFAULT_BREAKER: CircuitBreakerConfig = {
 
 export class CircuitBreaker {
   private history: CallRecord[] = [];
-  private startedAt = Date.now();
+  // Tracks time since the *last actual progress* (a tool call completing),
+  // not since the turn started. A long turn that keeps genuinely completing
+  // tool calls — e.g. many rounds against a slow local model — can easily
+  // run past hardTimeoutMs in total without ever being stuck; only a gap
+  // with zero progress for that long indicates something is actually hung.
+  // See the loop-runaway incident in the class doc comment above.
+  private lastProgressAt = Date.now();
 
   constructor(private config: CircuitBreakerConfig = DEFAULT_BREAKER) {}
 
@@ -33,12 +39,13 @@ export class CircuitBreaker {
     if (this.history.length > this.config.windowSize) {
       this.history.shift();
     }
+    this.lastProgressAt = Date.now();
   }
 
   /** Returns a reason string if the loop/timeout should be killed, else null. */
   shouldStop(): string | null {
-    if (Date.now() - this.startedAt > this.config.hardTimeoutMs) {
-      return `hard timeout exceeded (${this.config.hardTimeoutMs}ms)`;
+    if (Date.now() - this.lastProgressAt > this.config.hardTimeoutMs) {
+      return `hard timeout exceeded (${this.config.hardTimeoutMs}ms with no progress)`;
     }
     if (this.history.length < this.config.windowSize) return null;
 
@@ -51,7 +58,7 @@ export class CircuitBreaker {
 
   reset(): void {
     this.history = [];
-    this.startedAt = Date.now();
+    this.lastProgressAt = Date.now();
   }
 }
 
