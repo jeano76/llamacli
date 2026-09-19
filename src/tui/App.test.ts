@@ -41,3 +41,10 @@ test("filterMenuItems matches a substring anywhere in the command name, not just
 test("filterMenuItems returns an empty list when nothing matches, instead of falling back to all commands", () => {
   assert.deepEqual(filterMenuItems("/xyz123"), []);
 });
+
+test("filterMenuItems matches the plan-clear command", () => {
+  assert.deepEqual(
+    filterMenuItems("/plan").map((i) => i.key),
+    ["plan-clear"]
+  );
+});

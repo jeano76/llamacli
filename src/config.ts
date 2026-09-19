@@ -19,6 +19,10 @@ export interface LlamacliConfig {
   };
   compaction: {
     autoTriggerRatio: number;
+    /** Auto-continue past a compaction that interrupts a tool call mid-turn
+     *  instead of stopping and waiting for the user to type another
+     *  message. See loop.ts's AgentLoopOptions.autoResume. */
+    autoResume: boolean;
   };
   /** Remote debugging (Chrome DevTools Protocol) for the browser tools —
    *  connects to an already-running Chrome/Chromium started with
@@ -42,7 +46,7 @@ export const DEFAULT_CONFIG: LlamacliConfig = {
   // 0.25 = 0.95) keeps a real margin under 100% even in that worst case,
   // so the overflow-retry safety net is rarely needed rather than routinely
   // relied on. Trades slightly more frequent compaction for that.
-  compaction: { autoTriggerRatio: 0.7 },
+  compaction: { autoTriggerRatio: 0.7, autoResume: true },
   llama: {
     binPath: "llama-server",
     modelPath: "",
@@ -73,7 +77,21 @@ export async function loadConfig(
   try {
     const raw = await readFile(path, "utf8");
     const parsed = parse(raw) as Partial<LlamacliConfig>;
-    return { config: { ...DEFAULT_CONFIG, ...parsed } };
+    // A plain top-level spread would let an existing config.yaml that
+    // predates a new compaction field (e.g. old files only have
+    // autoTriggerRatio) silently drop that field's default entirely,
+    // since `parsed.compaction` — present but incomplete — replaces
+    // DEFAULT_CONFIG.compaction wholesale instead of filling the gap.
+    // Caught adding autoResume: every project's pre-existing
+    // .llamacli/config.yaml would otherwise load with autoResume
+    // `undefined` (falsy) instead of the intended default of `true`.
+    return {
+      config: {
+        ...DEFAULT_CONFIG,
+        ...parsed,
+        compaction: { ...DEFAULT_CONFIG.compaction, ...parsed.compaction },
+      },
+    };
   } catch {
     // No config yet in this project. Rather than silently falling back to
     // a default backend URL that's usually dead (this exact gap caused an

@@ -118,6 +118,11 @@ test("AgentLoop captures pendingToolCall when compaction fires mid-batch, and ab
       systemPrompt: "sys",
       thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
       onStatus: (s) => statusMessages.push(s),
+      // This test is specifically about the checkpoint left behind for
+      // manual resume (the next test covers the default autoResume: true
+      // path, which would otherwise fold the resume context back in and
+      // keep going within this same send() instead of stopping here).
+      autoResume: false,
     });
     await loop.send("do the thing");
 
@@ -166,6 +171,9 @@ test("a checkpoint left by mid-session compaction is picked up automatically by 
       systemPrompt: "sys",
       thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
       onStatus: (s) => statusMessages.push(s),
+      // Exercising the manual-resume path on purpose (see previous test);
+      // autoResume: true is covered by its own test below.
+      autoResume: false,
     });
 
     await loop.send("do the thing"); // leaves a checkpoint behind (see previous test)
@@ -183,6 +191,57 @@ test("a checkpoint left by mid-session compaction is picked up automatically by 
     // context (the interrupted tool call), not just a bare "are you still
     // there?" — buildResumePrompt() reports the pending call's name/reason,
     // not its raw arguments, so check for that rather than "step2".
+    const secondRequest = turnRequests[1];
+    assert.ok(secondRequest.messages.some((m) => typeof m.content === "string" && m.content.includes("update_plan")));
+  }));
+
+test("with the default autoResume: true, a compaction that interrupts a tool call resumes within the SAME send() — no second send() needed", () =>
+  withTempProject(async (dir) => {
+    const call1 = {
+      id: "c1",
+      type: "function" as const,
+      function: { name: "update_plan", arguments: JSON.stringify({ steps: [{ description: "step1", status: "in_progress" }] }) },
+    };
+    const call2 = {
+      id: "c2",
+      type: "function" as const,
+      function: { name: "update_plan", arguments: JSON.stringify({ steps: [{ description: "step2", status: "in_progress" }] }) },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [
+        assistantMessage(null, [call1, call2]), // abandoned mid-batch by compaction
+        assistantMessage("continuing now"), // picked up automatically, same send()
+      ],
+      // 1: top-of-loop -> low, 2: before call1 -> low, call1 runs,
+      // 3: before call2 -> high, compacts + abandons call2,
+      // 4: top-of-loop after auto-resume -> low, no further compaction.
+      tokenCounts: [1, 1, 1000, 1],
+    });
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+      // autoResume left unset on purpose: exercises the actual default.
+    });
+
+    await loop.send("do the thing");
+
+    // Never stopped and waited — no "[turn ended]" status, and the second
+    // scripted turn response was consumed within this single send() call.
+    assert.ok(!statusMessages.some((s) => s.includes("[turn ended]")));
+    assert.equal(turnRequests.length, 2, "expected the resumed turn to have run within the same send()");
+    assert.ok(statusMessages.some((s) => s.includes("resuming automatically")));
+
+    // The checkpoint must be consumed (not left for a later manual resume)
+    // once it's been folded back in automatically.
+    assert.equal(await readCheckpoint(dir), null, "checkpoint should be consumed after auto-resuming");
+
+    // And the resumed request must actually carry the interrupted call's
+    // context forward, same as the manual-resume path above.
     const secondRequest = turnRequests[1];
     assert.ok(secondRequest.messages.some((m) => typeof m.content === "string" && m.content.includes("update_plan")));
   }));

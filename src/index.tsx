@@ -109,6 +109,7 @@ async function main() {
       autoTriggerRatio: config.compaction.autoTriggerRatio,
       contextWindowTokens,
     },
+    autoResume: config.compaction.autoResume,
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
     onAssistantDone: () => (globalThis as any).__llamacli_ui?.finalizeAssistant(),
     onToolCall: (name, args) => (globalThis as any).__llamacli_ui?.pushTool(`[tool] ${name} ${args}`),
@@ -261,6 +262,12 @@ async function main() {
                 );
               })
               .catch((err: any) => ui?.pushStatus(`[rule save failed] ${err.message}`));
+            break;
+          case "plan-clear":
+            loop
+              .clearPlan()
+              .then(() => ui?.pushStatus("Plan progress cleared."))
+              .catch((err: any) => ui?.pushStatus(`[error] failed to clear plan: ${err.message}`));
             break;
           // "queue" is handled locally inside App (needs the live queue state).
         }

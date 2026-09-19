@@ -16,6 +16,7 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   { key: "rules", label: "/rules", description: "List loaded rules" },
   { key: "improve", label: "/improve", description: "Analyze repeated failures → propose a rule" },
   { key: "improve-apply", label: "/improve-apply", description: "Save the last proposal as a rule file" },
+  { key: "plan-clear", label: "/plan clear", description: "Clear a stuck plan-progress indicator" },
 ];
 
 export interface SlashMenuProps {

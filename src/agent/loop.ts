@@ -83,6 +83,15 @@ export interface AgentLoopOptions {
    *  exactly that kind of scroll, the same reasoning behind
    *  `onPlanProgress`. */
   onCompactionStatus?: (status: "running" | "complete" | "failed", timestamp: string) => void;
+  /** When a compaction interrupts a tool call mid-turn (checkpoint written,
+   *  batch abandoned — see the maybeCompact() call site below), immediately
+   *  fold the checkpoint's resume prompt back in and keep the same turn
+   *  going, instead of stopping and waiting for the user to type another
+   *  message. Defaults to true (config.ts's compaction.autoResume). Startup
+   *  resume (resumeIfCheckpointExists, for a checkpoint left by a crashed
+   *  previous process) already does this unconditionally — this extends the
+   *  same behavior to a compaction that fires live, mid-session. */
+  autoResume?: boolean;
 }
 
 /**
@@ -245,7 +254,7 @@ export class AgentLoop {
     // other unforeseen loop.
     const MAX_OVERFLOW_RETRIES = 8;
     let overflowRetries = 0;
-    while (true) {
+    turnLoop: while (true) {
       await this.maybeCompact();
 
       let res;
@@ -386,8 +395,24 @@ export class AgentLoop {
           // Without an explicit message here, the turn just stops with no
           // visible signal beyond whatever compact() already logged (which,
           // on failure, doesn't say the turn is over) — indistinguishable
-          // from the CLI having hung. Say so plainly: this is a real stop,
-          // not the agent still thinking.
+          // from the CLI having hung. Say so plainly.
+          if (this.opts.autoResume ?? true) {
+            // Fold the just-written checkpoint's resume prompt straight
+            // back into the conversation and re-enter the top of the turn
+            // loop — the next iteration's maybeCompact() no-ops (already
+            // compacted) and backend.chat() runs with the resumed context,
+            // so the abandoned tool call effectively gets reissued without
+            // waiting for a manual message. The self-healing circuit
+            // breaker (checked at the top of each tool call, never reset
+            // within a single send()/resumeIfCheckpointExists() call) still
+            // bounds this against a compaction/resume cycle that never
+            // makes real progress.
+            this.opts.onStatus?.(
+              "[compaction] interrupted mid-task — resuming automatically."
+            );
+            await this.injectResumeContextIfPending();
+            continue turnLoop;
+          }
           this.opts.onStatus?.(
             "[turn ended] Compaction interrupted this task. It'll pick back up automatically with your next message."
           );
@@ -629,6 +654,20 @@ export class AgentLoop {
 
   hasFailureLog(): boolean {
     return getFailureLog().length > 0;
+  }
+
+  /** Manually clears the plan-progress indicator and its on-disk checkpoint —
+   *  the escape hatch for when the model finishes real work but never calls
+   *  update_plan to mark the final step done, leaving a stale "N/M" stuck in
+   *  the status bar with no way to clear it (reported directly: the model
+   *  hallucinated a nonexistent "close the run from the browser UI" fix when
+   *  asked about this instead of admitting there was no such hook). Mirrors
+   *  the auto-cleanup block above but is invoked externally, by the user,
+   *  rather than by the model finishing all its declared steps. */
+  async clearPlan(): Promise<void> {
+    this.plan = [];
+    await clearCheckpoint(this.opts.projectRoot);
+    this.opts.onPlanProgress?.(0, 0);
   }
 
   private currentGoalSummary(): string {
