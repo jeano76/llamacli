@@ -65,6 +65,36 @@ function capToolResult(content: string, contextWindowTokens: number): string {
   return `${content.slice(0, cap)}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane]`;
 }
 
+
+/** Tool calls whose arguments carry a whole file's contents. Once the
+ *  call has actually run, that content is on disk — keeping a verbatim
+ *  copy of it in the conversation too is pure duplication, and a large
+ *  one: measured on a real session, three generated source files sat in
+ *  history as ~8,000 tokens of tool-call arguments, 49% of a
+ *  16,384-token window, on top of the files themselves already existing.
+ *  Compaction couldn't help either, since its kept tail preserves recent
+ *  messages verbatim — which is exactly what "compaction barely shrinks
+ *  anything" was. Tool RESULTS were already capped (capToolResult); tool
+ *  call ARGUMENTS never were. */
+const FILE_CONTENT_TOOLS = new Set(["write_file", "append_file"]);
+
+/** Replaces a completed file-write's `content` argument with a short
+ *  marker, keeping everything else (tool name, path) intact so the
+ *  conversation still reads as "I wrote this file". Safe because the
+ *  file itself is the source of truth from here on — the model can
+ *  read_file it if it ever needs the content back, and the tool result
+ *  ("wrote <path>") already confirms what happened. */
+function elideWrittenFileContent(argumentsJson: string): string {
+  try {
+    const args = JSON.parse(argumentsJson);
+    if (typeof args?.content !== "string" || args.content.length === 0) return argumentsJson;
+    const chars = args.content.length;
+    return JSON.stringify({ ...args, content: `[${chars} characters written to disk — read the file if you need them again]` });
+  } catch {
+    return argumentsJson; // unparseable (shouldn't happen post-execution) — leave as is
+  }
+}
+
 export interface AgentLoopOptions {
   projectRoot: string;
   model: string;
@@ -714,6 +744,14 @@ export class AgentLoop {
           }
           this.recordFileTouch(call.function.name, call.function.arguments);
           this.pushExecutedToolLog(`${call.function.name}(${this.summarizeArgs(call.function.arguments)})`);
+          // Drop the now-redundant copy of the file content from the
+          // assistant message still sitting in `this.messages` (pushed
+          // just above, before this batch ran) — see
+          // elideWrittenFileContent. Only after a SUCCESSFUL write: if it
+          // failed, the content is all that's left of the attempt.
+          if (FILE_CONTENT_TOOLS.has(call.function.name)) {
+            call.function.arguments = elideWrittenFileContent(call.function.arguments);
+          }
         } catch (err: any) {
           content = `ERROR: ${err.message}`;
           logFailure({

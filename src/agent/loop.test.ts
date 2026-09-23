@@ -1868,3 +1868,89 @@ test("enableThinking: true opts back in, sending no disable flag at all", () =>
 
     assert.equal(turnRequests[0].chat_template_kwargs, undefined, "expected no thinking override when explicitly opted in");
   }));
+
+// Measured on a real session: three generated source files sat in the
+// conversation as ~8,000 tokens of write_file tool-call ARGUMENTS — 49%
+// of a 16,384-token window — on top of those files already existing on
+// disk. Tool RESULTS were capped (capToolResult); arguments never were,
+// and compaction's kept tail preserves recent messages verbatim, so this
+// is what "compaction barely shrinks anything" actually was.
+test("a completed write_file's content is dropped from the conversation, since the file itself is now the source of truth", () =>
+  withTempProject(async (dir) => {
+    const bigContent = "X".repeat(5000);
+    const target = join(dir, "big.txt");
+    const sentRequests: ChatCompletionRequest[] = [];
+    let turnCallCount = 0;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        sentRequests.push(JSON.parse(JSON.stringify(req))); // deep snapshot
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          return assistantMessage(null, [
+            { id: "c1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: target, content: bigContent }) } },
+          ]);
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await loop.send("write a big file");
+
+    // The file really was written in full — eliding must never cost data.
+    assert.equal(await readFile(target, "utf8"), bigContent);
+
+    // ...but the SECOND request must no longer carry those 5,000 chars.
+    const followUp = JSON.stringify(sentRequests[1].messages);
+    assert.ok(!followUp.includes(bigContent), "the written content must not still be sitting in the conversation");
+    assert.match(followUp, /characters written to disk/);
+    assert.ok(followUp.includes(target), "the path must be kept — the conversation should still read as 'I wrote this file'");
+  }));
+
+test("a FAILED write_file keeps its content in the conversation (it's the only copy left)", () =>
+  withTempProject(async (dir) => {
+    const content = "Y".repeat(3000);
+    const sentRequests: ChatCompletionRequest[] = [];
+    let turnCallCount = 0;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        sentRequests.push(JSON.parse(JSON.stringify(req)));
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          return assistantMessage(null, [
+            // A path that can't be written (a directory component that is a file)
+            { id: "c1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "/proc/version/nope.txt", content }) } },
+          ]);
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await loop.send("write a file that fails");
+
+    assert.ok(
+      JSON.stringify(sentRequests[1].messages).includes(content),
+      "a failed write's content must be preserved — nothing else has it"
+    );
+  }));
