@@ -43,3 +43,27 @@ export async function detectRunningServer(
   const results = await Promise.all(ports.map((port) => probePort(host, port)));
   return results.find((r): r is DetectedServer => r !== null) ?? null;
 }
+
+/** Asks an already-known baseUrl (from an existing config.yaml) which model
+ *  it currently has loaded, via the same /v1/models endpoint. Unlike
+ *  detectRunningServer this doesn't scan ports — it's for refreshing a
+ *  config's `model` field on every load so swapping the model file on the
+ *  server (e.g. re-quantizing, switching checkpoints) doesn't leave a
+ *  stale name sitting in every project's config.yaml. Returns null (never
+ *  throws) if the server is unreachable or the response is malformed, so
+ *  callers can fall back to the last-known value instead of breaking
+ *  offline use. */
+export async function detectModelAt(baseUrl: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${baseUrl}/v1/models`, { signal: controller.signal });
+    if (!res.ok) return null;
+    const json = (await res.json()) as { data?: Array<{ id: string }> };
+    return json.data?.[0]?.id ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}

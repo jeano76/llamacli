@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import { DEFAULT_8GB_PROFILE } from "./backend/llamaServer.js";
-import { detectRunningServer, COMMON_PORTS } from "./backend/detect.js";
+import { detectRunningServer, detectModelAt, COMMON_PORTS } from "./backend/detect.js";
 
 export interface LlamacliConfig {
   backend: "local-llama" | "openai-compatible";
@@ -71,7 +71,10 @@ export async function loadConfig(
   // Overridable for tests, so they don't depend on what's actually running
   // on this machine's common ports (on the dev machine this project was
   // built on, 8080 is a real, permanently-running server).
-  detect: () => Promise<{ baseUrl: string; model: string } | null> = () => detectRunningServer()
+  detect: () => Promise<{ baseUrl: string; model: string } | null> = () => detectRunningServer(),
+  // Overridable for tests, same reason. Only called for an *existing*
+  // openai-compatible config — see below.
+  detectModel: (baseUrl: string) => Promise<string | null> = detectModelAt
 ): Promise<LoadConfigResult> {
   const path = join(projectRoot, ".llamacli", "config.yaml");
   try {
@@ -85,13 +88,26 @@ export async function loadConfig(
     // Caught adding autoResume: every project's pre-existing
     // .llamacli/config.yaml would otherwise load with autoResume
     // `undefined` (falsy) instead of the intended default of `true`.
-    return {
-      config: {
-        ...DEFAULT_CONFIG,
-        ...parsed,
-        compaction: { ...DEFAULT_CONFIG.compaction, ...parsed.compaction },
-      },
+    const config: LlamacliConfig = {
+      ...DEFAULT_CONFIG,
+      ...parsed,
+      compaction: { ...DEFAULT_CONFIG.compaction, ...parsed.compaction },
     };
+
+    // The `model` field in config.yaml is a cache, not the source of
+    // truth — it's whatever was detected (or hand-edited) the last time
+    // this file was written, and goes stale the moment the server's
+    // loaded model changes (a quant swap, a checkpoint switch). For
+    // openai-compatible backends the server itself always knows the
+    // current model, so re-ask it on every load and prefer that live
+    // value; only fall back to the stored one if the server's
+    // unreachable (offline use, server not started yet).
+    if (config.backend === "openai-compatible" && config.baseUrl) {
+      const liveModel = await detectModel(config.baseUrl);
+      if (liveModel) config.model = liveModel;
+    }
+
+    return { config };
   } catch {
     // No config yet in this project. Rather than silently falling back to
     // a default backend URL that's usually dead (this exact gap caused an
