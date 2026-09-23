@@ -139,7 +139,17 @@ async function main() {
     enableThinking: config.enableThinking ?? false,
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
     onAssistantDone: () => (globalThis as any).__llamacli_ui?.finalizeAssistant(),
-    onToolCall: (name, args) => (globalThis as any).__llamacli_ui?.pushTool(`[tool] ${name} ${args}`),
+    onToolCall: (name, args) => {
+      let preview = "";
+      try {
+        const parsed = JSON.parse(args);
+        preview = parsed.path ?? parsed.command ?? parsed.query ?? "";
+      } catch {
+        preview = args.slice(0, 60);
+      }
+      const label = preview ? `${name}(${preview})` : name;
+      (globalThis as any).__llamacli_ui?.pushTool(label);
+    },
     onDiff: (_path, diff) => (globalThis as any).__llamacli_ui?.pushDiff(diff),
     onStatus: (s) => (globalThis as any).__llamacli_ui?.pushStatus(s),
     onContextUsage: (used, total) =>

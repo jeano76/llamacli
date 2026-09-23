@@ -50,15 +50,11 @@ export function SlashMenu({ items, selectedIndex }: SlashMenuProps) {
         <Text dimColor>No matching commands</Text>
       ) : (
         items.map((item, i) => (
-          <Text key={item.key} inverse={i === selectedIndex}>
-            {item.label.padEnd(10)} {item.description}
+          <Text key={item.key} color={i === selectedIndex ? "cyan" : undefined} inverse={i === selectedIndex}>
+            {i === selectedIndex ? "❯ " : "  "}{item.label.padEnd(15)} <Text dimColor={i !== selectedIndex}>{item.description}</Text>
           </Text>
         ))
       )}
-      {/* A blank-string <Text> renders at ZERO height in Ink instead of a
-       *  real blank row (confirmed directly — see App.tsx's `asRow` for the
-       *  same issue with log lines), so a lone space is used here instead
-       *  to actually reserve the row. */}
       {Array.from({ length: blankRows }, (_, i) => (
         <Text key={`blank-${i}`}> </Text>
       ))}

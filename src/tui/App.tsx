@@ -542,10 +542,23 @@ export function App({
         <Text key={`${line.id}-${i}`}>{asRow(wrapped)}</Text>
       ));
     }
-    // tool-call JSON, user echo, status messages: plain text, no ANSI of
-    // their own, so the simpler char-width wrap is fine and cheaper.
-    return wrapToWidth((line.kind === "user" ? "> " : "") + line.text, width).map((wrapped, i) => (
-      <Text key={`${line.id}-${i}`} color={line.kind === "tool" ? "magenta" : "gray"}>
+    if (line.kind === "user") {
+      return wrapToWidth(`❯ ${line.text}`, width).map((wrapped, i) => (
+        <Text key={`${line.id}-${i}`} color="cyan" bold>
+          {asRow(wrapped)}
+        </Text>
+      ));
+    }
+    if (line.kind === "tool") {
+      return wrapToWidth(`⚡ ${line.text}`, width).map((wrapped, i) => (
+        <Text key={`${line.id}-${i}`} color="magenta">
+          {asRow(wrapped)}
+        </Text>
+      ));
+    }
+    // status messages
+    return wrapToWidth(line.text, width).map((wrapped, i) => (
+      <Text key={`${line.id}-${i}`} color="gray">
         {asRow(wrapped)}
       </Text>
     ));
@@ -565,6 +578,14 @@ export function App({
   const contentRows = menuOpen ? scrollableContentRows : logHeight - (showScrollIndicator ? 1 : 0);
   const sliceEnd = visualRows.length - clampedScroll;
   const sliceStart = Math.max(0, sliceEnd - contentRows);
+
+  const inputBorderColor = quitConfirmPending || resumeConfirmPending
+    ? "yellow"
+    : busy
+      ? "magenta"
+      : input.length > 0
+        ? "cyan"
+        : "gray";
 
   return (
     <Box flexDirection="column" height={rows} overflow="hidden">
@@ -595,8 +616,8 @@ export function App({
       {/* The prompt input lives INSIDE this bordered box, not below it —
        *  the border is the visible edge of the actual input area. */}
       <Box
-        borderStyle="single"
-        borderColor={quitConfirmPending || resumeConfirmPending ? "yellow" : "gray"}
+        borderStyle="round"
+        borderColor={inputBorderColor}
         paddingX={1}
         height={3}
         overflow="hidden"

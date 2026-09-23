@@ -113,23 +113,23 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
 
   return (
     <Box justifyContent="space-between" paddingX={1} height={1} overflow="hidden">
-      <Text dimColor>{tailToWidth(cwd, fieldWidth)}</Text>
-      <Text dimColor>{tailToWidth(model, fieldWidth)}</Text>
       <Box>
-        {/* Fixed-width regardless of whether a plan is active — see
-         *  PLAN_PROGRESS_WIDTH. A blank slot when there's no plan, not an
-         *  absent one, so this never shifts the gauge next to it. Hidden
-         *  below MIN_COLUMNS_FOR_PLAN_SLOT entirely (see hasRoomForPlanSlot)
-         *  rather than reserved unconditionally, so a narrow terminal isn't
-         *  forced to squeeze cwd/model to make room for it. */}
+        <Text color="blue">◆ </Text>
+        <Text dimColor>{tailToWidth(cwd, fieldWidth)}</Text>
+      </Box>
+      <Box>
+        <Text dimColor>│ </Text>
+        <Text color="cyan">{tailToWidth(model, fieldWidth)}</Text>
+      </Box>
+      <Box>
         {hasRoomForPlanSlot(columns) && (
           <>
-            <Text dimColor>{planText.padStart(PLAN_PROGRESS_WIDTH)}</Text>
+            <Text color={planText ? "cyan" : undefined} dimColor={!planText}>
+              {planText ? `📋 ${planText}`.padStart(PLAN_PROGRESS_WIDTH) : "".padStart(PLAN_PROGRESS_WIDTH)}
+            </Text>
             <Text> </Text>
           </>
         )}
-        {/* Same fixed-width-slot approach as plan progress, one level
-         *  narrower before it's dropped — see hasRoomForCompactionSlot. */}
         {hasRoomForCompactionSlot(columns) && (
           <>
             <Text color={compactionText ? compactionColor : undefined} dimColor={!compactionText}>
@@ -138,6 +138,7 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
             <Text> </Text>
           </>
         )}
+        <Text dimColor>│ </Text>
         <Text color={gaugeColor(contextUsedRatio)}>{renderGauge(contextUsedRatio)}</Text>
         <Text dimColor> {Math.round(contextUsedRatio * 100)}%</Text>
       </Box>
