@@ -1,23 +1,11 @@
-# llamacli 프로젝트 설정 예시 (PROMPT.md §1, §7)
-backend: local-llama   # local-llama | openai-compatible
-model: local-model
-
-# backend: openai-compatible 일 때 사용
-# baseUrl: http://127.0.0.1:8081
-# apiKey: sk-...
-
-llama:
-  binPath: llama-server      # PATH에 있거나 절대경로
-  modelPath: ""              # 필수: .gguf 모델 경로
-  port: 8081
-  contextSize: 8192          # 8GB RAM 기본 프로파일
-  threads: 4
-  gpuLayers: 0
+backend: openai-compatible
+baseUrl: http://127.0.0.1:8080
+model: /media/jeano/nvme-usb/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 
 compaction:
-  autoTriggerRatio: 0.85     # 컨텍스트 윈도우의 85% 도달 시 자동 컴팩션
+  autoTriggerRatio: 0.70
+  autoResume: true
 
 browser:
-  # 이미 --remote-debugging-port=9222 로 띄워둔 브라우저에만 붙는다. 새 브라우저를 실행하지 않음.
   debugPort: 9222
   host: 127.0.0.1

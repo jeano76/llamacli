@@ -219,8 +219,13 @@ export class AgentLoop {
     // that left the conversation with zero user-role messages at all —
     // hit in production 2026-09-21, a resumed session couldn't get a reply
     // out of the model at all). A resume is conceptually the user saying
-    // "continue," so "user" is also the more accurate role anyway.
-    this.messages.push({ role: "user", content: resumeText });
+    // Avoid accumulating duplicate resume messages consecutively
+    const lastMsg = this.messages[this.messages.length - 1];
+    if (lastMsg && lastMsg.role === "user" && typeof lastMsg.content === "string" && lastMsg.content.startsWith("[resuming")) {
+      lastMsg.content = resumeText;
+    } else {
+      this.messages.push({ role: "user", content: resumeText });
+    }
     // Restore the plan/progress too, not just the text summary — otherwise
     // the status bar's progress indicator (PLAN_PROGRESS_WIDTH) shows
     // nothing until the model happens to call update_plan again, even

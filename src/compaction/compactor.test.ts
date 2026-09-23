@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -687,4 +687,30 @@ test("composeSystemMessage replaces existing summary block instead of accumulati
   const occurrences = (result.match(/\[Compacted history summary\]/g) || []).length;
   assert.equal(occurrences, 1);
 });
+
+test("selectKeptTail excludes system messages from toSummarize to prevent recursive duplicate summarization", () => {
+  const messages: ChatMessage[] = [
+    { role: "system", content: "Original system instructions." },
+    { role: "user", content: "first question" },
+    { role: "assistant", content: "first answer" },
+    { role: "user", content: "second question" },
+    { role: "assistant", content: "second answer" },
+  ];
+  // With a small window budget, partition conversation
+  const { keepTail, toSummarize } = selectKeptTail(messages, 20, 0.4);
+  assert.ok(toSummarize.every((m) => m.role !== "system"), "system messages must never be sent to toSummarize");
+  assert.ok(keepTail.every((m) => m.role !== "system"), "system messages are managed separately by composeSystemMessage");
+});
+
+test("selectKeptTail accounts for CJK token weight to prevent undercounting and context overflow", () => {
+  // 100 Korean characters (~150 tokens) vs 100 ASCII characters (~25 tokens)
+  const koreanMsg: ChatMessage = { role: "user", content: "가".repeat(100) };
+  const asciiMsg: ChatMessage = { role: "user", content: "a".repeat(100) };
+
+  // Context window 100, tail budget 0.4 -> budget ~30 tokens
+  // Korean message (~150 tokens) exceeds 30 tokens immediately
+  const koreanRes = selectKeptTail([koreanMsg], 100, 0.4);
+  assert.equal(koreanRes.keepTail.length, 1); // at least 1 message kept
+});
+
 

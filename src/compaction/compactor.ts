@@ -33,9 +33,66 @@ function messageText(m: ChatMessage): string {
   return toolCalls ? `${content}\n${toolCalls}` : content;
 }
 
+/**
+ * Estimates the token weight of text, accounting for CJK (Hangul, Hanzi, Kana)
+ * characters which consume ~1.5 to 2.5 tokens per character rather than 0.25 (chars/4).
+ */
+export function estimateTextTokens(text: string): number {
+  if (!text) return 0;
+  let cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    // Hangul syllables & jamo: AC00-D7AF, 1100-11FF, 3130-318F
+    // CJK Unified Ideographs: 4E00-9FFF
+    // Hiragana/Katakana: 3040-30FF
+    if (
+      (code >= 0xac00 && code <= 0xd7af) ||
+      (code >= 0x1100 && code <= 0x11ff) ||
+      (code >= 0x3130 && code <= 0x318f) ||
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3040 && code <= 0x30ff)
+    ) {
+      cjk++;
+    }
+  }
+  const nonCjk = text.length - cjk;
+  // CJK: ~1.5 tokens/char. Non-CJK (ASCII/Latin/punctuation): ~0.25 tokens/char (4 chars/token).
+  return Math.ceil(cjk * 1.5 + nonCjk * 0.25);
+}
+
 function charBasedEstimate(messages: ChatMessage[], extraText: string): number {
-  const chars = messages.reduce((sum, m) => sum + messageText(m).length, 0) + extraText.length;
-  return Math.ceil(chars / 4);
+  let cjk = 0;
+  let totalLength = extraText.length;
+  for (const m of messages) {
+    const text = messageText(m);
+    totalLength += text.length;
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (
+        (code >= 0xac00 && code <= 0xd7af) ||
+        (code >= 0x1100 && code <= 0x11ff) ||
+        (code >= 0x3130 && code <= 0x318f) ||
+        (code >= 0x4e00 && code <= 0x9fff) ||
+        (code >= 0x3040 && code <= 0x30ff)
+      ) {
+        cjk++;
+      }
+    }
+  }
+  for (let i = 0; i < extraText.length; i++) {
+    const code = extraText.charCodeAt(i);
+    if (
+      (code >= 0xac00 && code <= 0xd7af) ||
+      (code >= 0x1100 && code <= 0x11ff) ||
+      (code >= 0x3130 && code <= 0x318f) ||
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3040 && code <= 0x30ff)
+    ) {
+      cjk++;
+    }
+  }
+  const nonCjk = totalLength - cjk;
+  return Math.ceil(cjk * 1.5 + nonCjk * 0.25);
 }
 
 /** Uses the backend's real tokenizer (llama.cpp `/tokenize`) when available;
@@ -178,25 +235,56 @@ export const DEFAULT_TAIL_BUDGET_FRACTION = 0.4;
 // system prompt and the ~626-token tool schema were added on top.
 const NEXT_REPLY_RESERVED_FRACTION = 0.25;
 
-function selectKeptTail(
+export function selectKeptTail(
   messages: ChatMessage[],
   contextWindowTokens: number,
   tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION
 ): { keepTail: ChatMessage[]; toSummarize: ChatMessage[] } {
+  // Only partition conversation messages (non-system), so messages[0] (system instructions)
+  // is never included in toSummarize or duplicated into summaries.
+  const nonSystemMessages = messages.filter((m) => m.role !== "system");
+  if (nonSystemMessages.length === 0) {
+    return { keepTail: [], toSummarize: [] };
+  }
+
   const availableForTail = Math.max(
     1,
     Math.floor(contextWindowTokens * (1 - NEXT_REPLY_RESERVED_FRACTION))
   );
-  const budgetChars = Math.max(1, Math.floor(availableForTail * 4 * tailBudgetFraction));
-  let used = 0;
-  let cutIndex = messages.length;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const len = messageText(messages[i]).length;
-    if (cutIndex < messages.length && used + len > budgetChars) break;
-    used += len;
+  const budgetTokens = Math.max(1, Math.floor(availableForTail * tailBudgetFraction));
+
+  let usedTokens = 0;
+  let cutIndex = nonSystemMessages.length;
+
+  for (let i = nonSystemMessages.length - 1; i >= 0; i--) {
+    const tokens = estimateTextTokens(messageText(nonSystemMessages[i]));
+    if (cutIndex < nonSystemMessages.length && usedTokens + tokens > budgetTokens) break;
+    usedTokens += tokens;
     cutIndex = i;
   }
-  return { keepTail: messages.slice(cutIndex), toSummarize: messages.slice(0, cutIndex) };
+
+  // Align cutIndex to a natural turn boundary: prefer starting keepTail at a user message
+  // so the conversation doesn't start with a dangling assistant response or orphaned tool call.
+  let alignedCutIndex = cutIndex;
+  if (alignedCutIndex > 0 && alignedCutIndex < nonSystemMessages.length) {
+    // If cut lands on an assistant or tool message, see if advancing to the next user message still keeps a tail
+    if (nonSystemMessages[alignedCutIndex].role !== "user") {
+      const nextUser = nonSystemMessages.findIndex((m, idx) => idx > alignedCutIndex && m.role === "user");
+      if (nextUser !== -1) {
+        alignedCutIndex = nextUser;
+      }
+    }
+  }
+
+  // Ensure at least the last message is kept
+  if (alignedCutIndex >= nonSystemMessages.length && nonSystemMessages.length > 0) {
+    alignedCutIndex = nonSystemMessages.length - 1;
+  }
+
+  return {
+    keepTail: nonSystemMessages.slice(alignedCutIndex),
+    toSummarize: nonSystemMessages.slice(0, alignedCutIndex),
+  };
 }
 
 /**
