@@ -31,6 +31,28 @@ export interface LlamacliConfig {
     debugPort: number;
     host?: string;
   };
+  /** Whether to let the model emit chain-of-thought (`reasoning_content`)
+   *  before its actual answer/tool call. Defaults to FALSE — measured
+   *  directly against the real backend, and it is the root cause behind a
+   *  long run of "the model never finished writing the file" failures:
+   *
+   *    same 420-token budget, same prompt:
+   *      thinking on  -> 420 reasoning_content deltas, 0 tool_calls deltas
+   *      thinking off ->   0 reasoning_content deltas, 362 tool_calls deltas
+   *
+   *  With it on, the model spent the ENTIRE max_tokens budget on thinking
+   *  and never even began the tool call — so nothing was written, nothing
+   *  could be salvaged (there were no tool_call deltas to recover), and
+   *  the UI showed nothing at all while it happened (llamacli renders
+   *  `content` deltas, not `reasoning_content`), which is what "it looks
+   *  stuck" actually was. llama-server itself warns about this at startup:
+   *  "chat template supports preserving reasoning, it is enabled by
+   *  default (may use more tokens, disable via --no-reasoning-preserve)".
+   *
+   *  Set true to opt back in (a model/task where visible deliberation is
+   *  worth the budget); llamacli then also streams the reasoning to the UI
+   *  rather than going silent. */
+  enableThinking?: boolean;
 }
 
 export const DEFAULT_CONFIG: LlamacliConfig = {

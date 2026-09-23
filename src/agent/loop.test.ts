@@ -1821,3 +1821,50 @@ test("falls back to the shrink-and-nudge strategy when there is no partialToolCa
     assert.equal(turnCallCount, 2);
     assert.ok(!statusMessages.some((s) => s.includes("recovered and saved")));
   }));
+
+// THE root cause behind a long run of "the model never finished writing
+// the file" failures, found by probing the real backend directly instead
+// of guessing — same 420-token budget, same prompt:
+//     thinking ON  -> 420 reasoning_content deltas, 0 tool_calls deltas
+//     thinking OFF ->   0 reasoning_content deltas, 362 tool_calls deltas
+// With it on, the whole budget went to invisible chain-of-thought before
+// the tool call even began: nothing got written, the salvage path had no
+// tool-call deltas to recover, and the UI rendered nothing the entire
+// time (it only draws `content` deltas) — which is what the repeated
+// "it looks stuck" reports actually were.
+test("chain-of-thought is disabled by default so the token budget goes to the actual work, not invisible reasoning", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({ turnResponses: [assistantMessage("done")], tokenCounts: [10] });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await loop.send("hi");
+
+    assert.deepEqual(
+      turnRequests[0].chat_template_kwargs,
+      { enable_thinking: false },
+      "expected thinking to be disabled by default on every turn request"
+    );
+  }));
+
+test("enableThinking: true opts back in, sending no disable flag at all", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({ turnResponses: [assistantMessage("done")], tokenCounts: [10] });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+      enableThinking: true,
+    });
+
+    await loop.send("hi");
+
+    assert.equal(turnRequests[0].chat_template_kwargs, undefined, "expected no thinking override when explicitly opted in");
+  }));

@@ -123,6 +123,7 @@ async function main() {
       contextWindowTokens,
     },
     autoResume: config.compaction.autoResume,
+    enableThinking: config.enableThinking ?? false,
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
     onAssistantDone: () => (globalThis as any).__llamacli_ui?.finalizeAssistant(),
     onToolCall: (name, args) => (globalThis as any).__llamacli_ui?.pushTool(`[tool] ${name} ${args}`),

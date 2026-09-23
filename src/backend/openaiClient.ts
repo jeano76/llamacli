@@ -292,6 +292,22 @@ export class OpenAICompatibleClient implements ModelBackend {
             content += choice.delta.content;
             deltaCount++;
           }
+          // Chain-of-thought, streamed by llama-server as its own field
+          // (NOT `content`) when the chat template preserves reasoning.
+          // Measured directly against the real backend: a request whose
+          // whole 420-token budget went to reasoning produced 420 of
+          // these deltas and zero `content`/`tool_calls` deltas — and
+          // because nothing here looked at this field, llamacli rendered
+          // absolutely nothing for the entire time, which is what the
+          // repeated "it looks stuck / 멈춘 것 같다" reports actually
+          // were. It also has to count toward deltaCount: these tokens
+          // are just as real against max_tokens as any other, and the
+          // client-side cap (see streamChat's doc comment) silently
+          // stopped bounding anything at all while the model was thinking.
+          const reasoning = (choice.delta as any).reasoning_content;
+          if (typeof reasoning === "string" && reasoning.length > 0) {
+            deltaCount++;
+          }
           if (choice.delta.tool_calls) {
             for (const tc of choice.delta.tool_calls as any[]) {
               const idx = tc.index ?? 0;

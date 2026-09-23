@@ -33,6 +33,13 @@ export interface ChatCompletionRequest {
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  /** llama.cpp-server / chat-template passthrough. Used to turn the
+   *  model's chain-of-thought off (`{ enable_thinking: false }`) — see
+   *  config.ts's `enableThinking` for the measurements behind why that's
+   *  the default: with thinking on, an entire max_tokens budget was
+   *  consumed by invisible `reasoning_content` before the tool call even
+   *  started. A backend that doesn't recognize the field ignores it. */
+  chat_template_kwargs?: Record<string, unknown>;
 }
 
 export interface ChatCompletionChunk {

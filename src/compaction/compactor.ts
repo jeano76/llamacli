@@ -232,7 +232,18 @@ export async function runCompaction(
   // should be concise by nature, not a full reply) but still scaled to the
   // real context window rather than a flat constant, same as loop.ts.
   const summaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(contextWindowTokens * 0.25)));
-  const res = await backend.chat({ model, messages: summaryRequest, stream: false, max_tokens: summaryMaxTokens });
+  // Same reason as loop.ts's own turn request (see its comment): with
+  // chain-of-thought on, the budget can be spent entirely on invisible
+  // reasoning before any summary text is produced — and a compaction that
+  // returns no usable summary is worse than useless, since the history it
+  // replaced is already gone.
+  const res = await backend.chat({
+    model,
+    messages: summaryRequest,
+    stream: false,
+    max_tokens: summaryMaxTokens,
+    chat_template_kwargs: { enable_thinking: false },
+  });
   const summaryText = res.choices[0]?.message.content ?? "(summary unavailable)";
 
   // Preserve the ORIGINAL system prompt (base prompt + injected .llamacli/rules),

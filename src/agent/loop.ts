@@ -63,6 +63,10 @@ export interface AgentLoopOptions {
   backend: ModelBackend;
   systemPrompt: string;
   thresholds: CompactionThresholds;
+  /** Off by default — see config.ts's `enableThinking` for the measured
+   *  reason (an entire max_tokens budget spent on invisible
+   *  `reasoning_content` before the tool call even began). */
+  enableThinking?: boolean;
   /** Called for each incremental token/chunk of assistant text as it streams in. */
   onAssistantDelta?: (text: string) => void;
   /** Called once an assistant message (streamed or not) is fully received —
@@ -360,6 +364,17 @@ export class AgentLoop {
             // repeats verbatim, so a non-compliant model still physically
             // cannot regenerate the identical oversized content again.
             max_tokens: Math.max(512, Math.floor(this.computeMaxTokens(usedBeforeChat) * toolCallMaxTokensShrinkFactor)),
+            // THE root cause behind a long run of "the model never
+            // finished writing the file" failures — measured directly
+            // against the real backend, same 420-token budget, same
+            // prompt: thinking ON gave 420 reasoning_content deltas and
+            // ZERO tool_calls deltas (the budget was gone before the tool
+            // call even started, so nothing was written and there were no
+            // tool-call deltas for the salvage path to recover either);
+            // thinking OFF gave 0 reasoning deltas and 362 tool_calls
+            // deltas from the identical budget. Everything else in this
+            // file's truncation handling is a safety net under this.
+            ...(this.opts.enableThinking ? {} : { chat_template_kwargs: { enable_thinking: false } }),
           },
           (chunk) => {
             // Defensive: `chunk.choices` isn't guaranteed non-empty/present
