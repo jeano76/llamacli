@@ -1,11 +1,13 @@
 import { exec } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ToolDef } from "../backend/types.js";
 import { formatDiff } from "./diff.js";
 import * as browser from "./browser.js";
 import type { BrowserConfig } from "./browser.js";
+import type { SkillIndexEntry } from "../skills/loader.js";
+import { loadSkillBody } from "../skills/loader.js";
 
 const execAsync = promisify(exec);
 
@@ -17,6 +19,23 @@ let browserScreenshotDir = join(process.cwd(), ".llamacli", "state", "screenshot
 export function configureBrowserTools(config: BrowserConfig, projectRoot: string): void {
   browserConfig = config;
   browserScreenshotDir = join(projectRoot, ".llamacli", "state", "screenshots");
+}
+
+/** Set once at startup from loadSkillIndex() (index.tsx). The index
+ *  (name+trigger only) is what the model sees up front via the system
+ *  prompt; `load_skill` is how it pulls a specific skill's full body only
+ *  when actually needed, rather than every skill's content being sent on
+ *  every request regardless of relevance.
+ *
+ *  Before this, loadSkillBody() had no caller anywhere in the codebase —
+ *  the 8 builtin skills (planning, code-review, security, ...) were
+ *  indexed and even copied into dist/ by the build, but the model itself
+ *  had no way to ever read one: the skill system was fully wired up on the
+ *  loader side and never connected to the tool-call side at all. */
+let skillIndex: SkillIndexEntry[] = [];
+
+export function configureSkills(index: SkillIndexEntry[]): void {
+  skillIndex = index;
 }
 
 export const TOOL_DEFS: ToolDef[] = [
@@ -96,6 +115,21 @@ export const TOOL_DEFS: ToolDef[] = [
           },
         },
         required: ["steps"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "load_skill",
+      description:
+        "Load the full body of a skill by name (from the list of available skills given " +
+        "in the system prompt). Use this when the current task matches a skill's trigger " +
+        "description, before starting that kind of work.",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string" } },
+        required: ["name"],
       },
     },
   },
@@ -187,11 +221,42 @@ export function setRunShellTimeoutForTests(ms: number): void {
   RUN_SHELL_TIMEOUT_MS = ms;
 }
 
+/** Above this, read_file refuses to load a whole file into memory before
+ *  capToolResult() (loop.ts) gets a chance to truncate it — a large binary,
+ *  log, or data file (routine to accidentally point at: a bundled asset, a
+ *  model weights file, a dump) could otherwise exhaust memory before any
+ *  cap applies at all. Read only up to the cap directly instead. */
+const READ_FILE_MAX_BYTES = 5 * 1024 * 1024;
+
 export async function executeTool(name: string, argsJson: string, projectRoot: string = process.cwd()): Promise<ToolResult> {
   const args = JSON.parse(argsJson || "{}");
   switch (name) {
-    case "read_file":
+    case "read_file": {
+      const info = await stat(args.path);
+      if (info.size > READ_FILE_MAX_BYTES) {
+        const fh = await open(args.path, "r");
+        try {
+          const buf = Buffer.alloc(READ_FILE_MAX_BYTES);
+          const { bytesRead } = await fh.read(buf, 0, READ_FILE_MAX_BYTES, 0);
+          return {
+            content:
+              buf.subarray(0, bytesRead).toString("utf8") +
+              `\n\n[...truncated: file is ${info.size} bytes, only the first ${READ_FILE_MAX_BYTES} were read]`,
+          };
+        } finally {
+          await fh.close();
+        }
+      }
       return { content: await readFile(args.path, "utf8") };
+    }
+    case "load_skill": {
+      const entry = skillIndex.find((s) => s.name === args.name);
+      if (!entry) {
+        const available = skillIndex.map((s) => s.name).join(", ") || "(none loaded)";
+        throw new Error(`unknown skill: ${args.name}. Available: ${available}`);
+      }
+      return { content: await loadSkillBody(entry) };
+    }
     case "write_file": {
       const before = await readFile(args.path, "utf8").catch(() => "");
       // Found auditing for the same class of gap as run_shell/CDP's
@@ -238,8 +303,36 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
       // on network, waiting on stdin, a runaway build) gets killed and
       // reported as a tool error instead of hanging the entire agent loop
       // with no way to recover — see RUN_SHELL_TIMEOUT_MS above.
-      const { stdout, stderr } = await execAsync(args.command, { cwd: projectRoot, timeout: RUN_SHELL_TIMEOUT_MS });
-      return { content: stdout || stderr };
+      //
+      // maxBuffer previously wasn't set (Node's default is 1MB), so any
+      // command with heavier output (a real build, a verbose test run) was
+      // killed with ENOBUFS and its output discarded entirely — the same
+      // class of gap the timeout above was added for.
+      //
+      // `stdout || stderr` previously dropped stderr whenever stdout was
+      // non-empty, even though plenty of real tools (tsc, pytest, cargo)
+      // write diagnostics to stderr alongside normal stdout output — losing
+      // exactly the information the model needs to judge whether a command
+      // that "succeeded" (exit 0) actually did what was asked.
+      //
+      // A non-zero exit makes execAsync throw and discard err.stdout/
+      // err.stderr entirely (only err.message survived before this) — so a
+      // failing command's actual output, the one piece of information that
+      // would tell the model WHY it failed, never reached it. Left to guess,
+      // the model tends to retry the same failing command — exactly the
+      // repetitive-call pattern the circuit breaker (selfHeal.ts) exists to
+      // catch, treating a *knowable* cause as an unrecoverable loop instead.
+      try {
+        const { stdout, stderr } = await execAsync(args.command, {
+          cwd: projectRoot,
+          timeout: RUN_SHELL_TIMEOUT_MS,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        return { content: [stdout, stderr].filter(Boolean).join("\n") || "(exit 0, no output)" };
+      } catch (err: any) {
+        const body = [err.stdout, err.stderr].filter(Boolean).join("\n");
+        throw new Error(body ? `exit ${err.code ?? "?"}: ${body}` : err.message);
+      }
     }
     case "browser_list_tabs":
       return { content: await browser.listTabs(browserConfig) };

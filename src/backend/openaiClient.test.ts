@@ -94,6 +94,31 @@ test("a mid-stream SSE error chunk throws a readable error instead of crashing o
     }
   ));
 
+// JSON.parse(data) previously wasn't guarded at all — one unparseable
+// `data:` line (a keepalive/comment some proxies inject, or any malformed
+// line) threw straight out of the loop and discarded every token already
+// streamed successfully before it, failing the whole turn over one
+// cosmetic line instead of just skipping it.
+test("an unparseable SSE data line is skipped, not thrown — tokens streamed before and after it still arrive", () =>
+  withFakeSSEServer(
+    'data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}\n\n' +
+      "data: this is not json\n\n" +
+      'data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}\n\n' +
+      "data: [DONE]\n\n",
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const deltas: string[] = [];
+      const res = await client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
+        (chunk) => {
+          if (chunk.choices[0]?.delta.content) deltas.push(chunk.choices[0].delta.content as string);
+        }
+      );
+      assert.equal(deltas.join(""), "hello");
+      assert.equal(res.choices[0].message.content, "hello");
+    }
+  ));
+
 test("a normal SSE stream with no error chunks still completes successfully (no regression)", () =>
   withFakeSSEServer(
     'data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}\n\n' +
@@ -327,3 +352,39 @@ test("a streaming chat() call times out when the body goes idle mid-stream, not 
       }
     }
   ));
+
+// cancel() backs the TUI's Esc-to-cancel feature: the user interrupting a
+// turn must actually stop the in-flight request against the backend, not
+// just stop rendering it locally — otherwise the single inference slot
+// (-np 1) stays pinned by a turn nobody wants anymore for as long as it
+// takes to finish on its own.
+test("cancel() aborts an in-flight streaming chat() call, distinguishably from a timeout", () =>
+  withUnboundedSSEServer(
+    500, // would otherwise keep streaming for ~2.5s
+    () => {},
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const deltas: string[] = [];
+      const chatPromise = client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
+        (chunk) => {
+          if (chunk.choices[0]?.delta.content) deltas.push(chunk.choices[0].delta.content as string);
+        }
+      );
+      // Give it a moment to actually start streaming before cancelling —
+      // cancelling instantly (before any chunk arrives) is covered by the
+      // "cancel before anything streams" case below.
+      await new Promise((r) => setTimeout(r, 20));
+      const start = Date.now();
+      client.cancel();
+      await assert.rejects(() => chatPromise, /cancelled/);
+      assert.ok(Date.now() - start < 500, "expected cancel() to abort promptly, not wait for the server");
+      assert.ok(deltas.length > 0, "expected at least one delta to have streamed before cancellation");
+      assert.ok(deltas.length < 500, "expected cancellation to have actually cut the stream short");
+    }
+  ));
+
+test("cancel() is a harmless no-op when no request is currently in flight", () => {
+  const client = new OpenAICompatibleClient("http://127.0.0.1:1"); // nothing listening — never actually called
+  assert.doesNotThrow(() => client.cancel());
+});

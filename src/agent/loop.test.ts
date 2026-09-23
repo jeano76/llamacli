@@ -652,7 +652,7 @@ test("a context-overflow error forces compaction and retries instead of just end
     assert.ok(!statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
   }));
 
-test("a context-overflow error that persists because compaction makes no further progress is reported, not retried forever", () =>
+test("a context-overflow error that persists even after tightening the kept-context budget down to the floor is reported, not retried forever", () =>
   withTempProject(async (dir) => {
     let turnCallCount = 0;
     const statusMessages: string[] = [];
@@ -665,10 +665,12 @@ test("a context-overflow error that persists because compaction makes no further
     const backend: ModelBackend = {
       async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
         if (!req.tools) {
-          // Always returns the exact same short summary — after the first
-          // compaction, later ones have nothing further to shrink, so
-          // estimateTokens sees no progress and the loop should give up
-          // rather than retrying up to the hard cap pointlessly.
+          // Always returns the exact same short summary regardless of
+          // which tail budget was requested — a genuinely unrecoverable
+          // case (nothing shrinks no matter how tightly the tail is
+          // squeezed) — so the loop should tighten a bounded number of
+          // times (see MIN_TAIL_BUDGET_FRACTION) and then give up, rather
+          // than retrying forever.
           return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
         }
         turnCallCount++;
@@ -689,8 +691,66 @@ test("a context-overflow error that persists because compaction makes no further
 
     await assert.doesNotReject(() => loop.send("do something"));
 
-    assert.equal(turnCallCount, 1, "the very first compaction attempt already makes no progress, so it should give up immediately");
+    // Tightens 0.4 -> 0.2 -> 0.1 -> 0.05 (floor) before giving up: the
+    // initial chat() call plus one retry per tightening step.
+    assert.equal(turnCallCount, 5, "expected the loop to retry across each tail-budget tightening step, then stop — not once, not forever");
+    assert.ok(statusMessages.some((s) => s.includes("smaller kept-context budget")));
     assert.ok(statusMessages.some((s) => s.includes("[error]")));
+  }));
+
+test("a compaction that stops helping at the default tail budget still recovers by retrying with a smaller one", () =>
+  withTempProject(async (dir) => {
+    // Reported live: a real session hit "no longer fits even after
+    // compaction" after just ONE non-improving pass at the default 40%
+    // tail budget, on a window where the tail + the next reply's own
+    // max_tokens reservation + the system prompt + tool schema together
+    // left no real room — even though a SMALLER tail alone would have been
+    // enough to fit. This is the success path for that exact scenario: the
+    // summary itself shrinks with each retry (simulating a smaller kept
+    // tail genuinely producing a smaller request each time), so the turn
+    // should recover instead of giving up.
+    let turnCallCount = 0;
+    let compactionCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          compactionCallCount++;
+          // Shrinks each time — simulates a tighter tail budget genuinely
+          // reducing what's kept, unlike the "stuck forever" test above.
+          return {
+            choices: [
+              { message: { role: "assistant", content: "s".repeat(Math.max(1, 50 - compactionCallCount * 10)) }, finish_reason: "stop" },
+            ],
+          };
+        }
+        turnCallCount++;
+        if (turnCallCount <= 3) {
+          const err: any = new Error(
+            'chat stream failed: 400 {"error":{"code":400,"message":"request (99999 tokens) exceeds the available context size (65536 tokens)","type":"exceed_context_size_error"}}'
+          );
+          throw err;
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 8_000 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.ok(statusMessages.some((s) => s.includes("smaller kept-context budget")));
+    // Recovered — must not have reported the "no longer fits" give-up message.
+    assert.ok(!statusMessages.some((s) => s.includes("no longer fits the context window")));
   }));
 
 test("update_plan persists a checkpoint immediately, independent of compaction, so a hard kill mid-task doesn't lose it", () =>
@@ -1054,4 +1114,78 @@ test("onCompactionStatus fires running then failed when the compaction summary r
       events.map((e) => e.status),
       ["running", "failed"]
     );
+  }));
+
+// cancelCurrentTurn() backs the TUI's Esc → Y ("cancel and save for later")
+// flow. Two things must both be true: the turn ends cleanly (not surfaced
+// as a failure/error status) once the backend's chat() call is aborted, and
+// a checkpoint is written that a later resumeIfCheckpointExists() can pick
+// back up — the same mechanism a mid-batch compaction interruption already
+// uses (see the "captures pendingToolCall when compaction fires mid-batch"
+// test above), reused here rather than inventing a second resume path.
+test("cancelCurrentTurn() ends the turn cleanly and writes a resumable checkpoint, instead of surfacing a failure", () =>
+  withTempProject(async (dir) => {
+    let cancelled = false;
+    let rejectChat: ((err: Error) => void) | null = null;
+    const backend: ModelBackend = {
+      async chat(): Promise<ChatCompletionResponse> {
+        // Mirrors the real OpenAICompatibleClient: chat() hangs until
+        // cancel() is called, then rejects — it never resolves on its own
+        // in this test, so reaching a clean end-of-turn can only happen
+        // via the cancellation path being exercised, not by coincidence.
+        return new Promise((_resolve, reject) => {
+          rejectChat = reject;
+        });
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 1;
+      },
+      cancel() {
+        cancelled = true;
+        rejectChat?.(new Error("cancelled by user"));
+      },
+    };
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    const sendPromise = loop.send("do the thing");
+    // Let send() actually reach the in-flight chat() call before cancelling.
+    await new Promise((r) => setTimeout(r, 10));
+    await loop.cancelCurrentTurn();
+
+    // Must resolve cleanly — cancellation is not a thrown/unhandled error.
+    await sendPromise;
+
+    assert.ok(cancelled, "expected backend.cancel() to have been called");
+    assert.ok(
+      statusMessages.some((s) => s.includes("[cancelled]")),
+      `expected a [cancelled] status message, got: ${JSON.stringify(statusMessages)}`
+    );
+
+    const checkpoint = await readCheckpoint(dir);
+    assert.ok(checkpoint, "expected a checkpoint to have been written");
+    assert.equal(checkpoint!.goal, "do the thing");
+  }));
+
+test("cancelCurrentTurn() is safe to call when no turn is currently running (no-op past the checkpoint write)", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({ turnResponses: [], tokenCounts: [1] });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100 },
+    });
+    await assert.doesNotReject(() => loop.cancelCurrentTurn());
   }));

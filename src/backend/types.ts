@@ -75,4 +75,13 @@ export interface ModelBackend {
    *  compaction fired 8x too eagerly, interrupting every single turn in a
    *  loop). Optional and may throw for non-llama.cpp backends. */
   getContextSize?(): Promise<number>;
+
+  /** Aborts whichever chat() call is currently in flight on this backend,
+   *  if any (a no-op otherwise). Lets the caller stop a turn the user
+   *  cancelled (e.g. via the TUI's Esc-to-cancel) instead of waiting for
+   *  the model to finish generating on its own — the single inference slot
+   *  (`-np 1`) would otherwise stay pinned by a turn nobody wants anymore
+   *  for as long as it takes to finish. Optional so a backend that can't
+   *  support mid-request cancellation simply doesn't implement it. */
+  cancel?(): void;
 }

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -255,11 +255,149 @@ test("runCompaction sanitizes tool_calls/tool-role messages so a strict backend 
         );
       }
 
-      assert.equal(result.messages[0].content, "[Compacted history summary]\nsummary text");
-      // the tool's matching result (index 4) landed in the kept tail (last 6
-      // messages), verbatim and untouched — sanitization only applies to
-      // what's actually sent for summarization, never to the preserved tail
-      assert.ok(result.messages.some((m) => m.role === "tool" && m.content === "Thu Sep 18"));
+      // The original system prompt ("sys") must survive compaction, concatenated
+      // with the summary as ONE system message — not silently replaced by it.
+      assert.equal(result.messages[0].role, "system");
+      assert.equal(result.messages[0].content, "sys\n\n[Compacted history summary]\nsummary text");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+// Same failure mode loop.ts's own main-turn request already guards against
+// (see its `max_tokens` comment): without it, llama-server defaults to
+// n_predict=-1 and a generation that never hits a natural stop token pins
+// the single inference slot forever, invisibly. Caught live via GET /slots
+// showing a real compaction summary request's n_decoded climbing past 700
+// with max_tokens/n_predict both -1 — this request path had no cap at all.
+test("runCompaction sets max_tokens on the summary request, scaled to the real context window", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+      ];
+      const partial = {
+        reason: "manual" as const,
+        goal: "g",
+        steps: [],
+        files: [],
+        pendingToolCall: null,
+        mustPreserve: [],
+      };
+
+      await runCompaction(dir, messages, backend, "m", partial, 16384);
+      const sent = lastRequest();
+      assert.ok(sent);
+      assert.ok(typeof sent!.max_tokens === "number" && sent!.max_tokens! > 0, `expected a positive max_tokens, got ${sent!.max_tokens}`);
+      // Scaled to the window (16384 * 0.25 = 4096), not a flat constant.
+      assert.equal(sent!.max_tokens, 4096);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("runCompaction's summary max_tokens has a floor for a small context window, and a ceiling for a very large one", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      const messages: ChatMessage[] = [{ role: "system", content: "sys" }, { role: "user", content: "hi" }];
+      const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      await runCompaction(dir, messages, backend, "m", partial, 512); // tiny window
+      assert.equal(lastRequest()!.max_tokens, 256); // floor, not 512*0.25=128
+
+      await runCompaction(dir, messages, backend, "m", partial, 200_000); // huge window
+      assert.equal(lastRequest()!.max_tokens, 4096); // ceiling, not 50000
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("runCompaction preserves the original system prompt (base prompt + injected project rules) across compaction, not just the summary", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      // A long-enough conversation that the system prompt (messages[0]) is
+      // guaranteed to fall into toSummarize under any real budget — this is
+      // the exact shape that made the bug invisible until now: it only shows
+      // up once a session is long enough to compact at all, and manifests as
+      // "the agent stopped following its rules," not a crash or test failure.
+      const SYSTEM_PROMPT = "SYSTEM-PROMPT-WITH-PROJECT-RULES: never force push, always run tests";
+      const messages: ChatMessage[] = [{ role: "system", content: SYSTEM_PROMPT }];
+      for (let i = 0; i < 40; i++) {
+        messages.push({ role: "user", content: "u".repeat(500) });
+        messages.push({ role: "assistant", content: "a".repeat(500) });
+      }
+
+      const backend: ModelBackend = {
+        async chat() {
+          return { choices: [{ message: { role: "assistant", content: "SUMMARY-TEXT" }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      const partial = { reason: "auto-threshold" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      const result = await runCompaction(dir, messages, backend, "m", partial, 4096);
+
+      assert.equal(result.messages[0].role, "system");
+      assert.ok(
+        (result.messages[0].content as string).includes(SYSTEM_PROMPT),
+        "original system prompt must survive compaction, not just its own summary"
+      );
+      // Still exactly one system message — never two (breaks chat-template-
+      // enforcing backends, per loop.ts's injectResumeContextIfPending doc).
+      assert.equal(result.messages.filter((m) => m.role === "system").length, 1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("runCompaction never leaves an orphaned role:tool message (no matching tool_calls) at the start of the compacted result", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      // Sweeps the tool-result size so the size-based cut point lands right
+      // on the boundary between a tool_calls-bearing assistant message and
+      // its matching tool response for at least one iteration — reproduced
+      // directly: 1 out of 20 sizes in this exact range hit the boundary.
+      for (let toolLen = 100; toolLen <= 2000; toolLen += 100) {
+        const messages: ChatMessage[] = [{ role: "system", content: "SYS" }];
+        for (let i = 0; i < 30; i++) {
+          messages.push({ role: "user", content: "u".repeat(200) });
+          messages.push({
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: `call_${i}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: `f${i}.ts` }) } }],
+          });
+          messages.push({ role: "tool", tool_call_id: `call_${i}`, content: "r".repeat(toolLen) });
+        }
+        const backend: ModelBackend = {
+          async chat() {
+            return { choices: [{ message: { role: "assistant", content: "S" }, finish_reason: "stop" }] };
+          },
+          async listModels() {
+            return [];
+          },
+        };
+        const partial = { reason: "auto-threshold" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+        const { messages: after } = await runCompaction(dir, messages, backend, "m", partial, 4096);
+
+        const liveIds = new Set(
+          after.flatMap((m) => (m.role === "assistant" ? (m.tool_calls ?? []).map((tc) => tc.id) : []))
+        );
+        for (const m of after) {
+          if (m.role === "tool") {
+            assert.ok(liveIds.has(m.tool_call_id!), `toolLen=${toolLen}: orphaned tool message (tool_call_id=${m.tool_call_id})`);
+          }
+        }
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -373,3 +511,87 @@ test("shouldCompact accounts for extraText too — a request that fits without i
   assert.equal(await shouldCompact(messages, thresholds), false);
   assert.equal(await shouldCompact(messages, thresholds, undefined, "y".repeat(4 * 30)), true); // 30+30=60 >= 50
 });
+
+// The kept tail's own budget was previously computed independently of the
+// room the NEXT request's own max_tokens reservation (loop.ts's turn
+// request always reserves ~25% of the window) also needs — so a
+// "successful" compaction could still leave (tail + reserved-reply) at or
+// past the entire window before the system prompt or tool schema even
+// entered the picture. Reported live: two compaction passes on a
+// 16384-token window both reported "no progress" and the turn failed
+// outright, because the 40%-of-window tail floor plus the 25%-of-window
+// reply reservation already summed past what was actually usable.
+test("a tighter tailBudgetFraction produces a smaller kept tail than the default, given the same messages", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const backend: ModelBackend = {
+        async chat() {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      const messages: ChatMessage[] = [{ role: "system", content: "sys" }];
+      for (let i = 0; i < 30; i++) {
+        messages.push({ role: "user", content: "u".repeat(200) });
+        messages.push({ role: "assistant", content: "a".repeat(200) });
+      }
+      const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      const atDefault = await runCompaction(dir, messages, backend, "m", partial, 16384, DEFAULT_TAIL_BUDGET_FRACTION);
+      const atTighter = await runCompaction(dir, messages, backend, "m", partial, 16384, DEFAULT_TAIL_BUDGET_FRACTION / 4);
+
+      const sizeOf = (result: typeof atDefault) =>
+        result.messages.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0);
+
+      assert.ok(
+        sizeOf(atTighter) < sizeOf(atDefault),
+        `expected a tighter tailBudgetFraction to keep less: default=${sizeOf(atDefault)}, tighter=${sizeOf(atTighter)}`
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("runCompaction's kept-tail budget accounts for the next reply's own reserved room, not just the raw window size", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const backend: ModelBackend = {
+        async chat() {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      // One large single message — small enough to fit if the tail budget
+      // is computed against the raw window (16384*4*0.4=26,214 chars), but
+      // should be summarized away once the reply reservation is subtracted
+      // first (16384*(1-0.25)*4*0.4=19,660 chars — still bigger than this
+      // message, so pick a size that only fits the FIRST calculation to
+      // prove the reservation is actually applied).
+      // The big message is NOT last — selectKeptTail always force-keeps at
+      // least the single most recent message regardless of budget (there's
+      // no better option if even that alone is oversized), so putting it
+      // last would trivially pass no matter what the budget math does.
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "q" },
+        { role: "assistant", content: "u".repeat(22_000) },
+        { role: "user", content: "one more short message after it" },
+      ];
+      const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      const { messages: after } = await runCompaction(dir, messages, backend, "m", partial, 16384);
+      const keptTheBigMessage = after.some((m) => typeof m.content === "string" && m.content.length >= 22_000);
+      assert.ok(
+        !keptTheBigMessage,
+        "expected the 22,000-char message to be summarized away once the next reply's reservation is subtracted from the tail budget"
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());

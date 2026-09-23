@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { executeTool, setRunShellTimeoutForTests } from "./index.js";
+import { executeTool, setRunShellTimeoutForTests, configureSkills } from "./index.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "llamacli-tools-test-"));
@@ -120,4 +120,76 @@ test("edit_file still throws its original error when old_text isn't found at all
       () => executeTool("edit_file", JSON.stringify({ path, old_text: "not present", new_text: "x" }), dir),
       /old_text not found/
     );
+  }));
+
+// The skill system (8 builtin skills shipped under src/skills/builtin/)
+// had loadSkillBody() defined but no caller anywhere in the codebase — the
+// model had no way to ever read a skill's body, only a human via the
+// /skills UI list. load_skill is the tool that actually connects it.
+test("load_skill returns the body of a configured skill by name", () =>
+  withTempDir(async (dir) => {
+    configureSkills([{ name: "planning", trigger: "when planning multi-step work", path: join(dir, "planning.md") }]);
+    try {
+      await writeFile(join(dir, "planning.md"), "# Planning skill body", "utf8");
+      const result = await executeTool("load_skill", JSON.stringify({ name: "planning" }), dir);
+      assert.equal(result.content, "# Planning skill body");
+    } finally {
+      configureSkills([]); // don't leak into other tests
+    }
+  }));
+
+test("load_skill rejects an unknown skill name and lists what's actually available", () =>
+  withTempDir(async (dir) => {
+    configureSkills([{ name: "security", trigger: "t", path: join(dir, "security.md") }]);
+    try {
+      await assert.rejects(
+        () => executeTool("load_skill", JSON.stringify({ name: "nonexistent" }), dir),
+        /unknown skill: nonexistent.*Available: security/s
+      );
+    } finally {
+      configureSkills([]);
+    }
+  }));
+
+// run_shell previously used `stdout || stderr`, silently dropping stderr
+// whenever stdout was non-empty — losing diagnostics from any tool (tsc,
+// pytest, cargo) that writes them to stderr alongside normal output.
+test("run_shell includes both stdout and stderr, not just whichever is non-empty first", () =>
+  withTempDir(async (dir) => {
+    const result = await executeTool("run_shell", JSON.stringify({ command: "echo out; echo err >&2" }), dir);
+    assert.match(result.content, /out/);
+    assert.match(result.content, /err/);
+  }));
+
+// A failing command previously surfaced only err.message ("Command failed:
+// ..."), discarding err.stdout/err.stderr entirely — the model had no way
+// to learn WHY a "succeeded" command actually failed, making it prone to
+// blindly retrying the same command (exactly what the circuit breaker in
+// selfHeal.ts exists to catch as an unrecoverable loop).
+test("run_shell surfaces the failing command's actual output, not just its exit message", () =>
+  withTempDir(async (dir) => {
+    await assert.rejects(
+      () => executeTool("run_shell", JSON.stringify({ command: "echo something specific went wrong >&2; exit 1" }), dir),
+      /something specific went wrong/
+    );
+  }));
+
+// read_file previously loaded the entire file into memory before
+// capToolResult() (loop.ts) got a chance to truncate it — a large file
+// (accidentally pointed at a bundled asset, a log, a data dump) could
+// exhaust memory before any cap ever applied.
+test("read_file truncates a file larger than the size cap instead of loading it all into memory", () =>
+  withTempDir(async (dir) => {
+    const path = join(dir, "big.txt");
+    // Write just over 5MB (READ_FILE_MAX_BYTES) of a repeating, greppable pattern.
+    const chunk = "0123456789".repeat(100); // 1000 bytes
+    const fh = await (await import("node:fs/promises")).open(path, "w");
+    try {
+      for (let i = 0; i < 5300; i++) await fh.write(chunk); // ~5.3MB
+    } finally {
+      await fh.close();
+    }
+    const result = await executeTool("read_file", JSON.stringify({ path }), dir);
+    assert.ok(result.content.length < 5.3 * 1024 * 1024, "result should be smaller than the original file");
+    assert.match(result.content, /truncated.*only the first/s);
   }));

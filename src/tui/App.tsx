@@ -13,6 +13,50 @@ export interface AppProps {
   model: string;
   onSubmit: (text: string) => void;
   onSlashCommand: (key: string) => void;
+  /** Called when the user confirms Esc → Y ("force quit, saving progress to
+   *  resume later"). Wired in index.tsx to: cancel the in-flight turn (if
+   *  one is running) or save the current conversation (if idle) — either
+   *  way writing a resumable checkpoint — and then actually exit the app
+   *  (unmount + let the process end), skipping /quit's normal
+   *  self-improvement-proposal gate entirely. That gate is a "review before
+   *  you go" nicety; Esc is the emergency/quick exit and must never block
+   *  on it. The checkpoint reuses the exact same mechanism a mid-batch
+   *  compaction interruption already writes, so the next launch's startup
+   *  resume-confirmation prompt (pendingResumeGoal below) picks it back up
+   *  with no extra wiring. */
+  onForceQuit: () => void;
+  /** Loaded once at startup (index.tsx) from .llamacli/state/prompt-history.json
+   *  — kept as the initial value here rather than App loading it itself, so
+   *  App stays pure UI/presentation and all filesystem I/O stays in
+   *  index.tsx, matching how config/rules/skills are already loaded there. */
+  initialHistory: string[];
+  /** Fires with the full updated history (already capped/deduped) every
+   *  time a new prompt is submitted, so index.tsx can persist it. */
+  onHistoryChange: (history: string[]) => void;
+  /** The previous session's checkpoint goal (its one-line restatement of
+   *  what the user originally asked for), if a checkpoint was sitting on
+   *  disk when this session started — read in index.tsx before render, so
+   *  the resume/discard question can be asked (and answered) right at
+   *  startup instead of silently auto-resuming. `null` when there's
+   *  nothing to ask about. */
+  pendingResumeGoal: string | null;
+  /** Called once the resume confirmation is answered: `true` resumes (via
+   *  AgentLoop.resumeIfCheckpointExists(), same as before this prompt
+   *  existed), `false` discards the checkpoint and starts fresh. */
+  onResumeDecision: (resume: boolean) => void;
+}
+
+/** Every prompt actually submitted counts, whether it was sent immediately
+ *  or queued while busy (see the Return-key handler below) — both are "the
+ *  user submitted a prompt" from history's point of view. Caps at
+ *  MAX_PROMPT_HISTORY and drops an exact-duplicate of the immediately
+ *  preceding entry (retyping/resubmitting the same thing shouldn't spam
+ *  history with repeats), same as a normal shell's history behaves. */
+export const MAX_PROMPT_HISTORY = 50;
+export function appendHistory(history: string[], text: string): string[] {
+  if (history[history.length - 1] === text) return history;
+  const next = [...history, text];
+  return next.length > MAX_PROMPT_HISTORY ? next.slice(next.length - MAX_PROMPT_HISTORY) : next;
 }
 
 interface LogLine {
@@ -34,11 +78,46 @@ export function filterMenuItems(input: string): SlashMenuItem[] {
   return SLASH_MENU_ITEMS.filter((item) => item.key.toLowerCase().includes(query));
 }
 
-export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
+export function App({
+  cwd,
+  model,
+  onSubmit,
+  onSlashCommand,
+  onForceQuit,
+  initialHistory,
+  onHistoryChange,
+  pendingResumeGoal,
+  onResumeDecision,
+}: AppProps) {
   const { stdout } = useStdout();
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
+  // Esc opens this Y/N confirmation instead of quitting immediately — a
+  // single stray keystroke shouldn't be able to kill the app (mid-turn or
+  // not). While this is true, useInput intercepts every key as part of the
+  // confirmation (see below) rather than normal typing/menu/etc.
+  const [quitConfirmPending, setQuitConfirmPending] = useState(false);
+  // Shown once at startup (initialized from the prop, which index.tsx only
+  // sets when a checkpoint was actually found on disk) — intercepts input
+  // the same way quitConfirmPending does, and is resolved before either the
+  // user can start typing a real message or the auto-resume machinery
+  // (AgentLoop.resumeIfCheckpointExists()) runs on its own.
+  const [resumeConfirmPending, setResumeConfirmPending] = useState(!!pendingResumeGoal);
+  // Prompt history (Up/Down arrow), most recent last — see appendHistory.
+  // Loaded once from disk (initialHistory) and kept in sync locally after
+  // that; onHistoryChange pushes each update back out for index.tsx to
+  // persist, rather than App doing its own file I/O (see AppProps doc).
+  const [history, setHistory] = useState<string[]>(initialHistory);
+  // -1 = not currently browsing history (typing fresh). 0 = the most
+  // recent entry, counting UP from the end of `history` as Up is pressed
+  // repeatedly — matches a normal shell's history navigation direction.
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  // What was actually typed before Up was first pressed, restored once
+  // Down navigates back past the most recent history entry — otherwise
+  // browsing history and then returning to "fresh" would silently discard
+  // whatever partial text the user had already typed.
+  const [historyDraft, setHistoryDraft] = useState("");
   const [contextUsedRatio, setContextUsedRatio] = useState(0);
   const [planProgress, setPlanProgress] = useState<{ done: number; total: number } | null>(null);
   // Requested directly: the "[compaction complete] ..." log line got
@@ -115,6 +194,31 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     wasBusyRef.current = busy;
   }, [busy]);
 
+  // Echoes the startup resume question into the scrolling log as well as
+  // showing it in the input box (see visibleInput below) — reported
+  // directly: the input-box-only version wasn't visible on a real
+  // terminal ("좌표 문제인듯" / "seems like a coordinate problem"). The
+  // input box's text is positioned via delicate absolute-cursor math tied
+  // to the terminal's reported size (see the cursor-positioning useEffect
+  // further down); if that size is ever misdetected the single-line
+  // question can end up genuinely off-screen or overwritten while the rest
+  // of the app still looks fine. The log area uses a completely different,
+  // independently-wrapped rendering path (wrapPreservingTables/wrapToWidth
+  // below), so this guarantees the question is visible regardless of
+  // whatever coordinate issue might affect the input box specifically.
+  useEffect(() => {
+    if (resumeConfirmPending) {
+      pushLine(
+        `이전 작업이 있습니다: "${pendingResumeGoal}"\n이어서 진행할까요? Y(예) / N(아니오) 를 입력해주세요.`,
+        "status"
+      );
+    }
+    // Runs once, at mount — resumeConfirmPending only ever starts true and
+    // is answered exactly once per session (see useInput below), so there's
+    // nothing to re-run this for.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useInput((char, key) => {
     // Ink's default Ctrl-C-exits-the-app behavior is disabled in index.tsx
     // (exitOnCtrlC: false) specifically so this reaches here instead —
@@ -125,6 +229,43 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
     // character" branch, which would otherwise insert the raw control
     // byte into whatever you were typing. /quit is still the only way out.
     if (key.ctrl && char.toLowerCase() === "c") {
+      return;
+    }
+
+    // Startup resume question, answered before anything else can happen —
+    // set once from pendingResumeGoal (index.tsx found a checkpoint on
+    // disk before this ever rendered) and never re-armed after being
+    // answered once, so it can't reappear mid-session.
+    if (resumeConfirmPending) {
+      const lower = char.toLowerCase();
+      if (lower === "y") {
+        setResumeConfirmPending(false);
+        pushLine("[resuming previous work...]", "status");
+        onResumeDecision(true);
+      } else if (lower === "n" || key.escape) {
+        setResumeConfirmPending(false);
+        pushLine("[starting fresh — previous checkpoint discarded]", "status");
+        onResumeDecision(false);
+      }
+      // any other key: still waiting for a real y/n answer — ignored.
+      return;
+    }
+
+    // Esc → Y/N confirmation dialog, entered below. While it's showing,
+    // every keystroke is consumed here (y/n/esc) rather than falling
+    // through to the menu or normal typing — a stray key must never
+    // silently quit the app, and must never silently leak into the input
+    // box either.
+    if (quitConfirmPending) {
+      const lower = char.toLowerCase();
+      if (lower === "y") {
+        setQuitConfirmPending(false);
+        pushLine("[force quitting — saving progress to resume later]", "status");
+        onForceQuit();
+      } else if (lower === "n" || key.escape) {
+        setQuitConfirmPending(false);
+      }
+      // any other key: still waiting for a real y/n answer — ignored.
       return;
     }
 
@@ -174,15 +315,48 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
       return;
     }
 
-    // Arrow keys are otherwise unused while typing a normal message (Ink
-    // gives an empty `char` for them, so the fallback append-to-input
-    // below is already a harmless no-op for these) — repurposed for
-    // scrollback instead of adding a new dedicated keybinding. PageUp/Down
-    // jump a full screen at a time; plain Up/Down move one line.
-    if (key.pageUp || key.pageDown || key.upArrow || key.downArrow) {
-      const amount = key.pageUp || key.pageDown ? Math.max(1, logHeightRef.current - 1) : 1;
-      const direction = key.pageUp || key.upArrow ? 1 : -1;
+    // Esc (menu not open, no confirmation already showing) opens the force-
+    // quit confirmation above — works at any time, not just while a turn is
+    // running, so it doubles as a quick "get me out of here" independent of
+    // /quit's normal self-improvement-review gate. Also echoed into the log
+    // (not just the input box) for the same visibility reason as the
+    // startup resume question above.
+    if (key.escape) {
+      setQuitConfirmPending(true);
+      pushLine("강제 종료하시겠습니까? 진행 중인 작업은 저장되어 다음 실행 시 이어집니다.\nY(예) / N(아니오) 를 입력해주세요.", "status");
+      return;
+    }
+
+    // PageUp/PageDown scroll the log a full screen at a time — unaffected
+    // by the history repurposing below (Ink gives an empty `char` for
+    // these, so the fallback append-to-input further down was already a
+    // harmless no-op for them).
+    if (key.pageUp || key.pageDown) {
+      const amount = Math.max(1, logHeightRef.current - 1);
+      const direction = key.pageUp ? 1 : -1;
       setScrollOffset((s) => Math.max(0, Math.min(maxScrollRef.current, s + amount * direction)));
+      return;
+    }
+
+    // Plain Up/Down: prompt history, matching a normal shell. (Previously
+    // these did line-by-line log scrollback — moved to PageUp/PageDown-only
+    // above, since history is the far more commonly reached-for behavior
+    // for arrow keys specifically, and Page Up/Down already covers
+    // scrollback on its own.)
+    if (key.upArrow || key.downArrow) {
+      if (history.length === 0) return;
+      if (key.upArrow) {
+        if (historyIndex >= history.length - 1) return; // already at the oldest entry
+        if (historyIndex === -1) setHistoryDraft(input); // stash what was being typed
+        const next = historyIndex + 1;
+        setHistoryIndex(next);
+        setInput(history[history.length - 1 - next]);
+      } else {
+        if (historyIndex === -1) return; // not currently browsing — nothing to go back to
+        const next = historyIndex - 1;
+        setHistoryIndex(next);
+        setInput(next === -1 ? historyDraft : history[history.length - 1 - next]);
+      }
       return;
     }
 
@@ -195,6 +369,15 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
         pushLine(input, "user");
         onSubmit(input);
       }
+      // Every actually-submitted prompt (sent now or queued) joins history —
+      // see appendHistory's doc comment on why both count.
+      setHistory((h) => {
+        const next = appendHistory(h, input);
+        onHistoryChange(next);
+        return next;
+      });
+      setHistoryIndex(-1);
+      setHistoryDraft("");
       setInput("");
       // A message you just sent should be visible without having to
       // manually scroll back down for it — snap back to the live tail,
@@ -241,7 +424,23 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
   // Reserves 2 extra columns for the input box's own left+right border
   // characters (see the bordered Box below) on top of its padding/spinner/space.
   const maxInputWidth = Math.max(10, columns - 6);
-  const visibleInput = tailToWidth(input, maxInputWidth);
+  // Shown next to the input any time it's not already showing one of the
+  // confirmation dialogs below, so the quit path is discoverable without
+  // having to already know the keybinding exists. Hidden below a
+  // reasonable width rather than squeezing the input box to near-nothing
+  // to make room for it on a narrow terminal.
+  const ESC_HINT = " (Esc to quit)";
+  const showEscHint = !quitConfirmPending && !resumeConfirmPending && columns >= 40;
+  const QUIT_CONFIRM_TEXT = "강제 종료하시겠습니까? 진행 중인 작업은 저장되어 다음 실행 시 이어집니다. (Y/N)";
+  const RESUME_CONFIRM_TEXT = pendingResumeGoal
+    ? `이전 작업을 이어서 하시겠습니까? "${pendingResumeGoal}" (Y/N)`
+    : "";
+  const escHintWidth = showEscHint ? stringWidth(ESC_HINT) : 0;
+  const visibleInput = resumeConfirmPending
+    ? tailToWidth(RESUME_CONFIRM_TEXT, maxInputWidth)
+    : quitConfirmPending
+      ? tailToWidth(QUIT_CONFIRM_TEXT, maxInputWidth)
+      : tailToWidth(input, Math.max(4, maxInputWidth - escHintWidth));
 
   // logHeight is a CONSTANT, independent of menu state — this is the outer
   // log-area Box's actual `height`, and it must never change, because
@@ -395,9 +594,16 @@ export function App({ cwd, model, onSubmit, onSlashCommand }: AppProps) {
 
       {/* The prompt input lives INSIDE this bordered box, not below it —
        *  the border is the visible edge of the actual input area. */}
-      <Box borderStyle="single" borderColor="gray" paddingX={1} height={3} overflow="hidden">
+      <Box
+        borderStyle="single"
+        borderColor={quitConfirmPending || resumeConfirmPending ? "yellow" : "gray"}
+        paddingX={1}
+        height={3}
+        overflow="hidden"
+      >
         <Spinner active={busy} />
-        <Text> {visibleInput}</Text>
+        <Text color={quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {visibleInput}</Text>
+        {showEscHint && <Text dimColor>{ESC_HINT}</Text>}
       </Box>
 
       <StatusBar

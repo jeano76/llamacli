@@ -71,9 +71,21 @@ export interface FailureLogEntry {
 }
 
 const failureLog: FailureLogEntry[] = [];
+// Module-level, so it lives for the whole process — a long-running session
+// with a persistently misbehaving tool/backend would otherwise grow this
+// without bound. It's also sent to the model WHOLESALE on every real-time
+// improvement check (selfImprove.ts's proposeImprovement(getFailureLog(),
+// ...), called via loop.ts's triggerRealtimeImprovementCheck after every
+// new failure) — an unbounded log means that request keeps growing too,
+// not just this array. Recent failures are what a pattern-detection pass
+// actually needs; keep only those.
+const MAX_FAILURE_LOG = 100;
 
 export function logFailure(entry: FailureLogEntry): void {
   failureLog.push(entry);
+  if (failureLog.length > MAX_FAILURE_LOG) {
+    failureLog.splice(0, failureLog.length - MAX_FAILURE_LOG);
+  }
 }
 
 export function getFailureLog(): readonly FailureLogEntry[] {

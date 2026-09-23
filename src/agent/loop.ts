@@ -3,7 +3,13 @@ import { AGENT_STATE_TOOLS, FILE_TOOLS, TOOL_DEFS, executeTool } from "../tools/
 import { CircuitBreaker } from "../hermes/selfHeal.js";
 import { logFailure, getFailureLog } from "../hermes/selfHeal.js";
 import { proposeImprovement, writeProposedRule, appendImprovementLog, ImprovementProposal } from "../hermes/selfImprove.js";
-import { runCompaction, estimateTokens, buildResumePrompt, CompactionThresholds } from "../compaction/compactor.js";
+import {
+  runCompaction,
+  estimateTokens,
+  buildResumePrompt,
+  CompactionThresholds,
+  DEFAULT_TAIL_BUDGET_FRACTION,
+} from "../compaction/compactor.js";
 import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
 import { stripToolCallTemplateLeak } from "./textSanitize.js";
@@ -113,8 +119,14 @@ export class AgentLoop {
   /** Files touched via read_file/write_file/edit_file, most-recent status wins. */
   private filesTouched = new Map<string, Checkpoint["files"][number]["status"]>();
   /** Fallback step history when the model never calls update_plan: every
-   *  successfully executed tool call, in order. */
+   *  successfully executed tool call, in order. Bounded (see
+   *  pushExecutedToolLog) — unbounded growth here doesn't cost request
+   *  tokens directly (it's never sent to the backend), but it IS written
+   *  verbatim into the on-disk checkpoint (currentSteps(), via compact())
+   *  on every compaction, so a very long tool-heavy session would otherwise
+   *  make that checkpoint file grow without limit too. */
   private executedToolLog: string[] = [];
+  private static readonly MAX_EXECUTED_TOOL_LOG = 200;
   /** Last self-improvement proposal shown to the user but not yet applied
    *  (§3: never write a proposed rule without explicit approval). */
   private pendingImprovement: ImprovementProposal | null = null;
@@ -131,6 +143,15 @@ export class AgentLoop {
    *  so a background analysis call must never fire while a turn is still
    *  actively in flight. */
   private hasNewFailuresThisTurn = false;
+  /** Set by cancelCurrentTurn() (TUI: Esc → Y confirms), consumed by
+   *  runUntilIdle() at the two points a turn can actually notice it — the
+   *  chat() catch block and the top of the tool-call loop. Kept as a flag
+   *  rather than throwing directly from cancelCurrentTurn() itself: that
+   *  method can be called at any time from the UI thread, completely
+   *  independent of where runUntilIdle currently is in its own await
+   *  chain, so there's no single `throw` site that would actually reach
+   *  the right place. */
+  private cancelRequested = false;
 
   constructor(private opts: AgentLoopOptions) {
     this.messages = [{ role: "system", content: opts.systemPrompt }];
@@ -147,7 +168,16 @@ export class AgentLoop {
     const resumeText = await buildResumePrompt(this.opts.projectRoot);
     if (!resumeText) return false;
     this.opts.onStatus?.(resumeText);
-    this.messages.push({ role: "system", content: resumeText });
+    // Must be role "user", not "system": this.messages already starts with
+    // one system message (the system prompt, set in the constructor), and
+    // pushing a second one broke chat-template-enforcing backends (llama.cpp
+    // Jinja templates that raise "System message must be at the beginning"
+    // for a second system entry, and separately "No user query found" when
+    // that left the conversation with zero user-role messages at all —
+    // hit in production 2026-09-21, a resumed session couldn't get a reply
+    // out of the model at all). A resume is conceptually the user saying
+    // "continue," so "user" is also the more accurate role anyway.
+    this.messages.push({ role: "user", content: resumeText });
     // Restore the plan/progress too, not just the text summary — otherwise
     // the status bar's progress indicator (PLAN_PROGRESS_WIDTH) shows
     // nothing until the model happens to call update_plan again, even
@@ -254,6 +284,20 @@ export class AgentLoop {
     // other unforeseen loop.
     const MAX_OVERFLOW_RETRIES = 8;
     let overflowRetries = 0;
+    // Starts at the normal default and HALVES each time a compaction
+    // attempt fails to shrink anything (see the `after >= before` branch
+    // below), down to a floor — rather than giving up the instant the
+    // first attempt doesn't help. Found live: the kept tail's own default
+    // budget (40% of the window) plus the next reply's reservation (25%)
+    // plus the (necessarily preserved) system prompt and tool schema can
+    // together already exceed a modest context window on their own, so
+    // "one compaction pass didn't shrink it" doesn't mean the conversation
+    // is truly unrecoverable — it means the tail itself needs to give up
+    // more room too. Reset per-turn (a fresh send() call starts over at
+    // the default), so a difficult turn doesn't leave every later turn in
+    // the session artificially starved of kept context.
+    let tailBudgetFraction = DEFAULT_TAIL_BUDGET_FRACTION;
+    const MIN_TAIL_BUDGET_FRACTION = 0.05;
     turnLoop: while (true) {
       await this.maybeCompact();
 
@@ -287,6 +331,20 @@ export class AgentLoop {
           }
         );
       } catch (err: any) {
+        // cancelCurrentTurn() already wrote a resumable checkpoint and
+        // called backend.cancel() before this throw ever happens — this is
+        // just recognizing that the resulting AbortError is the expected
+        // shape of a deliberate cancel, not a real failure to report or
+        // retry. Checked first, ahead of the overflow-retry branch below,
+        // since a cancel can in principle race a context-overflow message
+        // (both surface as an error out of the same backend.chat() call).
+        if (this.cancelRequested) {
+          this.cancelRequested = false;
+          this.opts.onStatus?.(
+            "[cancelled] work saved — it will resume automatically the next time llamacli starts in this project."
+          );
+          return;
+        }
         if (
           overflowRetries < MAX_OVERFLOW_RETRIES &&
           /exceeds the available context size|exceed_context_size_error/i.test(err.message)
@@ -296,17 +354,29 @@ export class AgentLoop {
             `[context overflow] request exceeded the context window — forcing compaction and retrying (${overflowRetries}/${MAX_OVERFLOW_RETRIES}).`
           );
           const before = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
-          await this.compact("auto-threshold", null);
+          await this.compact("auto-threshold", null, tailBudgetFraction);
           const after = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
-          // A compaction that didn't actually shrink anything (e.g. the
-          // remaining "must keep" tail — the resume context, the latest
-          // pending tool call — is itself already too large to fit on its
-          // own) would otherwise retry the exact same oversized request
-          // forever within the retry bound above. Only keep retrying while
-          // it's genuinely making progress; stop immediately once a
-          // compaction stops helping instead of burning the rest of the
-          // retry budget on a request that can't succeed.
+          // A compaction that didn't actually shrink anything at the
+          // CURRENT tail budget doesn't necessarily mean the conversation
+          // is truly unrecoverable — it can just mean the kept tail itself
+          // (see compactor.ts's DEFAULT_TAIL_BUDGET_FRACTION) needs to give
+          // up more room too. Tighten it and try again before giving up,
+          // down to a floor; only once even the tightest budget fails to
+          // help is this a real "one message alone is too large" stuck
+          // state, not a fixable one. Reported live: a real session hit
+          // "no longer fits even after compaction" after just ONE
+          // non-improving pass at the default 40% budget, on a 16384-token
+          // window where 40% (tail) + 25% (the next reply's own
+          // reservation) + the system prompt + tool schema together left
+          // no real room — a smaller tail alone was enough to fit.
           if (after >= before) {
+            if (tailBudgetFraction > MIN_TAIL_BUDGET_FRACTION) {
+              tailBudgetFraction = Math.max(MIN_TAIL_BUDGET_FRACTION, tailBudgetFraction / 2);
+              this.opts.onStatus?.(
+                `[context overflow] compaction alone didn't shrink it — retrying with a smaller kept-context budget (${Math.round(tailBudgetFraction * 100)}%).`
+              );
+              continue;
+            }
             this.opts.onStatus?.(
               "[error] the conversation no longer fits the context window even after compaction — some content is too large to keep."
             );
@@ -370,6 +440,21 @@ export class AgentLoop {
       }
 
       for (const call of message.tool_calls) {
+        // Cancellation can land here instead of inside the chat() catch
+        // above when the user hits Esc while a tool (run_shell, a file
+        // write, ...) is actually running rather than while the model is
+        // generating — backend.cancel() is a no-op in that case (nothing
+        // in flight on the backend to abort), so nothing throws from
+        // chat(). Checking here too means a cancel between tool calls in a
+        // batch is still honored promptly instead of only being noticed
+        // once the model streams its next reply.
+        if (this.cancelRequested) {
+          this.cancelRequested = false;
+          this.opts.onStatus?.(
+            "[cancelled] work saved — it will resume automatically the next time llamacli starts in this project."
+          );
+          return;
+        }
         const stopReason = this.breaker.shouldStop();
         if (stopReason) {
           this.opts.onStatus?.(`[stopped] self-healing circuit breaker tripped: ${stopReason}`);
@@ -435,7 +520,7 @@ export class AgentLoop {
             this.opts.onDiff?.(this.summarizeArgs(call.function.arguments), result.diff);
           }
           this.recordFileTouch(call.function.name, call.function.arguments);
-          this.executedToolLog.push(`${call.function.name}(${this.summarizeArgs(call.function.arguments)})`);
+          this.pushExecutedToolLog(`${call.function.name}(${this.summarizeArgs(call.function.arguments)})`);
         } catch (err: any) {
           content = `ERROR: ${err.message}`;
           logFailure({
@@ -489,6 +574,15 @@ export class AgentLoop {
     return `ERROR: unhandled state tool ${name}`;
   }
 
+  private pushExecutedToolLog(description: string): void {
+    this.executedToolLog.push(description);
+    if (this.executedToolLog.length > AgentLoop.MAX_EXECUTED_TOOL_LOG) {
+      // Drop from the front — oldest entries are the least useful for a
+      // fallback "what was done" summary anyway.
+      this.executedToolLog.splice(0, this.executedToolLog.length - AgentLoop.MAX_EXECUTED_TOOL_LOG);
+    }
+  }
+
   private recordFileTouch(toolName: string, argsJson: string): void {
     const status = FILE_TOOLS[toolName];
     if (!status) return;
@@ -521,6 +615,41 @@ export class AgentLoop {
 
   private currentFiles(): Checkpoint["files"] {
     return [...this.filesTouched.entries()].map(([path, status]) => ({ path, status }));
+  }
+
+  /** TUI entry point for Esc → Y (cancel the in-progress turn and save
+   *  progress to resume later). Deliberately does NOT go through
+   *  enqueue(): the currently-running turn IS the thing occupying
+   *  `taskChain` right now, so queuing behind it would mean waiting for
+   *  the very turn being cancelled to finish on its own first — exactly
+   *  what this exists to avoid. Safe to call while nothing is running too
+   *  (a no-op past the checkpoint write, which is harmless either way) —
+   *  the UI only wires this to Esc while `busy` is true, but there's
+   *  nothing here that depends on that being reliably true.
+   *
+   *  Writes the checkpoint FIRST, before requesting the abort — same
+   *  ordering compact() already uses, so a crash between the two steps
+   *  still leaves a resumable checkpoint on disk rather than losing
+   *  everything if the abort somehow tore something down first. */
+  async cancelCurrentTurn(): Promise<void> {
+    this.cancelRequested = true;
+    try {
+      await writeCheckpoint(this.opts.projectRoot, {
+        version: 1,
+        timestamp: new Date().toISOString(),
+        reason: "manual",
+        goal: this.currentGoalSummary(),
+        steps: this.currentSteps(),
+        files: this.currentFiles(),
+        pendingToolCall: null,
+        mustPreserve: [],
+      });
+    } catch {
+      // Best-effort, same as every other checkpoint write in this file —
+      // the cancel itself must still go through even if the disk write
+      // fails, rather than leaving the turn stuck running.
+    }
+    this.opts.backend.cancel?.();
   }
 
   /** Entry point for the /compact slash command — runs compaction immediately
@@ -565,7 +694,12 @@ export class AgentLoop {
 
   private async compact(
     reason: Checkpoint["reason"],
-    pendingToolCall: Checkpoint["pendingToolCall"]
+    pendingToolCall: Checkpoint["pendingToolCall"],
+    // See runUntilIdle's overflow-retry loop: passed smaller than
+    // DEFAULT_TAIL_BUDGET_FRACTION on a retry, when a previous compaction
+    // at the default fraction failed to shrink anything at all — the kept
+    // tail itself, not just old history, was the thing too large to fit.
+    tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION
   ): Promise<void> {
     this.opts.onCompactionStatus?.("running", new Date().toISOString());
     const partial: Omit<Checkpoint, "version" | "timestamp"> = {
@@ -583,7 +717,8 @@ export class AgentLoop {
         this.opts.backend,
         this.opts.model,
         partial,
-        this.opts.thresholds.contextWindowTokens
+        this.opts.thresholds.contextWindowTokens,
+        tailBudgetFraction
       );
       this.messages = messages;
       this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);

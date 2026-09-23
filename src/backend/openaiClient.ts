@@ -34,7 +34,19 @@ export function setFetchTimeoutsForTests(lightweightMs: number, chatMs: number):
  * This is the single client used everywhere else in the codebase — swapping
  * backends is a config change (baseUrl/apiKey), never a code change.
  */
+/** Distinguishes a deliberate cancel() from a real timeout on the same
+ *  AbortController — both produce an identical AbortError otherwise,
+ *  and the caller (loop.ts) needs to tell them apart to report a clean
+ *  "[cancelled]" status instead of a scary-looking timeout/network error. */
+const CANCELLED_REASON = "llamacli:cancelled-by-user";
+
 export class OpenAICompatibleClient implements ModelBackend {
+  // Tracks whichever chat() request is currently in flight, so cancel() has
+  // something to abort. Only ever one at a time in practice (the agent
+  // loop is single-turn-at-a-time), so a single field is enough — no need
+  // for a set/map of concurrent requests.
+  private currentChatController: AbortController | null = null;
+
   constructor(
     private baseUrl: string,
     private apiKey: string | undefined = undefined
@@ -46,15 +58,32 @@ export class OpenAICompatibleClient implements ModelBackend {
     return h;
   }
 
+  /** Aborts the in-flight chat() request, if any — see ModelBackend.cancel
+   *  doc comment. A no-op if nothing is currently in flight (e.g. the user
+   *  pressed Esc between turns). */
+  cancel(): void {
+    this.currentChatController?.abort(CANCELLED_REASON);
+  }
+
   /** Wraps fetch() with a real timeout — plain fetch() waits forever by
-   *  default, which is exactly the gap described above. */
-  private async fetchWithTimeout(url: string, options: Record<string, unknown>, timeoutMs: number, label: string) {
-    const controller = new AbortController();
+   *  default, which is exactly the gap described above. `controller`
+   *  defaults to a fresh one for non-chat (lightweight metadata) calls;
+   *  chat() passes its own so cancel() above can reach it. */
+  private async fetchWithTimeout(
+    url: string,
+    options: Record<string, unknown>,
+    timeoutMs: number,
+    label: string,
+    controller: AbortController = new AbortController()
+  ) {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await fetch(url, { ...options, signal: controller.signal as any });
     } catch (err: any) {
-      if (err?.name === "AbortError") throw new Error(`${label} timed out after ${timeoutMs}ms`);
+      if (err?.name === "AbortError") {
+        if (controller.signal.reason === CANCELLED_REASON) throw new Error("cancelled by user");
+        throw new Error(`${label} timed out after ${timeoutMs}ms`);
+      }
       throw err;
     } finally {
       clearTimeout(timer);
@@ -98,14 +127,21 @@ export class OpenAICompatibleClient implements ModelBackend {
     onDelta?: (chunk: ChatCompletionChunk) => void
   ): Promise<ChatCompletionResponse> {
     if (!req.stream || !onDelta) {
-      const res = await this.fetchWithTimeout(
-        `${this.baseUrl}/v1/chat/completions`,
-        { method: "POST", headers: this.headers(), body: JSON.stringify({ ...req, stream: false }) },
-        CHAT_FETCH_TIMEOUT_MS,
-        "chat"
-      );
-      if (!res.ok) throw new Error(`chat failed: ${res.status} ${await res.text()}`);
-      return (await res.json()) as ChatCompletionResponse;
+      const controller = new AbortController();
+      this.currentChatController = controller;
+      try {
+        const res = await this.fetchWithTimeout(
+          `${this.baseUrl}/v1/chat/completions`,
+          { method: "POST", headers: this.headers(), body: JSON.stringify({ ...req, stream: false }) },
+          CHAT_FETCH_TIMEOUT_MS,
+          "chat",
+          controller
+        );
+        if (!res.ok) throw new Error(`chat failed: ${res.status} ${await res.text()}`);
+        return (await res.json()) as ChatCompletionResponse;
+      } finally {
+        this.currentChatController = null;
+      }
     }
 
     return this.streamChat(req, onDelta);
@@ -132,6 +168,10 @@ export class OpenAICompatibleClient implements ModelBackend {
     onDelta: (chunk: ChatCompletionChunk) => void
   ): Promise<ChatCompletionResponse> {
     const controller = new AbortController();
+    // Set immediately (before the connection even completes) so cancel()
+    // can interrupt a turn that's still only connecting, not just one
+    // that's already streaming tokens.
+    this.currentChatController = controller;
     // Guards only the CONNECTION phase (no response at all yet) — once
     // streaming genuinely starts, a real generation can legitimately run
     // long, and that's what the max_tokens-triggered abort further below
@@ -149,7 +189,10 @@ export class OpenAICompatibleClient implements ModelBackend {
         signal: controller.signal as any, // node-fetch's AbortSignal type predates the global one
       });
     } catch (err: any) {
-      if (err?.name === "AbortError") throw new Error(`chat stream connection timed out after ${CHAT_FETCH_TIMEOUT_MS}ms`);
+      if (err?.name === "AbortError") {
+        if (controller.signal.reason === CANCELLED_REASON) throw new Error("cancelled by user");
+        throw new Error(`chat stream connection timed out after ${CHAT_FETCH_TIMEOUT_MS}ms`);
+      }
       throw err;
     } finally {
       clearTimeout(connectTimer);
@@ -199,7 +242,19 @@ export class OpenAICompatibleClient implements ModelBackend {
           const data = trimmed.slice(5).trim();
           if (data === "[DONE]") continue;
 
-          const parsed = JSON.parse(data) as ChatCompletionChunk;
+          // A single unparseable `data:` line (a keepalive/comment some
+          // proxies inject, a chunk split across a read boundary in an
+          // unexpected way) previously threw straight out of this loop —
+          // discarding every token already streamed successfully before it
+          // and failing the whole turn over one cosmetic line. Skip just
+          // that line; there's nothing this line could contain that's worth
+          // losing an otherwise-successful response over.
+          let parsed: ChatCompletionChunk;
+          try {
+            parsed = JSON.parse(data) as ChatCompletionChunk;
+          } catch {
+            continue;
+          }
           // The initial HTTP response can be 200 OK (so the `res.ok` check
           // above passes) with the actual failure only showing up later, as
           // an SSE data chunk shaped like `{"error": {...}}` with no
@@ -245,16 +300,22 @@ export class OpenAICompatibleClient implements ModelBackend {
         }
       }
     } catch (err: any) {
-      // AbortError from our own controller.abort() is expected in two
-      // cases: the max_tokens cap was hit mid-chunk (clientCapped), or the
-      // stream went idle too long (idleTimedOut) — neither is a real
-      // failure in the network sense. Anything else still propagates.
+      // AbortError from our own controller.abort() is expected in three
+      // cases: the max_tokens cap was hit mid-chunk (clientCapped), the
+      // stream went idle too long (idleTimedOut), or the user cancelled
+      // the turn (cancel(), checked via the abort reason) — none of these
+      // three is a real failure in the network sense. Anything else still
+      // propagates.
+      if (err?.name === "AbortError" && controller.signal.reason === CANCELLED_REASON) {
+        throw new Error("cancelled by user");
+      }
       if (err?.name === "AbortError" && idleTimedOut) {
         throw new Error(`chat stream went idle (no new data) for over ${CHAT_FETCH_TIMEOUT_MS}ms`);
       }
       if (!(clientCapped && err?.name === "AbortError")) throw err;
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
+      this.currentChatController = null;
     }
 
     const tool_calls = Object.values(toolCalls).map((tc) => ({

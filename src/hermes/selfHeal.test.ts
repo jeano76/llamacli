@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CircuitBreaker } from "./selfHeal.js";
+import { CircuitBreaker, clearFailureLog, getFailureLog, logFailure } from "./selfHeal.js";
 
 test("CircuitBreaker allows distinct calls under the window size", () => {
   const breaker = new CircuitBreaker({ windowSize: 12, maxDistinct: 3, hardTimeoutMs: 60_000 });
@@ -60,4 +60,24 @@ test("CircuitBreaker only keeps the most recent windowSize calls", () => {
   breaker.record({ toolName: "d", argsSignature: "1" });
   // window is now [b,c,d,d] — 3 distinct == maxDistinct, trips
   assert.ok(breaker.shouldStop());
+});
+
+// failureLog is module-level (shared across every AgentLoop in the
+// process) and was previously appended to without limit — a long session
+// against a persistently misbehaving tool/backend would grow it forever,
+// which matters doubly since proposeImprovement() sends the WHOLE log to
+// the model on every real-time improvement check.
+test("logFailure caps the failure log instead of growing it without bound", () => {
+  clearFailureLog();
+  try {
+    for (let i = 0; i < 150; i++) {
+      logFailure({ timestamp: `t${i}`, summary: "s", toolName: "run_shell", errorMessage: `e${i}` });
+    }
+    const log = getFailureLog();
+    assert.ok(log.length <= 100, `expected the log to be capped at 100, got ${log.length}`);
+    // the most recent entries are what's kept, not the oldest
+    assert.equal(log[log.length - 1].errorMessage, "e149");
+  } finally {
+    clearFailureLog();
+  }
 });

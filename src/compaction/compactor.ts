@@ -133,11 +133,36 @@ function sanitizeForSummary(messages: ChatMessage[]): ChatMessage[] {
  * option if even that alone is oversized — the tool_calls-aware size cap
  * upstream in loop.ts is what actually bounds any one message).
  */
+// The fraction of contextWindowTokens the kept tail is allowed to occupy.
+// Exported so loop.ts's overflow-retry path can pass a SMALLER value on a
+// retry (see runCompaction's tailBudgetFraction param below) instead of
+// giving up the instant one compaction attempt fails to shrink anything.
+export const DEFAULT_TAIL_BUDGET_FRACTION = 0.4;
+// Loop.ts's own main-turn request always reserves this fraction of the
+// window for max_tokens (the reply about to be generated) — see loop.ts's
+// `max_tokens: Math.max(512, Math.floor(...* 0.25))`. The kept tail and
+// that reservation were previously computed completely independently, so
+// a "successful" compaction could still leave (tail + reserved-reply) at
+// or past the ENTIRE window on its own, before the system prompt or tool
+// schema even entered the picture — found live: two compaction passes in
+// a row both reported "no progress" and the turn failed outright, on a
+// 16384-token window, because the 40%-of-window tail floor alone (6553
+// tokens) plus the 25%-of-window reply reservation (4096 tokens) already
+// summed past what was actually available once the (necessarily
+// preserved, see the system-prompt-survival fix elsewhere in this file)
+// system prompt and the ~626-token tool schema were added on top.
+const NEXT_REPLY_RESERVED_FRACTION = 0.25;
+
 function selectKeptTail(
   messages: ChatMessage[],
-  contextWindowTokens: number
+  contextWindowTokens: number,
+  tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION
 ): { keepTail: ChatMessage[]; toSummarize: ChatMessage[] } {
-  const budgetChars = Math.max(1, Math.floor(contextWindowTokens * 4 * 0.4));
+  const availableForTail = Math.max(
+    1,
+    Math.floor(contextWindowTokens * (1 - NEXT_REPLY_RESERVED_FRACTION))
+  );
+  const budgetChars = Math.max(1, Math.floor(availableForTail * 4 * tailBudgetFraction));
   let used = 0;
   let cutIndex = messages.length;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -159,7 +184,11 @@ export async function runCompaction(
   backend: ModelBackend,
   model: string,
   partialCheckpoint: Omit<Checkpoint, "version" | "timestamp">,
-  contextWindowTokens: number
+  contextWindowTokens: number,
+  // Lets a caller retry with a tighter tail — see loop.ts's overflow-retry
+  // loop, which halves this on each attempt that fails to shrink anything,
+  // rather than giving up after just one non-improving compaction.
+  tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION
 ): Promise<CompactionResult> {
   const checkpoint: Checkpoint = {
     version: 1,
@@ -168,26 +197,77 @@ export async function runCompaction(
   };
   await writeCheckpoint(projectRoot, checkpoint);
 
-  const { keepTail, toSummarize } = selectKeptTail(messages, contextWindowTokens);
+  const { keepTail, toSummarize } = selectKeptTail(messages, contextWindowTokens, tailBudgetFraction);
 
+  // No caller currently populates mustPreserve (loop.ts always passes []) —
+  // rather than silently referencing an always-empty list ("...and the
+  // following must-preserve facts:\n" followed by nothing, which reads as
+  // an incomplete/truncated instruction to the model), only mention it when
+  // there's actually something there.
+  const mustPreserveClause = checkpoint.mustPreserve.length
+    ? ` and the following must-preserve facts:\n${checkpoint.mustPreserve.join("\n")}`
+    : ".";
   const summaryRequest: ChatMessage[] = [
     {
       role: "system",
       content:
         "Summarize the following conversation for context compaction. " +
-        "Preserve verbatim any user-stated constraints, decisions, and the following " +
-        "must-preserve facts:\n" + checkpoint.mustPreserve.join("\n"),
+        "Preserve verbatim any user-stated constraints, decisions" + mustPreserveClause,
     },
     ...sanitizeForSummary(toSummarize),
   ];
 
-  const res = await backend.chat({ model, messages: summaryRequest, stream: false });
+  // Never leave this unset — same reasoning, and the exact same failure
+  // mode, as loop.ts's main-turn request: without max_tokens, llama-server
+  // defaults to n_predict=-1 (unbounded), and if the model never emits a
+  // natural stop token (a degenerate/repetition-loop generation, or simply
+  // a model that likes to keep going), the summary request pins the single
+  // inference slot indefinitely — blocking every other request, including
+  // the very turn that triggered this compaction, with no visible error.
+  // Caught live: GET /slots showed a summary request's n_decoded climbing
+  // past 700 with max_tokens/n_predict both -1, `stream: false` (so
+  // openaiClient.ts's own client-side streaming cap — added for exactly
+  // this reason — never even applies here; this path bypasses it
+  // entirely). Capped smaller than the main turn's own budget (a summary
+  // should be concise by nature, not a full reply) but still scaled to the
+  // real context window rather than a flat constant, same as loop.ts.
+  const summaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(contextWindowTokens * 0.25)));
+  const res = await backend.chat({ model, messages: summaryRequest, stream: false, max_tokens: summaryMaxTokens });
   const summaryText = res.choices[0]?.message.content ?? "(summary unavailable)";
 
-  const compactedMessages: ChatMessage[] = [
-    { role: "system", content: `[Compacted history summary]\n${summaryText}` },
-    ...keepTail,
-  ];
+  // Preserve the ORIGINAL system prompt (base prompt + injected .llamacli/rules),
+  // not just the compaction summary. selectKeptTail() keeps only the size-budgeted
+  // tail of `messages`, so the system prompt — always messages[0] — is otherwise
+  // always pushed into `toSummarize` and replaced wholesale the moment a session
+  // runs long enough to compact even once. Found live: after the first compaction,
+  // the agent silently stopped following project rules injected at startup — no
+  // error, just the rules being gone, since they'd been overwritten by the summary
+  // text. Kept as ONE system message (not two): loop.ts already documents that a
+  // second system-role message breaks chat-template-enforcing backends, so this
+  // concatenates into the existing single system slot instead of adding another.
+  const originalSystem = messages.find((m) => m.role === "system");
+  const systemContent = [
+    typeof originalSystem?.content === "string" ? originalSystem.content : "",
+    `[Compacted history summary]\n${summaryText}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  // keepTail's cut point is purely size-based and can land between a
+  // `tool_calls`-bearing assistant message and its matching `tool` response,
+  // leaving keepTail starting with a `tool` message that has no corresponding
+  // tool_calls entry anywhere in the compacted result. At least one real
+  // backend rejects that shape outright. sanitizeForSummary() already guards
+  // against the equivalent problem for the summary REQUEST slice above; this
+  // is the same fix applied to the slice that actually keeps being used
+  // afterward. Reproduced directly: sweeping tool-result sizes from 100 to
+  // 2000 chars found 1 case (out of 20) landing exactly on this boundary.
+  let tail = keepTail;
+  while (tail.length > 0 && tail[0].role === "tool") {
+    tail = tail.slice(1);
+  }
+
+  const compactedMessages: ChatMessage[] = [{ role: "system", content: systemContent }, ...tail];
 
   return { messages: compactedMessages, checkpoint };
 }

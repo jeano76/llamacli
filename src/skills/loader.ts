@@ -190,3 +190,18 @@ export function injectRulesIntoSystemPrompt(basePrompt: string, rules: RuleFile[
   const ruleText = rules.map((r) => `--- ${r.path} ---\n${r.content}`).join("\n\n");
   return `${basePrompt}\n\n# Project Rules (always apply)\n${ruleText}`;
 }
+
+/** Lists the available skills' names + triggers (never their full bodies —
+ *  those stay lazily loaded via the `load_skill` tool, per §5) so the model
+ *  actually knows they exist. Before this, loadSkillIndex()'s result was
+ *  used only to print a list for the human in `/skills` — the model itself
+ *  had no way to learn a skill existed, since neither the index nor a way
+ *  to fetch a skill's body ever reached the system prompt or the tool
+ *  list. The 8 builtin skills (planning, code-review, security, ...) were
+ *  fully wired up on the loader/build side and effectively dead code from
+ *  the model's perspective. */
+export function injectSkillIndexIntoSystemPrompt(basePrompt: string, skills: SkillIndexEntry[]): string {
+  if (skills.length === 0) return basePrompt;
+  const list = skills.map((s) => `- ${s.name}: ${s.trigger}`).join("\n");
+  return `${basePrompt}\n\n# Available Skills\nCall the load_skill tool with one of these names when its trigger matches the current task:\n${list}`;
+}

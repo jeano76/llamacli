@@ -3,12 +3,14 @@ import React from "react";
 import { render } from "ink";
 import { App } from "./tui/App.js";
 import { loadConfig } from "./config.js";
-import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt } from "./skills/loader.js";
+import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt, injectSkillIndexIntoSystemPrompt } from "./skills/loader.js";
 import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { LlamaServerManager } from "./backend/llamaServer.js";
 import { OpenAICompatibleClient } from "./backend/openaiClient.js";
 import { AgentLoop } from "./agent/loop.js";
-import { configureBrowserTools } from "./tools/index.js";
+import { configureBrowserTools, configureSkills } from "./tools/index.js";
+import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
+import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -66,8 +68,19 @@ async function main() {
   const { config, setupMessage } = await loadConfig(projectRoot);
   const rules = await loadRules(projectRoot);
   const skillIndex = await loadSkillIndex(projectRoot);
-  const systemPrompt = injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT, rules);
+  const systemPrompt = injectSkillIndexIntoSystemPrompt(
+    injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT, rules),
+    skillIndex
+  );
   configureBrowserTools(config.browser ?? { debugPort: 9222, host: "127.0.0.1" }, projectRoot);
+  configureSkills(skillIndex);
+  const initialHistory = await loadPromptHistory(projectRoot);
+  // Read (but don't act on) any checkpoint left from a previous session —
+  // the resume/discard decision is now asked via the TUI (pendingResumeGoal
+  // below) instead of resuming automatically. Reading it here, before
+  // render(), is what lets that first render already know whether to show
+  // the question at all.
+  const pendingCheckpoint = await readCheckpoint(projectRoot);
 
   let backend: OpenAICompatibleClient;
   if (config.backend === "local-llama" && config.llama?.modelPath) {
@@ -139,6 +152,48 @@ async function main() {
     <App
       cwd={projectRoot}
       model={config.model}
+      initialHistory={initialHistory}
+      onHistoryChange={(history) => {
+        // Fire-and-forget: a failed write here must never block sending a
+        // message — it only means history browsing across restarts falls a
+        // step behind, not that anything in the actual conversation breaks.
+        savePromptHistory(projectRoot, history).catch(() => {});
+      }}
+      pendingResumeGoal={pendingCheckpoint?.goal ?? null}
+      onResumeDecision={(resume) => {
+        const ui = (globalThis as any).__llamacli_ui;
+        if (!resume) {
+          // Declined — this checkpoint must not linger and get silently
+          // picked up by a later automatic path (e.g. a mid-turn compaction
+          // interruption's own resume check) once the user has explicitly
+          // said "start fresh." Best-effort: a failed delete here just
+          // means the (now-stale) checkpoint sits on disk unused, not a
+          // reason to block starting the session.
+          clearCheckpoint(projectRoot).catch(() => {});
+          return;
+        }
+        ui?.setBusy(true);
+        loop
+          .resumeIfCheckpointExists()
+          .catch((err: any) => ui?.pushStatus(`[error] failed to resume from checkpoint: ${err.message}`))
+          .finally(() => ui?.setBusy(false));
+      }}
+      onForceQuit={() => {
+        const ui = (globalThis as any).__llamacli_ui;
+        // Mid-turn: cancel it (aborts the backend request, writes a
+        // resumable checkpoint) — matches the busy-specific path this used
+        // to be. Idle: save whatever conversation exists so far, the same
+        // mechanism /quit's own save-before-exit already uses. Either way,
+        // this is the "force" exit: no self-improvement-proposal gate (see
+        // AppProps.onForceQuit's doc comment) — just save and go.
+        const save = ui?.isBusy?.() ? loop.cancelCurrentTurn() : loop.saveStateOnQuit();
+        save
+          .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${err.message}] quitting anyway.`))
+          .finally(() => {
+            ui?.setBusy(false);
+            unmount();
+          });
+      }}
       onSubmit={async (text) => {
         const ui = (globalThis as any).__llamacli_ui;
         ui?.setBusy(true);
@@ -278,11 +333,10 @@ async function main() {
 
   if (setupMessage) (globalThis as any).__llamacli_ui?.pushStatus(setupMessage);
 
-  try {
-    await loop.resumeIfCheckpointExists();
-  } catch (err: any) {
-    (globalThis as any).__llamacli_ui?.pushStatus(`[error] failed to resume from checkpoint: ${err.message}`);
-  }
+  // Resuming (or discarding) a found checkpoint now happens via the
+  // App-rendered Y/N question (pendingResumeGoal/onResumeDecision above)
+  // instead of unconditionally here — this used to auto-resume with no way
+  // to say "no, start fresh."
 }
 
 main().catch((err) => {
