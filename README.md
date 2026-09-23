@@ -2390,6 +2390,73 @@ only ever appears after the turn's own final response.
 > 하나뿐인 슬롯을 두고 절대 경쟁하지 않음. 호출 순서를 추적해서 개선 체크 요청이 항상
 > 턴의 최종 응답 이후에만 나타나는지 확인하는 테스트로 검증함.
 
+### Compaction kept re-triggering on nearly every step, and resumed goals nested inside themselves
+
+Reported directly, with the exact symptom from a real session: "압축을 해도
+중복된 토큰이 누적되는거 같아" (even after compacting, duplicate tokens seem
+to keep piling up). Root cause, confirmed against the real backend at
+`n_ctx=4096`: the compacted tail's budget and the summary's `max_tokens` cap
+were both flat fractions of the context window, computed with no regard for
+the *fixed* per-request overhead (system prompt + tool schema), which
+measured at 1,283 tokens — 31% of that window on its own. A "successful"
+compaction still landed around 3,500 tokens against a 2,867-token
+auto-trigger (70% of 4,096), so the very next turn compacted again — forever,
+each pass re-summarizing what the last pass had just summarized.
+
+Two smaller bugs compounded it once a session lived through more than one
+compaction:
+
+- `composeSystemMessage()` (added to replace, not append, the previous
+  summary block) cut the old summary at its first blank line rather than to
+  the end of the system message. Model-written summaries are routinely
+  multi-paragraph, so paragraphs 2..N of every old summary survived the
+  "replacement" and piled up on every pass — the actual source of the
+  reported "누적" (accumulation).
+- `currentGoalSummary()` took the first `role: "user"` message in
+  `this.messages` as the checkpoint's goal. After one compaction, that
+  message *is* the injected `[resuming after compaction] previous goal: ...`
+  text, so the next checkpoint's goal wrapped the previous resume message
+  inside itself, and the one after that wrapped *that* — found live in
+  `.llamacli/state/checkpoint.json` as a goal field containing
+  `[resuming after compaction] previous goal: [resuming after compaction]
+  previous goal: ...`, several turns deep.
+- Excluding the system message from the summarization slice (a prior fix, to
+  stop the base prompt from being summarized into itself) had a side effect
+  no one had caught: the *previous* summary lived only in that excluded
+  system message, so it was never handed to the next summary request either
+  — each compaction pass silently forgot everything the last one had
+  condensed, rather than building on it.
+
+Fixed all three: `AgentLoop.compact()` now measures the real fixed overhead
+(the same `estimateTokens()` call used elsewhere, on the base system prompt
+alone) before sizing the summary cap and kept-tail budget, so the *compacted*
+conversation lands at ~75% of the trigger threshold instead of drifting past
+it immediately — and warns once, explicitly, if the configured context window
+is too small for that to be possible at all (telling the user to raise
+llama-server's `-c`). The AgentLoop now tracks the real user-stated goal in
+its own field instead of re-deriving it from `this.messages`, and
+`stripResumePrefix()` unwraps any already-nested `previous goal:` text (both
+for new checkpoints and for one already nested on disk). `composeSystemMessage`
+now finds the summary header and treats everything from there to the end of
+the string as the block being replaced, not just up to the first blank line.
+And the previous summary is now passed explicitly into the next summary
+request (as a synthetic leading message) and replaced by the new one, instead
+of silently dropping out of the loop.
+
+Verified two ways. First, seven new unit tests in
+`src/compaction/compactor.test.ts` and `src/agent/loop.test.ts` — including
+one that reproduces the exact nested-goal string pulled from a real
+`checkpoint.json` and confirms it fails against the pre-fix code before
+passing against the fix. Second, live: restarted the real `llama-server`
+backing this at `-c 24576` (a stale-VRAM autodetect script had been landing
+it at `-c 4096`, the proximate trigger for how badly this showed up) and
+monitored a real, separate llamacli session end-to-end through two real
+auto-threshold compactions — confirmed via the live checkpoint and the
+server's own `/slots` + logs that each compaction fired only once per
+threshold crossing (17,329 → 8,518 tokens on the first), never nested the
+goal, and left enough headroom that the very next turn didn't immediately
+re-trigger.
+
 ## Remote browser control (Chrome DevTools Protocol)
 
 `src/tools/browser.ts` attaches to a browser the user already has running with
