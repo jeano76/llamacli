@@ -529,7 +529,81 @@ test("every chat request sent to the backend caps max_tokens instead of leaving 
     await loop.send("hello");
 
     assert.equal(turnRequests.length, 1);
-    assert.equal(turnRequests[0].max_tokens, 2000); // 25% of the 8000-token context window
+    // computeMaxTokens: available = 8000 - 1(used) - 256(margin) = 7743,
+    // ceiling = 8000*0.75 = 6000 -> min(7743, 6000) = 6000.
+    assert.equal(turnRequests[0].max_tokens, 6000);
+  }));
+
+// Reported live: a request with only 6,400 tokens of real history (9,984
+// tokens of genuinely free room in a 16,384-token window) still got capped
+// at a flat 25%-of-window 4,096, truncating a write_file tool call's
+// arguments — a long generated document — mid-JSON-string. The server's
+// grammar-constrained tool-call parser then rejected the resulting
+// unterminated string as invalid JSON (500 "missing closing quote"),
+// which looked like the whole turn had silently stopped. max_tokens must
+// scale with the room actually left, not a flat fraction of the window.
+test("max_tokens gives a small conversation real headroom instead of a flat fraction of the window", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [6400], // matches the real incident's conversation size
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await loop.send("hello");
+
+    // available = 16384 - 6400 - 256 = 9728; ceiling = 16384*0.75 = 12288
+    // -> min(9728, 12288) = 9728. The old flat formula would have given
+    // 4096 here — more than double what this fix provides, which is
+    // exactly the gap that truncated the real tool call.
+    assert.equal(turnRequests[0].max_tokens, 9728);
+    assert.ok(turnRequests[0].max_tokens! > 4096, "expected more headroom than the old flat 25% formula would have given");
+  }));
+
+test("max_tokens still has a ceiling even when the conversation is nearly empty, so it never becomes effectively unbounded again", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [0],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 65536 },
+    });
+
+    await loop.send("hello");
+
+    // available would be ~65280 (nearly the whole window) without a
+    // ceiling — clamped to 65536*0.75 = 49152 instead.
+    assert.equal(turnRequests[0].max_tokens, 49152);
+  }));
+
+test("max_tokens never goes below its floor even when almost no room is left", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [7900], // leaves only ~-156 tokens of "available" room in an 8000 window
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.999, contextWindowTokens: 8000 }, // high enough that compaction doesn't intervene first
+    });
+
+    await loop.send("hello");
+
+    assert.equal(turnRequests[0].max_tokens, 512);
   }));
 
 test("an oversized tool result is truncated before it's sent to the backend, not passed through raw", () =>

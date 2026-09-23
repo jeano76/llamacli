@@ -299,7 +299,7 @@ export class AgentLoop {
     let tailBudgetFraction = DEFAULT_TAIL_BUDGET_FRACTION;
     const MIN_TAIL_BUDGET_FRACTION = 0.05;
     turnLoop: while (true) {
-      await this.maybeCompact();
+      const { used: usedBeforeChat } = await this.maybeCompact();
 
       let res;
       try {
@@ -315,10 +315,10 @@ export class AgentLoop {
             // pinning the single inference slot and blocking every other
             // request indefinitely instead of failing visibly. Caught live
             // via GET /slots showing n_decoded climbing past 22k with
-            // max_tokens/n_predict both -1. Cap well under the context
-            // window so a runaway reply still leaves room to be seen and
-            // recovered from rather than silently consuming it all.
-            max_tokens: Math.max(512, Math.floor(this.opts.thresholds.contextWindowTokens * 0.25)),
+            // max_tokens/n_predict both -1. See computeMaxTokens()'s doc
+            // comment for why this is sized to the room actually left
+            // rather than a flat fraction of the window.
+            max_tokens: this.computeMaxTokens(usedBeforeChat),
           },
           (chunk) => {
             // Defensive: `chunk.choices` isn't guaranteed non-empty/present
@@ -471,11 +471,13 @@ export class AgentLoop {
         // the assistant message that requested it gets summarized away by
         // compact(), so there's no valid tool_call_id left to answer anyway.
         if (
-          await this.maybeCompact({
-            name: call.function.name,
-            argumentsJson: call.function.arguments,
-            reason: "compaction threshold hit before this call could run",
-          })
+          (
+            await this.maybeCompact({
+              name: call.function.name,
+              argumentsJson: call.function.arguments,
+              reason: "compaction threshold hit before this call could run",
+            })
+          ).compacted
         ) {
           // Without an explicit message here, the turn just stops with no
           // visible signal beyond whatever compact() already logged (which,
@@ -682,14 +684,49 @@ export class AgentLoop {
   /** Measures current context usage, reports it to the UI (§2.5), and
    *  compacts if over threshold. Returns whether it compacted, so callers
    *  mid-tool-call-batch know to abandon the rest of the batch. */
-  private async maybeCompact(pendingToolCall: Checkpoint["pendingToolCall"] = null): Promise<boolean> {
+  /** Returns the pre-compaction token estimate alongside whether it
+   *  compacted, so the top-of-turnLoop call site (runUntilIdle) can reuse
+   *  it to size max_tokens dynamically without a second tokenize() call —
+   *  see computeMaxTokens()'s doc comment for why that estimate matters. */
+  private async maybeCompact(
+    pendingToolCall: Checkpoint["pendingToolCall"] = null
+  ): Promise<{ compacted: boolean; used: number }> {
     const used = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
     this.opts.onContextUsage?.(used, this.opts.thresholds.contextWindowTokens);
     if (used >= this.opts.thresholds.contextWindowTokens * this.opts.thresholds.autoTriggerRatio) {
       await this.compact("auto-threshold", pendingToolCall);
-      return true;
+      return { compacted: true, used };
     }
-    return false;
+    return { compacted: false, used };
+  }
+
+  /** How many tokens the upcoming request is allowed to generate.
+   *
+   *  Previously a flat `contextWindowTokens * 0.25`, regardless of how
+   *  much of the window the conversation actually used — found live: a
+   *  request with only 6,400 tokens of real history (9,984 tokens of
+   *  genuinely free room in a 16,384-token window) still got capped at a
+   *  flat 4,096, truncating a `write_file` tool call's arguments — a
+   *  long generated document — mid-JSON-string. The server's
+   *  grammar-constrained tool-call parser then rejected the resulting
+   *  unterminated string as invalid JSON (500 "missing closing quote"),
+   *  which looked to the user like the whole turn had silently stopped.
+   *
+   *  Sized to the room actually left (window minus what's already used,
+   *  minus a fixed safety margin) instead, so a small conversation gets
+   *  real headroom for a legitimately long single response/tool call.
+   *  Still bounded at a ceiling — this must never become effectively
+   *  unbounded again (the exact failure `max_tokens` exists to prevent:
+   *  n_predict=-1 pinning the single inference slot indefinitely on a
+   *  degenerate/repetition-loop generation) — just a much more generous
+   *  one than the old flat 25%. */
+  private computeMaxTokens(usedTokens: number): number {
+    const window = this.opts.thresholds.contextWindowTokens;
+    const SAFETY_MARGIN_TOKENS = 256;
+    const CEILING_FRACTION = 0.75;
+    const available = window - usedTokens - SAFETY_MARGIN_TOKENS;
+    const ceiling = Math.floor(window * CEILING_FRACTION);
+    return Math.max(512, Math.min(available, ceiling));
   }
 
   private async compact(
