@@ -595,3 +595,78 @@ test("runCompaction's kept-tail budget accounts for the next reply's own reserve
       await rm(dir, { recursive: true, force: true });
     }
   })());
+
+// Measured against the real backend: tokenizing concatenated message text
+// + the raw tools JSON undercounted the true prompt by 18.8% (1,482 vs
+// 1,825) on a modest conversation, and the gap grows with message count
+// (the chat template wraps every message in role markers and injects a
+// tool-use instruction preamble that appears nowhere in the raw text).
+// Live consequence: requests of 16,921 / 18,346 / 20,521 tokens sent
+// against a 16,384-token window and hard-rejected, because prompt +
+// max_tokens was sized off a number thousands of tokens below reality.
+test("estimateTokens prefers the backend's exact prompt count over tokenizing concatenated text", async () => {
+  const calls: string[] = [];
+  const backend: ModelBackend = {
+    async chat() {
+      throw new Error("not used");
+    },
+    async listModels() {
+      return [];
+    },
+    async tokenize() {
+      calls.push("tokenize");
+      return 1000; // the OLD, undercounting path
+    },
+    async countPromptTokens() {
+      calls.push("countPromptTokens");
+      return 1825; // what the server actually charges
+    },
+  };
+
+  const used = await estimateTokens([{ role: "user", content: "hi" }], backend, "tools-json", []);
+
+  assert.equal(used, 1825, "expected the exact count, not the undercounting tokenize() path");
+  assert.deepEqual(calls, ["countPromptTokens"], "tokenize() must not even be called when the exact count is available");
+});
+
+test("estimateTokens falls back to tokenize() when the backend has no /apply-template", async () => {
+  const backend: ModelBackend = {
+    async chat() {
+      throw new Error("not used");
+    },
+    async listModels() {
+      return [];
+    },
+    async tokenize() {
+      return 1000;
+    },
+    async countPromptTokens() {
+      throw new Error("applyTemplate failed: 404"); // e.g. a non-llama.cpp backend
+    },
+  };
+
+  assert.equal(await estimateTokens([{ role: "user", content: "hi" }], backend, "tools-json", []), 1000);
+});
+
+test("estimateTokens passes the tools through to the exact count, since the template's tools section is a real part of the prompt", async () => {
+  let receivedTools: unknown;
+  const tools = [
+    { type: "function" as const, function: { name: "write_file", description: "d", parameters: { type: "object", properties: {} } } },
+  ];
+  const backend: ModelBackend = {
+    async chat() {
+      throw new Error("not used");
+    },
+    async listModels() {
+      return [];
+    },
+    async countPromptTokens(_messages, t) {
+      receivedTools = t;
+      return 42;
+    },
+  };
+
+  await estimateTokens([{ role: "user", content: "hi" }], backend, "", tools);
+
+  assert.deepEqual(receivedTools, tools);
+});

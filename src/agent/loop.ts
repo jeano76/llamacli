@@ -409,9 +409,9 @@ export class AgentLoop {
           this.opts.onStatus?.(
             `[context overflow] request exceeded the context window — forcing compaction and retrying (${overflowRetries}/${MAX_OVERFLOW_RETRIES}).`
           );
-          const before = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
+          const before = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON, TOOL_DEFS);
           await this.compact("auto-threshold", null, tailBudgetFraction);
-          const after = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
+          const after = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON, TOOL_DEFS);
           // A compaction that didn't actually shrink anything at the
           // CURRENT tail budget doesn't necessarily mean the conversation
           // is truly unrecoverable — it can just mean the kept tail itself
@@ -874,7 +874,7 @@ export class AgentLoop {
   private async maybeCompact(
     pendingToolCall: Checkpoint["pendingToolCall"] = null
   ): Promise<{ compacted: boolean; used: number }> {
-    const used = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON);
+    const used = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON, TOOL_DEFS);
     this.opts.onContextUsage?.(used, this.opts.thresholds.contextWindowTokens);
     if (used >= this.opts.thresholds.contextWindowTokens * this.opts.thresholds.autoTriggerRatio) {
       await this.compact("auto-threshold", pendingToolCall);

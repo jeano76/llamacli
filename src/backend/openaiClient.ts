@@ -3,7 +3,9 @@ import type {
   ChatCompletionChunk,
   ChatCompletionRequest,
   ChatCompletionResponse,
+  ChatMessage,
   ModelBackend,
+  ToolDef,
 } from "./types.js";
 
 // Found auditing for the same class of bug already fixed three times
@@ -109,6 +111,25 @@ export class OpenAICompatibleClient implements ModelBackend {
     if (!res.ok) throw new Error(`tokenize failed: ${res.status} ${await res.text()}`);
     const json = (await res.json()) as { tokens: unknown[] };
     return json.tokens.length;
+  }
+
+  /** Exact prompt token count: render through the server's own chat
+   *  template first (`/apply-template`), then tokenize THAT — see
+   *  ModelBackend.countPromptTokens for the measurements behind why
+   *  tokenizing concatenated message text instead undercounts by ~19%
+   *  and grows worse with conversation length. Throws for a backend
+   *  without /apply-template; callers fall back. */
+  async countPromptTokens(messages: ChatMessage[], tools?: ToolDef[]): Promise<number> {
+    const res = await this.fetchWithTimeout(
+      `${this.baseUrl}/apply-template`,
+      { method: "POST", headers: this.headers(), body: JSON.stringify(tools?.length ? { messages, tools } : { messages }) },
+      LIGHTWEIGHT_FETCH_TIMEOUT_MS,
+      "applyTemplate"
+    );
+    if (!res.ok) throw new Error(`applyTemplate failed: ${res.status} ${await res.text()}`);
+    const { prompt } = (await res.json()) as { prompt?: string };
+    if (typeof prompt !== "string") throw new Error("applyTemplate: response had no prompt field");
+    return this.tokenize(prompt);
   }
 
   /** llama.cpp-server-specific endpoint — callers must be ready for this to

@@ -74,6 +74,26 @@ export interface ModelBackend {
    *  have it. Returns the exact token count for the given text. */
   tokenize?(text: string): Promise<number>;
 
+  /** The EXACT number of prompt tokens the backend will actually charge
+   *  for this request — messages rendered through the server's real chat
+   *  template (llama.cpp's `/apply-template`), tools section included,
+   *  then tokenized. Prefer this over tokenize() on concatenated message
+   *  text, which silently misses everything the template adds.
+   *
+   *  Measured directly against the real backend: concatenating message
+   *  text + the tools JSON and tokenizing that undercounted the true
+   *  prompt by 18.8% (1,482 vs 1,825) on a modest conversation — the
+   *  template wraps every message in role markers AND injects a whole
+   *  "# Tools ... If you choose to call a function ONLY reply in the
+   *  following format" preamble that the raw JSON never contains. The
+   *  undercount scales with message count, so it is worst exactly when
+   *  it matters most: near the context limit. Live consequence, seen
+   *  repeatedly: requests of 16,921 / 18,346 / 20,521 tokens sent against
+   *  a 16,384-token window and hard-rejected, because prompt +
+   *  max_tokens was sized off an estimate that was thousands of tokens
+   *  low. Optional — callers fall back to the approximation. */
+  countPromptTokens?(messages: ChatMessage[], tools?: ToolDef[]): Promise<number>;
+
   /** llama.cpp-server-specific `/props` endpoint. Returns the server's
    *  actual running context size (`n_ctx`), so compaction thresholds can be
    *  based on what the backend is really configured with instead of a

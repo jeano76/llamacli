@@ -1,4 +1,4 @@
-import type { ChatMessage } from "../backend/types.js";
+import type { ChatMessage, ToolDef } from "../backend/types.js";
 import type { ModelBackend } from "../backend/types.js";
 import { Checkpoint, readCheckpoint, writeCheckpoint } from "./checkpoint.js";
 
@@ -52,7 +52,31 @@ function charBasedEstimate(messages: ChatMessage[], extraText: string): number {
  *  request, and never counted here at all before this, silently
  *  undercounting every threshold check by that much. Callers that don't
  *  send tools (the compaction summary request itself) simply omit this. */
-export async function estimateTokens(messages: ChatMessage[], backend?: ModelBackend, extraText = ""): Promise<number> {
+export async function estimateTokens(
+  messages: ChatMessage[],
+  backend?: ModelBackend,
+  extraText = "",
+  tools?: ToolDef[]
+): Promise<number> {
+  // Ask the backend what the prompt ACTUALLY costs (messages rendered
+  // through its own chat template, tools section included) before falling
+  // back to anything approximate. Measured: tokenizing concatenated
+  // message text + the raw tools JSON — the previous best effort, and
+  // still the fallback below — undercounts the real prompt by ~19% on a
+  // modest conversation and by more as messages accumulate, because the
+  // template wraps every message in role markers and injects a tool-use
+  // instruction preamble that appears nowhere in the raw text. That
+  // undercount is what sized max_tokens too generously and produced a run
+  // of live "request (20,521 tokens) exceeds the available context size
+  // (16,384 tokens)" rejections: prompt + max_tokens was computed against
+  // a number thousands of tokens below reality.
+  if (backend?.countPromptTokens) {
+    try {
+      return await backend.countPromptTokens(messages, tools);
+    } catch {
+      // no /apply-template (non-llama.cpp backend) — fall through
+    }
+  }
   if (backend?.tokenize) {
     try {
       const text = [...messages.map(messageText), extraText].join("\n");
@@ -68,9 +92,10 @@ export async function shouldCompact(
   messages: ChatMessage[],
   thresholds: CompactionThresholds,
   backend?: ModelBackend,
-  extraText = ""
+  extraText = "",
+  tools?: ToolDef[]
 ): Promise<boolean> {
-  const used = await estimateTokens(messages, backend, extraText);
+  const used = await estimateTokens(messages, backend, extraText, tools);
   return used >= thresholds.contextWindowTokens * thresholds.autoTriggerRatio;
 }
 
