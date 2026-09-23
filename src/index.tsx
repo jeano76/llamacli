@@ -192,6 +192,18 @@ async function main() {
           .finally(() => {
             ui?.setBusy(false);
             unmount();
+            // Reported live: force-quit appeared to work (the status line
+            // logged, Y/N dialog closed) but the process itself kept
+            // running and kept accepting/processing input afterward.
+            // unmount() only tears down the Ink render tree and releases
+            // stdin's raw-mode listener — it does NOT call process.exit(),
+            // and a lingering open handle (node-fetch's keep-alive
+            // connection pool, an in-flight timer) is enough to keep
+            // Node's event loop alive indefinitely on its own. The
+            // SIGINT/SIGTERM handlers above already call process.exit(0)
+            // explicitly for exactly this reason — this path needs the
+            // same explicit call, not just unmount() on its own.
+            process.exit(0);
           });
       }}
       onSubmit={async (text) => {
@@ -226,7 +238,19 @@ async function main() {
               loop
                 .saveStateOnQuit()
                 .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${err.message}] quitting anyway.`))
-                .finally(() => unmount());
+                .finally(() => {
+                  unmount();
+                  // Reported live (via the sibling onForceQuit path, same
+                  // bug applies here): unmount() alone tears down the Ink
+                  // render tree but does NOT terminate the Node process —
+                  // a lingering open handle (node-fetch's keep-alive pool,
+                  // an in-flight timer) is enough to keep it running
+                  // indefinitely, silently accepting/processing further
+                  // input even though /quit appeared to have worked. The
+                  // SIGINT/SIGTERM handlers above already call
+                  // process.exit(0) explicitly for exactly this reason.
+                  process.exit(0);
+                });
               break;
             }
             quitConfirmed = true;
