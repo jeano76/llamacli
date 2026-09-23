@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -714,3 +714,104 @@ test("selectKeptTail accounts for CJK token weight to prevent undercounting and 
 });
 
 
+test("composeSystemMessage drops EVERY paragraph of a multi-paragraph previous summary, not just the first", () => {
+  const original = "Base rules.\n\n[Compacted history summary]\nPara one.\n\nPara two.\n\n- bullet three";
+  const result = composeSystemMessage(original, "New summary.");
+  assert.equal(result, "Base rules.\n\n[Compacted history summary]\nNew summary.");
+});
+
+test("splitSystemMessage separates the base prompt from the appended summary", () => {
+  assert.deepEqual(splitSystemMessage("Base."), { base: "Base.", summary: null });
+  assert.deepEqual(splitSystemMessage("Base.\n\n[Compacted history summary]\nA\n\nB"), { base: "Base.", summary: "A\n\nB" });
+});
+
+test("stripResumePrefix unwraps a goal that nested previous resume messages inside itself", () => {
+  const nested =
+    "[resuming after compaction] previous goal: [resuming after compaction] previous goal: do the thing\n\nremaining steps:\n- (todo) x";
+  assert.equal(stripResumePrefix(nested), "do the thing");
+  assert.equal(stripResumePrefix("plain goal"), "plain goal");
+});
+
+test("buildResumePrompt never nests a previous resume message inside the goal", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+  try {
+    await writeCheckpoint(dir, {
+      version: 1,
+      timestamp: new Date().toISOString(),
+      reason: "auto-threshold",
+      goal: "[resuming after compaction] previous goal: [resuming after compaction] previous goal: do the thing",
+      steps: [],
+      files: [],
+      pendingToolCall: null,
+      mustPreserve: [],
+    });
+    const prompt = (await buildResumePrompt(dir))!;
+    assert.equal(prompt.match(/previous goal:/g)!.length, 1);
+    assert.match(prompt, /previous goal: do the thing/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a second runCompaction feeds the previous summary to the summary model and replaces it, instead of losing or stacking it", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const requests: ChatCompletionRequest[] = [];
+      let n = 0;
+      const backend: ModelBackend = {
+        async chat(req) {
+          requests.push(req);
+          n++;
+          return { choices: [{ message: { role: "assistant", content: `SUMMARY-${n}\n\nsecond paragraph ${n}` }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      const partial = { reason: "auto-threshold" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+      const convo = (): ChatMessage[] =>
+        Array.from({ length: 20 }, (_, i) => ({ role: (i % 2 ? "assistant" : "user") as "user" | "assistant", content: "x".repeat(400) }));
+
+      const first = await runCompaction(dir, [{ role: "system", content: "BASE" }, ...convo()], backend, "m", partial, 4096);
+      const second = await runCompaction(dir, [...first.messages, ...convo()], backend, "m", partial, 4096);
+
+      const secondInput = requests[1].messages.map((m) => m.content).join("\n");
+      assert.ok(secondInput.includes("SUMMARY-1"), "previous summary must reach the summary model");
+      assert.ok(!secondInput.includes("BASE"), "the base system prompt must not be summarized");
+      const sys = second.messages[0].content as string;
+      assert.equal(sys, "BASE\n\n[Compacted history summary]\nSUMMARY-2\n\nsecond paragraph 2");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("runCompaction keeps the summary request itself inside the window and honours a caller summary cap", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      let req: ChatCompletionRequest | undefined;
+      const backend: ModelBackend = {
+        async chat(r) {
+          req = r;
+          return { choices: [{ message: { role: "assistant", content: "S" }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      const partial = { reason: "auto-threshold" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+      // ~3x the window of Korean text to summarize (the overflow-retry shape).
+      const messages: ChatMessage[] = [{ role: "system", content: "BASE" }];
+      for (let i = 0; i < 30; i++) {
+        messages.push({ role: "user", content: "가".repeat(300) });
+        messages.push({ role: "assistant", content: "나".repeat(300) });
+      }
+      await runCompaction(dir, messages, backend, "m", partial, 4096, 0.05, 300);
+      assert.equal(req!.max_tokens, 300);
+      const inputTokens = req!.messages.reduce((n, m) => n + estimateTextTokens(String(m.content ?? "")), 0);
+      assert.ok(inputTokens + req!.max_tokens! <= 4096, `summary request ${inputTokens}+${req!.max_tokens} must fit a 4096 window`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());

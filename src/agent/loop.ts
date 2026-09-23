@@ -9,6 +9,8 @@ import {
   buildResumePrompt,
   CompactionThresholds,
   DEFAULT_TAIL_BUDGET_FRACTION,
+  splitSystemMessage,
+  stripResumePrefix,
 } from "../compaction/compactor.js";
 import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
@@ -159,6 +161,15 @@ export class AgentLoop {
 
   /** Model-declared plan via the `update_plan` tool (PROMPT.md §2.2 steps). */
   private plan: Checkpoint["steps"] = [];
+  /** The session's task as the user stated it. Tracked explicitly because
+   *  deriving it from `this.messages` stops working after the first
+   *  compaction: the first user message left in the kept tail is then the
+   *  injected "[resuming ...]" message, and recording THAT as the goal made
+   *  every later resume message nest the previous one inside itself. */
+  private goal: string | null = null;
+  /** Warn only once per session that the fixed prompt overhead leaves no
+   *  room for compaction to work with — see compact(). */
+  private warnedWindowTooSmall = false;
   /** Files touched via read_file/write_file/edit_file, most-recent status wins. */
   private filesTouched = new Map<string, Checkpoint["files"][number]["status"]>();
   /** Fallback step history when the model never calls update_plan: every
@@ -231,6 +242,7 @@ export class AgentLoop {
     // nothing until the model happens to call update_plan again, even
     // though a resumed checkpoint may already record real remaining steps.
     const checkpoint = await readCheckpoint(this.opts.projectRoot);
+    if (checkpoint && !this.goal) this.goal = stripResumePrefix(checkpoint.goal);
     if (checkpoint && checkpoint.steps.length > 0) {
       this.plan = checkpoint.steps;
       this.opts.onPlanProgress?.(checkpoint.steps.filter((s) => s.status === "done").length, checkpoint.steps.length);
@@ -277,6 +289,7 @@ export class AgentLoop {
       // back up, even though a checkpoint was sitting on disk the whole
       // time. Check every time, not just at startup.
       await this.injectResumeContextIfPending();
+      this.goal ??= userText.trim().slice(0, 200) || null;
       this.messages.push({ role: "user", content: userText });
       await this.runUntilIdle();
       this.checkForRealtimeImprovementAfterTurn();
@@ -986,6 +999,46 @@ export class AgentLoop {
     return Math.max(512, Math.min(available, ceiling));
   }
 
+  /** Sizes the summary and the kept tail so that the COMPACTED conversation
+   *  (base system prompt + tool schema + summary + tail) lands clearly under
+   *  the auto-trigger threshold. Both used to be flat fractions of the
+   *  window, independent of the fixed per-request overhead — measured live
+   *  on a 4096-token window: base prompt + tool schema alone = 1,283 tokens,
+   *  summary cap 1,024, tail budget 1,228, so a "successful" compaction left
+   *  ~3,500 tokens against a 2,867 trigger and the very next step compacted
+   *  again — every step, forever, each pass re-summarizing the last. */
+  private async postCompactionBudget(
+    maxTailBudgetFraction: number
+  ): Promise<{ tailBudgetFraction: number; summaryMaxTokens: number | undefined }> {
+    const window = this.opts.thresholds.contextWindowTokens;
+    const systemText = typeof this.messages[0]?.content === "string" ? this.messages[0].content : "";
+    const overhead = await estimateTokens(
+      [{ role: "system", content: splitSystemMessage(systemText).base }],
+      this.opts.backend,
+      toolDefsJson(),
+      activeToolDefs()
+    );
+    // Leave a quarter of the trigger level free after compacting, so the
+    // conversation can grow for a while before the next compaction.
+    const target = Math.floor(window * this.opts.thresholds.autoTriggerRatio * 0.75);
+    const room = target - overhead;
+    if (room < 512 && !this.warnedWindowTooSmall) {
+      this.warnedWindowTooSmall = true;
+      this.opts.onStatus?.(
+        `[warning] the system prompt + tool schema alone use ${overhead} of ${window} context tokens — ` +
+          `too little room is left for compaction to keep useful history. Restart llama-server with a larger -c (e.g. 16384 or more).`
+      );
+    }
+    const usableRoom = Math.max(256, room);
+    // Same default cap as runCompaction's; only tightened when room is short.
+    const defaultSummaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(window * 0.25)));
+    const summaryMaxTokens = Math.min(defaultSummaryMaxTokens, Math.floor(usableRoom / 2));
+    // selectKeptTail() measures its budget as a fraction of 75% of the window.
+    const tailTokens = usableRoom - summaryMaxTokens;
+    const tailBudgetFraction = Math.min(maxTailBudgetFraction, Math.max(0.02, tailTokens / (window * 0.75)));
+    return { tailBudgetFraction, summaryMaxTokens };
+  }
+
   private async compact(
     reason: Checkpoint["reason"],
     pendingToolCall: Checkpoint["pendingToolCall"],
@@ -1005,6 +1058,7 @@ export class AgentLoop {
       mustPreserve: [],
     };
     try {
+      const budget = await this.postCompactionBudget(tailBudgetFraction);
       const { messages, checkpoint } = await runCompaction(
         this.opts.projectRoot,
         this.messages,
@@ -1012,7 +1066,8 @@ export class AgentLoop {
         this.opts.model,
         partial,
         this.opts.thresholds.contextWindowTokens,
-        tailBudgetFraction
+        budget.tailBudgetFraction,
+        budget.summaryMaxTokens
       );
       this.messages = messages;
       this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
@@ -1100,7 +1155,10 @@ export class AgentLoop {
   }
 
   private currentGoalSummary(): string {
-    const firstUser = this.messages.find((m) => m.role === "user");
+    if (this.goal) return this.goal;
+    const firstUser = this.messages.find(
+      (m) => m.role === "user" && typeof m.content === "string" && !m.content.startsWith("[resuming")
+    );
     return typeof firstUser?.content === "string" ? firstUser.content.slice(0, 200) : "(unknown)";
   }
 }

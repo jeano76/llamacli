@@ -301,7 +301,11 @@ export async function runCompaction(
   // Lets a caller retry with a tighter tail — see loop.ts's overflow-retry
   // loop, which halves this on each attempt that fails to shrink anything,
   // rather than giving up after just one non-improving compaction.
-  tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION
+  tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION,
+  // Lets the caller shrink the summary below its default cap so that
+  // base prompt + summary + kept tail lands under the auto-trigger
+  // threshold — see loop.ts compact().
+  summaryMaxTokensCap?: number
 ): Promise<CompactionResult> {
   const checkpoint: Checkpoint = {
     version: 1,
@@ -320,6 +324,42 @@ export async function runCompaction(
   const mustPreserveClause = checkpoint.mustPreserve.length
     ? ` and the following must-preserve facts:\n${checkpoint.mustPreserve.join("\n")}`
     : ".";
+  // selectKeptTail() never puts the system message into toSummarize (so the
+  // base prompt isn't summarized into the summary and re-appended to itself
+  // on every pass), which also means the PREVIOUS summary would never reach
+  // the summary model — each compaction would silently forget everything
+  // the last one had condensed. Hand it over explicitly instead; the new
+  // summary then replaces it (composeSystemMessage) rather than stacking.
+  const originalSystem = messages.find((m) => m.role === "system");
+  const originalSystemText = typeof originalSystem?.content === "string" ? originalSystem.content : "";
+  const previousSummary = splitSystemMessage(originalSystemText).summary;
+  const summaryInput = sanitizeForSummary([
+    ...(previousSummary
+      ? [{ role: "user" as const, content: `[Summary of even earlier conversation]\n${previousSummary}` }]
+      : []),
+    ...toSummarize,
+  ]);
+
+  const defaultSummaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(contextWindowTokens * 0.25)));
+  const summaryMaxTokens = summaryMaxTokensCap
+    ? Math.max(128, Math.min(defaultSummaryMaxTokens, summaryMaxTokensCap))
+    : defaultSummaryMaxTokens;
+
+  // The summary request is itself a request against the same window. On the
+  // overflow-retry path the history being summarized can be close to the
+  // whole window already, and prompt + summaryMaxTokens then overflows too,
+  // so the compaction fails and nothing ever shrinks. Drop the oldest
+  // messages (after the previous summary, which condenses them anyway)
+  // until the input fits.
+  const inputBudget = Math.max(256, contextWindowTokens - summaryMaxTokens - 512);
+  const firstDroppable = previousSummary ? 1 : 0;
+  while (
+    summaryInput.length > firstDroppable + 1 &&
+    summaryInput.reduce((n, m) => n + estimateTextTokens(messageText(m)), 0) > inputBudget
+  ) {
+    summaryInput.splice(firstDroppable, 1);
+  }
+
   const summaryRequest: ChatMessage[] = [
     {
       role: "system",
@@ -327,7 +367,7 @@ export async function runCompaction(
         "Summarize the following conversation for context compaction. " +
         "Preserve verbatim any user-stated constraints, decisions" + mustPreserveClause,
     },
-    ...sanitizeForSummary(toSummarize),
+    ...summaryInput,
   ];
 
   // Never leave this unset — same reasoning, and the exact same failure
@@ -344,7 +384,6 @@ export async function runCompaction(
   // entirely). Capped smaller than the main turn's own budget (a summary
   // should be concise by nature, not a full reply) but still scaled to the
   // real context window rather than a flat constant, same as loop.ts.
-  const summaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(contextWindowTokens * 0.25)));
   // Same reason as loop.ts's own turn request (see its comment): with
   // chain-of-thought on, the budget can be spent entirely on invisible
   // reasoning before any summary text is produced — and a compaction that
@@ -369,11 +408,7 @@ export async function runCompaction(
   // text. Kept as ONE system message (not two): loop.ts already documents that a
   // second system-role message breaks chat-template-enforcing backends, so this
   // concatenates into the existing single system slot instead of adding another.
-  const originalSystem = messages.find((m) => m.role === "system");
-  const systemContent = composeSystemMessage(
-    typeof originalSystem?.content === "string" ? originalSystem.content : "",
-    summaryText
-  );
+  const systemContent = composeSystemMessage(originalSystemText, summaryText);
 
   // keepTail's cut point is purely size-based and can land between a
   // `tool_calls`-bearing assistant message and its matching `tool` response,
@@ -394,35 +429,45 @@ export async function runCompaction(
   return { messages: compactedMessages, checkpoint };
 }
 
+const SUMMARY_HEADER = "[Compacted history summary]";
+
 /**
- * Assemble the final system-role message after a compaction pass.
- *
- * * If the original system content already contains a block that starts with
- *   `[Compacted history summary]`, that block is replaced with the new summary.
- * * Otherwise the summary block is appended (separated by a blank line) to the
- *   original system content.
- *
- * This logic guarantees that at most one summary block exists in the final
- * system message, eliminating the token-bloat caused by repeated appends.
+ * Splits a system message into the original base prompt and the compaction
+ * summary appended to it (if any). The summary block is always appended LAST
+ * (see composeSystemMessage), so everything from the header to the end is
+ * the summary. The previous version cut the block at the first blank line
+ * after the header instead — but model-written summaries are routinely
+ * multi-paragraph markdown, so paragraphs 2..N of every old summary were
+ * treated as "content after the block" and kept, piling up a little more
+ * duplicated text on every compaction.
+ */
+export function splitSystemMessage(content: string): { base: string; summary: string | null } {
+  const idx = content.indexOf(SUMMARY_HEADER);
+  if (idx === -1) return { base: content, summary: null };
+  return {
+    base: content.slice(0, idx).trimEnd(),
+    summary: content.slice(idx + SUMMARY_HEADER.length).trim(),
+  };
+}
+
+/**
+ * Assemble the final system-role message after a compaction pass: the
+ * original base prompt plus exactly one summary block, replacing any
+ * summary block already there rather than appending a second one.
  */
 export function composeSystemMessage(originalContent: string, newSummary: string): string {
-  const summaryBlock = `[Compacted history summary]\n${newSummary}`;
-  const summaryHeader = "[Compacted history summary]";
+  const { base } = splitSystemMessage(originalContent);
+  return [base, `${SUMMARY_HEADER}\n${newSummary}`].filter(Boolean).join("\n\n");
+}
 
-  const existingIdx = originalContent.indexOf(summaryHeader);
-  if (existingIdx !== -1) {
-    const before = originalContent.slice(0, existingIdx).trimEnd();
-    const after = originalContent.slice(
-      originalContent.indexOf("\n\n", existingIdx) === -1
-        ? originalContent.length
-        : originalContent.indexOf("\n\n", existingIdx)
-    ).trimStart();
-
-    const parts = [before, summaryBlock, after].filter(Boolean);
-    return parts.join("\n\n");
-  }
-
-  return [originalContent, summaryBlock].filter(Boolean).join("\n\n");
+/** Removes any number of leading "[resuming ...] previous goal: " prefixes.
+ *  The goal recorded in a checkpoint used to be taken from the first user
+ *  message in the conversation — which, after one compaction, IS the
+ *  injected resume message — so each checkpoint's goal wrapped the previous
+ *  resume text ("[resuming after compaction] previous goal: [resuming after
+ *  compaction] previous goal: ..."), growing on every compaction. */
+export function stripResumePrefix(goal: string): string {
+  return goal.replace(/^(\s*\[resuming[^\]]*\]\s*previous goal:\s*)+/, "").split("\n\nremaining steps:")[0].trim() || "(unknown)";
 }
 
 /**
@@ -441,7 +486,7 @@ export async function buildResumePrompt(projectRoot: string): Promise<string | n
   // agent seems to be picking up mid-task.
   const resumeReasonText = checkpoint.reason === "plan-progress" ? "resuming previous session" : "resuming after compaction";
   const lines = [
-    `[${resumeReasonText}] previous goal: ${checkpoint.goal}`,
+    `[${resumeReasonText}] previous goal: ${stripResumePrefix(checkpoint.goal)}`,
     remaining.length
       ? `remaining steps:\n${remaining.map((s) => `- (${s.status}) ${s.description}`).join("\n")}`
       : "All steps were already done — re-verifying before wrapping up.",

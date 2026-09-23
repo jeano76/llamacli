@@ -1954,3 +1954,39 @@ test("a FAILED write_file keeps its content in the conversation (it's the only c
       "a failed write's content must be preserved — nothing else has it"
     );
   }));
+
+test("the checkpoint goal stays the user's real goal across repeated compactions, instead of nesting the previous resume message", () =>
+  withTempProject(async (dir) => {
+    const plan = (id: string, d: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "update_plan", arguments: JSON.stringify({ steps: [{ description: d, status: "in_progress" }] }) },
+    });
+    const { backend } = scriptedBackend({
+      turnResponses: [
+        assistantMessage(null, [plan("c1", "s1"), plan("c2", "s2")]), // compaction fires before c2
+        assistantMessage(null, [plan("c3", "s3"), plan("c4", "s4")]), // and again before c4
+        assistantMessage("done"),
+      ],
+      // top, c1, c2(HIGH), budget, top, c3, c4(HIGH), budget, top
+      tokenCounts: [1, 1, 1000, 1, 1, 1, 1000, 1, 1],
+    });
+    const statuses: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statuses.push(s),
+    });
+
+    await loop.send("do the thing");
+
+    const resumes = statuses.filter((s) => s.includes("previous goal:"));
+    assert.equal(resumes.length, 2, `expected two resumes, got: ${JSON.stringify(statuses)}`);
+    for (const r of resumes) {
+      assert.equal(r.match(/previous goal:/g)!.length, 1, `nested resume text: ${r}`);
+      assert.match(r, /previous goal: do the thing/);
+    }
+  }));
