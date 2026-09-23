@@ -13,6 +13,7 @@ import {
 import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
 import { stripToolCallTemplateLeak } from "./textSanitize.js";
+import { salvagePartialFileWrite } from "./toolCallSalvage.js";
 
 // Sent as the `tools` field on every main-loop request (never on the
 // compaction summary request, which omits tools entirely) — computed once
@@ -323,6 +324,17 @@ export class AgentLoop {
     let toolCallMaxTokensShrinkFactor = 1;
     const MIN_TOOL_CALL_MAX_TOKENS_SHRINK_FACTOR = 0.125;
     let lastToolCallTruncationMessage: string | null = null;
+    // Requested directly: don't just discard a truncated write and ask the
+    // model to redo the whole thing from memory — recover the prefix that
+    // DID generate successfully (openaiClient.ts attaches it to the error
+    // as `partialToolCalls`) and write it to the real file for real, then
+    // only ask the model to generate the REMAINDER. Tracks, per path
+    // salvaged so far THIS turn, how many characters are already on disk —
+    // the first salvage for a given path uses write_file (create/
+    // overwrite), every salvage after that for the SAME path uses
+    // append_file instead, so a multi-round recovery on one large file
+    // builds it up correctly rather than each round overwriting the last.
+    const salvagedCharsWrittenByPath = new Map<string, number>();
     turnLoop: while (true) {
       const { used: usedBeforeChat } = await this.maybeCompact();
 
@@ -434,6 +446,54 @@ export class AgentLoop {
           /Failed to parse tool call arguments as JSON/i.test(err.message)
         ) {
           toolCallTruncationRetries++;
+          // Try to recover the prefix that DID generate successfully
+          // before falling back to the shrink-and-retry strategy below —
+          // requested directly: don't just discard a truncated write and
+          // make the model regenerate the whole thing from memory (the
+          // very thing that produced the identical-content, identical-
+          // cutoff repeat this file was written to guard against in the
+          // first place). Only applies to a write_file/append_file call
+          // (the only tools whose truncated argument is itself the thing
+          // worth saving) and only when salvagePartialFileWrite() can
+          // actually make sense of the raw accumulated arguments — a
+          // genuinely unsalvageable shape (no recognizable path/content
+          // fields at all) falls through to the shrink-and-nudge path
+          // exactly as before.
+          const partialCall = (err as any).partialToolCalls?.find(
+            (c: any) => c?.name === "write_file" || c?.name === "append_file"
+          );
+          const salvaged = partialCall ? salvagePartialFileWrite(partialCall.arguments ?? "") : null;
+          if (salvaged) {
+            const alreadyWritten = salvagedCharsWrittenByPath.get(salvaged.path) ?? 0;
+            const isContinuation = alreadyWritten > 0;
+            try {
+              await executeTool(
+                isContinuation ? "append_file" : "write_file",
+                JSON.stringify({ path: salvaged.path, content: salvaged.partialContent }),
+                this.opts.projectRoot
+              );
+              salvagedCharsWrittenByPath.set(salvaged.path, alreadyWritten + salvaged.partialContent.length);
+              this.opts.onStatus?.(
+                `[tool call truncated] recovered and saved ${salvaged.partialContent.length} already-generated characters to ${salvaged.path} (${alreadyWritten + salvaged.partialContent.length} total so far) — asking the model to continue from there (${toolCallTruncationRetries}/${MAX_TOOL_CALL_TRUNCATION_RETRIES}).`
+              );
+              this.messages.push({
+                role: "user",
+                content:
+                  `Your last tool call writing ${salvaged.path} was cut off before finishing, but the ${salvaged.partialContent.length} characters it did generate were NOT lost — ` +
+                  `they've already been saved to the file (${alreadyWritten + salvaged.partialContent.length} characters on disk so far). ` +
+                  `Do not repeat any of that content and do not use write_file again for this path. Continue by calling append_file with path="${salvaged.path}" ` +
+                  `and content equal to ONLY what comes next, picking up exactly where the saved content leaves off, until the file is complete.`,
+              });
+              continue;
+            } catch (writeErr: any) {
+              // The salvage extraction succeeded but actually persisting
+              // it failed (disk error, bad path, ...) — fall through to
+              // the shrink-and-nudge path below rather than losing the
+              // turn over a salvage-specific failure; that path has no
+              // dependency on the filesystem write having worked.
+              this.opts.onStatus?.(`[tool call truncated] salvage write failed (${writeErr.message}) — falling back.`);
+            }
+          }
           // Detected by comparing the error text verbatim: the server
           // embeds the actual generated (truncated) string in its
           // "last read: ..." field, so an IDENTICAL message means the

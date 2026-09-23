@@ -119,6 +119,70 @@ test("an unparseable SSE data line is skipped, not thrown — tokens streamed be
     }
   ));
 
+// Backs agent/loop.ts's tool-call-truncation SALVAGE recovery (requested
+// directly: don't discard a truncated write_file's already-generated
+// content, save it and only ask the model for the remainder). That
+// recovery needs the raw accumulated tool_calls arguments string from
+// BEFORE the error chunk arrived — this is the client-side half of that:
+// confirming it's actually attached to the thrown error, not silently
+// dropped the way it was before this existed.
+// Hand-escaping nested-quote JSON inside SSE literal strings is exactly
+// the class of bug this file's own "unparseable SSE data line" test
+// guards the CLIENT against — build each chunk with JSON.stringify
+// instead of typing escapes by hand, so a malformed test fixture can't
+// masquerade as a passing test (an earlier draft of this test did exactly
+// that: a bracket-mismatch typo made the fixture's own JSON invalid, the
+// client's own "skip unparseable lines" resilience silently ate it, and
+// the assertion below then failed for the wrong reason entirely).
+function sseChunk(obj: unknown): string {
+  return `data: ${JSON.stringify(obj)}\n\n`;
+}
+
+test("a mid-stream tool-call-truncation error attaches the partial tool_calls accumulated before it, not just the error text", () =>
+  withFakeSSEServer(
+    sseChunk({
+      choices: [
+        { delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "write_file", arguments: '{"path":"a.txt",' } }] }, finish_reason: null },
+      ],
+    }) +
+      sseChunk({
+        choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"content":"partial conte' } }] }, finish_reason: null }],
+      }) +
+      sseChunk({ error: { code: 500, message: "Failed to parse tool call arguments as JSON: missing closing quote", type: "server_error" } }),
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      let caught: any;
+      try {
+        await client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true }, () => {});
+        assert.fail("expected chat() to reject");
+      } catch (err) {
+        caught = err;
+      }
+      assert.match(caught.message, /Failed to parse tool call arguments as JSON/);
+      assert.ok(Array.isArray(caught.partialToolCalls), "expected partialToolCalls to be attached to the thrown error");
+      assert.equal(caught.partialToolCalls.length, 1);
+      assert.equal(caught.partialToolCalls[0].name, "write_file");
+      assert.equal(caught.partialToolCalls[0].arguments, '{"path":"a.txt","content":"partial conte');
+    }
+  ));
+
+test("a mid-stream error with no tool_calls deltas at all attaches an empty partialToolCalls, not undefined or a crash", () =>
+  withFakeSSEServer(
+    'data: {"choices":[{"delta":{"content":"some text"},"finish_reason":null}]}\n\n' +
+      'data: {"error":{"code":500,"message":"Failed to parse tool call arguments as JSON: cut","type":"server_error"}}\n\n',
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      let caught: any;
+      try {
+        await client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true }, () => {});
+        assert.fail("expected chat() to reject");
+      } catch (err) {
+        caught = err;
+      }
+      assert.deepEqual(caught.partialToolCalls, []);
+    }
+  ));
+
 test("a normal SSE stream with no error chunks still completes successfully (no regression)", () =>
   withFakeSSEServer(
     'data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}\n\n' +

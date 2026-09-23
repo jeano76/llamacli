@@ -267,7 +267,21 @@ export class OpenAICompatibleClient implements ModelBackend {
           // unrelated line of code choke on the malformed shape.
           if ((parsed as any).error) {
             const errBody = (parsed as any).error;
-            throw new Error(`chat stream error: ${errBody.message ?? JSON.stringify(errBody)}`);
+            const err: any = new Error(`chat stream error: ${errBody.message ?? JSON.stringify(errBody)}`);
+            // Reported live: a tool call cut off mid-JSON by max_tokens
+            // (e.g. a write_file call generating a long file) triggers
+            // exactly this error — the server discovers the accumulated
+            // arguments don't parse as valid JSON only once generation has
+            // already finished. Everything streamed before that point is
+            // otherwise thrown away with it, even though it's real,
+            // already-generated content the caller could recover and save
+            // instead of asking the model to regenerate the whole thing
+            // from scratch (unreliable — a model can just produce the
+            // identical oversized content again and hit the identical
+            // wall). Attaching what was accumulated so far lets the
+            // caller (loop.ts) salvage it.
+            err.partialToolCalls = Object.values(toolCalls);
+            throw err;
           }
           if (!Array.isArray(parsed.choices)) continue;
           onDelta(parsed);

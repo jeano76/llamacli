@@ -1602,3 +1602,222 @@ test("the tool-call-truncation shrink factor does not leak across separate send(
       "expected the second turn to start fresh at the full budget, not inherit the first turn's shrink"
     );
   }));
+
+// Requested directly: don't just discard a truncated write_file call and
+// ask the model to regenerate everything from memory — recover whatever
+// prefix DID stream successfully (openaiClient.ts attaches it to the
+// thrown error as `partialToolCalls`) and save it to the REAL file, then
+// only ask the model for the remainder. These integration tests drive
+// AgentLoop end to end with a fake backend that attaches partialToolCalls
+// the same way the real client does, and check the actual file on disk —
+// not just status text — since that's the thing that must never be lost.
+function truncatedToolCallError(message: string, toolName: string, argsJson: string): Error {
+  const err: any = new Error(message);
+  err.partialToolCalls = [{ id: "c1", name: toolName, arguments: argsJson }];
+  return err;
+}
+
+test("a truncated write_file call is salvaged: the generated prefix is saved to the real file, not discarded", () =>
+  withTempProject(async (dir) => {
+    const targetPath = join(dir, "salvaged.txt");
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          throw truncatedToolCallError(
+            "chat stream error: Failed to parse tool call arguments as JSON: missing closing quote",
+            "write_file",
+            JSON.stringify({ path: targetPath, content: "first half of the file " }).slice(0, -2) // cut before the closing quote+brace
+          );
+        }
+        return assistantMessage("done, continuing with append_file next turn conceptually");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    const onDisk = await readFile(targetPath, "utf8");
+    assert.equal(onDisk, "first half of the file ", "expected the salvaged prefix to actually be written to disk, not discarded");
+    assert.ok(
+      statusMessages.some((s) => s.includes("recovered and saved")),
+      `expected a salvage status message, got: ${JSON.stringify(statusMessages)}`
+    );
+    assert.ok(
+      statusMessages.some((s) => s.includes(`${"first half of the file ".length}`)),
+      "expected the status message to report the actual salvaged character count"
+    );
+  }));
+
+test("a second truncation on the SAME path appends to what was already salvaged, instead of overwriting it", () =>
+  withTempProject(async (dir) => {
+    const targetPath = join(dir, "multi-salvage.txt");
+    let turnCallCount = 0;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          throw truncatedToolCallError(
+            "chat stream error: Failed to parse tool call arguments as JSON: cut 1",
+            "write_file",
+            JSON.stringify({ path: targetPath, content: "AAA-" }).slice(0, -2)
+          );
+        }
+        if (turnCallCount === 2) {
+          // The model followed instructions this time and used append_file
+          // with only the remainder — but that ALSO gets cut off.
+          throw truncatedToolCallError(
+            "chat stream error: Failed to parse tool call arguments as JSON: cut 2",
+            "append_file",
+            JSON.stringify({ path: targetPath, content: "BBB-" }).slice(0, -2)
+          );
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    const onDisk = await readFile(targetPath, "utf8");
+    assert.equal(onDisk, "AAA-BBB-", `expected both salvaged chunks concatenated in order, got: ${JSON.stringify(onDisk)}`);
+  }));
+
+test("salvage recovery's nudge tells the model to use append_file for the specific path and not repeat already-saved content", () =>
+  withTempProject(async (dir) => {
+    const targetPath = join(dir, "instructed.txt");
+    let turnCallCount = 0;
+    const sentMessages: ChatMessage[][] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        turnCallCount++;
+        sentMessages.push([...req.messages]); // snapshot — `this.messages` is mutated in place on later turns
+        if (turnCallCount === 1) {
+          throw truncatedToolCallError(
+            "chat stream error: Failed to parse tool call arguments as JSON: cut",
+            "write_file",
+            JSON.stringify({ path: targetPath, content: "partial data" }).slice(0, -2)
+          );
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    const secondRequestMessages = sentMessages[1];
+    const nudge = secondRequestMessages[secondRequestMessages.length - 1];
+    assert.equal(nudge.role, "user");
+    assert.match(nudge.content as string, /append_file/);
+    assert.match(nudge.content as string, /do not (repeat|use write_file)/i);
+    assert.match(nudge.content as string, new RegExp(targetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }));
+
+test("falls back to the shrink-and-nudge strategy when the truncated call isn't a salvageable file write (e.g. no recognizable path/content fields)", () =>
+  withTempProject(async (dir) => {
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          // A run_shell call, not a file write — nothing to salvage.
+          throw truncatedToolCallError(
+            "chat stream error: Failed to parse tool call arguments as JSON: cut",
+            "run_shell",
+            '{"command":"echo something really lo'
+          );
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("run a command"));
+
+    assert.equal(turnCallCount, 2, "expected the normal (non-salvage) retry to still happen");
+    assert.ok(!statusMessages.some((s) => s.includes("recovered and saved")), "must not claim a salvage that didn't happen");
+    assert.ok(
+      statusMessages.some((s) => s.includes("[tool call truncated]") && !s.includes("recovered and saved")),
+      `expected the ordinary fallback status, got: ${JSON.stringify(statusMessages)}`
+    );
+  }));
+
+test("falls back to the shrink-and-nudge strategy when there is no partialToolCalls data at all (e.g. a non-openaiClient backend)", () =>
+  withTempProject(async (dir) => {
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          // No partialToolCalls attached at all.
+          const err: any = new Error("chat stream error: Failed to parse tool call arguments as JSON: cut");
+          throw err;
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    assert.equal(turnCallCount, 2);
+    assert.ok(!statusMessages.some((s) => s.includes("recovered and saved")));
+  }));
