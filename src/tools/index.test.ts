@@ -229,3 +229,43 @@ test("read_file truncates a file larger than the size cap instead of loading it 
     assert.ok(result.content.length < 5.3 * 1024 * 1024, "result should be smaller than the original file");
     assert.match(result.content, /truncated.*only the first/s);
   }));
+
+// Measured against the real backend: the full tool schema costs 1,238
+// prompt tokens on EVERY request (7.6% of a 16,384-token window) and the
+// 4 browser tools are ~400-500 of that — paid whether or not a browser is
+// ever touched. They're also useless without a debuggable browser, so
+// index.tsx probes for one at startup and only enables them if it answers.
+test("browser tools are excluded from the offered tools by default", async () => {
+  const { activeToolDefs, configureBrowserTools, TOOL_DEFS } = await import("./index.js");
+  configureBrowserTools({ debugPort: 9222, host: "127.0.0.1" }, "/tmp", false);
+  const names = activeToolDefs().map((t) => t.function.name);
+  assert.ok(!names.some((n) => n.startsWith("browser_")), `expected no browser tools, got: ${names.join(", ")}`);
+  // Everything else must still be there — this is a filter, not a rewrite.
+  const nonBrowser = TOOL_DEFS.filter((t) => !t.function.name.startsWith("browser_")).map((t) => t.function.name);
+  assert.deepEqual(names, nonBrowser);
+});
+
+test("browser tools are offered once enabled (a debuggable browser was found, or config forced it on)", async () => {
+  const { activeToolDefs, configureBrowserTools, TOOL_DEFS } = await import("./index.js");
+  configureBrowserTools({ debugPort: 9222, host: "127.0.0.1" }, "/tmp", true);
+  assert.deepEqual(
+    activeToolDefs().map((t) => t.function.name),
+    TOOL_DEFS.map((t) => t.function.name)
+  );
+  configureBrowserTools({ debugPort: 9222, host: "127.0.0.1" }, "/tmp", false); // restore
+});
+
+test("a browser tool called while disabled fails with a readable reason, not a confusing connection error", () =>
+  withTempDir(async (dir) => {
+    const { configureBrowserTools } = await import("./index.js");
+    configureBrowserTools({ debugPort: 9222, host: "127.0.0.1" }, dir, false);
+    await assert.rejects(() => executeTool("browser_list_tabs", "{}", dir), /disabled for this project/);
+    await assert.rejects(() => executeTool("browser_navigate", JSON.stringify({ url: "http://x" }), dir), /disabled for this project/);
+  }));
+
+test("isBrowserAvailable returns false (not a throw) when nothing is listening on the debug port", async () => {
+  const { isBrowserAvailable } = await import("./browser.js");
+  // Port 1 is never a CDP endpoint; must resolve false rather than reject,
+  // since this runs on the startup path.
+  assert.equal(await isBrowserAvailable({ debugPort: 1, host: "127.0.0.1" }, 500), false);
+});

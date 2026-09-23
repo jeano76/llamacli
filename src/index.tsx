@@ -9,6 +9,7 @@ import { LlamaServerManager } from "./backend/llamaServer.js";
 import { OpenAICompatibleClient } from "./backend/openaiClient.js";
 import { AgentLoop } from "./agent/loop.js";
 import { configureBrowserTools, configureSkills } from "./tools/index.js";
+import { isBrowserAvailable } from "./tools/browser.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
 
@@ -18,7 +19,13 @@ conventions, never make unverified changes, and confirm before destructive comma
 
 When starting a task that needs multiple steps, declare them with the update_plan tool, and
 update each step's status (todo/in_progress/done) as it starts or finishes. This plan survives
-context compaction, so work can resume accurately after it.
+context compaction, so work can resume accurately after it.`;
+
+// Only appended when the browser tools are actually enabled (config.yaml's
+// browser.enabled). Describing tools the model wasn't given is both
+// confusing and a pure token cost — the point of the toggle is to stop
+// paying for browser support in the (usual) sessions that never use it.
+const BROWSER_SYSTEM_PROMPT = `
 
 You can also remotely control a browser the user already has running with
 --remote-debugging-port, via browser_list_tabs / browser_navigate / browser_eval /
@@ -68,11 +75,17 @@ async function main() {
   const { config, setupMessage } = await loadConfig(projectRoot);
   const rules = await loadRules(projectRoot);
   const skillIndex = await loadSkillIndex(projectRoot);
+  // Automatic by default: offer the browser tools only when a debuggable
+  // browser is actually reachable right now (see browser.ts
+  // isBrowserAvailable / config.ts browser.enabled). An explicit
+  // `enabled` in config.yaml forces it either way.
+  const browserCfg = config.browser ?? { debugPort: 9222, host: "127.0.0.1" };
+  const browserEnabled = config.browser?.enabled ?? (await isBrowserAvailable(browserCfg));
   const systemPrompt = injectSkillIndexIntoSystemPrompt(
-    injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT, rules),
+    injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT + (browserEnabled ? BROWSER_SYSTEM_PROMPT : ""), rules),
     skillIndex
   );
-  configureBrowserTools(config.browser ?? { debugPort: 9222, host: "127.0.0.1" }, projectRoot);
+  configureBrowserTools(browserCfg, projectRoot, browserEnabled);
   configureSkills(skillIndex);
   const initialHistory = await loadPromptHistory(projectRoot);
   // Read (but don't act on) any checkpoint left from a previous session —

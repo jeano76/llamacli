@@ -1,5 +1,5 @@
 import type { ChatMessage, ModelBackend } from "../backend/types.js";
-import { AGENT_STATE_TOOLS, FILE_TOOLS, TOOL_DEFS, executeTool } from "../tools/index.js";
+import { AGENT_STATE_TOOLS, FILE_TOOLS, activeToolDefs, executeTool } from "../tools/index.js";
 import { CircuitBreaker } from "../hermes/selfHeal.js";
 import { logFailure, getFailureLog } from "../hermes/selfHeal.js";
 import { proposeImprovement, writeProposedRule, appendImprovementLog, ImprovementProposal } from "../hermes/selfImprove.js";
@@ -25,7 +25,15 @@ import { salvagePartialFileWrite } from "./toolCallSalvage.js";
 // compaction ever fired — measured directly, this JSON alone tokenizes to
 // 626 real tokens, sent on every single request and previously never
 // counted at all.
-const TOOL_DEFS_JSON = JSON.stringify(TOOL_DEFS);
+// Computed per use, not once at module load: configureBrowserTools()
+// (index.tsx, startup) decides which tools are active, and this module is
+// imported before that runs. It must also always match the list actually
+// sent as `tools` below — an estimate computed off a different list is
+// exactly how every token measurement silently drifted from reality
+// before.
+function toolDefsJson(): string {
+  return JSON.stringify(activeToolDefs());
+}
 
 // A single tool result (e.g. read_file on a large or binary-ish file, a
 // noisy shell command's stdout) had no size limit before this was added —
@@ -348,7 +356,7 @@ export class AgentLoop {
           {
             model: this.opts.model,
             messages: this.messages,
-            tools: TOOL_DEFS,
+            tools: activeToolDefs(),
             stream: true,
             // Never leave this unset: without it llama-server defaults to
             // n_predict=-1 (unbounded), and a degenerate generation (no
@@ -409,9 +417,9 @@ export class AgentLoop {
           this.opts.onStatus?.(
             `[context overflow] request exceeded the context window — forcing compaction and retrying (${overflowRetries}/${MAX_OVERFLOW_RETRIES}).`
           );
-          const before = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON, TOOL_DEFS);
+          const before = await estimateTokens(this.messages, this.opts.backend, toolDefsJson(), activeToolDefs());
           await this.compact("auto-threshold", null, tailBudgetFraction);
-          const after = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON, TOOL_DEFS);
+          const after = await estimateTokens(this.messages, this.opts.backend, toolDefsJson(), activeToolDefs());
           // A compaction that didn't actually shrink anything at the
           // CURRENT tail budget doesn't necessarily mean the conversation
           // is truly unrecoverable — it can just mean the kept tail itself
@@ -874,7 +882,7 @@ export class AgentLoop {
   private async maybeCompact(
     pendingToolCall: Checkpoint["pendingToolCall"] = null
   ): Promise<{ compacted: boolean; used: number }> {
-    const used = await estimateTokens(this.messages, this.opts.backend, TOOL_DEFS_JSON, TOOL_DEFS);
+    const used = await estimateTokens(this.messages, this.opts.backend, toolDefsJson(), activeToolDefs());
     this.opts.onContextUsage?.(used, this.opts.thresholds.contextWindowTokens);
     if (used >= this.opts.thresholds.contextWindowTokens * this.opts.thresholds.autoTriggerRatio) {
       await this.compact("auto-threshold", pendingToolCall);

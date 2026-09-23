@@ -16,9 +16,33 @@ const execAsync = promisify(exec);
 let browserConfig: BrowserConfig = { debugPort: 9222, host: "127.0.0.1" };
 let browserScreenshotDir = join(process.cwd(), ".llamacli", "state", "screenshots");
 
-export function configureBrowserTools(config: BrowserConfig, projectRoot: string): void {
+/** Whether the 4 browser tools are offered to the model at all. Off by
+ *  default: measured against the real backend, the tool schema costs
+ *  1,238 prompt tokens on EVERY request (7.6% of a 16,384-token window),
+ *  and the browser tools are ~400-500 of that — paid on every single
+ *  request whether or not a browser is ever touched, in a session that
+ *  usually never touches one. Enable per project via config.yaml's
+ *  `browser.enabled: true`. */
+let browserToolsEnabled = false;
+
+export function configureBrowserTools(config: BrowserConfig, projectRoot: string, enabled = false): void {
   browserConfig = config;
+  browserToolsEnabled = enabled;
   browserScreenshotDir = join(projectRoot, ".llamacli", "state", "screenshots");
+}
+
+const BROWSER_DISABLED_MESSAGE =
+  "browser tools are disabled for this project — set `browser.enabled: true` in .llamacli/config.yaml to use them";
+
+const BROWSER_TOOL_NAMES = new Set(["browser_list_tabs", "browser_navigate", "browser_eval", "browser_screenshot"]);
+
+/** The tools actually sent to the model, after applying config. Always
+ *  call this rather than using TOOL_DEFS directly for a request — and use
+ *  the SAME list for the token estimate, or the estimate silently stops
+ *  matching what's really sent (the exact failure mode that made every
+ *  measurement ~19% low before /apply-template). */
+export function activeToolDefs(): ToolDef[] {
+  return browserToolsEnabled ? TOOL_DEFS : TOOL_DEFS.filter((t) => !BROWSER_TOOL_NAMES.has(t.function.name));
 }
 
 /** Set once at startup from loadSkillIndex() (index.tsx). The index
@@ -363,12 +387,20 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
       }
     }
     case "browser_list_tabs":
+      // Defensive: a disabled browser tool isn't in activeToolDefs(), so
+      // the model is never offered it — but a stale tool call replayed
+      // from a checkpoint/resume could still reach here, and failing with
+      // a readable reason beats a confusing CDP connection error.
+      if (!browserToolsEnabled) throw new Error(BROWSER_DISABLED_MESSAGE);
       return { content: await browser.listTabs(browserConfig) };
     case "browser_navigate":
+      if (!browserToolsEnabled) throw new Error(BROWSER_DISABLED_MESSAGE);
       return { content: await browser.navigate(browserConfig, args.url, args.target_id) };
     case "browser_eval":
+      if (!browserToolsEnabled) throw new Error(BROWSER_DISABLED_MESSAGE);
       return { content: await browser.evaluate(browserConfig, args.expression, args.target_id) };
     case "browser_screenshot": {
+      if (!browserToolsEnabled) throw new Error(BROWSER_DISABLED_MESSAGE);
       const path = args.path ?? join(browserScreenshotDir, `${Date.now()}.png`);
       return { content: await browser.screenshot(browserConfig, path, args.target_id) };
     }

@@ -213,3 +213,28 @@ export async function screenshot(config: BrowserConfig, outPath: string, targetI
     return outPath;
   });
 }
+
+/** Is a debuggable browser actually reachable right now?
+ *
+ *  Drives whether the browser tools are offered to the model at all
+ *  (tools/index.ts activeToolDefs, wired in index.tsx at startup). They
+ *  are useless without one — every call would just fail with "couldn't
+ *  reach the browser debug port" — while still costing ~400-500 prompt
+ *  tokens on EVERY request for their schema (measured against the real
+ *  backend: the full tool schema is 1,238 tokens, 7.6% of a
+ *  16,384-token window). So: probe once, offer them only if a browser is
+ *  really there. Short timeout because this runs on the startup path and
+ *  a firewalled/black-holed port must not stall launch; any failure means
+ *  "not available", never an error. */
+export async function isBrowserAvailable(config: BrowserConfig, timeoutMs = 1500): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${endpoint(config)}/json/version`, { signal: controller.signal as any });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}

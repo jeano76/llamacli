@@ -30,6 +30,22 @@ export interface LlamacliConfig {
   browser?: {
     debugPort: number;
     host?: string;
+    /** Whether to offer the 4 browser tools to the model.
+     *
+     *  LEFT UNSET (the default) this is AUTOMATIC: llamacli probes the
+     *  debug port at startup and offers the tools only if a debuggable
+     *  browser actually answers. They're useless without one — every call
+     *  would just fail with "couldn't reach the browser debug port" —
+     *  while still costing ~400-500 prompt tokens on EVERY request for
+     *  their schema (measured: the full tool schema is 1,238 tokens, 7.6%
+     *  of a 16,384-token window). So a session that never starts a
+     *  debuggable browser never pays for them, and one that does gets
+     *  them with no configuration at all.
+     *
+     *  Set explicitly to force it either way (true: offer them even if
+     *  the probe fails, e.g. a browser started later in the session;
+     *  false: never offer them). */
+    enabled?: boolean;
   };
   /** Whether to let the model emit chain-of-thought (`reasoning_content`)
    *  before its actual answer/tool call. Defaults to FALSE — measured
