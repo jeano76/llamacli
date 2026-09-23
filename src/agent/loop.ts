@@ -406,17 +406,32 @@ export class AgentLoop {
         // of its allotted reply budget mid-string. Recoverable — unlike a
         // real context overflow, nothing about the conversation itself is
         // too large; the single UPCOMING reply just needs to be shorter.
-        // Nudge the model to split the content across multiple smaller
-        // tool calls and retry, rather than surfacing this as a dead-end
-        // parse-error status the user has to notice and manually recover
-        // from themselves.
         if (
           toolCallTruncationRetries < MAX_TOOL_CALL_TRUNCATION_RETRIES &&
           /Failed to parse tool call arguments as JSON/i.test(err.message)
         ) {
           toolCallTruncationRetries++;
+          // A vague "write shorter content" nudge is unenforceable — the
+          // model can silently ignore it and produce another oversized
+          // blob. Give it a concrete, checkable number instead: the exact
+          // character budget the NEXT retry's max_tokens actually allows,
+          // derived the same way computeMaxTokens() sizes the request
+          // itself (chars-per-token estimate * a safety factor, since a
+          // real generated string usually costs MORE JSON-encoded
+          // characters than raw text — escaped quotes/newlines/backslashes
+          // in code or markdown routinely nearly double it) — plus the
+          // append_file tool (tools/index.ts), which turns "one file, one
+          // shot" into a fixed-size chunking protocol: write_file for the
+          // first chunk, append_file repeatedly for the rest, each call
+          // naturally bounded by the same per-reply budget that caused
+          // this in the first place, so no single call can blow it again.
+          const CHARS_PER_TOKEN_ESTIMATE = 4;
+          const JSON_ESCAPE_SAFETY_FACTOR = 0.5;
+          const chunkCharBudget = Math.floor(
+            this.computeMaxTokens(usedBeforeChat) * CHARS_PER_TOKEN_ESTIMATE * JSON_ESCAPE_SAFETY_FACTOR
+          );
           this.opts.onStatus?.(
-            `[tool call truncated] the model's last tool call was cut off before it could finish (too long for the available reply budget) — asking it to write shorter/split content and retrying (${toolCallTruncationRetries}/${MAX_TOOL_CALL_TRUNCATION_RETRIES}).`
+            `[tool call truncated] the model's last tool call was cut off before it could finish (too long for the available reply budget) — asking it to continue in ~${chunkCharBudget}-character chunks and retrying (${toolCallTruncationRetries}/${MAX_TOOL_CALL_TRUNCATION_RETRIES}).`
           );
           // Not a tool result (there's no valid tool_call_id — the
           // assistant message that would have carried one never made it
@@ -426,7 +441,10 @@ export class AgentLoop {
           this.messages.push({
             role: "user",
             content:
-              "Your last tool call's arguments were cut off before finishing (too long for the reply budget) and could not be parsed. Retry with shorter content — split a large file write into multiple smaller tool calls instead of one large one.",
+              `Your last tool call's arguments were cut off before finishing (too long for the reply budget) and could not be parsed — nothing was written. ` +
+              `Do not retry the same call. Instead, write this content in fixed-size chunks of no more than ${chunkCharBudget} characters each: ` +
+              `call write_file once with the FIRST chunk (this creates/overwrites the file), then call append_file once per remaining chunk, in order, ` +
+              `until the full content has been written. Each individual call's content argument must stay under the ${chunkCharBudget}-character limit.`,
           });
           continue;
         }

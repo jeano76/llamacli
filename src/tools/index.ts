@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ToolDef } from "../backend/types.js";
@@ -56,6 +56,23 @@ export const TOOL_DEFS: ToolDef[] = [
     function: {
       name: "write_file",
       description: "Write (overwrite) a file's contents.",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "append_file",
+      description:
+        "Append content to the end of a file, creating it (and any missing parent " +
+        "directories) if it doesn't exist yet. Use this to write a large file in " +
+        "multiple smaller calls instead of one write_file call whose content might " +
+        "not fit in a single reply: call write_file once for the FIRST chunk (creates " +
+        "the file), then append_file repeatedly, in order, for each remaining chunk.",
       parameters: {
         type: "object",
         properties: { path: { type: "string" }, content: { type: "string" } },
@@ -197,6 +214,7 @@ export const AGENT_STATE_TOOLS = new Set(["update_plan"]);
 export const FILE_TOOLS: Record<string, "modified" | "read"> = {
   read_file: "read",
   write_file: "modified",
+  append_file: "modified",
   edit_file: "modified",
 };
 
@@ -267,6 +285,16 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
       await mkdir(dirname(args.path), { recursive: true });
       await writeFile(args.path, args.content, "utf8");
       return { content: `wrote ${args.path}`, diff: formatDiff(args.path, before, args.content) };
+    }
+    case "append_file": {
+      const before = await readFile(args.path, "utf8").catch(() => "");
+      // Same directory-creation fix as write_file — a first append_file
+      // call (e.g. after a truncated write_file never got to run) must
+      // still be able to create the file fresh, not require it to
+      // already exist.
+      await mkdir(dirname(args.path), { recursive: true });
+      await appendFile(args.path, args.content, "utf8");
+      return { content: `appended ${args.content.length} chars to ${args.path}`, diff: formatDiff(args.path, before, before + args.content) };
     }
     case "edit_file": {
       const original = await readFile(args.path, "utf8");

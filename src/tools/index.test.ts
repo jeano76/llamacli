@@ -76,6 +76,42 @@ test("write_file still works normally for a file in an already-existing director
     assert.equal(await readFile(path, "utf8"), "v2");
   }));
 
+// Backs the fixed-size chunking recovery path (agent/loop.ts's "tool call
+// truncated" retry): write_file for the first chunk, append_file for each
+// remaining one — this is what makes that actually possible instead of
+// only ever being able to overwrite a file wholesale in one shot.
+test("append_file appends to an existing file's content rather than overwriting it", () =>
+  withTempDir(async (dir) => {
+    const path = join(dir, "chunked.txt");
+    await executeTool("write_file", JSON.stringify({ path, content: "chunk1-" }), dir);
+    const result = await executeTool("append_file", JSON.stringify({ path, content: "chunk2-" }), dir);
+    assert.match(result.content, /appended/);
+    const { readFile } = await import("node:fs/promises");
+    assert.equal(await readFile(path, "utf8"), "chunk1-chunk2-");
+  }));
+
+test("append_file creates the file (and missing parent directories) when it doesn't exist yet", () =>
+  withTempDir(async (dir) => {
+    // Mirrors write_file's own directory-creation fix — an append_file
+    // call must be able to serve as the FIRST call too (e.g. if a prior
+    // write_file attempt was the one that got truncated and never ran).
+    const path = join(dir, "new", "nested", "file.txt");
+    const result = await executeTool("append_file", JSON.stringify({ path, content: "first" }), dir);
+    assert.match(result.content, /appended/);
+    const { readFile } = await import("node:fs/promises");
+    assert.equal(await readFile(path, "utf8"), "first");
+  }));
+
+test("append_file called multiple times in sequence reconstructs the full content in order", () =>
+  withTempDir(async (dir) => {
+    const path = join(dir, "multi.txt");
+    await executeTool("write_file", JSON.stringify({ path, content: "part1-" }), dir);
+    await executeTool("append_file", JSON.stringify({ path, content: "part2-" }), dir);
+    await executeTool("append_file", JSON.stringify({ path, content: "part3" }), dir);
+    const { readFile } = await import("node:fs/promises");
+    assert.equal(await readFile(path, "utf8"), "part1-part2-part3");
+  }));
+
 // `.replace()` only ever touches the FIRST match — if old_text also
 // appears elsewhere in the file (genuinely common: similar-looking
 // functions, repeated boilerplate), the previous `.includes()` check only
