@@ -1393,7 +1393,212 @@ test("a tool call that keeps getting truncated even after being told to split it
 
     await assert.doesNotReject(() => loop.send("write a large file"));
 
-    // 1 initial call + MAX_TOOL_CALL_TRUNCATION_RETRIES(3) retries = 4, then gives up.
-    assert.equal(turnCallCount, 4, `expected a bounded number of retries, not an infinite loop, got ${turnCallCount} calls`);
+    // 1 initial call + MAX_TOOL_CALL_TRUNCATION_RETRIES(5) retries = 6, then gives up.
+    assert.equal(turnCallCount, 6, `expected a bounded number of retries, not an infinite loop, got ${turnCallCount} calls`);
     assert.ok(statusMessages.some((s) => s.includes("[error]")), "expected a final [error] status once retries are exhausted");
+    // The exact same error message every time means every retry after the
+    // first is a "repeat" — the shrink-and-force-smaller path, not the
+    // plain first-attempt nudge.
+    assert.ok(
+      statusMessages.some((s) => s.includes("exact same cutoff")),
+      `expected the repeat-detection status to fire, got: ${JSON.stringify(statusMessages)}`
+    );
+  }));
+
+// Reported live: the text nudge alone was NOT enough — a real retry
+// regenerated the EXACT same content (byte-identical, per the server's own
+// error text embedding it) and got cut off at the exact same character
+// column, twice in a row, because computeMaxTokens() gave the identical
+// max_tokens both times and the model simply ignored the chunking
+// instruction. The fix: detect a verbatim-repeated error and force
+// max_tokens smaller for the retry regardless of what the model does —
+// a real server-enforced cap it cannot ignore, unlike a prompt
+// instruction. These tests exercise that mechanism directly.
+test("a verbatim-repeated tool-call-truncation error halves max_tokens for the retry, not just the prompt text", () =>
+  withTempProject(async (dir) => {
+    const SAME_ERROR =
+      'chat stream error: Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at line 1, column 3420: syntax error while parsing value - invalid string: missing closing quote';
+    let turnCallCount = 0;
+    const turnRequests: ChatCompletionRequest[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnRequests.push(req);
+        turnCallCount++;
+        if (turnCallCount <= 2) {
+          const err: any = new Error(SAME_ERROR); // identical both times — a repeat
+          throw err;
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    assert.equal(turnCallCount, 3);
+    const [firstAttempt, secondAttempt, thirdAttempt] = turnRequests;
+    // First attempt: normal computeMaxTokens(), no shrink applied yet.
+    // Second attempt: the FIRST error hadn't repeated anything yet either
+    // (nothing to compare against), so it's also unshrunk...
+    assert.equal(firstAttempt.max_tokens, secondAttempt.max_tokens, "the first failure has nothing to repeat yet — no shrink on the 2nd attempt");
+    // ...but the second attempt's error is IDENTICAL to the first, so the
+    // THIRD attempt (after that repeat is detected) must be forced smaller.
+    assert.ok(
+      thirdAttempt.max_tokens! < secondAttempt.max_tokens!,
+      `expected max_tokens to shrink after a verbatim-repeated failure: 2nd=${secondAttempt.max_tokens}, 3rd=${thirdAttempt.max_tokens}`
+    );
+    assert.equal(thirdAttempt.max_tokens, Math.floor(secondAttempt.max_tokens! * 0.5), "expected exactly a 50% shrink on the first repeat");
+  }));
+
+test("the shrink factor keeps halving on further consecutive repeats, down to a floor, instead of shrinking only once", () =>
+  withTempProject(async (dir) => {
+    const SAME_ERROR = 'chat stream error: Failed to parse tool call arguments as JSON: missing closing quote';
+    const turnRequests: ChatCompletionRequest[] = [];
+    let turnCallCount = 0;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnRequests.push(req);
+        turnCallCount++;
+        throw new Error(SAME_ERROR); // always identical — every retry after the first is a repeat
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    // Shrink factor sequence applied to each attempt: 1 (1st, nothing to
+    // repeat yet), 1 (2nd, still nothing — the 1st error becomes the
+    // baseline), 0.5, 0.25, 0.125, 0.125 (floor — MIN is 0.125, does not
+    // go to 0.0625). max_tokens is monotonically non-increasing and never
+    // drops below the 512 floor.
+    const maxTokensSequence = turnRequests.map((r) => r.max_tokens);
+    for (let i = 1; i < maxTokensSequence.length; i++) {
+      assert.ok(
+        maxTokensSequence[i]! <= maxTokensSequence[i - 1]!,
+        `expected a non-increasing max_tokens sequence, got: ${JSON.stringify(maxTokensSequence)}`
+      );
+      assert.ok(maxTokensSequence[i]! >= 512, `max_tokens must never drop below its 512 floor, got: ${JSON.stringify(maxTokensSequence)}`);
+    }
+    // With MIN_TOOL_CALL_MAX_TOKENS_SHRINK_FACTOR = 0.125, it must stop
+    // shrinking (plateau) before reaching the end of the bounded retries —
+    // confirms there IS a floor, not an unbounded halve-forever.
+    const last = maxTokensSequence[maxTokensSequence.length - 1]!;
+    const secondToLast = maxTokensSequence[maxTokensSequence.length - 2]!;
+    assert.equal(last, secondToLast, "expected the shrink factor to have already hit its floor and plateaued by the last retry");
+  }));
+
+test("a tool-call-truncation error that's DIFFERENT from the previous one resets the shrink factor, instead of compounding an unrelated failure", () =>
+  withTempProject(async (dir) => {
+    const turnRequests: ChatCompletionRequest[] = [];
+    let turnCallCount = 0;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnRequests.push(req);
+        turnCallCount++;
+        if (turnCallCount <= 2) {
+          // Same message twice — a genuine repeat, forces a shrink for the 3rd attempt.
+          throw new Error('chat stream error: Failed to parse tool call arguments as JSON: column 100 missing closing quote');
+        }
+        if (turnCallCount === 3) {
+          // A DIFFERENT failure this time (different column/content) — the
+          // model DID produce something different, even though it still
+          // failed. This should not be punished as if it ignored guidance.
+          throw new Error('chat stream error: Failed to parse tool call arguments as JSON: column 42 missing closing quote');
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    assert.equal(turnCallCount, 4);
+    const [, secondAttempt, thirdAttempt, fourthAttempt] = turnRequests;
+    // 3rd attempt (after the genuine repeat of the 1st/2nd) is shrunk.
+    assert.ok(thirdAttempt.max_tokens! < secondAttempt.max_tokens!, "expected a shrink after the genuine repeat");
+    // 4th attempt (after a DIFFERENT failure than the 3rd) resets back to
+    // the full, un-shrunk computeMaxTokens() value — same as the 1st/2nd.
+    assert.equal(fourthAttempt.max_tokens, secondAttempt.max_tokens, "expected the shrink factor to reset once the failure stopped repeating verbatim");
+  }));
+
+test("the tool-call-truncation shrink factor does not leak across separate send() turns", () =>
+  withTempProject(async (dir) => {
+    const SAME_ERROR = 'chat stream error: Failed to parse tool call arguments as JSON: missing closing quote';
+    const turnRequests: ChatCompletionRequest[] = [];
+    let turnCallCount = 0;
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnRequests.push(req);
+        turnCallCount++;
+        // First turn: fail twice (a genuine repeat, forces a shrink), then succeed.
+        // Second turn: succeed immediately — its first request must NOT
+        // still carry the shrink forced by the first turn's failures.
+        if (turnCallCount <= 2) throw new Error(SAME_ERROR);
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file")); // turn 1: fails, fails, recovers (shrunk on the 3rd attempt)
+    await assert.doesNotReject(() => loop.send("write another file")); // turn 2: a fresh send() call
+
+    assert.equal(turnCallCount, 4);
+    const [firstTurnAttempt1, , firstTurnAttempt3, secondTurnAttempt1] = turnRequests;
+    assert.ok(
+      firstTurnAttempt3.max_tokens! < firstTurnAttempt1.max_tokens!,
+      "sanity check: the first turn's 3rd attempt should indeed have been shrunk"
+    );
+    assert.equal(
+      secondTurnAttempt1.max_tokens,
+      firstTurnAttempt1.max_tokens,
+      "expected the second turn to start fresh at the full budget, not inherit the first turn's shrink"
+    );
   }));

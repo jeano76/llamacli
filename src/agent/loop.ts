@@ -302,8 +302,27 @@ export class AgentLoop {
     // way overflowRetries is — a model that keeps generating oversized
     // content despite being told to split it up must eventually surface
     // as a real failure, not retry forever.
-    const MAX_TOOL_CALL_TRUNCATION_RETRIES = 3;
+    const MAX_TOOL_CALL_TRUNCATION_RETRIES = 5;
     let toolCallTruncationRetries = 0;
+    // Reported live: the text nudge alone was not enough — a real retry
+    // regenerated the EXACT same content and got cut off at the EXACT
+    // same character column as the first attempt, twice, because nothing
+    // about the actual request changed (same computeMaxTokens() result
+    // both times, since `usedBeforeChat` barely moves between retries in
+    // the same turn) — the model simply ignored the character-budget
+    // instruction and tried to write the whole thing again. A prompt
+    // instruction is not enforceable; max_tokens itself is — it's a real
+    // server-side generation cap, honored regardless of whether the model
+    // "chooses" to respect it. This factor HALVES max_tokens (down to a
+    // floor) specifically when the error repeats verbatim, so a model
+    // that keeps ignoring the chunking instruction still gets physically
+    // forced to generate less each time — guaranteeing the failure point
+    // moves earlier and the wasted generation shrinks every retry, even
+    // in the worst case where the instruction itself is never followed.
+    // Reset per-turn, same as tailBudgetFraction above.
+    let toolCallMaxTokensShrinkFactor = 1;
+    const MIN_TOOL_CALL_MAX_TOKENS_SHRINK_FACTOR = 0.125;
+    let lastToolCallTruncationMessage: string | null = null;
     turnLoop: while (true) {
       const { used: usedBeforeChat } = await this.maybeCompact();
 
@@ -323,8 +342,12 @@ export class AgentLoop {
             // via GET /slots showing n_decoded climbing past 22k with
             // max_tokens/n_predict both -1. See computeMaxTokens()'s doc
             // comment for why this is sized to the room actually left
-            // rather than a flat fraction of the window.
-            max_tokens: this.computeMaxTokens(usedBeforeChat),
+            // rather than a flat fraction of the window. Multiplied by
+            // toolCallMaxTokensShrinkFactor (see its own comment above) —
+            // 1 normally, but forced smaller after a tool call truncation
+            // repeats verbatim, so a non-compliant model still physically
+            // cannot regenerate the identical oversized content again.
+            max_tokens: Math.max(512, Math.floor(this.computeMaxTokens(usedBeforeChat) * toolCallMaxTokensShrinkFactor)),
           },
           (chunk) => {
             // Defensive: `chunk.choices` isn't guaranteed non-empty/present
@@ -411,27 +434,51 @@ export class AgentLoop {
           /Failed to parse tool call arguments as JSON/i.test(err.message)
         ) {
           toolCallTruncationRetries++;
-          // A vague "write shorter content" nudge is unenforceable — the
-          // model can silently ignore it and produce another oversized
-          // blob. Give it a concrete, checkable number instead: the exact
-          // character budget the NEXT retry's max_tokens actually allows,
-          // derived the same way computeMaxTokens() sizes the request
-          // itself (chars-per-token estimate * a safety factor, since a
-          // real generated string usually costs MORE JSON-encoded
-          // characters than raw text — escaped quotes/newlines/backslashes
-          // in code or markdown routinely nearly double it) — plus the
-          // append_file tool (tools/index.ts), which turns "one file, one
-          // shot" into a fixed-size chunking protocol: write_file for the
-          // first chunk, append_file repeatedly for the rest, each call
-          // naturally bounded by the same per-reply budget that caused
-          // this in the first place, so no single call can blow it again.
+          // Detected by comparing the error text verbatim: the server
+          // embeds the actual generated (truncated) string in its
+          // "last read: ..." field, so an IDENTICAL message means the
+          // model regenerated identical content and got cut at the exact
+          // same point — proof the chunking instruction below was
+          // ignored, not just that another large file happened to be
+          // involved. Reported live: this happened twice in a row on the
+          // very same file. When it repeats, halve the shrink factor
+          // (floor MIN_TOOL_CALL_MAX_TOKENS_SHRINK_FACTOR) so the NEXT
+          // request's max_tokens — a real server-enforced cap the model
+          // cannot ignore, unlike a prompt instruction — is smaller than
+          // what just failed, guaranteeing the cutoff point moves earlier
+          // and less generation is wasted even in the worst case. Resets
+          // to 1 the moment a retry produces genuinely different content
+          // (no reason to keep punishing a request that's actually
+          // responding to the guidance).
+          const isRepeatOfLastFailure = err.message === lastToolCallTruncationMessage;
+          lastToolCallTruncationMessage = err.message;
+          toolCallMaxTokensShrinkFactor = isRepeatOfLastFailure
+            ? Math.max(MIN_TOOL_CALL_MAX_TOKENS_SHRINK_FACTOR, toolCallMaxTokensShrinkFactor / 2)
+            : 1;
+          // A vague "write shorter content" nudge is unenforceable on its
+          // own — the model can silently ignore it and produce another
+          // oversized blob (as above). Give it a concrete, checkable
+          // number too: the exact character budget the NEXT retry's
+          // (possibly now-shrunk) max_tokens actually allows, derived the
+          // same way computeMaxTokens() sizes the request itself
+          // (chars-per-token estimate * a safety factor, since a real
+          // generated string usually costs MORE JSON-encoded characters
+          // than raw text — escaped quotes/newlines/backslashes in code or
+          // markdown routinely nearly double it) — plus the append_file
+          // tool (tools/index.ts), which turns "one file, one shot" into a
+          // fixed-size chunking protocol: write_file for the first chunk,
+          // append_file repeatedly for the rest.
           const CHARS_PER_TOKEN_ESTIMATE = 4;
           const JSON_ESCAPE_SAFETY_FACTOR = 0.5;
-          const chunkCharBudget = Math.floor(
-            this.computeMaxTokens(usedBeforeChat) * CHARS_PER_TOKEN_ESTIMATE * JSON_ESCAPE_SAFETY_FACTOR
+          const nextMaxTokens = Math.max(
+            512,
+            Math.floor(this.computeMaxTokens(usedBeforeChat) * toolCallMaxTokensShrinkFactor)
           );
+          const chunkCharBudget = Math.floor(nextMaxTokens * CHARS_PER_TOKEN_ESTIMATE * JSON_ESCAPE_SAFETY_FACTOR);
           this.opts.onStatus?.(
-            `[tool call truncated] the model's last tool call was cut off before it could finish (too long for the available reply budget) — asking it to continue in ~${chunkCharBudget}-character chunks and retrying (${toolCallTruncationRetries}/${MAX_TOOL_CALL_TRUNCATION_RETRIES}).`
+            isRepeatOfLastFailure
+              ? `[tool call truncated] the model repeated the exact same oversized content and hit the exact same cutoff — forcing a smaller reply budget (~${chunkCharBudget} chars) and retrying (${toolCallTruncationRetries}/${MAX_TOOL_CALL_TRUNCATION_RETRIES}).`
+              : `[tool call truncated] the model's last tool call was cut off before it could finish (too long for the available reply budget) — asking it to continue in ~${chunkCharBudget}-character chunks and retrying (${toolCallTruncationRetries}/${MAX_TOOL_CALL_TRUNCATION_RETRIES}).`
           );
           // Not a tool result (there's no valid tool_call_id — the
           // assistant message that would have carried one never made it
@@ -440,11 +487,15 @@ export class AgentLoop {
           // same as how a human would redirect the very next turn.
           this.messages.push({
             role: "user",
-            content:
-              `Your last tool call's arguments were cut off before finishing (too long for the reply budget) and could not be parsed — nothing was written. ` +
-              `Do not retry the same call. Instead, write this content in fixed-size chunks of no more than ${chunkCharBudget} characters each: ` +
-              `call write_file once with the FIRST chunk (this creates/overwrites the file), then call append_file once per remaining chunk, in order, ` +
-              `until the full content has been written. Each individual call's content argument must stay under the ${chunkCharBudget}-character limit.`,
+            content: isRepeatOfLastFailure
+              ? `STOP. You just tried to write the exact same content again and it was cut off at the exact same point — you did NOT shorten it. ` +
+                `This is a hard limit, not a suggestion: your next reply can physically generate at most ${chunkCharBudget} characters of tool-call content before being cut off. ` +
+                `Call write_file with ONLY the first part of the file (well under ${chunkCharBudget} characters) and STOP THERE — do not try to include the rest. ` +
+                `You will be prompted to continue with append_file afterward.`
+              : `Your last tool call's arguments were cut off before finishing (too long for the reply budget) and could not be parsed — nothing was written. ` +
+                `Do not retry the same call. Instead, write this content in fixed-size chunks of no more than ${chunkCharBudget} characters each: ` +
+                `call write_file once with the FIRST chunk (this creates/overwrites the file), then call append_file once per remaining chunk, in order, ` +
+                `until the full content has been written. Each individual call's content argument must stay under the ${chunkCharBudget}-character limit.`,
           });
           continue;
         }
