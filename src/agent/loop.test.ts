@@ -529,9 +529,9 @@ test("every chat request sent to the backend caps max_tokens instead of leaving 
     await loop.send("hello");
 
     assert.equal(turnRequests.length, 1);
-    // computeMaxTokens: available = 8000 - 1(used) - 256(margin) = 7743,
-    // ceiling = 8000*0.75 = 6000 -> min(7743, 6000) = 6000.
-    assert.equal(turnRequests[0].max_tokens, 6000);
+    // computeMaxTokens: available = 8000 - 1(used) - 2048(margin) = 5951,
+    // ceiling = 8000*0.75 = 6000 -> min(5951, 6000) = 5951.
+    assert.equal(turnRequests[0].max_tokens, 5951);
   }));
 
 // Reported live: a request with only 6,400 tokens of real history (9,984
@@ -558,12 +558,52 @@ test("max_tokens gives a small conversation real headroom instead of a flat frac
 
     await loop.send("hello");
 
-    // available = 16384 - 6400 - 256 = 9728; ceiling = 16384*0.75 = 12288
-    // -> min(9728, 12288) = 9728. The old flat formula would have given
-    // 4096 here — more than double what this fix provides, which is
+    // available = 16384 - 6400 - 2048(margin) = 7936; ceiling = 16384*0.75
+    // = 12288 -> min(7936, 12288) = 7936. The old flat formula would have
+    // given 4096 here — nearly double what this fix provides, which is
     // exactly the gap that truncated the real tool call.
-    assert.equal(turnRequests[0].max_tokens, 9728);
+    assert.equal(turnRequests[0].max_tokens, 7936);
     assert.ok(turnRequests[0].max_tokens! > 4096, "expected more headroom than the old flat 25% formula would have given");
+  }));
+
+// Reported live (a second, distinct incident from the one above): a real
+// request's prompt ALONE — per the server's own token count — came in
+// ~1,200 tokens larger than what estimateTokens() had told computeMaxTokens()
+// the conversation was. With the old 256-token margin, max_tokens (set
+// generously, since the underestimate made room look more plentiful than
+// it really was) plus the now-underestimated prompt together summed past
+// the real context window — the server hard-truncated at exactly 16,384
+// tokens (`truncated=1`) independent of max_tokens entirely (the
+// generation itself, 2,504 tokens, was genuinely under its own cap).
+// Simulates that same estimate-vs-real gap and checks the wider margin
+// leaves enough slack to keep prompt+reply under the window.
+test("max_tokens leaves enough margin to absorb a real gap between estimateTokens() and the backend's own tokenizer", () =>
+  withTempProject(async (dir) => {
+    const REAL_PROMPT_TOKENS = 13_880; // what the server actually counted, live
+    const ESTIMATE_GAP = 1_200; // how far short estimateTokens() fell of that, live
+    const WINDOW = 16_384;
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [REAL_PROMPT_TOKENS - ESTIMATE_GAP], // the client's (under)estimate
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: WINDOW },
+    });
+
+    await loop.send("hello");
+
+    const maxTokens = turnRequests[0].max_tokens!;
+    // The real-world failure mode: REAL_PROMPT_TOKENS + maxTokens ended up
+    // at/over WINDOW. This must leave real slack even against the observed
+    // gap, not just barely clear it.
+    assert.ok(
+      REAL_PROMPT_TOKENS + maxTokens < WINDOW,
+      `expected prompt(${REAL_PROMPT_TOKENS}) + max_tokens(${maxTokens}) to stay under the window(${WINDOW}), got ${REAL_PROMPT_TOKENS + maxTokens}`
+    );
   }));
 
 test("max_tokens still has a ceiling even when the conversation is nearly empty, so it never becomes effectively unbounded again", () =>

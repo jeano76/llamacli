@@ -713,16 +713,39 @@ export class AgentLoop {
    *  which looked to the user like the whole turn had silently stopped.
    *
    *  Sized to the room actually left (window minus what's already used,
-   *  minus a fixed safety margin) instead, so a small conversation gets
-   *  real headroom for a legitimately long single response/tool call.
-   *  Still bounded at a ceiling — this must never become effectively
-   *  unbounded again (the exact failure `max_tokens` exists to prevent:
-   *  n_predict=-1 pinning the single inference slot indefinitely on a
+   *  minus a safety margin) instead, so a small conversation gets real
+   *  headroom for a legitimately long single response/tool call. Still
+   *  bounded at a ceiling — this must never become effectively unbounded
+   *  again (the exact failure `max_tokens` exists to prevent: n_predict=-1
+   *  pinning the single inference slot indefinitely on a
    *  degenerate/repetition-loop generation) — just a much more generous
-   *  one than the old flat 25%. */
+   *  one than the old flat 25%.
+   *
+   *  The margin was originally 256 — found live to be nowhere near enough:
+   *  a real request's PROMPT ALONE (13,880 tokens, per the server's own
+   *  count) ran ~1,200 tokens over what `usedTokens` (this client's
+   *  estimate, fed by estimateTokens()) had said the conversation was.
+   *  The generation that followed (2,504 tokens — genuinely under its
+   *  3,497 max_tokens cap, so the cap itself wasn't the problem) then
+   *  pushed prompt+reply to exactly 16,384 — the server's own context
+   *  limit — and got hard-truncated (`truncated=1`) independent of
+   *  max_tokens entirely. `estimateTokens()` does use the backend's real
+   *  tokenizer when available, but a live gap of that size means
+   *  something server-side (chat-template wrapping, per-message role
+   *  formatting, the exact tool-call grammar overhead) still isn't fully
+   *  captured by tokenizing the raw message text alone.
+   *
+   *  A first fix raised this to 1,024 — a regression test reproducing the
+   *  exact observed gap (real_prompt + max_tokens = window + gap - margin)
+   *  caught that this was STILL under the 1,200-token gap itself, only
+   *  narrowing the overflow to 176 tokens rather than eliminating it: the
+   *  margin must exceed the observed gap, not just be in its general
+   *  neighborhood. 2,048 clears the known gap with a real cushion (~70%
+   *  more) for the next one to vary by, rather than being tuned to just
+   *  barely survive this specific incident. */
   private computeMaxTokens(usedTokens: number): number {
     const window = this.opts.thresholds.contextWindowTokens;
-    const SAFETY_MARGIN_TOKENS = 256;
+    const SAFETY_MARGIN_TOKENS = 2048;
     const CEILING_FRACTION = 0.75;
     const available = window - usedTokens - SAFETY_MARGIN_TOKENS;
     const ceiling = Math.floor(window * CEILING_FRACTION);
