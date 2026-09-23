@@ -815,3 +815,37 @@ test("runCompaction keeps the summary request itself inside the window and honou
       await rm(dir, { recursive: true, force: true });
     }
   })());
+
+test("runCompaction keeps the newest tool result by pulling its assistant tool_calls message into the tail, instead of dropping it", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const backend: ModelBackend = {
+        async chat() {
+          return { choices: [{ message: { role: "assistant", content: "S" }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      const partial = { reason: "auto-threshold" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+      // The live shape: a failing `npm test` whose output alone exceeds the
+      // tail budget, so the size-based cut keeps only the tool result.
+      const messages: ChatMessage[] = [
+        { role: "system", content: "BASE" },
+        { role: "user", content: "verify the tests pass" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "t1", type: "function", function: { name: "run_shell", arguments: '{"command":"npm test"}' } }],
+        },
+        { role: "tool", tool_call_id: "t1", content: "ERROR: exit 1: " + "FAIL x\n".repeat(3000) },
+      ];
+      const result = await runCompaction(dir, messages, backend, "m", partial, 4096, 0.05);
+      const roles = result.messages.map((m) => m.role);
+      assert.deepEqual(roles, ["system", "assistant", "tool"], `got ${roles.join(",")}`);
+      assert.equal(result.messages[2].tool_call_id, "t1");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());

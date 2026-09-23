@@ -794,7 +794,13 @@ export class AgentLoop {
             call.function.arguments = elideWrittenFileContent(call.function.arguments);
           }
         } catch (err: any) {
-          content = `ERROR: ${err.message}`;
+          // Capped exactly like a successful result: run_shell reports a
+          // non-zero exit by throwing with the command's full output in the
+          // message. A failing `npm test` (41,920 chars, ~16K tokens) went
+          // into the history uncapped, pushed usage past the compaction
+          // trigger on its own, got compacted away before the model read it,
+          // and the model reran it — a compaction every ~16s, live.
+          content = capToolResult(`ERROR: ${err.message}`, this.opts.thresholds.contextWindowTokens);
           logFailure({
             timestamp: new Date().toISOString(),
             summary: `tool ${call.function.name} failed`,

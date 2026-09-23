@@ -419,7 +419,24 @@ export async function runCompaction(
   // is the same fix applied to the slice that actually keeps being used
   // afterward. Reproduced directly: sweeping tool-result sizes from 100 to
   // 2000 chars found 1 case (out of 20) landing exactly on this boundary.
+  //
+  // Prefer pulling the matching assistant message (and any sibling tool
+  // results of the same batch) back into the tail over dropping the tool
+  // results: when the newest message is a tool result, it is exactly what
+  // the model needs next. Dropping it made a live session loop — a failing
+  // `npm test` whose output alone pushed usage past the trigger was
+  // compacted away before the model ever saw it, so the model reran the
+  // same command, every ~16s, indefinitely. Only fall back to dropping when
+  // no owning assistant message exists in the summarized slice.
   let tail = keepTail;
+  if (tail.length > 0 && tail[0].role === "tool") {
+    let i = toSummarize.length - 1;
+    while (i >= 0 && toSummarize[i].role === "tool") i--;
+    const owner = i >= 0 ? toSummarize[i] : undefined;
+    if (owner?.role === "assistant" && owner.tool_calls?.length) {
+      tail = [...toSummarize.slice(i), ...tail];
+    }
+  }
   while (tail.length > 0 && tail[0].role === "tool") {
     tail = tail.slice(1);
   }

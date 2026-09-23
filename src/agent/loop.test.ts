@@ -2039,3 +2039,29 @@ test("a raw multi-KB backend error (e.g. a truncated write_file dump) never reac
     assert.ok(longest < 500, `expected every status line capped, longest was ${longest} chars: ${statuses.find((s) => s.length === longest)?.slice(0, 80)}`);
     assert.ok(statuses.some((s) => s.includes("more characters truncated")), `expected a truncation marker among: ${JSON.stringify(statuses)}`);
   }));
+
+test("a failing tool's error output is capped like a successful result, not pushed into the history in full", () =>
+  withTempProject(async (dir) => {
+    // run_shell reports a non-zero exit by throwing with the full output.
+    const call = {
+      id: "c1",
+      type: "function" as const,
+      function: { name: "run_shell", arguments: JSON.stringify({ command: "node -e \"process.stdout.write('x'.repeat(50000)); process.exit(1)\"" }) },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 4096 },
+    });
+    await loop.send("run it");
+    const toolMsg = turnRequests[1].messages.find((m) => m.role === "tool")!;
+    assert.match(String(toolMsg.content), /^ERROR:/);
+    assert.ok(String(toolMsg.content).length < 5000, `expected a capped error result, got ${String(toolMsg.content).length} chars`);
+    assert.match(String(toolMsg.content), /truncated/);
+  }));
