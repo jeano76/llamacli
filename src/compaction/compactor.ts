@@ -282,12 +282,10 @@ export async function runCompaction(
   // second system-role message breaks chat-template-enforcing backends, so this
   // concatenates into the existing single system slot instead of adding another.
   const originalSystem = messages.find((m) => m.role === "system");
-  const systemContent = [
+  const systemContent = composeSystemMessage(
     typeof originalSystem?.content === "string" ? originalSystem.content : "",
-    `[Compacted history summary]\n${summaryText}`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+    summaryText
+  );
 
   // keepTail's cut point is purely size-based and can land between a
   // `tool_calls`-bearing assistant message and its matching `tool` response,
@@ -306,6 +304,37 @@ export async function runCompaction(
   const compactedMessages: ChatMessage[] = [{ role: "system", content: systemContent }, ...tail];
 
   return { messages: compactedMessages, checkpoint };
+}
+
+/**
+ * Assemble the final system-role message after a compaction pass.
+ *
+ * * If the original system content already contains a block that starts with
+ *   `[Compacted history summary]`, that block is replaced with the new summary.
+ * * Otherwise the summary block is appended (separated by a blank line) to the
+ *   original system content.
+ *
+ * This logic guarantees that at most one summary block exists in the final
+ * system message, eliminating the token-bloat caused by repeated appends.
+ */
+export function composeSystemMessage(originalContent: string, newSummary: string): string {
+  const summaryBlock = `[Compacted history summary]\n${newSummary}`;
+  const summaryHeader = "[Compacted history summary]";
+
+  const existingIdx = originalContent.indexOf(summaryHeader);
+  if (existingIdx !== -1) {
+    const before = originalContent.slice(0, existingIdx).trimEnd();
+    const after = originalContent.slice(
+      originalContent.indexOf("\n\n", existingIdx) === -1
+        ? originalContent.length
+        : originalContent.indexOf("\n\n", existingIdx)
+    ).trimStart();
+
+    const parts = [before, summaryBlock, after].filter(Boolean);
+    return parts.join("\n\n");
+  }
+
+  return [originalContent, summaryBlock].filter(Boolean).join("\n\n");
 }
 
 /**

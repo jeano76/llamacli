@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -670,3 +670,21 @@ test("estimateTokens passes the tools through to the exact count, since the temp
 
   assert.deepEqual(receivedTools, tools);
 });
+
+test("composeSystemMessage appends summary when no existing summary block is present", () => {
+  const original = "System instructions and rules.";
+  const summary = "Turn 1 was discussed.";
+  const result = composeSystemMessage(original, summary);
+  assert.equal(result, "System instructions and rules.\n\n[Compacted history summary]\nTurn 1 was discussed.");
+});
+
+test("composeSystemMessage replaces existing summary block instead of accumulating duplicates", () => {
+  const original = "System instructions and rules.\n\n[Compacted history summary]\nTurn 1 was discussed.";
+  const newSummary = "Turn 1 and 2 were discussed.";
+  const result = composeSystemMessage(original, newSummary);
+  assert.equal(result, "System instructions and rules.\n\n[Compacted history summary]\nTurn 1 and 2 were discussed.");
+  // Ensure the header appears only once
+  const occurrences = (result.match(/\[Compacted history summary\]/g) || []).length;
+  assert.equal(occurrences, 1);
+});
+
