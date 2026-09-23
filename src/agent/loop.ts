@@ -298,6 +298,12 @@ export class AgentLoop {
     // the session artificially starved of kept context.
     let tailBudgetFraction = DEFAULT_TAIL_BUDGET_FRACTION;
     const MIN_TAIL_BUDGET_FRACTION = 0.05;
+    // See the "tool call truncated" catch branch below. Bounded the same
+    // way overflowRetries is — a model that keeps generating oversized
+    // content despite being told to split it up must eventually surface
+    // as a real failure, not retry forever.
+    const MAX_TOOL_CALL_TRUNCATION_RETRIES = 3;
+    let toolCallTruncationRetries = 0;
     turnLoop: while (true) {
       const { used: usedBeforeChat } = await this.maybeCompact();
 
@@ -389,6 +395,39 @@ export class AgentLoop {
             this.hasNewFailuresThisTurn = true;
             return;
           }
+          continue;
+        }
+        // A tool call's arguments got cut off mid-generation by max_tokens
+        // (NOT a context-window overflow — llama-server's own `truncated`
+        // flag is 0 for this; the reply itself just hit its cap before a
+        // large generated string could close) and the server rejects the
+        // resulting unterminated JSON with a 500. Reported live twice: a
+        // write_file call generating a long document/source file ran out
+        // of its allotted reply budget mid-string. Recoverable — unlike a
+        // real context overflow, nothing about the conversation itself is
+        // too large; the single UPCOMING reply just needs to be shorter.
+        // Nudge the model to split the content across multiple smaller
+        // tool calls and retry, rather than surfacing this as a dead-end
+        // parse-error status the user has to notice and manually recover
+        // from themselves.
+        if (
+          toolCallTruncationRetries < MAX_TOOL_CALL_TRUNCATION_RETRIES &&
+          /Failed to parse tool call arguments as JSON/i.test(err.message)
+        ) {
+          toolCallTruncationRetries++;
+          this.opts.onStatus?.(
+            `[tool call truncated] the model's last tool call was cut off before it could finish (too long for the available reply budget) — asking it to write shorter/split content and retrying (${toolCallTruncationRetries}/${MAX_TOOL_CALL_TRUNCATION_RETRIES}).`
+          );
+          // Not a tool result (there's no valid tool_call_id — the
+          // assistant message that would have carried one never made it
+          // into `this.messages`, since the request itself threw before
+          // any of it was appended) — a plain user-role nudge instead,
+          // same as how a human would redirect the very next turn.
+          this.messages.push({
+            role: "user",
+            content:
+              "Your last tool call's arguments were cut off before finishing (too long for the reply budget) and could not be parsed. Retry with shorter content — split a large file write into multiple smaller tool calls instead of one large one.",
+          });
           continue;
         }
         // A network/backend failure here must never crash the whole CLI —

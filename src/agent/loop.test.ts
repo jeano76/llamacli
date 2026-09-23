@@ -1303,3 +1303,89 @@ test("cancelCurrentTurn() is safe to call when no turn is currently running (no-
     });
     await assert.doesNotReject(() => loop.cancelCurrentTurn());
   }));
+
+// Reported live twice: a tool call generating a long document/source file
+// (a write_file call) got cut off by max_tokens mid-JSON-string — NOT a
+// context overflow (llama-server's own `truncated` flag was 0 both
+// times) — and the server rejected the resulting unterminated string with
+// a 500 "Failed to parse tool call arguments as JSON". This is
+// recoverable: nothing about the conversation is too large, the single
+// upcoming reply just needs to be shorter/split up.
+test("a tool call truncated by max_tokens (not a context overflow) is recovered by nudging the model to split content, not surfaced as a dead end", () =>
+  withTempProject(async (dir) => {
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          const err: any = new Error(
+            'chat stream error: Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at line 1, column 3828: syntax error while parsing value - invalid string: missing closing quote'
+          );
+          throw err;
+        }
+        return assistantMessage("done, wrote a shorter file this time");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    assert.equal(turnCallCount, 2, "expected exactly one retry after the truncated tool call, not zero or a loop");
+    assert.ok(
+      statusMessages.some((s) => s.includes("[tool call truncated]")),
+      `expected a [tool call truncated] status, got: ${JSON.stringify(statusMessages)}`
+    );
+    assert.ok(!statusMessages.some((s) => s.includes("[error]")), "must not also report this as a dead-end error once recovered");
+  }));
+
+test("a tool call that keeps getting truncated even after being told to split it up eventually surfaces as a real failure, not an infinite retry", () =>
+  withTempProject(async (dir) => {
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const truncationError = () => {
+      const err: any = new Error(
+        'chat stream error: Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] missing closing quote'
+      );
+      return err;
+    };
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnCallCount++;
+        throw truncationError();
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("write a large file"));
+
+    // 1 initial call + MAX_TOOL_CALL_TRUNCATION_RETRIES(3) retries = 4, then gives up.
+    assert.equal(turnCallCount, 4, `expected a bounded number of retries, not an infinite loop, got ${turnCallCount} calls`);
+    assert.ok(statusMessages.some((s) => s.includes("[error]")), "expected a final [error] status once retries are exhausted");
+  }));
