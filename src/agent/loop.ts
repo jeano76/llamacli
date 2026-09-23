@@ -67,6 +67,29 @@ function capToolResult(content: string, contextWindowTokens: number): string {
   return `${content.slice(0, cap)}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane]`;
 }
 
+/** Caps how much of `err.message` ever reaches an `onStatus` line.
+ *
+ *  Two real error shapes can make `err.message` itself enormous: a
+ *  non-streaming backend failure's message is `res.text()` — the entire
+ *  raw HTTP response body, verbatim — and a mid-stream SSE error chunk's
+ *  message can embed the backend's own "last read: ..." diagnostic, which
+ *  for the exact failure this exists to catch (a `write_file` call
+ *  truncated mid-JSON-string) contains the whole partially-generated file.
+ *  Reported live: after `MAX_TOOL_CALL_TRUNCATION_RETRIES` was exhausted
+ *  on a multi-KB test file, the fallback `[error] couldn't reach the model
+ *  backend: ${err.message}` line dumped several kilobytes of raw escaped
+ *  JSON (nested quotes, `\n`, the file's own source code, ending in the
+ *  literal `,"type":"server_error"}}`) straight onto the screen — visually
+ *  indistinguishable from a crash, even though the turn had already ended
+ *  cleanly and `/quit` still worked. `logFailure()` still gets the
+ *  untouched original (debugging/self-improvement needs the real text);
+ *  only what's shown to the user goes through this. */
+export function summarizeErrorForDisplay(message: string, maxLen = 300): string {
+  if (message.length <= maxLen) return message;
+  const omitted = message.length - maxLen;
+  return `${message.slice(0, maxLen)}... [${omitted} more characters truncated]`;
+}
+
 
 /** Tool calls whose arguments carry a whole file's contents. Once the
  *  call has actually run, that content is on disk — keeping a verbatim
@@ -635,7 +658,7 @@ export class AgentLoop {
         // with no .llamacli/config.yaml (falls back to an unreachable
         // default backend URL): report it and end the turn gracefully so
         // the user can fix config/connectivity and try again.
-        this.opts.onStatus?.(`[error] couldn't reach the model backend: ${err.message}`);
+        this.opts.onStatus?.(`[error] couldn't reach the model backend: ${summarizeErrorForDisplay(err.message)}`);
         logFailure({
           timestamp: new Date().toISOString(),
           summary: "backend chat request failed",
@@ -1078,7 +1101,7 @@ export class AgentLoop {
       // nothing is lost — just don't crash, and don't pretend the
       // conversation was compacted when it wasn't.
       this.opts.onStatus?.(
-        `[compaction failed] ${err.message} — checkpoint was saved, but the conversation wasn't summarized; continuing with the current context.`
+        `[compaction failed] ${summarizeErrorForDisplay(err.message)} — checkpoint was saved, but the conversation wasn't summarized; continuing with the current context.`
       );
       this.opts.onCompactionStatus?.("failed", new Date().toISOString());
       logFailure({

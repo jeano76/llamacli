@@ -369,6 +369,43 @@ export class OpenAICompatibleClient implements ModelBackend {
       this.currentChatController = null;
     }
 
+    // When the client-side max_tokens cap above cuts the stream (the usual
+    // way generation ends on this build, since the server ignores
+    // max_tokens when streaming), the server never gets to send its own
+    // "Failed to parse tool call arguments" error chunk: we hung up first.
+    // A tool call cut off mid-arguments then came back as a normal-looking
+    // reply. loop.ts put it into the history, and from then on EVERY
+    // request failed: llama-server JSON-parses the tool_calls arguments of
+    // every INPUT message while applying the chat template
+    // (common/chat.cpp func_args_not_string), so the unterminated string
+    // sitting in history made each retry fail instantly, with the model
+    // never even called. Seen live: 6 attempts (apply-template + chat
+    // each, 12 server exceptions) burned through in 1.5s, then a hard
+    // error. Raise the same error the server would have, with the partial
+    // calls attached, so loop.ts's salvage/chunking recovery handles it
+    // and the broken call never enters the history.
+    const unparseable = Object.values(toolCalls).find((tc) => {
+      if (!tc.arguments) return false;
+      try {
+        JSON.parse(tc.arguments);
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    if (unparseable) {
+      // The tail keeps loop.ts's verbatim-repeat detection meaningful (an
+      // identical regeneration cut at the identical point yields an
+      // identical message) without embedding the whole generated file.
+      const err: any = new Error(
+        `Failed to parse tool call arguments as JSON: the reply stopped (finish_reason=${finishReason ?? "unknown"}) ` +
+          `after ${unparseable.arguments.length} characters of ${unparseable.name} arguments, ending with ` +
+          JSON.stringify(unparseable.arguments.slice(-60))
+      );
+      err.partialToolCalls = Object.values(toolCalls);
+      throw err;
+    }
+
     const tool_calls = Object.values(toolCalls).map((tc) => ({
       id: tc.id,
       type: "function" as const,

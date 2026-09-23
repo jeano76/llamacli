@@ -452,3 +452,67 @@ test("cancel() is a harmless no-op when no request is currently in flight", () =
   const client = new OpenAICompatibleClient("http://127.0.0.1:1"); // nothing listening — never actually called
   assert.doesNotThrow(() => client.cancel());
 });
+
+// Seen live: the client-side max_tokens cap cut a write_file call
+// mid-arguments. Because the client hung up first, the server never sent
+// its own parse-error chunk, and the truncated call came back as a normal
+// reply. Once it was in the history, llama-server failed to apply the chat
+// template to every later request (it JSON-parses tool_calls arguments in
+// input messages), so every retry failed instantly.
+test("a tool call cut off by the client-side max_tokens cap throws the truncation error with partialToolCalls, instead of returning a broken call", async () => {
+  const chunks = [
+    sseChunk({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "write_file", arguments: '{"path":"a.txt",' } }] }, finish_reason: null }] }),
+    sseChunk({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"content":"line1\\n' } }] }, finish_reason: null }] }),
+    sseChunk({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "line2\\n" } }] }, finish_reason: null }] }),
+    sseChunk({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'line3"}' } }] }, finish_reason: "tool_calls" }] }),
+  ];
+  // One chunk per write, spaced out, like a real generation — so the
+  // client's cap (checked after each read) cuts the stream mid-arguments.
+  const server: Server = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    let i = 0;
+    const interval = setInterval(() => {
+      if (i >= chunks.length || res.destroyed) {
+        clearInterval(interval);
+        if (!res.destroyed) res.end();
+        return;
+      }
+      res.write(chunks[i++]);
+    }, 20);
+    req.on("close", () => clearInterval(interval));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (typeof address !== "object" || address === null) throw new Error("no server address");
+  try {
+    const client = new OpenAICompatibleClient(`http://127.0.0.1:${address.port}`);
+    let caught: any;
+    try {
+      await client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 2 }, () => {});
+      assert.fail("expected chat() to reject");
+    } catch (err) {
+      caught = err;
+    }
+    assert.match(caught.message, /Failed to parse tool call arguments as JSON/);
+    assert.match(caught.message, /finish_reason=length/);
+    assert.ok(caught.message.length < 400, "must not embed the whole generated content");
+    assert.equal(caught.partialToolCalls[0].name, "write_file");
+    assert.equal(caught.partialToolCalls[0].arguments, '{"path":"a.txt","content":"line1\\n');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a complete tool call still comes back normally (no regression)", () =>
+  withFakeSSEServer(
+    sseChunk({
+      choices: [
+        { delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "read_file", arguments: '{"path":"a.txt"}' } }] }, finish_reason: "tool_calls" },
+      ],
+    }),
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const res = await client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 100 }, () => {});
+      assert.equal(res.choices[0].message.tool_calls?.[0].function.arguments, '{"path":"a.txt"}');
+    }
+  ));

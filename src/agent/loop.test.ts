@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AgentLoop } from "./loop.js";
+import { AgentLoop, summarizeErrorForDisplay } from "./loop.js";
 import { readCheckpoint, writeCheckpoint, Checkpoint } from "../compaction/checkpoint.js";
 import { clearFailureLog } from "../hermes/selfHeal.js";
 import type {
@@ -1989,4 +1989,53 @@ test("the checkpoint goal stays the user's real goal across repeated compactions
       assert.equal(r.match(/previous goal:/g)!.length, 1, `nested resume text: ${r}`);
       assert.match(r, /previous goal: do the thing/);
     }
+  }));
+
+test("summarizeErrorForDisplay caps a raw backend error dump instead of showing it in full", () => {
+  const short = "connection refused";
+  assert.equal(summarizeErrorForDisplay(short), short);
+
+  const huge = "chat failed: 500 " + JSON.stringify({ error: { code: 500, message: "x".repeat(5000), type: "server_error" } });
+  const shown = summarizeErrorForDisplay(huge);
+  assert.ok(shown.length < 400, `expected a capped message, got ${shown.length} chars`);
+  assert.match(shown, /more characters truncated/);
+});
+
+test("a raw multi-KB backend error (e.g. a truncated write_file dump) never reaches onStatus in full, after retries are exhausted", () =>
+  withTempProject(async (dir) => {
+    // Simulates the real production shape: every retry attempt throws the
+    // exact same "Failed to parse tool call arguments as JSON" error whose
+    // message embeds several KB of the model's own generated content (the
+    // server's "last read: ..." diagnostic) — reproduced live with a
+    // truncated write_file call on a multi-KB test file. Once
+    // MAX_TOOL_CALL_TRUNCATION_RETRIES is exhausted, this used to fall
+    // through to a generic status line that dumped the raw error verbatim.
+    const hugeMessage = "chat stream error: Failed to parse tool call arguments as JSON: " + "x".repeat(6000);
+    const backend: ModelBackend = {
+      async chat() {
+        const err: any = new Error(hugeMessage);
+        throw err;
+      },
+      async listModels() {
+        return ["fake-model"];
+      },
+      async tokenize() {
+        return 1;
+      },
+    };
+    const statuses: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100000 },
+      onStatus: (s) => statuses.push(s),
+    });
+
+    await loop.send("write a big file");
+
+    const longest = Math.max(...statuses.map((s) => s.length));
+    assert.ok(longest < 500, `expected every status line capped, longest was ${longest} chars: ${statuses.find((s) => s.length === longest)?.slice(0, 80)}`);
+    assert.ok(statuses.some((s) => s.includes("more characters truncated")), `expected a truncation marker among: ${JSON.stringify(statuses)}`);
   }));

@@ -7,7 +7,7 @@ import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt, injectSkillInde
 import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { LlamaServerManager } from "./backend/llamaServer.js";
 import { OpenAICompatibleClient } from "./backend/openaiClient.js";
-import { AgentLoop } from "./agent/loop.js";
+import { AgentLoop, summarizeErrorForDisplay } from "./agent/loop.js";
 import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { isBrowserAvailable } from "./tools/browser.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
@@ -189,7 +189,7 @@ async function main() {
         ui?.setBusy(true);
         loop
           .resumeIfCheckpointExists()
-          .catch((err: any) => ui?.pushStatus(`[error] failed to resume from checkpoint: ${err.message}`))
+          .catch((err: any) => ui?.pushStatus(`[error] failed to resume from checkpoint: ${summarizeErrorForDisplay(err.message)}`))
           .finally(() => ui?.setBusy(false));
       }}
       onForceQuit={() => {
@@ -202,7 +202,7 @@ async function main() {
         // AppProps.onForceQuit's doc comment) — just save and go.
         const save = ui?.isBusy?.() ? loop.cancelCurrentTurn() : loop.saveStateOnQuit();
         save
-          .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${err.message}] quitting anyway.`))
+          .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${summarizeErrorForDisplay(err.message)}] quitting anyway.`))
           .finally(() => {
             ui?.setBusy(false);
             unmount();
@@ -229,7 +229,7 @@ async function main() {
           // Defensive: AgentLoop already catches expected backend/compaction
           // failures internally, but nothing here should ever be allowed to
           // crash the whole TUI process over an unexpected error.
-          ui?.pushStatus(`[error] ${err.message}`);
+          ui?.pushStatus(`[error] ${summarizeErrorForDisplay(err.message)}`);
         } finally {
           ui?.setBusy(false);
         }
@@ -251,7 +251,7 @@ async function main() {
               ui?.pushStatus("[saving progress before quitting...]");
               loop
                 .saveStateOnQuit()
-                .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${err.message}] quitting anyway.`))
+                .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${summarizeErrorForDisplay(err.message)}] quitting anyway.`))
                 .finally(() => {
                   unmount();
                   // Reported live (via the sibling onForceQuit path, same
@@ -286,7 +286,7 @@ async function main() {
                   ].join("\n")
                 );
               })
-              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${err.message}`));
+              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${summarizeErrorForDisplay(err.message)}`));
             break;
           }
           case "help": {
@@ -308,7 +308,7 @@ async function main() {
             ui?.setBusy(true);
             loop
               .forceCompact()
-              .catch((err: any) => ui?.pushStatus(`[compaction failed] ${err.message}`))
+              .catch((err: any) => ui?.pushStatus(`[compaction failed] ${summarizeErrorForDisplay(err.message)}`))
               .finally(() => ui?.setBusy(false));
             break;
           case "skills":
@@ -342,7 +342,7 @@ async function main() {
                     : "No recurring failure pattern yet, nothing to propose."
                 );
               })
-              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${err.message}`));
+              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${summarizeErrorForDisplay(err.message)}`));
             break;
           case "improve-apply":
             loop
@@ -354,13 +354,13 @@ async function main() {
                     : "No pending proposal to apply. Run /improve first."
                 );
               })
-              .catch((err: any) => ui?.pushStatus(`[rule save failed] ${err.message}`));
+              .catch((err: any) => ui?.pushStatus(`[rule save failed] ${summarizeErrorForDisplay(err.message)}`));
             break;
           case "plan-clear":
             loop
               .clearPlan()
               .then(() => ui?.pushStatus("Plan progress cleared."))
-              .catch((err: any) => ui?.pushStatus(`[error] failed to clear plan: ${err.message}`));
+              .catch((err: any) => ui?.pushStatus(`[error] failed to clear plan: ${summarizeErrorForDisplay(err.message)}`));
             break;
           // "queue" is handled locally inside App (needs the live queue state).
         }
