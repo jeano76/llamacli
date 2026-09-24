@@ -1084,9 +1084,13 @@ export class AgentLoop {
       toolDefsJson(),
       activeToolDefs()
     );
-    // Leave a quarter of the trigger level free after compacting, so the
-    // conversation can grow for a while before the next compaction.
-    const target = Math.floor(window * this.opts.thresholds.autoTriggerRatio * 0.75);
+    // Land at half the trigger level, so the conversation can grow for a
+    // while before the next compaction. Was 75%: measured live on a 24,576
+    // window, that left ~4-6K tokens of room, and tool-heavy steps add
+    // 2-5K each, so compaction (30-40s of summary generation) came every
+    // 2-5 minutes. Half the trigger roughly doubles the room, at the cost
+    // of keeping less recent conversation verbatim.
+    const target = Math.floor(window * this.opts.thresholds.autoTriggerRatio * 0.5);
     const room = target - overhead;
     if (room < 512 && !this.warnedWindowTooSmall) {
       this.warnedWindowTooSmall = true;
