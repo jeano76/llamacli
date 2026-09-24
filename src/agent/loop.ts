@@ -291,12 +291,16 @@ export interface AgentLoopOptions {
    *  vs kept/summarized — lets the UI show compaction's before/after
    *  instead of it being a black box. */
   onCompactionDetail?: (detail: CompactionDetail) => void;
-  /** Fires right as the model is about to start processing the next
-   *  command — a fresh send(), or a queued message being drained into an
-   *  already-running turn. Used by the TUI to fold expanded diffs back
-   *  down (see App.tsx's collapseDiffs) — requested directly to trigger on
-   *  this, not on the human's Enter keypress itself (a queued/auto-resumed
-   *  command the model picks up on its own never goes through that key). */
+  /** Fires once per chat() round, on the model's first output token
+   *  (content or reasoning delta) — not any earlier. Used by the TUI to
+   *  fold expanded diffs back down (see App.tsx's collapseDiffs).
+   *  Requested directly, twice: first to trigger on the model actually
+   *  starting the next command rather than the human's Enter keypress (a
+   *  queued/auto-resumed command the model picks up on its own never goes
+   *  through that key), then refined to fire on its first output token
+   *  specifically, not at send()/queue-drain time — folding right when
+   *  send() is called collapsed diffs a moment before the model had
+   *  actually started responding. */
   onTurnStart?: () => void;
   /** When a compaction interrupts a tool call mid-turn (checkpoint written,
    *  batch abandoned — see the maybeCompact() call site below), immediately
@@ -467,7 +471,6 @@ export class AgentLoop {
   }
 
   async send(userText: string): Promise<void> {
-    this.opts.onTurnStart?.();
     await this.enqueue(async () => {
       // The circuit breaker is created once per AgentLoop (i.e. once per
       // process) and never reset anywhere before this — its 30-minute
@@ -608,7 +611,6 @@ export class AgentLoop {
       // steering a task usually means every queued message together, not
       // one per tool-call round.
       if (this.queuedMessages.length > 0) {
-        this.opts.onTurnStart?.();
         for (const text of this.queuedMessages) {
           this.opts.onStatus?.(`[applying queued message] ${text}`);
           this.messages.push({ role: "user", content: text });
@@ -636,6 +638,18 @@ export class AgentLoop {
         return;
       }
       const { used: usedBeforeChat } = await this.maybeCompact();
+
+      // Fires once, on this round's FIRST delta (content or reasoning) —
+      // requested directly ("diff 접는 순간은 모델이 다음 토큰을 출력하는
+      // 시점에 접혀지게 해줘"): folding on send()/queue-drain itself
+      // collapsed diffs before the model had actually started responding,
+      // which is a moment earlier than asked for.
+      let firedTurnStart = false;
+      const maybeFireTurnStart = () => {
+        if (firedTurnStart) return;
+        firedTurnStart = true;
+        this.opts.onTurnStart?.();
+      };
 
       let res;
       try {
@@ -680,6 +694,14 @@ export class AgentLoop {
             // don't assume every backend does) — a bare `chunk.choices[0]`
             // throws instead of just skipping the chunk when it's missing.
             const delta = chunk.choices?.[0]?.delta;
+            // Any of the three delta shapes means the model has started
+            // producing SOMETHING for this round — a tool-call-only round
+            // (content: null, the common case in an agentic loop) has no
+            // content/reasoning delta at all, so gating solely on those
+            // would mean this almost never fires in practice.
+            if (delta?.content || (delta as any)?.reasoning_content || delta?.tool_calls?.length) {
+              maybeFireTurnStart();
+            }
             if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
             const reasoning = (delta as any)?.reasoning_content;
             if (typeof reasoning === "string" && reasoning) this.opts.onReasoningDelta?.(reasoning);

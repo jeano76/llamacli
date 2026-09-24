@@ -36,7 +36,10 @@ function scriptedBackend(opts: {
   let tokenizeIndex = 0;
   const turnRequests: ChatCompletionRequest[] = [];
   const backend: ModelBackend = {
-    async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+    async chat(
+      req: ChatCompletionRequest,
+      onDelta?: (chunk: { choices: Array<{ delta: Partial<ChatMessage>; finish_reason: string | null }> }) => void
+    ): Promise<ChatCompletionResponse> {
       if (!req.tools) {
         // compactor.ts's internal "summarize the old turns" request
         return {
@@ -47,6 +50,14 @@ function scriptedBackend(opts: {
       const res = opts.turnResponses[turnIndex];
       turnIndex++;
       if (!res) throw new Error(`scriptedBackend: no turn response scripted for call ${turnIndex}`);
+      // Fire one synthetic delta mirroring the scripted response, so tests
+      // exercising streaming-driven behavior (onAssistantDelta,
+      // onReasoningDelta, onTurnStart — see loop.ts's maybeFireTurnStart)
+      // see it, same as the real backend would via at least one chunk.
+      const message = res.choices[0]?.message;
+      if (onDelta && message) {
+        onDelta({ choices: [{ delta: { content: message.content, tool_calls: message.tool_calls }, finish_reason: null }] });
+      }
       return res;
     },
     async listModels() {
@@ -2477,7 +2488,7 @@ test("harness: a message queued mid-turn reaches the model at the NEXT request, 
       onTurnStart: () => turnStartCount++,
     });
     const sendPromise = loop.send("start the task");
-    assert.equal(turnStartCount, 1, "onTurnStart must fire right as send() starts processing the new command");
+    assert.equal(turnStartCount, 0, "onTurnStart must not fire before the model has actually produced anything yet");
     loop.queueMessage("actually, also check the logs");
     releaseRound1!();
     await sendPromise;
@@ -2489,8 +2500,7 @@ test("harness: a message queued mid-turn reaches the model at the NEXT request, 
     assert.ok(round3Has, "once in history it stays for every later request too");
     assert.ok(queueSnapshots.some((q) => q.length === 1), "onQueueChange must report it while queued");
     assert.ok(queueSnapshots.at(-1)?.length === 0, "and report it drained once applied");
-    // Fired once for send() itself and once when the queued message was
-    // drained into round 2 — not on every tool-call round in between (round
-    // 3 had nothing queued to drain).
-    assert.equal(turnStartCount, 2, "onTurnStart should also fire when the queued message is drained into the turn");
+    // Fires once per round's first output token (see loop.ts's
+    // maybeFireTurnStart) — all 3 rounds here each produce something.
+    assert.equal(turnStartCount, 3, "onTurnStart should fire once per round, on its first delta");
   }));
