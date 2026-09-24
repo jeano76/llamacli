@@ -138,6 +138,13 @@ test("AgentLoop captures pendingToolCall when compaction fires mid-batch, and ab
     await loop.send("do the thing");
 
     assert.ok(statusMessages.some((s) => s.includes("compaction complete")));
+    // A plain-language heads-up the moment compaction STARTS — requested
+    // directly: "컴팩션을 수행하는 경우 출력창에 친절하게 ... 안내가
+    // 되면 좋겠어" — must come before the "complete" line, not after.
+    const startIdx = statusMessages.findIndex((s) => s.includes("메모리 공간을 확보합니다"));
+    const completeIdx = statusMessages.findIndex((s) => s.includes("compaction complete"));
+    assert.ok(startIdx !== -1, "expected the friendly compaction-starting message");
+    assert.ok(startIdx < completeIdx, "the starting message must come before the completion message");
     // A mid-batch abandonment must say the turn is over — otherwise it's
     // indistinguishable from the CLI having hung (reported directly: "진행
     // 중인지 멈춘건지 모르겠네" / "can't tell if this is still running").

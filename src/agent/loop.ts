@@ -1461,6 +1461,13 @@ export class AgentLoop {
     tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION
   ): Promise<void> {
     this.opts.onCompactionStatus?.("running", new Date().toISOString());
+    // Requested directly: "컴팩션을 수행하는 경우 출력창에 친절하게 ...
+    // 안내가 되면 좋겠어" — a plain-language heads-up the moment
+    // compaction starts, not just the terser "[compaction complete]" line
+    // that only ever appeared after the fact.
+    this.opts.onStatus?.(
+      "[compaction] 지금 대화내용의 중요한 요점을 다시 정리하여 메모리 공간을 확보합니다. 잠시후 결과를 알려드리겠습니다."
+    );
     const partial: Omit<Checkpoint, "version" | "timestamp"> = {
       reason,
       goal: this.currentGoalSummary(),
