@@ -328,10 +328,16 @@ export function runHintText(columns: number): string {
   // With mouse reporting on (wheel scrollback), plain clicks go to the app;
   // holding Shift hands them back to the terminal, so Shift+drag selects and
   // Shift+right-click opens the terminal's own Copy/Paste menu.
+  // Esc and /quit are NOT the same thing — Esc cancels the running turn and
+  // exits right away (a checkpoint is written first so it resumes next
+  // time), while /quit waits for the turn to finish and runs the normal
+  // self-improvement-review gate first. Spelled out directly (강제종료 vs
+  // 정상종료) rather than just "Esc: 종료" for both, which didn't say which
+  // was which.
   const forms = [
-    "  실행 중 · Esc: 종료 · Shift+드래그: 선택 · Shift+우클릭: 복사/붙여넣기",
-    "  Esc: 종료 · Shift+우클릭: 복사/붙여넣기",
-    "  Esc: 종료",
+    "  실행 중 · Esc: 강제종료 · /quit: 정상종료 · Shift+드래그: 선택 · Shift+우클릭: 복사/붙여넣기",
+    "  Esc: 강제종료 · /quit: 정상종료 · Shift+우클릭: 복사/붙여넣기",
+    "  Esc: 강제종료 · /quit: 정상종료",
   ];
   return forms.find((f) => stringWidth(f) <= columns - 1) ?? forms[forms.length - 1];
 }

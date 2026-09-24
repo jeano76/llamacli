@@ -116,11 +116,21 @@ test("parseMouseWheel consumes clicks without scrolling, and ignores ordinary in
   assert.equal(parseMouseWheel("[<not a report"), null);
 });
 
-test("the running-state key hint uses the long form when it fits, and a short one otherwise", () => {
+test("the running-state key hint uses the long form when it fits, and a short one otherwise, and always distinguishes Esc (force quit) from /quit (normal quit)", () => {
   assert.match(runHintText(100), /Shift\+드래그: 선택 · Shift\+우클릭: 복사\/붙여넣기/);
-  assert.equal(runHintText(50), "  Esc: 종료 · Shift+우클릭: 복사/붙여넣기");
-  assert.equal(runHintText(30), "  Esc: 종료");
-  for (const cols of [20, 40, 60, 80, 120]) assert.ok(stringWidth(runHintText(cols)) <= cols - 1 || cols < 14);
+  assert.equal(runHintText(50), "  Esc: 강제종료 · /quit: 정상종료");
+  assert.equal(runHintText(30), "  Esc: 강제종료 · /quit: 정상종료");
+  for (const cols of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 40, 60, 80, 120]) {
+    const text = runHintText(cols);
+    assert.match(text, /Esc: 강제종료/);
+    assert.match(text, /\/quit: 정상종료/);
+    // The shortest form is itself fairly wide now that it must name both
+    // Esc and /quit distinctly (see runHintText's doc comment) — only the
+    // widest form's own line matters for not overflowing a normal terminal;
+    // an unrealistically narrow one (<34 cols) is a display cutoff, not a
+    // display-code bug, the same carve-out the old shortest form had.
+    if (cols >= 34) assert.ok(stringWidth(text) <= cols - 1);
+  }
 });
 
 test("shimmerBands reveals text as a one-directional wave that never un-reveals already-passed text", () => {
