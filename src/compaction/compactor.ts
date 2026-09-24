@@ -369,6 +369,21 @@ export async function runCompaction(
     },
     ...summaryInput,
   ];
+  // The request must END with a user turn asking for the summary. When the
+  // last message is an assistant one (usual here: sanitizeForSummary turns
+  // tool calls and results into assistant text), llama-server treats it as
+  // an assistant prefill and the model CONTINUES that message instead of
+  // summarizing. Measured against the real backend: ending on the assistant
+  // message returned an echo of the tool-call text; ending on a user
+  // request returned an actual summary. Live, one compaction's summary
+  // request generated a single token, so everything it replaced was lost.
+  const SUMMARY_INSTRUCTION = "Now write the summary of the conversation above. Output only the summary.";
+  const lastInput = summaryRequest[summaryRequest.length - 1];
+  if (lastInput.role === "user" && typeof lastInput.content === "string") {
+    summaryRequest[summaryRequest.length - 1] = { ...lastInput, content: `${lastInput.content}\n\n${SUMMARY_INSTRUCTION}` };
+  } else {
+    summaryRequest.push({ role: "user", content: SUMMARY_INSTRUCTION });
+  }
 
   // Never leave this unset — same reasoning, and the exact same failure
   // mode, as loop.ts's main-turn request: without max_tokens, llama-server

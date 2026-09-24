@@ -849,3 +849,37 @@ test("runCompaction keeps the newest tool result by pulling its assistant tool_c
       await rm(dir, { recursive: true, force: true });
     }
   })());
+
+test("the summary request always ends with a user turn, so the backend summarizes instead of continuing an assistant prefill", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      let req: ChatCompletionRequest | undefined;
+      const backend: ModelBackend = {
+        async chat(r) {
+          req = r;
+          return { choices: [{ message: { role: "assistant", content: "S" }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      const partial = { reason: "auto-threshold" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+      const messages: ChatMessage[] = [{ role: "system", content: "BASE" }];
+      for (let i = 0; i < 20; i++) {
+        messages.push({ role: "user", content: "u".repeat(400) });
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: `t${i}`, type: "function", function: { name: "run_shell", arguments: '{"command":"ls"}' } }],
+        });
+        messages.push({ role: "tool", tool_call_id: `t${i}`, content: "x".repeat(400) });
+      }
+      await runCompaction(dir, messages, backend, "m", partial, 4096, 0.05);
+      const last = req!.messages[req!.messages.length - 1];
+      assert.equal(last.role, "user");
+      assert.match(String(last.content), /write the summary/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
