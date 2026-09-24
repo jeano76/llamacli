@@ -518,7 +518,7 @@ export function App({
           if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
         }, 60);
       }
-    }, 16);
+    }, 32);
     return () => {
       clearInterval(shineId);
       if (bounceId !== null) clearInterval(bounceId);
