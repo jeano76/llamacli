@@ -160,6 +160,22 @@ export function shouldHideCursor(state: { quitting: boolean; busy: boolean; inpu
   return state.quitting || (state.busy && state.input.length === 0);
 }
 
+/** The key-hint line shown under the log while the agent is running (never
+ *  inside the input box: it used to sit next to the prompt and take width
+ *  from it, which threw off the input's width/cursor math — reported
+ *  directly). Picks the long form when it fits the terminal width. */
+export function runHintText(columns: number): string {
+  // With mouse reporting on (wheel scrollback), plain clicks go to the app;
+  // holding Shift hands them back to the terminal, so Shift+drag selects and
+  // Shift+right-click opens the terminal's own Copy/Paste menu.
+  const forms = [
+    "  실행 중 · Esc: 종료 · Shift+드래그: 선택 · Shift+우클릭: 복사/붙여넣기",
+    "  Esc: 종료 · Shift+우클릭: 복사/붙여넣기",
+    "  Esc: 종료",
+  ];
+  return forms.find((f) => stringWidth(f) <= columns - 1) ?? forms[forms.length - 1];
+}
+
 /** Input-box text while progress is being saved before exit. */
 export function quittingStatusText(elapsedMs: number): string {
   return `진행 상황 저장 중… ${Math.floor(elapsedMs / 1000)}초 · Esc: 저장하지 않고 바로 종료`;
@@ -546,19 +562,11 @@ export function App({
   // Reserves 2 extra columns for the input box's own left+right border
   // characters (see the bordered Box below) on top of its padding/spinner/space.
   const maxInputWidth = Math.max(10, columns - 6);
-  // Shown next to the input any time it's not already showing one of the
-  // confirmation dialogs below, so the quit path is discoverable without
-  // having to already know the keybinding exists. Hidden below a
-  // reasonable width rather than squeezing the input box to near-nothing
-  // to make room for it on a narrow terminal.
-  const ESC_HINT = " (Esc to quit)";
   const quitting = quittingSince !== null;
-  const showEscHint = !quitting && !quitConfirmPending && !resumeConfirmPending && columns >= 40;
   const QUIT_CONFIRM_TEXT = "강제 종료하시겠습니까? 진행 중인 작업은 저장되어 다음 실행 시 이어집니다. (Y/N)";
   const RESUME_CONFIRM_TEXT = pendingResumeGoal
     ? `이전 작업을 이어서 하시겠습니까? "${pendingResumeGoal}" (Y/N)`
     : "";
-  const escHintWidth = showEscHint ? stringWidth(ESC_HINT) : 0;
   const quittingText = quitting ? quittingStatusText(Date.now() - quittingSince!) : "";
   const visibleInput = quitting
     ? tailToWidth(quittingText, maxInputWidth)
@@ -566,7 +574,7 @@ export function App({
     ? tailToWidth(RESUME_CONFIRM_TEXT, maxInputWidth)
     : quitConfirmPending
       ? tailToWidth(QUIT_CONFIRM_TEXT, maxInputWidth)
-      : tailToWidth(input, Math.max(4, maxInputWidth - escHintWidth));
+      : tailToWidth(input, maxInputWidth);
 
   // logHeight is a CONSTANT, independent of menu state — this is the outer
   // log-area Box's actual `height`, and it must never change, because
@@ -646,12 +654,18 @@ export function App({
   // scrollOffset > 0) keeps maxScrollRef consistent regardless of current
   // scroll position, avoiding a circular "how much can I scroll depends on
   // whether I'm already scrolled" dependency.
-  const scrollableContentRows = menuOpen ? Math.max(0, logHeight - menuBoxHeight) : Math.max(0, logHeight - 1);
+  // One row at the bottom of the log area goes to the key hint, only while
+  // the agent is running.
+  const showRunHint = busy && !quitting && !quitConfirmPending && !resumeConfirmPending && !menuOpen;
+  const hintRows = showRunHint ? 1 : 0;
+  const scrollableContentRows = menuOpen
+    ? Math.max(0, logHeight - menuBoxHeight)
+    : Math.max(0, logHeight - 1 - hintRows);
   const maxScroll = Math.max(0, allRows.length - scrollableContentRows);
   maxScrollRef.current = maxScroll;
   const clampedScroll = menuOpen ? 0 : Math.min(scrollOffset, maxScroll);
   const showScrollIndicator = !menuOpen && clampedScroll > 0;
-  const contentRows = menuOpen ? scrollableContentRows : logHeight - (showScrollIndicator ? 1 : 0);
+  const contentRows = menuOpen ? scrollableContentRows : logHeight - (showScrollIndicator ? 1 : 0) - hintRows;
   const sliceEnd = allRows.length - clampedScroll;
   const sliceStart = Math.max(0, sliceEnd - contentRows);
 
@@ -687,6 +701,7 @@ export function App({
         )}
         {allRows.slice(sliceStart, sliceEnd).map(renderRow)}
         {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
+        {showRunHint && <Text dimColor>{runHintText(columns)}</Text>}
       </Box>
 
       {/* The prompt input lives INSIDE this bordered box, not below it —
@@ -700,7 +715,6 @@ export function App({
       >
         <Spinner active={busy || quitting} />
         <Text color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {visibleInput}</Text>
-        {showEscHint && <Text dimColor>{ESC_HINT}</Text>}
       </Box>
 
       <StatusBar

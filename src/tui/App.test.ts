@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS } from "./App.js";
+import stringWidth from "string-width";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText } from "./App.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
 // Reported directly: the slash menu could only be driven with arrow keys —
@@ -113,4 +114,11 @@ test("parseMouseWheel consumes clicks without scrolling, and ignores ordinary in
   assert.equal(parseMouseWheel("[<0;10;5m"), 0);
   assert.equal(parseMouseWheel("hello"), null);
   assert.equal(parseMouseWheel("[<not a report"), null);
+});
+
+test("the running-state key hint uses the long form when it fits, and a short one otherwise", () => {
+  assert.match(runHintText(100), /Shift\+드래그: 선택 · Shift\+우클릭: 복사\/붙여넣기/);
+  assert.equal(runHintText(50), "  Esc: 종료 · Shift+우클릭: 복사/붙여넣기");
+  assert.equal(runHintText(30), "  Esc: 종료");
+  for (const cols of [20, 40, 60, 80, 120]) assert.ok(stringWidth(runHintText(cols)) <= cols - 1 || cols < 14);
 });
