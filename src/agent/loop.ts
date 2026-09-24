@@ -238,6 +238,10 @@ export interface AgentLoopOptions {
    *  Off by default — see that file's doc comment for why. From
    *  config.yaml's checkpoint.git. */
   gitCheckpoint?: boolean;
+  /** llama.cpp repeat_penalty sent with every chat request. Defaults to 1.1
+   *  (see ChatCompletionRequest.repeat_penalty) — from config.yaml's
+   *  llama.repeatPenalty. */
+  repeatPenalty?: number;
   /** Clock, injectable for tests. */
   now?: () => number;
   /** Called for each incremental token/chunk of assistant text as it streams in. */
@@ -638,6 +642,8 @@ export class AgentLoop {
             // repeats verbatim, so a non-compliant model still physically
             // cannot regenerate the identical oversized content again.
             max_tokens: Math.max(512, Math.floor(this.computeMaxTokens(usedBeforeChat) * toolCallMaxTokensShrinkFactor)),
+            // See ChatCompletionRequest.repeat_penalty's doc comment.
+            repeat_penalty: this.opts.repeatPenalty ?? 1.1,
             // THE root cause behind a long run of "the model never
             // finished writing the file" failures — measured directly
             // against the real backend, same 420-token budget, same

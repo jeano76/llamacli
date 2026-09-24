@@ -40,6 +40,12 @@ export interface ChatCompletionRequest {
    *  consumed by invisible `reasoning_content` before the tool call even
    *  started. A backend that doesn't recognize the field ignores it. */
   chat_template_kwargs?: Record<string, unknown>;
+  /** llama.cpp-server sampling passthrough, ignored by backends that don't
+   *  recognize it. Sent explicitly because a bare launch of llama-server
+   *  defaults this to 1.0 (off) — confirmed live via GET /slots — which
+   *  lets a degenerate loop repeat the same phrase verbatim until
+   *  max_tokens cuts it off instead of self-correcting. */
+  repeat_penalty?: number;
 }
 
 export interface ChatCompletionChunk {

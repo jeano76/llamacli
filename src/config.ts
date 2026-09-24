@@ -9,6 +9,10 @@ export interface LlamacliConfig {
   model: string;
   baseUrl?: string; // for openai-compatible / attach-existing
   apiKey?: string;
+  /** repeat_penalty sent with every chat request (see loop.ts's
+   *  AgentLoopOptions.repeatPenalty for why this isn't left unset).
+   *  Defaults to 1.1. */
+  repeatPenalty?: number;
   llama?: {
     binPath: string;
     modelPath: string;

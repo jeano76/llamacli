@@ -201,6 +201,7 @@ async function main() {
     enableThinking: config.enableThinking ?? false,
     verify: config.verify?.afterEdit,
     gitCheckpoint: config.checkpoint?.git ?? false,
+    repeatPenalty: config.repeatPenalty,
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
     onAssistantDone: () => {
       (globalThis as any).__llamacli_ui?.finalizeAssistant();
