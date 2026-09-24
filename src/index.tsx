@@ -257,6 +257,7 @@ async function main() {
       (globalThis as any).__llamacli_ui?.pushTool(label);
     },
     onDiff: (_path, diff) => (globalThis as any).__llamacli_ui?.pushDiff(diff),
+    onToolResult: (command, output) => (globalThis as any).__llamacli_ui?.pushToolResult(command, output),
     onStatus: (s) => (globalThis as any).__llamacli_ui?.pushStatus(s),
     onContextUsage: (used, total) =>
       (globalThis as any).__llamacli_ui?.setContextUsedRatio(total > 0 ? Math.min(1, used / total) : 0),

@@ -265,6 +265,9 @@ export interface AgentLoopOptions {
   onToolCall?: (name: string, args: string) => void;
   /** ANSI-colored diff for a file-mutating tool call, UI-only. */
   onDiff?: (path: string, diff: string) => void;
+  /** Fires with a run_shell command's raw output — see its call site's doc
+   *  comment for why it's scoped to that tool only. */
+  onToolResult?: (command: string, output: string) => void;
   onStatus?: (status: string) => void;
   /** Fires whenever context usage is (re-)measured, so the UI's context
    *  battery gauge can reflect real usage (PROMPT.md §2.5) instead of being
@@ -1044,6 +1047,16 @@ export class AgentLoop {
             : capToolResult(result.content, this.opts.thresholds.contextWindowTokens);
           if (result.diff) {
             this.opts.onDiff?.(this.summarizeArgs(call.function.arguments), result.diff);
+          }
+          // Requested directly: a run_shell result (npm test, npm run
+          // build, ...) was never actually shown in the TUI at all —
+          // only the "⚡ run_shell(npm test)" call label, not what it
+          // printed. Scoped to run_shell (not every tool): a read_file
+          // result would just duplicate a file already visible on disk,
+          // but a shell command's output is often the ONLY place that
+          // information exists.
+          if (call.function.name === "run_shell") {
+            this.opts.onToolResult?.(this.summarizeArgs(call.function.arguments), content);
           }
           this.recordFileTouch(call.function.name, call.function.arguments);
           this.pushExecutedToolLog(`${call.function.name}(${this.summarizeArgs(call.function.arguments)})`);

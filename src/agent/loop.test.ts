@@ -246,6 +246,40 @@ test("with the default autoResume: true, a compaction that interrupts a tool cal
     assert.ok(secondRequest.messages.some((m) => typeof m.content === "string" && m.content.includes("update_plan")));
   }));
 
+test("onToolResult fires with a run_shell command's real output, and only for run_shell (not other tools)", () =>
+  withTempProject(async (dir) => {
+    await writeFile(join(dir, "f.txt"), "file content", "utf8");
+    const shellCall = {
+      id: "c1",
+      type: "function" as const,
+      function: { name: "run_shell", arguments: JSON.stringify({ command: "echo hello-from-test" }) },
+    };
+    const readCall = {
+      id: "c2",
+      type: "function" as const,
+      function: { name: "read_file", arguments: JSON.stringify({ path: "f.txt" }) },
+    };
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [shellCall, readCall]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const toolResults: { command: string; output: string }[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+      onToolResult: (command, output) => toolResults.push({ command, output }),
+    });
+
+    await loop.send("run it");
+
+    assert.equal(toolResults.length, 1, "expected exactly one onToolResult call, for run_shell only");
+    assert.match(toolResults[0].command, /echo/);
+    assert.match(toolResults[0].output, /hello-from-test/);
+  }));
+
 test("a turn that ends on plain text with no tool call announces it's done, instead of just going quiet", () =>
   withTempProject(async (dir) => {
     const { backend } = scriptedBackend({

@@ -68,7 +68,7 @@ export function appendHistory(history: string[], text: string): string[] {
 interface LogLine {
   id: number;
   text: string;
-  kind: "user" | "assistant" | "status" | "tool" | "diff" | "reasoning" | "compaction-detail";
+  kind: "user" | "assistant" | "status" | "tool" | "diff" | "reasoning" | "compaction-detail" | "tool-result";
   /** Precomputed folded-state label for kinds whose fold summary can't be
    *  derived from `text` alone (e.g. "compaction-detail", whose text is the
    *  full expanded body). Unused for "reasoning", which derives its own via
@@ -81,7 +81,7 @@ let logIdCounter = 0;
 interface RenderedRow {
   key: string;
   text: string;
-  kind: LogLine["kind"] | "reasoning-folded" | "compaction-detail-folded";
+  kind: LogLine["kind"] | "reasoning-folded" | "compaction-detail-folded" | "diff-folded" | "tool-result-folded";
   lineId: number;
 }
 
@@ -113,6 +113,40 @@ export function compactionDetailBody(detail: { droppedPreview: string[]; summary
     `🗑 잊혀진 내용:\n${detail.droppedPreview.map((l) => `  - ${l}`).join("\n")}\n\n` +
     `✨ 강조된 내용 (요약):\n${detail.summary}`
   );
+}
+
+/** Extracts the path and +added/-removed line counts from a formatDiff()
+ *  string (src/tools/diff.ts) — its header is `\x1b[1m--- ${path}\x1b[0m`
+ *  and each changed line is prefixed with the green/red ANSI codes it
+ *  defines. Used for the folded summary label; a diff text that doesn't
+ *  match the expected shape (defensive — formatDiff's own format could
+ *  change) falls back to a generic label rather than throwing. */
+export function parseDiffStats(diffText: string): { path: string; added: number; removed: number } {
+  const pathMatch = diffText.match(/^\x1b\[1m--- (.+?)\x1b\[0m/);
+  const added = (diffText.match(/\x1b\[32m\+/g) ?? []).length;
+  const removed = (diffText.match(/\x1b\[31m-/g) ?? []).length;
+  return { path: pathMatch?.[1] ?? "(unknown file)", added, removed };
+}
+
+/** Folded summary line for a run_shell result (e.g. `npm test` output) —
+ *  requested directly ("유닛테스트 수행시 테스트 결과도 펼침과 닫힘기능으로
+ *  제공한다"): a shell command's output was previously never shown in the
+ *  TUI at all, only the "⚡ run_shell(...)" call label. Defaults folded
+ *  like reasoning/compaction (raw shell output can be long and isn't the
+ *  point of the screen most of the time), expandable the same way. */
+export function foldedToolResultSummary(command: string, output: string): string {
+  const lines = output.split("\n").length;
+  return `▸ 결과: ${command} (${lines}줄) — 클릭해서 펼치기`;
+}
+
+/** Folded summary line for a diff block — requested directly ("기본적으로는
+ *  화면에 펼짐으로 나타내고 다음 명령어 진입시 닫힘으로"): diffs start
+ *  expanded (the opposite default from reasoning/compaction, which start
+ *  folded) and only collapse once the next command is submitted, via
+ *  collapsedDiffIds in App — still expandable again afterward by click. */
+export function foldedDiffSummary(diffText: string): string {
+  const { path, added, removed } = parseDiffStats(diffText);
+  return `▸ diff: ${path} (+${added} -${removed}) — 클릭해서 펼치기`;
 }
 
 /** A single band's role in the "thinking" shimmer: `dim` hasn't been
@@ -255,6 +289,27 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
     // when it is exactly the text that was just highlighted revealing it.
     return (
       <Text key={row.key} color="cyan" italic>
+        {row.text}
+      </Text>
+    );
+  }
+  if (row.kind === "tool-result-folded") {
+    return (
+      <Text key={row.key} color="blue">
+        {row.text}
+      </Text>
+    );
+  }
+  if (row.kind === "tool-result") {
+    return (
+      <Text key={row.key} color="blue">
+        {row.text}
+      </Text>
+    );
+  }
+  if (row.kind === "diff-folded") {
+    return (
+      <Text key={row.key} color="green">
         {row.text}
       </Text>
     );
@@ -447,11 +502,20 @@ export function App({
   // Requested directly: reasoning is useful to check but clutters the log
   // once it's no longer the point of what's on screen.
   const [expandedReasoningIds, setExpandedReasoningIds] = useState<Set<number>>(new Set());
+  // Diffs are the opposite default: shown expanded (visible right away,
+  // since that's the point — the user asked to actually see the change),
+  // and only fold down once the next command is submitted (see the Return
+  // handler below), rather than needing a click just to see what changed.
+  // Still toggleable by click either way afterward.
+  const [collapsedDiffIds, setCollapsedDiffIds] = useState<Set<number>>(new Set());
   // Rebuilt every render (see the allRows loop) so a click handler — which
   // only runs later, async, in response to a real terminal event — can map
   // the absolute terminal row it landed on back to a log line without
   // recomputing the whole layout itself.
-  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean }[] }>({ firstRow: 1, entries: [] });
+  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean; isDiff: boolean }[] }>({
+    firstRow: 1,
+    entries: [],
+  });
   // How far scrollOffset can go before there's nothing further back to see —
   // updated every render (see below) rather than recomputed inside the key
   // handler, which would mean redoing the markdown/wrap rendering work
@@ -520,6 +584,13 @@ export function App({
     );
   }
 
+  function pushToolResult(command: string, output: string) {
+    const foldLabel = foldedToolResultSummary(command, output);
+    setLog((prev) =>
+      [...prev, { id: logIdCounter++, text: output, kind: "tool-result" as const, foldLabel }].slice(-MAX_LOG_ENTRIES)
+    );
+  }
+
 
   // Echoes the startup resume question into the scrolling log as well as
   // showing it in the input box (see visibleInput below) — reported
@@ -571,7 +642,11 @@ export function App({
           const idx = row - firstRow;
           const entry = idx >= 0 && idx < entries.length ? entries[idx] : undefined;
           if (!entry?.foldable) continue;
-          setExpandedReasoningIds((prev) => {
+          // Diffs track their FOLDED ids (default expanded); everything
+          // else tracks its EXPANDED ids (default folded) — see
+          // collapsedDiffIds/expandedReasoningIds's own doc comments.
+          const setFn = entry.isDiff ? setCollapsedDiffIds : setExpandedReasoningIds;
+          setFn((prev) => {
             const next = new Set(prev);
             if (next.has(entry.lineId)) next.delete(entry.lineId);
             else next.add(entry.lineId);
@@ -733,6 +808,16 @@ export function App({
 
     if (key.return) {
       if (input.trim().length === 0) return;
+      // Diffs default to expanded so the change is actually visible right
+      // away, but shouldn't stay taking up the whole log forever — folding
+      // them the moment the next command is entered (rather than needing a
+      // click) was requested directly ("기본적으로는 화면에 펼짐으로
+      // 나타내고 다음 명령어 진입시 닫힘으로"). Still re-expandable by click.
+      setCollapsedDiffIds((prev) => {
+        const next = new Set(prev);
+        for (const line of log) if (line.kind === "diff") next.add(line.id);
+        return next;
+      });
       if (busy) {
         onQueueMessage(input);
         pushLine(`[queued] ${input}`, "status");
@@ -777,6 +862,7 @@ export function App({
     pushReasoningDelta,
     finalizeReasoning,
     pushCompactionDetail,
+    pushToolResult,
     setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
     pushTool: (t: string) => pushLine(t, "tool"),
@@ -918,6 +1004,42 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "compaction-detail-folded", lineId: line.id });
       continue;
     }
+    if (line.kind === "tool-result") {
+      if (!expandedReasoningIds.has(line.id)) {
+        allRows.push({
+          key: `${line.id}-fold`,
+          text: line.foldLabel ?? "▸ 결과 — 클릭해서 펼치기",
+          kind: "tool-result-folded",
+          lineId: line.id,
+        });
+        continue;
+      }
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "tool-result-folded", lineId: line.id });
+      continue;
+    }
+    // Diffs: opposite default from the two folds above (see
+    // collapsedDiffIds's doc comment) — shown in full unless collapsed,
+    // either by clicking or because the next command was submitted.
+    if (line.kind === "diff") {
+      if (collapsedDiffIds.has(line.id)) {
+        allRows.push({ key: `${line.id}-fold`, text: line.foldLabel ?? foldedDiffSummary(line.text), kind: "diff-folded", lineId: line.id });
+        continue;
+      }
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "diff-folded", lineId: line.id });
+      continue;
+    }
     let cached = rowCache.get(line.id);
     if (!cached || cached.text !== line.text || cached.width !== width) {
       cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
@@ -970,7 +1092,12 @@ export function App({
             r.kind === "reasoning" ||
             r.kind === "reasoning-folded" ||
             r.kind === "compaction-detail" ||
-            r.kind === "compaction-detail-folded",
+            r.kind === "compaction-detail-folded" ||
+            r.kind === "tool-result" ||
+            r.kind === "tool-result-folded" ||
+            r.kind === "diff" ||
+            r.kind === "diff-folded",
+          isDiff: r.kind === "diff" || r.kind === "diff-folded",
         })),
     };
   }

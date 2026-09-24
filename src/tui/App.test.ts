@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary } from "./App.js";
+import { formatDiff } from "../tools/diff.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
 // Reported directly: the slash menu could only be driven with arrow keys —
@@ -197,4 +198,35 @@ test("foldedCompactionSummary names counts, and compactionDetailBody shows both 
   assert.match(body, /old request/);
   assert.match(body, /강조된/);
   assert.match(body, /the gist of it/);
+});
+
+test("foldedToolResultSummary names the command and the output's line count, and invites a click to expand", () => {
+  const label = foldedToolResultSummary("npm test", "line1\nline2\nline3");
+  assert.match(label, /npm test/);
+  assert.match(label, /3줄/);
+  assert.match(label, /펼치기/);
+});
+
+test("parseDiffStats reads the path and +/- counts out of a real formatDiff() string", () => {
+  const diff = formatDiff("src/foo.ts", "line1\nline2\nline3", "line1\nchanged\nline3\nline4");
+  const stats = parseDiffStats(diff);
+  assert.equal(stats.path, "src/foo.ts");
+  assert.ok(stats.added >= 1, "expected at least the changed/added line to be counted");
+  assert.ok(stats.removed >= 1, "expected the replaced line to be counted as removed");
+});
+
+test("parseDiffStats falls back gracefully on text that doesn't look like formatDiff's output", () => {
+  const stats = parseDiffStats("not a diff at all");
+  assert.equal(stats.path, "(unknown file)");
+  assert.equal(stats.added, 0);
+  assert.equal(stats.removed, 0);
+});
+
+test("foldedDiffSummary names the file and the +/- counts, and invites a click to expand", () => {
+  const diff = formatDiff("a.js", "old", "new");
+  const label = foldedDiffSummary(diff);
+  assert.match(label, /a\.js/);
+  assert.match(label, /\+\d+/);
+  assert.match(label, /-\d+/);
+  assert.match(label, /펼치기/);
 });
