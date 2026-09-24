@@ -73,17 +73,25 @@ const GLYPHS: Record<string, string[]> = {
   N: ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
   E: ["█████", "█    ", "████ ", "█    ", "█████"],
   S: [" ████", "█    ", " ███ ", "    █", "████ "],
+  C: [" ████", "█    ", "█    ", "█    ", " ████"],
+  L: ["█    ", "█    ", "█    ", "█    ", "█████"],
+  I: ["█████", "  █  ", "  █  ", "  █  ", "█████"],
 };
 const BLANK_GLYPH = ["     ", "     ", "     ", "     ", "     "];
+// Narrower than a letter's own blank — a full 5-wide gap between WORDS (as
+// opposed to the 1-column gap buildArt already puts between letters) reads
+// as a big empty hole rather than a word break.
+const WORD_GAP_GLYPH = ["   ", "   ", "   ", "   ", "   "];
 const ART_ROWS = 5;
 
-/** Builds the 5-row block-letter art for `word` (letters side by side, one
- *  space apart), uppercased. Pure so it — and the shake animation over it —
- *  is unit-testable without a terminal. */
-export function buildArt(word: string): string[] {
+/** Builds the 5-row block-letter art for `text` (letters side by side, one
+ *  space apart; a literal space becomes a narrower word gap), uppercased.
+ *  Pure so it — and the shake animation over it — is unit-testable without
+ *  a terminal. */
+export function buildArt(text: string): string[] {
   const rows = new Array(ART_ROWS).fill("");
-  for (const ch of word.toUpperCase()) {
-    const glyph = GLYPHS[ch] ?? BLANK_GLYPH;
+  for (const ch of text.toUpperCase()) {
+    const glyph = ch === " " ? WORD_GAP_GLYPH : GLYPHS[ch] ?? BLANK_GLYPH;
     for (let r = 0; r < ART_ROWS; r++) {
       rows[r] += (rows[r] ? " " : "") + glyph[r];
     }
@@ -91,7 +99,7 @@ export function buildArt(word: string): string[] {
   return rows;
 }
 
-export const HARNESS_ART = buildArt("HARNESS");
+export const HARNESS_ART = buildArt("HARNESS CLI");
 /** Every row of HARNESS_ART is the same width (buildArt pads letters to a
  *  fixed 5-column glyph) — used to right-align the caption line under it. */
 export const ART_WIDTH = HARNESS_ART[0].length;

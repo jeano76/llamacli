@@ -16,11 +16,21 @@ test("buildArt lays out each letter's glyph side by side, 5 rows tall, blank for
   assert.doesNotThrow(() => buildArt("H?"));
 });
 
-test("HARNESS_ART actually spells HARNESS (7 glyphs wide, non-blank)", () => {
+test("HARNESS_ART spells out HARNESS CLI (every row the same width, non-blank)", () => {
   assert.equal(HARNESS_ART.length, 5);
-  // 7 letters, each 5 wide, 1-space gaps between: 7*5 + 6 = 41 columns.
-  for (const row of HARNESS_ART) assert.equal(row.length, 41);
+  assert.deepEqual(HARNESS_ART, buildArt("HARNESS CLI"));
+  const widths = new Set(HARNESS_ART.map((row) => row.length));
+  assert.equal(widths.size, 1, "every row must be the same width for the art to look like a rectangle");
   assert.ok(HARNESS_ART.some((row) => row.includes("█")), "the art must actually draw something, not be all spaces");
+});
+
+test("buildArt gives a literal space a narrower gap than a real letter's own blank", () => {
+  // "A B" is A, a word-gap space, then B (unrecognized → a full blank
+  // letter cell) — the word gap must contribute less width than an actual
+  // blank letter would, or a space reads as just another empty letter.
+  const spaceWidth = buildArt(" ")[0].length;
+  const blankLetterWidth = buildArt("?")[0].length;
+  assert.ok(spaceWidth < blankLetterWidth, "a word-gap space should be narrower than a blank letter cell");
 });
 
 test("shakeFrame jitters the art for a while and then settles perfectly still (no leading offset)", () => {
