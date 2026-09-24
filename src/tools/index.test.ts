@@ -269,3 +269,21 @@ test("isBrowserAvailable returns false (not a throw) when nothing is listening o
   // since this runs on the startup path.
   assert.equal(await isBrowserAvailable({ debugPort: 1, host: "127.0.0.1" }, 500), false);
 });
+
+test("read_file with start_line/end_line returns only those lines, plus the range it covers", () =>
+  withTempDir(async (dir) => {
+    const path = join(dir, "f.txt");
+    await writeFile(path, Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n") + "\n");
+    const part = await executeTool("read_file", JSON.stringify({ path, start_line: 4, end_line: 6 }), dir);
+    assert.equal(part.content, "line 4\nline 5\nline 6");
+    assert.deepEqual(part.lineRange, { start: 4, end: 6, total: 10 });
+
+    const tail = await executeTool("read_file", JSON.stringify({ path, start_line: 9 }), dir);
+    assert.equal(tail.content, "line 9\nline 10");
+
+    const whole = await executeTool("read_file", JSON.stringify({ path }), dir);
+    assert.equal(whole.content, Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n") + "\n");
+    assert.deepEqual(whole.lineRange, { start: 1, end: 10, total: 10 });
+
+    await assert.rejects(executeTool("read_file", JSON.stringify({ path, start_line: 11 }), dir), /past the end/);
+  }));

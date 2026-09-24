@@ -2065,3 +2065,30 @@ test("a failing tool's error output is capped like a successful result, not push
     assert.ok(String(toolMsg.content).length < 5000, `expected a capped error result, got ${String(toolMsg.content).length} chars`);
     assert.match(String(toolMsg.content), /truncated/);
   }));
+
+test("an over-long read_file result is cut at a line boundary and says which start_line to continue from", () =>
+  withTempProject(async (dir) => {
+    const path = join(dir, "big.js");
+    await writeFile(path, Array.from({ length: 1000 }, (_, i) => `const line${i + 1} = ${i + 1};`).join("\n") + "\n");
+    const call1 = { id: "r1", type: "function" as const, function: { name: "read_file", arguments: JSON.stringify({ path }) } };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call1]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 4096 },
+    });
+    await loop.send("read it");
+    const toolMsg = String(turnRequests[1].messages.find((m) => m.role === "tool")!.content);
+    const m = toolMsg.match(/\[showing lines 1-(\d+) of 1000 — call read_file with path=.* and start_line=(\d+) to continue\]$/);
+    assert.ok(m, `expected a continuation marker, got tail: ${toolMsg.slice(-160)}`);
+    const lastShown = Number(m![1]);
+    assert.equal(Number(m![2]), lastShown + 1);
+    // The body ends with a complete line, the one the marker names.
+    const body = toolMsg.slice(0, toolMsg.lastIndexOf("\n\n[showing"));
+    assert.ok(body.endsWith(`const line${lastShown} = ${lastShown};`), `body ends with: ${body.slice(-40)}`);
+  }));

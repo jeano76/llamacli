@@ -67,6 +67,36 @@ function capToolResult(content: string, contextWindowTokens: number): string {
   return `${content.slice(0, cap)}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane]`;
 }
 
+/** capToolResult() for a read_file result: cuts at a line boundary rather
+ *  than mid-line, and always says which lines are shown and where to
+ *  continue. Before this, read_file could only return a whole file, and a
+ *  file past the cap was cut with a bare "[...truncated]": a live session
+ *  editing a 19,304-byte file never saw its last ~4,500 characters, re-read
+ *  it after every compaction, and stalled for about an hour. */
+function capReadFileResult(
+  content: string,
+  range: { start: number; end: number; total: number },
+  path: string,
+  contextWindowTokens: number
+): string {
+  const cap = toolResultCharCap(contextWindowTokens);
+  let body = content;
+  let shownEnd = range.end;
+  if (body.length > cap) {
+    const cut = body.lastIndexOf("\n", cap);
+    // A single line longer than the whole cap: nothing to cut at cleanly.
+    if (cut <= 0) return capToolResult(content, contextWindowTokens);
+    body = body.slice(0, cut);
+    shownEnd = range.start + body.split("\n").length - 1;
+  }
+  if (range.start === 1 && shownEnd === range.total) return body;
+  const next =
+    shownEnd < range.total
+      ? ` — call read_file with path=${JSON.stringify(path)} and start_line=${shownEnd + 1} to continue`
+      : "";
+  return `${body}\n\n[showing lines ${range.start}-${shownEnd} of ${range.total}${next}]`;
+}
+
 /** Caps how much of `err.message` ever reaches an `onStatus` line.
  *
  *  Two real error shapes can make `err.message` itself enormous: a
@@ -779,7 +809,14 @@ export class AgentLoop {
         let content: string;
         try {
           const result = await executeTool(call.function.name, call.function.arguments, this.opts.projectRoot);
-          content = capToolResult(result.content, this.opts.thresholds.contextWindowTokens);
+          content = result.lineRange
+            ? capReadFileResult(
+                result.content,
+                result.lineRange,
+                JSON.parse(call.function.arguments).path,
+                this.opts.thresholds.contextWindowTokens
+              )
+            : capToolResult(result.content, this.opts.thresholds.contextWindowTokens);
           if (result.diff) {
             this.opts.onDiff?.(this.summarizeArgs(call.function.arguments), result.diff);
           }

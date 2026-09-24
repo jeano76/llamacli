@@ -67,10 +67,17 @@ export const TOOL_DEFS: ToolDef[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a file's contents from the local filesystem.",
+      description:
+        "Read a file's contents from the local filesystem. For a large file, pass start_line/end_line " +
+        "(1-based, inclusive) to read only part of it. A result too long to return in full is cut at a " +
+        "line boundary and ends with a note giving the start_line to continue from.",
       parameters: {
         type: "object",
-        properties: { path: { type: "string" } },
+        properties: {
+          path: { type: "string" },
+          start_line: { type: "integer", description: "First line to read (1-based). Defaults to 1." },
+          end_line: { type: "integer", description: "Last line to read (inclusive). Defaults to the end of the file." },
+        },
         required: ["path"],
       },
     },
@@ -248,6 +255,10 @@ export interface ToolResult {
   /** ANSI-colored unified diff for file-mutating tools, UI-only (never sent
    *  to the model — it would waste tokens and the model doesn't need color). */
   diff?: string;
+  /** Set by read_file: the lines `content` covers and the file's total line
+   *  count, so loop.ts can cut an over-long result at a line boundary and
+   *  tell the model which start_line to continue from. */
+  lineRange?: { start: number; end: number; total: number };
 }
 
 /** How long a single `run_shell` call is allowed to block before it's
@@ -289,7 +300,21 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
           await fh.close();
         }
       }
-      return { content: await readFile(args.path, "utf8") };
+      const text = await readFile(args.path, "utf8");
+      const lines = text.split("\n");
+      if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+      const total = lines.length;
+      if (args.start_line === undefined && args.end_line === undefined) {
+        return { content: text, lineRange: { start: 1, end: total, total } };
+      }
+      const start = Math.max(1, Math.floor(Number(args.start_line ?? 1)));
+      const end = Math.min(total, Math.floor(Number(args.end_line ?? total)));
+      if (!Number.isFinite(start) || !Number.isFinite(end)) {
+        throw new Error("start_line and end_line must be integers");
+      }
+      if (start > total) throw new Error(`start_line ${start} is past the end of the file (${total} lines)`);
+      if (end < start) throw new Error(`end_line ${end} is before start_line ${start}`);
+      return { content: lines.slice(start - 1, end).join("\n"), lineRange: { start, end, total } };
     }
     case "load_skill": {
       const entry = skillIndex.find((s) => s.name === args.name);
