@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, shineArtFrame, shineArtFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -490,14 +490,15 @@ export function App({
     // Three phases, one after another (not simultaneous — several
     // flourishes going at once reads as chaotic rather than a sequence of
     // distinct little touches): the HARNESS wordmark shakes itself steady,
-    // then "cli" shines in underneath it (same reveal-wave reasoning text
-    // streams in with — requested directly: "구동 로그에 Thinking 시의
-    // 샤이닝 효과도 추가해줘"), then the version line's ball bounces.
-    // "CLI" is small plain text, not block art — sized down per "cli는
-    // 소문자로 좀 작게 해주고", then cased per the follow-up clarification
-    // "Harness CLI 처럼 대소문자 반영해줘": the acronym stays uppercase,
-    // matching how "Harness CLI" is written everywhere else (this repo's
-    // own name, package.json, the docs) rather than literally lowercased.
+    // then the WHOLE "HARNESS CLI" text shines — requested directly, twice:
+    // "구동 로그에 Thinking 시의 샤이닝 효과도 추가해줘" (add reasoning's
+    // shining effect to the startup log too), then "Harnesss CLI 의 글씨
+    // 전체를 빛나는 효과를 Think 처럼 색갈변활르 줘" (the WHOLE text, not
+    // just "CLI") — then the version line's ball bounces. "CLI" is small
+    // plain text, not block art (per "cli는 소문자로 좀 작게 해주고"),
+    // cased per the follow-up "Harness CLI 처럼 대소문자 반영해줘": the
+    // acronym stays uppercase, matching how the app's own name is written
+    // everywhere else, rather than literally lowercased.
     const CLI_TEXT = "CLI";
     let shakeTick = 0;
     let shineId: ReturnType<typeof setInterval> | null = null;
@@ -508,10 +509,12 @@ export function App({
       if (shakeTick >= shakeFrameCount()) {
         clearInterval(shakeId);
         let shineTick = 0;
+        const shineTicks = Math.max(shineArtFrameCount(HARNESS_ART), shineFrameCount(CLI_TEXT));
         shineId = setInterval(() => {
           shineTick++;
+          setLineText(artLineId, shineArtFrame(HARNESS_ART, shineTick));
           setLineText(cliLineId, rightAlign(shineFrame(CLI_TEXT, shineTick), ART_WIDTH));
-          if (shineTick >= shineFrameCount(CLI_TEXT)) {
+          if (shineTick >= shineTicks) {
             clearInterval(shineId!);
             let bounceTick = 0;
             bounceId = setInterval(() => {

@@ -83,6 +83,20 @@ export function shineFrameCount(text: string, speed = 2): number {
   return Math.ceil(text.length / speed);
 }
 
+/** shineFrame applied to every row of a multi-row block, at the SAME tick —
+ *  a single left-to-right wave sweeping across the whole shape at once
+ *  (rather than row by row), so it reads as one shine passing over the
+ *  logo. Requested directly: "Harnesss CLI 의 글씨 전체를 빛나는 효과를
+ *  Think 처럼 색갈변활르 줘" (give the WHOLE "Harness CLI" text the same
+ *  shining/color-change effect as Thinking). */
+export function shineArtFrame(art: string[], tick: number, speed = 2, bandWidth = 4): string {
+  return art.map((row) => shineFrame(row, tick, speed, bandWidth)).join("\n");
+}
+
+export function shineArtFrameCount(art: string[], speed = 2): number {
+  return Math.max(0, ...art.map((row) => shineFrameCount(row, speed)));
+}
+
 /** Block-letter ASCII art, 5 rows tall — requested directly: "대문 로그를
  *  Ansi 의 아스키 코드를 이용해서 Harness 글자모양을 만들고 흔들리는 것은
  *  글씨 자체야" ("build the banner's 'Harness' shape out of ANSI/ASCII, and

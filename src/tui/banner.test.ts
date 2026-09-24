@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, shineArtFrame, shineArtFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
@@ -79,6 +79,22 @@ test("shineFrame reveals text as a one-directional wave, same shape as reasoning
 test("shineFrameCount scales with text length and empty text needs no ticks", () => {
   assert.equal(shineFrameCount(""), 0);
   assert.equal(shineFrameCount("CLI", 2), 2); // 3 chars / 2 per tick, rounded up
+});
+
+test("shineArtFrame sweeps the shine wave across every row of a multi-row block at once", () => {
+  const art = ["AAAA", "BBBB"];
+  const mid = shineArtFrame(art, 1);
+  const lines = mid.split("\n");
+  assert.equal(lines.length, 2, "one shined line per art row");
+  // Every row reflects the SAME tick, not staggered row by row.
+  assert.deepEqual(lines, [shineFrame(art[0], 1), shineFrame(art[1], 1)]);
+
+  const settled = shineArtFrame(art, shineArtFrameCount(art));
+  assert.equal(settled, shineArtFrame(art, shineArtFrameCount(art) + 20), "clamps once every row has fully revealed");
+});
+
+test("shineArtFrameCount is driven by the longest row (so a shorter row finishing early doesn't cut the sweep short)", () => {
+  assert.equal(shineArtFrameCount(["ab", "abcdef"], 2), shineFrameCount("abcdef", 2));
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {
