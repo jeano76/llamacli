@@ -1102,6 +1102,19 @@ export function App({
       continue;
     }
     if (line.kind === "tool-result") {
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      // Only worth folding when it actually spans more than one line —
+      // requested directly ("도구 사용도 출력도 한 줄이 넘으면 ... 자동으로
+      // 닫힘"): a one-line result folding down to a one-line summary just
+      // to be clicked back open is pure friction, not decluttering.
+      if (cached.rows.length <= 1) {
+        cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+        continue;
+      }
       if (!expandedReasoningIds.has(line.id)) {
         allRows.push({
           key: `${line.id}-fold`,
@@ -1110,11 +1123,6 @@ export function App({
           lineId: line.id,
         });
         continue;
-      }
-      let cached = rowCache.get(line.id);
-      if (!cached || cached.text !== line.text || cached.width !== width) {
-        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
-        rowCache.set(line.id, cached);
       }
       cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "tool-result-folded", lineId: line.id });
