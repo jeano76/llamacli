@@ -90,7 +90,7 @@ export function foldedReasoningSummary(text: string): string {
   const chars = text.trim().length;
   return `▸ 생각 과정 (${chars}자) — 클릭해서 펼치기`;
 }
-export const foldToggleHintExpanded = "  ▾ 클릭해서 접기";
+export const foldToggleHintExpanded = "  ▴ 클릭해서 접기";
 
 /** A single band's role in the "thinking" shimmer: `dim` hasn't been
  *  reached by the reveal wave yet, `peak` is the wave's leading edge (the
