@@ -258,6 +258,30 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
       </Text>
     );
   }
+  if (row.kind === "assistant" && shimmerTick !== undefined) {
+    // Same shining reveal-wave as reasoning (see streamingAssistantId's
+    // doc comment) — requested directly: "로그 문자를 생각의 글씨의
+    // 빛나는 효과처럼 나타나게 해줘".
+    return (
+      <Text key={row.key}>
+        {shimmerBands(row.text, shimmerTick).map((b, i) => {
+          if (b.role === "peak") {
+            return (
+              <Text key={i} bold>
+                {b.text}
+              </Text>
+            );
+          }
+          if (b.role === "settled") return <Text key={i}>{b.text}</Text>;
+          return (
+            <Text key={i} color="gray" dimColor>
+              {b.text}
+            </Text>
+          );
+        })}
+      </Text>
+    );
+  }
   if (row.kind === "compaction-detail-folded") {
     return (
       <Text key={row.key} color="yellow">
@@ -556,12 +580,20 @@ export function App({
   // on change, so the shimmer needs actual state to know THIS render's
   // active line and to drive its own timer.
   const [thinkingLineId, setThinkingLineId] = useState<number | null>(null);
+  // The streaming ASSISTANT line gets the same shining reveal-wave effect
+  // reasoning text already has — requested directly: "로그 문자를 생각의
+  // 글씨의 빛나는 효과처럼 나타나게 해줘". Shares shimmerTick with
+  // reasoning below (reasoning and assistant content don't stream at the
+  // same time in practice — reasoning always finishes first — so one
+  // counter is enough; each line's OWN reveal wave still starts fresh, via
+  // setShimmerTick(0) wherever a new line of either kind begins).
+  const [streamingAssistantId, setStreamingAssistantId] = useState<number | null>(null);
   const [shimmerTick, setShimmerTick] = useState(0);
   useEffect(() => {
-    if (thinkingLineId === null) return;
+    if (thinkingLineId === null && streamingAssistantId === null) return;
     const id = setInterval(() => setShimmerTick((t) => t + 1), SHIMMER_TICK_MS);
     return () => clearInterval(id);
-  }, [thinkingLineId]);
+  }, [thinkingLineId, streamingAssistantId]);
   const reasoningStreamingIdRef = useRef<number | null>(null);
   // Finished reasoning blocks the user has clicked open — everything else
   // finished renders as one folded summary line (foldedReasoningSummary).
@@ -622,12 +654,23 @@ export function App({
       }
       const id = logIdCounter++;
       streamingIdRef.current = id;
+      setStreamingAssistantId(id);
+      // A fresh reveal wave for the new line — reusing the running tick
+      // count would start it already partway (or fully) revealed.
+      setShimmerTick(0);
       return [...prev, { id, text: stripToolCallTemplateLeak(text), kind: "assistant" as const }].slice(-MAX_LOG_ENTRIES);
     });
   }
 
   function finalizeAssistant() {
+    // The row cache is keyed on (id, text, width) — text doesn't change
+    // between the last delta and finalizing, so without this the NEXT
+    // render would reuse the streaming render's plain-shimmer rows
+    // instead of re-wrapping through markdown now that streaming (and the
+    // shimmer) is over.
+    if (streamingIdRef.current !== null) rowCacheRef.current.delete(streamingIdRef.current);
     streamingIdRef.current = null;
+    setStreamingAssistantId(null);
   }
 
   function pushReasoningDelta(text: string) {
@@ -1148,6 +1191,23 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "diff-folded", lineId: line.id });
       continue;
     }
+    // The currently-streaming assistant line gets the same shining
+    // reveal-wave effect reasoning already has (see streamingAssistantId's
+    // doc comment) — plain wrapping, not markdown, while it's playing:
+    // shimmerBands slices raw characters, which would tear markdown's own
+    // embedded ANSI color codes apart. Reverts to real markdown rendering
+    // once finalizeAssistant() clears streamingAssistantId (and this same
+    // id's stale cache entry, so the next render re-wraps instead of
+    // reusing these plain rows).
+    if (line.kind === "assistant" && line.id === streamingAssistantId) {
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapToWidth(line.text, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      continue;
+    }
     let cached = rowCache.get(line.id);
     if (!cached || cached.text !== line.text || cached.width !== width) {
       cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
@@ -1240,7 +1300,11 @@ export function App({
             )}
           </Text>
         )}
-        {allRows.slice(sliceStart, sliceEnd).map((row) => renderRow(row, row.lineId === thinkingLineId ? shimmerTick : undefined))}
+        {allRows
+          .slice(sliceStart, sliceEnd)
+          .map((row) =>
+            renderRow(row, row.lineId === thinkingLineId || row.lineId === streamingAssistantId ? shimmerTick : undefined)
+          )}
         {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
         {showRunHint && <Text dimColor>{runHintText(columns)}</Text>}
       </Box>
