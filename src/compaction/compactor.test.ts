@@ -264,6 +264,38 @@ test("runCompaction sanitizes tool_calls/tool-role messages so a strict backend 
     }
   })());
 
+// Requested directly: compaction was a black box — the user wanted to see
+// before/after, what got dropped vs what the summary kept/emphasized.
+test("runCompaction returns a detail report naming what was dropped and what replaced it", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "please investigate the slow endpoint" },
+        { role: "assistant", content: "looking into it now" },
+        { role: "user", content: "q2" },
+        { role: "assistant", content: "answer3" },
+        { role: "user", content: "q3" },
+        { role: "assistant", content: "answer4" },
+      ];
+      const { backend } = strictNoToolsBackend();
+      const partial = { reason: "manual" as const, goal: "test", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      const result = await runCompaction(dir, messages, backend, "m", partial, 30);
+
+      assert.ok(result.detail.droppedCount > 0, "expected some older messages to be dropped");
+      assert.ok(result.detail.keptCount > 0, "expected some recent messages kept as the tail");
+      assert.equal(result.detail.summary, "summary text"); // strictNoToolsBackend's scripted reply
+      assert.ok(
+        result.detail.droppedPreview.some((l) => l.includes("please investigate the slow endpoint")),
+        "the dropped-content preview should name what was actually summarized away"
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
 // Same failure mode loop.ts's own main-turn request already guards against
 // (see its `max_tokens` comment): without it, llama-server defaults to
 // n_predict=-1 and a generation that never hits a natural stop token pins

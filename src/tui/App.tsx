@@ -68,7 +68,12 @@ export function appendHistory(history: string[], text: string): string[] {
 interface LogLine {
   id: number;
   text: string;
-  kind: "user" | "assistant" | "status" | "tool" | "diff" | "reasoning";
+  kind: "user" | "assistant" | "status" | "tool" | "diff" | "reasoning" | "compaction-detail";
+  /** Precomputed folded-state label for kinds whose fold summary can't be
+   *  derived from `text` alone (e.g. "compaction-detail", whose text is the
+   *  full expanded body). Unused for "reasoning", which derives its own via
+   *  foldedReasoningSummary(text). */
+  foldLabel?: string;
 }
 
 let logIdCounter = 0;
@@ -76,7 +81,7 @@ let logIdCounter = 0;
 interface RenderedRow {
   key: string;
   text: string;
-  kind: LogLine["kind"] | "reasoning-folded";
+  kind: LogLine["kind"] | "reasoning-folded" | "compaction-detail-folded";
   lineId: number;
 }
 
@@ -91,6 +96,24 @@ export function foldedReasoningSummary(text: string): string {
   return `▸ 생각 과정 (${chars}자) — 클릭해서 펼치기`;
 }
 export const foldToggleHintExpanded = "  ▴ 클릭해서 접기";
+
+/** Folded summary line for a compaction's before/after detail (see
+ *  CompactionDetail in compactor.ts) — requested directly ("컴팩션하는
+ *  과정을 그래픽컬하게 보여주고... 어떤 내용들이 잊혀지고 어떤 내용들이
+ *  강조가 되었는지"): what got dropped vs what the summary kept/emphasized,
+ *  folded by default like a reasoning block and expandable the same way. */
+export function foldedCompactionSummary(droppedCount: number, droppedTokens: number, keptCount: number): string {
+  return `▸ 압축 완료 — ${droppedCount}개 메시지 요약됨(~${droppedTokens}토큰), ${keptCount}개 메시지 유지 — 클릭해서 펼치기`;
+}
+
+/** The expanded body: dropped-content preview first (what was forgotten),
+ *  then the summary text that replaced it (what was kept/emphasized). */
+export function compactionDetailBody(detail: { droppedPreview: string[]; summary: string }): string {
+  return (
+    `🗑 잊혀진 내용:\n${detail.droppedPreview.map((l) => `  - ${l}`).join("\n")}\n\n` +
+    `✨ 강조된 내용 (요약):\n${detail.summary}`
+  );
+}
 
 /** A single band's role in the "thinking" shimmer: `dim` hasn't been
  *  reached by the reveal wave yet, `peak` is the wave's leading edge (the
@@ -186,6 +209,20 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
             </Text>
           );
         })}
+      </Text>
+    );
+  }
+  if (row.kind === "compaction-detail-folded") {
+    return (
+      <Text key={row.key} color="yellow">
+        {row.text}
+      </Text>
+    );
+  }
+  if (row.kind === "compaction-detail") {
+    return (
+      <Text key={row.key} color="yellow">
+        {row.text}
       </Text>
     );
   }
@@ -468,6 +505,15 @@ export function App({
     setThinkingLineId(null);
   }
 
+  function pushCompactionDetail(detail: { droppedCount: number; droppedTokens: number; droppedPreview: string[]; keptCount: number; keptTokens: number; summary: string }) {
+    const foldLabel = foldedCompactionSummary(detail.droppedCount, detail.droppedTokens, detail.keptCount);
+    setLog((prev) =>
+      [...prev, { id: logIdCounter++, text: compactionDetailBody(detail), kind: "compaction-detail" as const, foldLabel }].slice(
+        -MAX_LOG_ENTRIES
+      )
+    );
+  }
+
 
   // Echoes the startup resume question into the scrolling log as well as
   // showing it in the input box (see visibleInput below) — reported
@@ -724,6 +770,7 @@ export function App({
     finalizeAssistant,
     pushReasoningDelta,
     finalizeReasoning,
+    pushCompactionDetail,
     setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
     pushTool: (t: string) => pushLine(t, "tool"),
@@ -842,6 +889,29 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "reasoning-folded", lineId: line.id });
       continue;
     }
+    // Compaction before/after detail: same fold-by-default, click-to-expand
+    // pattern as reasoning, just always foldable (never "currently
+    // streaming") and using its own precomputed label instead of deriving
+    // one from the (here, already-expanded-body) text.
+    if (line.kind === "compaction-detail") {
+      if (!expandedReasoningIds.has(line.id)) {
+        allRows.push({
+          key: `${line.id}-fold`,
+          text: line.foldLabel ?? "▸ 압축 완료 — 클릭해서 펼치기",
+          kind: "compaction-detail-folded",
+          lineId: line.id,
+        });
+        continue;
+      }
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "compaction-detail-folded", lineId: line.id });
+      continue;
+    }
     let cached = rowCache.get(line.id);
     if (!cached || cached.text !== line.text || cached.width !== width) {
       cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
@@ -888,7 +958,14 @@ export function App({
       firstRow: 1 + gap + (showScrollIndicator ? 1 : 0),
       entries: allRows
         .slice(sliceStart, sliceEnd)
-        .map((r) => ({ lineId: r.lineId, foldable: r.kind === "reasoning" || r.kind === "reasoning-folded" })),
+        .map((r) => ({
+          lineId: r.lineId,
+          foldable:
+            r.kind === "reasoning" ||
+            r.kind === "reasoning-folded" ||
+            r.kind === "compaction-detail" ||
+            r.kind === "compaction-detail-folded",
+        })),
     };
   }
 

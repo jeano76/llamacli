@@ -11,6 +11,7 @@ import {
   DEFAULT_TAIL_BUDGET_FRACTION,
   splitSystemMessage,
   stripResumePrefix,
+  type CompactionDetail,
 } from "../compaction/compactor.js";
 import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
@@ -283,6 +284,10 @@ export interface AgentLoopOptions {
    *  exactly that kind of scroll, the same reasoning behind
    *  `onPlanProgress`. */
   onCompactionStatus?: (status: "running" | "complete" | "failed", timestamp: string) => void;
+  /** Fires once per successful compaction with what was actually dropped
+   *  vs kept/summarized — lets the UI show compaction's before/after
+   *  instead of it being a black box. */
+  onCompactionDetail?: (detail: CompactionDetail) => void;
   /** When a compaction interrupts a tool call mid-turn (checkpoint written,
    *  batch abandoned — see the maybeCompact() call site below), immediately
    *  fold the checkpoint's resume prompt back in and keep the same turn
@@ -1412,7 +1417,7 @@ export class AgentLoop {
     };
     try {
       const budget = await this.postCompactionBudget(tailBudgetFraction);
-      const { messages, checkpoint } = await runCompaction(
+      const { messages, checkpoint, detail } = await runCompaction(
         this.opts.projectRoot,
         this.messages,
         this.opts.backend,
@@ -1432,6 +1437,7 @@ export class AgentLoop {
       }
       this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
       this.opts.onCompactionStatus?.("complete", checkpoint.timestamp);
+      this.opts.onCompactionDetail?.(detail);
     } catch (err: any) {
       // The checkpoint file itself is already written by this point
       // (runCompaction writes it before making the summary request), so

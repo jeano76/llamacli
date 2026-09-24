@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody } from "./App.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
 // Reported directly: the slash menu could only be driven with arrow keys —
@@ -173,4 +173,18 @@ test("foldedReasoningSummary and the expanded hint both name what a click does",
   assert.match(foldedReasoningSummary("x".repeat(42)), /42자/);
   assert.match(foldedReasoningSummary("hi"), /펼치기/);
   assert.match(foldToggleHintExpanded, /접기/);
+});
+
+test("foldedCompactionSummary names counts, and compactionDetailBody shows both dropped and kept content", () => {
+  const label = foldedCompactionSummary(6, 1200, 3);
+  assert.match(label, /6개/);
+  assert.match(label, /1200/);
+  assert.match(label, /3개/);
+  assert.match(label, /펼치기/);
+
+  const body = compactionDetailBody({ droppedPreview: ["[user] old request", "[tool] some output"], summary: "the gist of it" });
+  assert.match(body, /잊혀진/);
+  assert.match(body, /old request/);
+  assert.match(body, /강조된/);
+  assert.match(body, /the gist of it/);
 });

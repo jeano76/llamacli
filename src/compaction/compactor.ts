@@ -9,9 +9,34 @@ export interface CompactionThresholds {
   contextWindowTokens: number;
 }
 
+/** What a compaction actually did to the conversation — requested directly
+ *  so the TUI can show before/after instead of compaction being a black
+ *  box ("어떤 내용들이 잊혀지고 어떤 내용들이 강조가 되게 되었는지"). */
+export interface CompactionDetail {
+  droppedCount: number;
+  droppedTokens: number;
+  /** One line per dropped message, "[role] first ~70 chars", capped —
+   *  see DETAIL_PREVIEW_CAP. */
+  droppedPreview: string[];
+  keptCount: number;
+  keptTokens: number;
+  /** What replaced the dropped messages — the same text written to the
+   *  checkpoint and the system prompt. */
+  summary: string;
+}
+
 export interface CompactionResult {
   messages: ChatMessage[];
   checkpoint: Checkpoint;
+  detail: CompactionDetail;
+}
+
+const DETAIL_PREVIEW_CAP = 8;
+
+function previewLine(m: ChatMessage): string {
+  const text = messageText(m).trim().replace(/\s+/g, " ");
+  const snippet = text.length > 70 ? `${text.slice(0, 70)}…` : text || "(empty)";
+  return `[${m.role}] ${snippet}`;
 }
 
 /** The text that actually counts toward a message's size in the real
@@ -478,7 +503,19 @@ export async function runCompaction(
 
   const compactedMessages: ChatMessage[] = [{ role: "system", content: systemContent }, ...tail];
 
-  return { messages: compactedMessages, checkpoint: finalCheckpoint };
+  const detail: CompactionDetail = {
+    droppedCount: toSummarize.length,
+    droppedTokens: toSummarize.reduce((n, m) => n + estimateTextTokens(messageText(m)), 0),
+    droppedPreview: toSummarize.slice(0, DETAIL_PREVIEW_CAP).map(previewLine),
+    keptCount: tail.length,
+    keptTokens: tail.reduce((n, m) => n + estimateTextTokens(messageText(m)), 0),
+    summary: summaryText,
+  };
+  if (toSummarize.length > DETAIL_PREVIEW_CAP) {
+    detail.droppedPreview.push(`…and ${toSummarize.length - DETAIL_PREVIEW_CAP} more`);
+  }
+
+  return { messages: compactedMessages, checkpoint: finalCheckpoint, detail };
 }
 
 const SUMMARY_HEADER = "[Compacted history summary]";
