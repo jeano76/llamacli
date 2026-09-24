@@ -98,8 +98,22 @@ export function shineFrameCount(text: string, speed = 2): number {
  *    되는거야" (a bright block of the same color family moving diagonally
  *    left-to-right, like reasoning's own sparkle)
  *  Monotonic per character (once revealed, never reverts to dim), same as
- *  every other shimmer in this app — only the shape of the sweep is new. */
-export function shineMultilineFrame(lines: string[], tick: number, speed = 10, bandWidth = 3, slantPerRow = 1): string {
+ *  every other shimmer in this app — only the shape of the sweep is new.
+ *
+ *  `peakAllowed(row, col)` restricts WHERE the bright peak color can show
+ *  at all — requested directly: "마지막 보라색 마지막 S 모양과 CLI 문자
+ *  까지만이야" (the final purple/peak color should only ever appear on
+ *  the last "S" and on "CLI"). Everywhere it returns false, a character
+ *  goes straight from dim to settled with no peak flash in between.
+ *  Defaults to allowing it everywhere (the plain, unrestricted sweep). */
+export function shineMultilineFrame(
+  lines: string[],
+  tick: number,
+  speed = 10,
+  bandWidth = 3,
+  slantPerRow = 1,
+  peakAllowed: (row: number, col: number) => boolean = () => true
+): string {
   return lines
     .map((line, row) => {
       const effectiveTick = Math.max(0, tick - row * slantPerRow);
@@ -107,7 +121,8 @@ export function shineMultilineFrame(lines: string[], tick: number, speed = 10, b
       const peakStart = Math.max(0, revealed - bandWidth);
       let out = "";
       for (let i = 0; i < line.length; i++) {
-        const color = i < peakStart ? SETTLED : i < revealed ? PEAK : DIM;
+        const inPeakBand = i >= peakStart && i < revealed;
+        const color = i < peakStart ? SETTLED : inPeakBand && peakAllowed(row, i) ? PEAK : i < revealed ? SETTLED : DIM;
         out += `${color}${line[i]}`;
       }
       return out + RESET;
@@ -126,16 +141,23 @@ export function shineMultilineFrameCount(lines: string[], speed = 10, slantPerRo
  *  small-text word-reveal, which wasn't actual letter shapes. Only the
  *  letters this app's name needs; an unknown character renders as a blank
  *  5x5 cell rather than throwing. */
+// Corners softened from a hard █ to the medium-shade ▓ — requested
+// directly: "Ascii ansi 코드로 작성된 글씨의 디자인이 너무 기계적인데
+// 이쁜게 통통하게 만들어줘" (the ASCII/ANSI lettering looks too
+// mechanical — make it cute and chubby/rounded). A plain rectangular
+// block-letter font reads as sharp and mechanical; rounding just the
+// four outer corners of each 5x5 glyph fakes a rounded-corner look
+// without redesigning every stroke.
 const GLYPHS: Record<string, string[]> = {
-  H: ["█   █", "█   █", "█████", "█   █", "█   █"],
-  A: [" ███ ", "█   █", "█████", "█   █", "█   █"],
-  R: ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
-  N: ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
-  E: ["█████", "█    ", "████ ", "█    ", "█████"],
-  S: [" ████", "█    ", " ███ ", "    █", "████ "],
-  C: [" ████", "█    ", "█    ", "█    ", " ████"],
-  L: ["█    ", "█    ", "█    ", "█    ", "█████"],
-  I: ["█████", "  █  ", "  █  ", "  █  ", "█████"],
+  H: ["▓   ▓", "█   █", "█████", "█   █", "▓   ▓"],
+  A: [" ███ ", "█   █", "█████", "█   █", "▓   ▓"],
+  R: ["▓███ ", "█   █", "████ ", "█  █ ", "▓   ▓"],
+  N: ["▓   ▓", "██  █", "█ █ █", "█  ██", "▓   ▓"],
+  E: ["▓███▓", "█    ", "████ ", "█    ", "▓███▓"],
+  S: [" ███▓", "█    ", " ███ ", "    █", "▓███ "],
+  C: [" ███▓", "█    ", "█    ", "█    ", " ███▓"],
+  L: ["▓    ", "█    ", "█    ", "█    ", "▓███▓"],
+  I: ["▓███▓", "  █  ", "  █  ", "  █  ", "▓███▓"],
 };
 const BLANK_GLYPH = ["     ", "     ", "     ", "     ", "     "];
 // Narrower than a letter's own blank — a full 5-wide gap between WORDS (as
@@ -143,6 +165,10 @@ const BLANK_GLYPH = ["     ", "     ", "     ", "     ", "     "];
 // as a big empty hole rather than a word break.
 const WORD_GAP_GLYPH = ["   ", "   ", "   ", "   ", "   "];
 const ART_ROWS = 5;
+/** Every glyph above is 5 columns wide — used by callers (App.tsx) that
+ *  need to know where the LAST letter's columns start, to restrict the
+ *  shine's peak color to it (see shineMultilineFrame's peakAllowed). */
+export const LETTER_WIDTH = 5;
 
 /** Builds the 5-row block-letter art for `text` (letters side by side, one
  *  space apart; a literal space becomes a narrower word gap), uppercased.

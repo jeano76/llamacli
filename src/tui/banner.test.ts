@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shineFrame, shineFrameCount, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, LETTER_WIDTH, rightAlign, shineFrame, shineFrameCount, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
@@ -10,8 +10,12 @@ test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => 
 test("buildArt lays out each letter's glyph side by side, 5 rows tall, blank for an unknown character", () => {
   const art = buildArt("HA");
   assert.equal(art.length, 5, "block-letter art is 5 rows tall");
-  // "H"'s glyph starts with a full-height vertical bar in column 0.
-  assert.ok(art.every((row) => row[0] === "█"), "H's left stroke should run the full height");
+  // "H"'s glyph has a vertical bar in column 0 — solid in the middle rows,
+  // rounded (▓, not the hard █) at the top/bottom corners for a softer
+  // look (see GLYPHS's own doc comment).
+  assert.match(art[0][0], /[█▓]/, "H's left stroke starts (rounded or square) at the top");
+  assert.equal(art[2][0], "█", "H's left stroke is solid through the middle");
+  assert.match(art[4][0], /[█▓]/, "H's left stroke ends (rounded or square) at the bottom");
   // An unrecognized character renders as blank space, not a crash.
   assert.doesNotThrow(() => buildArt("H?"));
 });
@@ -52,6 +56,10 @@ test("ART_WIDTH matches HARNESS_ART's actual row width, so a caption line right-
   assert.equal(rightAlign("x", ART_WIDTH).length, ART_WIDTH);
 });
 
+test("LETTER_WIDTH matches every glyph's real width, so ART_WIDTH - LETTER_WIDTH lands exactly on the last letter's start column", () => {
+  assert.equal(ART_WIDTH % (LETTER_WIDTH + 1), LETTER_WIDTH, "N letters of LETTER_WIDTH + 1-column gaps, no trailing gap");
+});
+
 test("shineFrame reveals text as a one-directional wave, same shape as reasoning's own shimmer — never un-reveals once settled", () => {
   const text = "CLI";
   const early = shineFrame(text, 1);
@@ -90,6 +98,21 @@ test("shineMultilineFrameCount accounts for the LAST row's diagonal delay plus i
   const slantPerRow = 2;
   const speed = 1;
   assert.equal(shineMultilineFrameCount(lines, speed, slantPerRow), 2 * slantPerRow + Math.ceil(1 / speed));
+});
+
+test("shineMultilineFrame's peakAllowed restricts WHERE the bright peak color can appear — elsewhere a character goes straight from dim to settled", () => {
+  const lines = ["AAAAAAAAAA"]; // one row, 10 chars
+  // Peak only allowed in the last 3 columns.
+  const peakAllowed = (_row: number, col: number) => col >= 7;
+  // Pick a tick where the reveal wave's peak band would normally sit
+  // somewhere in the middle (columns 0-6, where peakAllowed says no).
+  const frame = shineMultilineFrame(lines, 1, 3, 3, 1, peakAllowed);
+  assert.doesNotMatch(frame, /\x1b\[1;95m/, "no peak color anywhere the predicate forbids it, even mid-reveal");
+
+  // Once the wave reaches the allowed region (near full reveal), peak
+  // should actually show up there.
+  const laterFrame = shineMultilineFrame(lines, 3, 3, 3, 1, peakAllowed);
+  assert.match(laterFrame, /\x1b\[1;95m/, "peak color shows up once the wave enters the allowed region");
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {
