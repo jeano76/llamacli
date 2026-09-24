@@ -1156,8 +1156,15 @@ export class AgentLoop {
   ): Promise<{ tailBudgetFraction: number; summaryMaxTokens: number | undefined }> {
     const window = this.opts.thresholds.contextWindowTokens;
     const systemText = typeof this.messages[0]?.content === "string" ? this.messages[0].content : "";
+    // The one-character user turn is there because some chat templates
+    // (Ornith-1.5's) reject a conversation with no user message; without
+    // it this exact count failed on every compaction and fell back to a
+    // rougher estimate that misses the template's own overhead.
     const overhead = await estimateTokens(
-      [{ role: "system", content: splitSystemMessage(systemText).base }],
+      [
+        { role: "system", content: splitSystemMessage(systemText).base },
+        { role: "user", content: "." },
+      ],
       this.opts.backend,
       toolDefsJson(),
       activeToolDefs()
