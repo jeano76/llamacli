@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, ART_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, ART_WIDTH, LETTER_WIDTH, SETTLED, BALL_COLOR, RESET, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -502,6 +502,17 @@ export function App({
     // how the app's own name is written everywhere else).
     const CLI_TEXT = "CLI";
     const shineLines = [...HARNESS_ART, CLI_TEXT];
+    // Once the shine settles, the last letter of HARNESS and all of "CLI"
+    // get recolored to match the bounce-ball's own color — requested
+    // directly: "CLI 글자와 마지막 S 도형을 애니메이션 마지막엔 탁구공과
+    // 같은 색으로 해줘". Built fresh from the plain (uncolored) source
+    // text rather than patched into the shine's own frame, so there's no
+    // risk of a leftover color from the sweep mixing in.
+    const lastLetterStartsAt = ART_WIDTH - LETTER_WIDTH;
+    const finalArtText = HARNESS_ART.map(
+      (row) => `${SETTLED}${row.slice(0, lastLetterStartsAt)}${BALL_COLOR}${row.slice(lastLetterStartsAt)}${RESET}`
+    ).join("\n");
+    const finalCliText = `${BALL_COLOR}${CLI_TEXT}${RESET}`;
     let shineTick = 0;
     let bounceId: ReturnType<typeof setInterval> | null = null;
     const shineTicks = shineMultilineFrameCount(shineLines);
@@ -512,18 +523,15 @@ export function App({
       setLineText(cliLineId, rightAlign(frame[HARNESS_ART.length], ART_WIDTH));
       if (shineTick >= shineTicks) {
         clearInterval(shineId);
-        // Keep CLI's just-settled text as-is rather than re-emitting it
-        // plain — it should stay the same (single, unified) color it
-        // shined in with, not lose that the moment the version/ball join it.
-        const cliShined = frame[HARNESS_ART.length];
+        setLineText(artLineId, finalArtText);
         let bounceTick = 0;
         bounceId = setInterval(() => {
           bounceTick++;
-          setLineText(cliLineId, rightAlign(`${cliShined}  ${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
+          setLineText(cliLineId, rightAlign(`${finalCliText}  ${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
           if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
         }, 60);
       }
-    }, 32);
+    }, 48);
     return () => {
       clearInterval(shineId);
       if (bounceId !== null) clearInterval(bounceId);

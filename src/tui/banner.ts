@@ -15,8 +15,8 @@ export function buildVersionString(mtimeMs: number): string {
   return `v${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
 }
 
-const RESET = "\x1b[0m";
-const SETTLED = "\x1b[1;36m"; // bold cyan — matches the reasoning shimmer's settled color
+export const RESET = "\x1b[0m";
+export const SETTLED = "\x1b[1;36m"; // bold cyan — matches the reasoning shimmer's settled color
 const PEAK = "\x1b[1;95m"; // bold bright magenta — the word currently landing
 const DIM = "\x1b[2;90m"; // dim gray — not yet reached (reasoning shimmer's own "unread" color)
 
@@ -49,7 +49,7 @@ export function bannerWordCount(text: string): number {
 // smaller than the last (gravity), settling on the ground.
 const BOUNCE_HEIGHTS = [0, 1, 2, 3, 2, 1, 0, 1, 2, 3, 2, 1, 2, 3];
 const BOUNCE_DOTS = ["⠁", "⠂", "⠄", "⡀"];
-const BALL_COLOR = "\x1b[1;33m"; // bold yellow — reads as a distinct little flourish, not more banner text
+export const BALL_COLOR = "\x1b[1;33m"; // bold yellow — reads as a distinct little flourish, not more banner text
 
 /** One frame of the bouncing-ball flourish, played once after the word
  *  reveal finishes. Clamps to the final (resting) frame past the end. */
@@ -107,7 +107,7 @@ export function shineFrameCount(text: string, speed = 2): number {
  *    single final color) — so there's nothing left to look inconsistent.
  *  Monotonic per character (once revealed, never reverts to dim), same as
  *  every other shimmer in this app — only the shape of the sweep is new. */
-export function shineMultilineFrame(lines: string[], tick: number, speed = 10, slantPerRow = 1): string {
+export function shineMultilineFrame(lines: string[], tick: number, speed = 8, slantPerRow = 1): string {
   return lines
     .map((line, row) => {
       const effectiveTick = Math.max(0, tick - row * slantPerRow);
@@ -121,7 +121,7 @@ export function shineMultilineFrame(lines: string[], tick: number, speed = 10, s
     .join("\n");
 }
 
-export function shineMultilineFrameCount(lines: string[], speed = 10, slantPerRow = 1): number {
+export function shineMultilineFrameCount(lines: string[], speed = 8, slantPerRow = 1): number {
   return Math.max(0, ...lines.map((line, row) => row * slantPerRow + Math.ceil(line.length / speed)));
 }
 
