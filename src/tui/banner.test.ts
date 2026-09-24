@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, shineArtFrame, shineArtFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
@@ -81,20 +81,23 @@ test("shineFrameCount scales with text length and empty text needs no ticks", ()
   assert.equal(shineFrameCount("CLI", 2), 2); // 3 chars / 2 per tick, rounded up
 });
 
-test("shineArtFrame sweeps the shine wave across every row of a multi-row block at once", () => {
-  const art = ["AAAA", "BBBB"];
-  const mid = shineArtFrame(art, 1);
-  const lines = mid.split("\n");
-  assert.equal(lines.length, 2, "one shined line per art row");
-  // Every row reflects the SAME tick, not staggered row by row.
-  assert.deepEqual(lines, [shineFrame(art[0], 1), shineFrame(art[1], 1)]);
+test("shineMultilineFrame treats every line as ONE continuous character stream, reading through row 0 fully before row 1 starts", () => {
+  const lines = ["AAAA", "BBBB"];
+  // At a small tick (with the default speed/bandWidth), only row 0 should
+  // have started revealing — row 1 must still be entirely unrevealed (dim).
+  const early = shineMultilineFrame(lines, 1, 1, 1);
+  const [row0, row1] = early.split("\n");
+  assert.match(row0, /\x1b\[1;95m|\x1b\[1;36m/, "row 0 has started revealing");
+  assert.doesNotMatch(row1, /\x1b\[1;95m|\x1b\[1;36m/, "row 1 hasn't started yet — it's still fully dim");
 
-  const settled = shineArtFrame(art, shineArtFrameCount(art));
-  assert.equal(settled, shineArtFrame(art, shineArtFrameCount(art) + 20), "clamps once every row has fully revealed");
+  const settled = shineMultilineFrame(lines, shineMultilineFrameCount(lines));
+  assert.equal(settled, shineMultilineFrame(lines, shineMultilineFrameCount(lines) + 20), "clamps once every character has revealed");
+  const strippedSettled = settled.replace(/\x1b\[[0-9;]*m/g, "");
+  assert.equal(strippedSettled, lines.join("\n"));
 });
 
-test("shineArtFrameCount is driven by the longest row (so a shorter row finishing early doesn't cut the sweep short)", () => {
-  assert.equal(shineArtFrameCount(["ab", "abcdef"], 2), shineFrameCount("abcdef", 2));
+test("shineMultilineFrameCount scales with the TOTAL character count across all lines combined, not any single line", () => {
+  assert.equal(shineMultilineFrameCount(["ab", "abcdef"], 2), Math.ceil((2 + 6) / 2));
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {

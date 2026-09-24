@@ -83,18 +83,36 @@ export function shineFrameCount(text: string, speed = 2): number {
   return Math.ceil(text.length / speed);
 }
 
-/** shineFrame applied to every row of a multi-row block, at the SAME tick —
- *  a single left-to-right wave sweeping across the whole shape at once
- *  (rather than row by row), so it reads as one shine passing over the
- *  logo. Requested directly: "Harnesss CLI 의 글씨 전체를 빛나는 효과를
- *  Think 처럼 색갈변활르 줘" (give the WHOLE "Harness CLI" text the same
- *  shining/color-change effect as Thinking). */
-export function shineArtFrame(art: string[], tick: number, speed = 2, bandWidth = 4): string {
-  return art.map((row) => shineFrame(row, tick, speed, bandWidth)).join("\n");
+/** shineFrame over MULTIPLE lines treated as ONE continuous character
+ *  stream — a single wave reading through every character of the whole
+ *  block in order (row 0 left-to-right, then row 1, ...), not each row
+ *  sweeping in parallel. Requested directly, clarifying an earlier
+ *  (row-parallel) attempt: "Harness CLI 는 그대로 ascii code 와 Ansi
+ *  적용을 하는데 글씨를 구성하는 문자 하나하나가 빛나는 효과를 Harness
+ *  CLI 전체 생겨야 하는거야" (each individual character's shine should
+ *  happen across the WHOLE "Harness CLI" as one sequence, not per line).
+ *  Newlines themselves don't consume a reveal slot. */
+export function shineMultilineFrame(lines: string[], tick: number, speed = 8, bandWidth = 10): string {
+  const totalChars = lines.reduce((n, l) => n + l.length, 0);
+  const revealed = Math.min(totalChars, tick * speed);
+  const peakStart = Math.max(0, revealed - bandWidth);
+  let pos = 0;
+  const outLines: string[] = [];
+  for (const line of lines) {
+    let out = "";
+    for (const ch of line) {
+      const color = pos < peakStart ? SETTLED : pos < revealed ? PEAK : DIM;
+      out += `${color}${ch}`;
+      pos++;
+    }
+    outLines.push(out + RESET);
+  }
+  return outLines.join("\n");
 }
 
-export function shineArtFrameCount(art: string[], speed = 2): number {
-  return Math.max(0, ...art.map((row) => shineFrameCount(row, speed)));
+export function shineMultilineFrameCount(lines: string[], speed = 8): number {
+  const totalChars = lines.reduce((n, l) => n + l.length, 0);
+  return Math.ceil(totalChars / speed);
 }
 
 /** Block-letter ASCII art, 5 rows tall — requested directly: "대문 로그를

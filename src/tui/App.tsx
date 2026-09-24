@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, shineArtFrame, shineArtFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -490,16 +490,19 @@ export function App({
     // Three phases, one after another (not simultaneous — several
     // flourishes going at once reads as chaotic rather than a sequence of
     // distinct little touches): the HARNESS wordmark shakes itself steady,
-    // then the WHOLE "HARNESS CLI" text shines — requested directly, twice:
-    // "구동 로그에 Thinking 시의 샤이닝 효과도 추가해줘" (add reasoning's
-    // shining effect to the startup log too), then "Harnesss CLI 의 글씨
-    // 전체를 빛나는 효과를 Think 처럼 색갈변활르 줘" (the WHOLE text, not
-    // just "CLI") — then the version line's ball bounces. "CLI" is small
-    // plain text, not block art (per "cli는 소문자로 좀 작게 해주고"),
-    // cased per the follow-up "Harness CLI 처럼 대소문자 반영해줘": the
-    // acronym stays uppercase, matching how the app's own name is written
-    // everywhere else, rather than literally lowercased.
+    // then the WHOLE "HARNESS CLI" text shines as ONE continuous
+    // character-by-character wave (not each row sweeping in parallel) —
+    // requested directly, refined twice: "구동 로그에 Thinking 시의
+    // 샤이닝 효과도 추가해줘" (add reasoning's shining effect here too),
+    // "Harnesss CLI 의 글씨 전체를 빛나는 효과를 Think 처럼 색갈변활르 줘"
+    // (the WHOLE text), then "글씨를 구성하는 문자 하나하나가 빛나는
+    // 효과를 Harness CLI 전체 생겨야 하는거야" (each character's shine
+    // as ONE sequence across the whole thing, not per line) — then the
+    // version line's ball bounces. "CLI" is small plain text, not block
+    // art (per "cli는 소문자로 좀 작게 해주고"), cased per the follow-up
+    // "Harness CLI 처럼 대소문자 반영해줘": the acronym stays uppercase.
     const CLI_TEXT = "CLI";
+    const shineLines = [...HARNESS_ART, CLI_TEXT];
     let shakeTick = 0;
     let shineId: ReturnType<typeof setInterval> | null = null;
     let bounceId: ReturnType<typeof setInterval> | null = null;
@@ -509,11 +512,12 @@ export function App({
       if (shakeTick >= shakeFrameCount()) {
         clearInterval(shakeId);
         let shineTick = 0;
-        const shineTicks = Math.max(shineArtFrameCount(HARNESS_ART), shineFrameCount(CLI_TEXT));
+        const shineTicks = shineMultilineFrameCount(shineLines);
         shineId = setInterval(() => {
           shineTick++;
-          setLineText(artLineId, shineArtFrame(HARNESS_ART, shineTick));
-          setLineText(cliLineId, rightAlign(shineFrame(CLI_TEXT, shineTick), ART_WIDTH));
+          const frame = shineMultilineFrame(shineLines, shineTick).split("\n");
+          setLineText(artLineId, frame.slice(0, HARNESS_ART.length).join("\n"));
+          setLineText(cliLineId, rightAlign(frame[HARNESS_ART.length], ART_WIDTH));
           if (shineTick >= shineTicks) {
             clearInterval(shineId!);
             let bounceTick = 0;
