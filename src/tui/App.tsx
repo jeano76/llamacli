@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -455,8 +455,8 @@ export function App({
     const versionLineId = logIdCounter++;
     setLog((prev) => [
       { id: artLineId, text: shakeFrame(HARNESS_ART, 0), kind: "status" as const },
-      { id: versionLineId, text: startupBanner.version, kind: "status" as const },
-      { id: logIdCounter++, text: `\x1b[2m${startupBanner.repoUrl}\x1b[0m`, kind: "status" as const },
+      { id: logIdCounter++, text: rightAlign(`\x1b[2m${startupBanner.repoUrl}\x1b[0m`, ART_WIDTH), kind: "status" as const },
+      { id: versionLineId, text: rightAlign(startupBanner.version, ART_WIDTH), kind: "status" as const },
       ...prev,
     ]);
     const setLineText = (id: number, text: string) => setLog((prev) => prev.map((line) => (line.id === id ? { ...line, text } : line)));
@@ -474,7 +474,7 @@ export function App({
         let bounceTick = 0;
         bounceId = setInterval(() => {
           bounceTick++;
-          setLineText(versionLineId, `${startupBanner.version}  ${bounceFrame(bounceTick)}`);
+          setLineText(versionLineId, rightAlign(`${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
           if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
         }, 60);
       }

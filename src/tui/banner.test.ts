@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, buildArt, HARNESS_ART, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
@@ -36,6 +36,25 @@ test("shakeFrame jitters the art for a while and then settles perfectly still (n
   assert.equal(shakeFrame(art, shakeFrameCount() + 20), settled);
   // It's an actual animation, not a no-op — early ticks differ from settled.
   assert.notEqual(early, settled);
+});
+
+test("rightAlign pads plain text so it ends flush at the given width, ignoring ANSI codes in the width count", () => {
+  const plain = rightAlign("v20260924", 20);
+  assert.equal(plain.length, 20);
+  assert.ok(plain.endsWith("v20260924"));
+
+  // ANSI-wrapped text must be measured by its VISIBLE width, not its raw
+  // string length (which would over-count and under-pad).
+  const colored = rightAlign("\x1b[2mhttps://example.com\x1b[0m", 30);
+  const stripped = colored.replace(/\x1b\[[0-9;]*m/g, "");
+  assert.equal(stripped.length, 30);
+
+  assert.equal(rightAlign("way too long for this width", 5), "way too long for this width", "never truncates");
+});
+
+test("ART_WIDTH matches HARNESS_ART's actual row width, so a caption line right-aligned to it lines up", () => {
+  assert.equal(ART_WIDTH, HARNESS_ART[0].length);
+  assert.equal(rightAlign("x", ART_WIDTH).length, ART_WIDTH);
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {

@@ -1,12 +1,9 @@
 /** The startup banner shown once, inside the app's own log (see App.tsx's
- *  mount effect and AppProps.startupBanner) — a colored "Harness CLI" line
- *  with a build-date version, revealed one WORD at a time, finishing with a
- *  small bouncing-ball flourish. Requested directly: "대문로그는 한
- *  단어씩 나타나게 해줘 그리고 마지막에 위아래로 공이 튀는 것처럼 통통통
- *  하고 튀는 효과를 넣어주고" ("reveal the banner one word at a time, and
- *  add a bouncing-ball effect — like a ball bouncing up and down — at the
- *  end"). Pure ANSI + pure functions so the animation is unit-testable
- *  without a terminal. */
+ *  mount effect and AppProps.startupBanner): "HARNESS" as block-letter
+ *  ASCII art that shakes itself steady, then a version line with a small
+ *  bouncing-ball flourish, right-aligned to the art's own width. Pure ANSI
+ *  + pure functions so the animation is unit-testable without a terminal. */
+import stringWidth from "string-width";
 
 /** `vYYYYMMDD` from a file's mtime — used with dist/index.js's own mtime as
  *  a build date, since there's no separate build-info step to read from. */
@@ -95,6 +92,19 @@ export function buildArt(word: string): string[] {
 }
 
 export const HARNESS_ART = buildArt("HARNESS");
+/** Every row of HARNESS_ART is the same width (buildArt pads letters to a
+ *  fixed 5-column glyph) — used to right-align the caption line under it. */
+export const ART_WIDTH = HARNESS_ART[0].length;
+
+/** Right-pads `text` with leading spaces so its VISIBLE width (ANSI codes
+ *  don't count, via string-width) ends flush with `width` — requested
+ *  directly: "버전과 탁구공같은 튀김은 HARNESS 마지막 길이를 맞춰서 우측
+ *  정렬을 해줘" (right-align the version + bounce-ball line to HARNESS's
+ *  own width). Never truncates: text wider than `width` is returned as-is. */
+export function rightAlign(text: string, width: number): string {
+  const pad = Math.max(0, width - stringWidth(text));
+  return " ".repeat(pad) + text;
+}
 
 const SHAKE_TICKS = 14;
 const ART_COLOR = "\x1b[1;36m"; // bold cyan, same settled color the rest of the app's animations use
