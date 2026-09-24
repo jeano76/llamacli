@@ -99,7 +99,7 @@ export function shineFrameCount(text: string, speed = 2): number {
  *    left-to-right, like reasoning's own sparkle)
  *  Monotonic per character (once revealed, never reverts to dim), same as
  *  every other shimmer in this app — only the shape of the sweep is new. */
-export function shineMultilineFrame(lines: string[], tick: number, speed = 6, bandWidth = 6, slantPerRow = 1): string {
+export function shineMultilineFrame(lines: string[], tick: number, speed = 20, bandWidth = 8, slantPerRow = 1): string {
   return lines
     .map((line, row) => {
       const effectiveTick = Math.max(0, tick - row * slantPerRow);
@@ -115,7 +115,7 @@ export function shineMultilineFrame(lines: string[], tick: number, speed = 6, ba
     .join("\n");
 }
 
-export function shineMultilineFrameCount(lines: string[], speed = 6, slantPerRow = 1): number {
+export function shineMultilineFrameCount(lines: string[], speed = 20, slantPerRow = 1): number {
   return Math.max(0, ...lines.map((line, row) => row * slantPerRow + Math.ceil(line.length / speed)));
 }
 
