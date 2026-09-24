@@ -152,8 +152,12 @@ function wrapLogLine(line: LogLine, width: number): string[] {
 
 function renderRow(row: RenderedRow, shimmerTick?: number) {
   if (row.kind === "reasoning-folded") {
+    // Same cyan the reasoning text itself settles at once fully revealed
+    // (not dim) — reported directly that dim gray made the fold line hard
+    // to read; it's also the click target, so it should read as "live UI",
+    // not muted-away text.
     return (
-      <Text key={row.key} color="gray" dimColor>
+      <Text key={row.key} color="cyan">
         {row.text}
       </Text>
     );
