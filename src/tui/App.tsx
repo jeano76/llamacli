@@ -476,13 +476,14 @@ export function App({
   // alt-screen switch, which was invisible in practice.
   useEffect(() => {
     const artLineId = logIdCounter++;
+    // CLI, the version, and the bounce-ball flourish all share ONE line,
+    // right-aligned together — requested directly: "Harness 아래 CLI 와
+    // 버전정보 그리고 탁구공모양을 한줄에 우측 정렬로 해서 작성해줘".
     const cliLineId = logIdCounter++;
-    const versionLineId = logIdCounter++;
     setLog((prev) => [
       { id: artLineId, text: HARNESS_ART.join("\n"), kind: "status" as const },
       { id: cliLineId, text: "", kind: "status" as const },
       { id: logIdCounter++, text: rightAlign(`\x1b[2m${startupBanner.repoUrl}\x1b[0m`, ART_WIDTH), kind: "status" as const },
-      { id: versionLineId, text: rightAlign(startupBanner.version, ART_WIDTH), kind: "status" as const },
       ...prev,
     ]);
     const setLineText = (id: number, text: string) => setLog((prev) => prev.map((line) => (line.id === id ? { ...line, text } : line)));
@@ -517,10 +518,14 @@ export function App({
       setLineText(cliLineId, rightAlign(frame[HARNESS_ART.length], ART_WIDTH));
       if (shineTick >= shineTicks) {
         clearInterval(shineId);
+        // Keep CLI's just-settled (peak-colored) text as-is rather than
+        // re-emitting it plain — it should stay the same color it shined
+        // in with, not lose that the moment the version/ball join it.
+        const cliShined = frame[HARNESS_ART.length];
         let bounceTick = 0;
         bounceId = setInterval(() => {
           bounceTick++;
-          setLineText(versionLineId, rightAlign(`${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
+          setLineText(cliLineId, rightAlign(`${cliShined}  ${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
           if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
         }, 60);
       }

@@ -11,11 +11,11 @@ test("buildArt lays out each letter's glyph side by side, 5 rows tall, blank for
   const art = buildArt("HA");
   assert.equal(art.length, 5, "block-letter art is 5 rows tall");
   // "H"'s glyph has a vertical bar in column 0 — solid in the middle rows,
-  // rounded (▓, not the hard █) at the top/bottom corners for a softer
+  // rounded (░, not the hard █) at the top/bottom corners for a softer
   // look (see GLYPHS's own doc comment).
-  assert.match(art[0][0], /[█▓]/, "H's left stroke starts (rounded or square) at the top");
+  assert.match(art[0][0], /[█░]/, "H's left stroke starts (rounded or square) at the top");
   assert.equal(art[2][0], "█", "H's left stroke is solid through the middle");
-  assert.match(art[4][0], /[█▓]/, "H's left stroke ends (rounded or square) at the bottom");
+  assert.match(art[4][0], /[█░]/, "H's left stroke ends (rounded or square) at the bottom");
   // An unrecognized character renders as blank space, not a crash.
   assert.doesNotThrow(() => buildArt("H?"));
 });

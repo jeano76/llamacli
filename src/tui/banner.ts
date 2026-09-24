@@ -103,9 +103,16 @@ export function shineFrameCount(text: string, speed = 2): number {
  *  `peakAllowed(row, col)` restricts WHERE the bright peak color can show
  *  at all — requested directly: "마지막 보라색 마지막 S 모양과 CLI 문자
  *  까지만이야" (the final purple/peak color should only ever appear on
- *  the last "S" and on "CLI"). Everywhere it returns false, a character
- *  goes straight from dim to settled with no peak flash in between.
- *  Defaults to allowing it everywhere (the plain, unrestricted sweep). */
+ *  the last "S" and on "CLI"). Where it returns false, a character goes
+ *  straight from dim to settled, same as everywhere else — no peak flash.
+ *  Where it returns true, the character STAYS peak once revealed (rather
+ *  than fading on to settled after the band passes) — requested directly,
+ *  clarifying the first version: "마지막 S와 CLI 전체가 같은 색이어야해
+ *  지금 마지막 S의 구성이 두가지 색상으로 되어있어" (the whole last S and
+ *  CLI should be ONE color — it was reading as two, since only the
+ *  characters still inside the moving band were peak and the rest of that
+ *  same letter had already faded to settled). Defaults to allowing peak
+ *  everywhere, fading as usual (the plain, unrestricted sweep). */
 export function shineMultilineFrame(
   lines: string[],
   tick: number,
@@ -121,8 +128,11 @@ export function shineMultilineFrame(
       const peakStart = Math.max(0, revealed - bandWidth);
       let out = "";
       for (let i = 0; i < line.length; i++) {
-        const inPeakBand = i >= peakStart && i < revealed;
-        const color = i < peakStart ? SETTLED : inPeakBand && peakAllowed(row, i) ? PEAK : i < revealed ? SETTLED : DIM;
+        const allowed = peakAllowed(row, i);
+        let color: string;
+        if (i >= revealed) color = DIM;
+        else if (allowed) color = PEAK; // stays peak for good once revealed — no fade to settled
+        else color = SETTLED; // never peak here at all, per peakAllowed
         out += `${color}${line[i]}`;
       }
       return out + RESET;
@@ -141,23 +151,24 @@ export function shineMultilineFrameCount(lines: string[], speed = 10, slantPerRo
  *  small-text word-reveal, which wasn't actual letter shapes. Only the
  *  letters this app's name needs; an unknown character renders as a blank
  *  5x5 cell rather than throwing. */
-// Corners softened from a hard █ to the medium-shade ▓ — requested
-// directly: "Ascii ansi 코드로 작성된 글씨의 디자인이 너무 기계적인데
-// 이쁜게 통통하게 만들어줘" (the ASCII/ANSI lettering looks too
-// mechanical — make it cute and chubby/rounded). A plain rectangular
-// block-letter font reads as sharp and mechanical; rounding just the
-// four outer corners of each 5x5 glyph fakes a rounded-corner look
+// Corners softened from a hard █ to the light-shade ░ — requested
+// directly, twice: "Ascii ansi 코드로 작성된 글씨의 디자인이 너무
+// 기계적인데 이쁜게 통통하게 만들어줘" (too mechanical — make it cute
+// and chubby/rounded), then "좀더 통통하게 해줘" (even more so — the
+// medium ▓ shade the first pass used wasn't soft enough). A plain
+// rectangular block-letter font reads as sharp and mechanical; rounding
+// just the four outer corners of each 5x5 glyph fakes a rounded-corner look
 // without redesigning every stroke.
 const GLYPHS: Record<string, string[]> = {
-  H: ["▓   ▓", "█   █", "█████", "█   █", "▓   ▓"],
-  A: [" ███ ", "█   █", "█████", "█   █", "▓   ▓"],
-  R: ["▓███ ", "█   █", "████ ", "█  █ ", "▓   ▓"],
-  N: ["▓   ▓", "██  █", "█ █ █", "█  ██", "▓   ▓"],
-  E: ["▓███▓", "█    ", "████ ", "█    ", "▓███▓"],
-  S: [" ███▓", "█    ", " ███ ", "    █", "▓███ "],
-  C: [" ███▓", "█    ", "█    ", "█    ", " ███▓"],
-  L: ["▓    ", "█    ", "█    ", "█    ", "▓███▓"],
-  I: ["▓███▓", "  █  ", "  █  ", "  █  ", "▓███▓"],
+  H: ["░   ░", "█   █", "█████", "█   █", "░   ░"],
+  A: [" ███ ", "█   █", "█████", "█   █", "░   ░"],
+  R: ["░███ ", "█   █", "████ ", "█  █ ", "░   ░"],
+  N: ["░   ░", "██  █", "█ █ █", "█  ██", "░   ░"],
+  E: ["░███░", "█    ", "████ ", "█    ", "░███░"],
+  S: [" ███░", "█    ", " ███ ", "    █", "░███ "],
+  C: [" ███░", "█    ", "█    ", "█    ", " ███░"],
+  L: ["░    ", "█    ", "█    ", "█    ", "░███░"],
+  I: ["░███░", "  █  ", "  █  ", "  █  ", "░███░"],
 };
 const BLANK_GLYPH = ["     ", "     ", "     ", "     ", "     "];
 // Narrower than a letter's own blank — a full 5-wide gap between WORDS (as
