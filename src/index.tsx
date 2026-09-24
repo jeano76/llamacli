@@ -22,7 +22,12 @@ conventions, never make unverified changes, and confirm before destructive comma
 
 When starting a task that needs multiple steps, declare them with the update_plan tool, and
 update each step's status (todo/in_progress/done) as it starts or finishes. This plan survives
-context compaction, so work can resume accurately after it.`;
+context compaction, so work can resume accurately after it.
+
+While investigating or debugging, call the note tool the moment you establish something worth
+not re-deriving: a root cause, a verified fact, a dead end already ruled out. Do this as you go,
+not only once told to — context compaction keeps only a summary of the conversation, but a note
+survives it word for word.`;
 
 // Only appended when the browser tools are actually enabled (config.yaml's
 // browser.enabled). Describing tools the model wasn't given is both
