@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens, CONTINUE_AFTER_COMPACTION } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -843,8 +843,10 @@ test("runCompaction keeps the newest tool result by pulling its assistant tool_c
       ];
       const result = await runCompaction(dir, messages, backend, "m", partial, 4096, 0.05);
       const roles = result.messages.map((m) => m.role);
-      assert.deepEqual(roles, ["system", "assistant", "tool"], `got ${roles.join(",")}`);
-      assert.equal(result.messages[2].tool_call_id, "t1");
+      // A placeholder user turn comes first: the kept tail has no user
+      // message of its own (see the next test).
+      assert.deepEqual(roles, ["system", "user", "assistant", "tool"], `got ${roles.join(",")}`);
+      assert.equal(result.messages[3].tool_call_id, "t1");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -879,6 +881,43 @@ test("the summary request always ends with a user turn, so the backend summarize
       const last = req!.messages[req!.messages.length - 1];
       assert.equal(last.role, "user");
       assert.match(String(last.content), /write the summary/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("a compacted conversation always contains a user message, since some chat templates reject one without", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const backend: ModelBackend = {
+        async chat() {
+          return { choices: [{ message: { role: "assistant", content: "S" }, finish_reason: "stop" }] };
+        },
+        async listModels() {
+          return [];
+        },
+      };
+      const partial = { reason: "auto-threshold" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+      // Live shape (Ornith-1.5's template: "No user query found in messages."):
+      // the kept tail is a pure tool-call chain.
+      const messages: ChatMessage[] = [{ role: "system", content: "BASE" }, { role: "user", content: "deploy netproxy" }];
+      for (let i = 0; i < 12; i++) {
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: `t${i}`, type: "function", function: { name: "run_shell", arguments: '{"command":"ls"}' } }],
+        });
+        messages.push({ role: "tool", tool_call_id: `t${i}`, content: "x".repeat(600) });
+      }
+      const result = await runCompaction(dir, messages, backend, "m", partial, 4096, 0.05);
+      assert.equal(result.messages[1].role, "user");
+      assert.equal(result.messages[1].content, CONTINUE_AFTER_COMPACTION);
+      assert.equal(result.messages.filter((m) => m.role === "user").length, 1);
+
+      // A tail that already has a real user message gets no placeholder.
+      const withUser = await runCompaction(dir, [{ role: "system", content: "BASE" }, { role: "user", content: "hi" }, { role: "assistant", content: "hello" }], backend, "m", partial, 24576);
+      assert.ok(!withUser.messages.some((m) => m.content === CONTINUE_AFTER_COMPACTION));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

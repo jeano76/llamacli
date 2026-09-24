@@ -456,12 +456,26 @@ export async function runCompaction(
     tail = tail.slice(1);
   }
 
+  // Some chat templates reject a conversation with no user message at all
+  // ("No user query found in messages." — Ornith-1.5's does; Qwen3.6's
+  // doesn't). A size-based tail can easily be nothing but a tool-call
+  // chain, the user's request having gone into the summary, so give it a
+  // user turn to hang off. Verified against the real server: the same
+  // compacted shape is rejected without this and accepted with it.
+  if (!tail.some((m) => m.role === "user")) {
+    tail = [{ role: "user", content: CONTINUE_AFTER_COMPACTION }, ...tail];
+  }
+
   const compactedMessages: ChatMessage[] = [{ role: "system", content: systemContent }, ...tail];
 
   return { messages: compactedMessages, checkpoint };
 }
 
 const SUMMARY_HEADER = "[Compacted history summary]";
+/** Placeholder user turn for a compacted conversation whose kept tail has
+ *  no user message (see runCompaction). */
+export const CONTINUE_AFTER_COMPACTION =
+  "[Earlier conversation was compacted — see the summary in the system message. Continue the current task.]";
 
 /**
  * Splits a system message into the original base prompt and the compaction
