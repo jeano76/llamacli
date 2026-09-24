@@ -246,6 +246,30 @@ test("with the default autoResume: true, a compaction that interrupts a tool cal
     assert.ok(secondRequest.messages.some((m) => typeof m.content === "string" && m.content.includes("update_plan")));
   }));
 
+test("a turn that ends on plain text with no tool call announces it's done, instead of just going quiet", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("here is my analysis, all done")],
+      tokenCounts: [1],
+    });
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await loop.send("do the thing");
+
+    // Reported live: a long plain-text reply with no follow-up tool call
+    // left the screen looking identical to a hang, with nothing marking
+    // the turn as actually finished.
+    assert.ok(statusMessages.some((s) => s.includes("done") && s.includes("waiting")));
+  }));
+
 test("AgentLoop does not trigger compaction when usage stays under the threshold throughout", () =>
   withTempProject(async (dir) => {
     const call1 = {

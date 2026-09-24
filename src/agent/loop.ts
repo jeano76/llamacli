@@ -926,6 +926,11 @@ export class AgentLoop {
           }
           this.opts.onPlanProgress?.(0, 0);
         }
+        // A turn that ends on plain text (no tool call) leaves nothing on
+        // screen marking it as finished — reported live as the TUI looking
+        // "stuck" after a long response, when the turn had actually ended
+        // cleanly and was just waiting for the next message the whole time.
+        this.opts.onStatus?.("[done — waiting for your next message]");
         return; // assistant is done, control returns to the prompt
       }
 
