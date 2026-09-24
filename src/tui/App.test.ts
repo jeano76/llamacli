@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands } from "./App.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
 // Reported directly: the slash menu could only be driven with arrow keys —
@@ -121,4 +121,27 @@ test("the running-state key hint uses the long form when it fits, and a short on
   assert.equal(runHintText(50), "  Esc: 종료 · Shift+우클릭: 복사/붙여넣기");
   assert.equal(runHintText(30), "  Esc: 종료");
   for (const cols of [20, 40, 60, 80, 120]) assert.ok(stringWidth(runHintText(cols)) <= cols - 1 || cols < 14);
+});
+
+test("shimmerBands splits text into a single moving bright band over an otherwise dim string", () => {
+  const text = "abcdefghijklmnopqrst"; // 20 chars, band width 10 (default)
+  const atStart = shimmerBands(text, 0);
+  // tick 0: band starts at -10 (fully before the string) -> nothing bright yet
+  assert.deepEqual(atStart, [{ text, bright: false }]);
+
+  const midway = shimmerBands(text, 15); // start = 15-10=5, end=15
+  assert.deepEqual(midway, [
+    { text: "abcde", bright: false },
+    { text: "fghijklmno", bright: true },
+    { text: "pqrst", bright: false },
+  ]);
+  const rejoined = midway.map((b) => b.text).join("");
+  assert.equal(rejoined, text, "bands must reconstruct the original text exactly");
+});
+
+test("shimmerBands is empty for empty text and never throws for a tick beyond the text length", () => {
+  assert.deepEqual(shimmerBands("", 5), []);
+  const text = "hi";
+  const bands = shimmerBands(text, 9999);
+  assert.equal(bands.map((b) => b.text).join(""), text);
 });

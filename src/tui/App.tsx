@@ -77,7 +77,39 @@ interface RenderedRow {
   key: string;
   text: string;
   kind: LogLine["kind"];
+  lineId: number;
 }
+
+/** Splits `text` into bright/dim runs for the "thinking" shimmer — a band
+ *  of brighter characters sweeping across the line, advancing one tick at
+ *  a time. Only ever applied to the single reasoning line currently
+ *  streaming (see the App component), so this never runs against settled
+ *  text. Pure function: same (text, tick) always gives the same bands, so
+ *  it has nothing to do with the row-wrap cache (keyed on text, not tick). */
+export function shimmerBands(text: string, tick: number, bandWidth = SHIMMER_BAND_WIDTH): { text: string; bright: boolean }[] {
+  if (!text) return [];
+  const period = text.length + bandWidth;
+  const start = (tick % period) - bandWidth;
+  const end = start + bandWidth;
+  const bands: { text: string; bright: boolean }[] = [];
+  let cur = "";
+  let curBright: boolean | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const bright = i >= start && i < end;
+    if (curBright === null) curBright = bright;
+    if (bright !== curBright) {
+      bands.push({ text: cur, bright: curBright });
+      cur = "";
+      curBright = bright;
+    }
+    cur += text[i];
+  }
+  if (cur) bands.push({ text: cur, bright: curBright! });
+  return bands;
+}
+
+const SHIMMER_BAND_WIDTH = 10;
+export const SHIMMER_TICK_MS = 80;
 
 /** Wraps one log entry into terminal rows (unpadded). */
 function wrapLogLine(line: LogLine, width: number): string[] {
@@ -101,7 +133,24 @@ function wrapLogLine(line: LogLine, width: number): string[] {
   return wrapToWidth(line.text, width);
 }
 
-function renderRow(row: RenderedRow) {
+function renderRow(row: RenderedRow, shimmerTick?: number) {
+  if (row.kind === "reasoning" && shimmerTick !== undefined) {
+    return (
+      <Text key={row.key}>
+        {shimmerBands(row.text, shimmerTick).map((b, i) =>
+          b.bright ? (
+            <Text key={i} color="cyan" italic>
+              {b.text}
+            </Text>
+          ) : (
+            <Text key={i} color="gray" dimColor italic>
+              {b.text}
+            </Text>
+          )
+        )}
+      </Text>
+    );
+  }
   if (row.kind === "user") {
     return (
       <Text key={row.key} color="cyan" bold>
@@ -124,6 +173,9 @@ function renderRow(row: RenderedRow) {
     );
   }
   if (row.kind === "reasoning") {
+    // Settled reasoning (the line finished, or shimmerTick not supplied —
+    // e.g. it scrolled out of the live streaming position): plain dim,
+    // matching every OTHER finished log entry once it stops changing.
     return (
       <Text key={row.key} color="gray" dimColor italic>
         {row.text}
@@ -280,6 +332,16 @@ export function App({
   // appending to, so successive deltas mutate one line instead of spawning
   // a new one per chunk.
   const streamingIdRef = useRef<number | null>(null);
+  // A ref alone (reasoningStreamingIdRef below) doesn't trigger a re-render
+  // on change, so the shimmer needs actual state to know THIS render's
+  // active line and to drive its own timer.
+  const [thinkingLineId, setThinkingLineId] = useState<number | null>(null);
+  const [shimmerTick, setShimmerTick] = useState(0);
+  useEffect(() => {
+    if (thinkingLineId === null) return;
+    const id = setInterval(() => setShimmerTick((t) => t + 1), SHIMMER_TICK_MS);
+    return () => clearInterval(id);
+  }, [thinkingLineId]);
   const reasoningStreamingIdRef = useRef<number | null>(null);
   // How far scrollOffset can go before there's nothing further back to see —
   // updated every render (see below) rather than recomputed inside the key
@@ -327,12 +389,14 @@ export function App({
       }
       const id = logIdCounter++;
       reasoningStreamingIdRef.current = id;
+      setThinkingLineId(id);
       return [...prev, { id, text, kind: "reasoning" as const }].slice(-MAX_LOG_ENTRIES);
     });
   }
 
   function finalizeReasoning() {
     reasoningStreamingIdRef.current = null;
+    setThinkingLineId(null);
   }
 
 
@@ -670,7 +734,7 @@ export function App({
       cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
       rowCache.set(line.id, cached);
     }
-    cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind }));
+    cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
   }
   if (rowCache.size > liveIds.size) {
     for (const id of rowCache.keys()) if (!liveIds.has(id)) rowCache.delete(id);
@@ -727,7 +791,7 @@ export function App({
             )}
           </Text>
         )}
-        {allRows.slice(sliceStart, sliceEnd).map(renderRow)}
+        {allRows.slice(sliceStart, sliceEnd).map((row) => renderRow(row, row.lineId === thinkingLineId ? shimmerTick : undefined))}
         {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
         {showRunHint && <Text dimColor>{runHintText(columns)}</Text>}
       </Box>
