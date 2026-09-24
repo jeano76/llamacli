@@ -1,6 +1,6 @@
 backend: openai-compatible
 baseUrl: http://127.0.0.1:8080
-model: /media/jeano/nvme-usb/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+model: /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
 
 compaction:
   autoTriggerRatio: 0.70
