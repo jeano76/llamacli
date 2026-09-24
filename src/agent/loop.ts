@@ -133,6 +133,27 @@ export function summarizeErrorForDisplay(message: string, maxLen = 300): string 
  *  call ARGUMENTS never were. */
 const FILE_CONTENT_TOOLS = new Set(["write_file", "append_file"]);
 
+function elidedContentMarker(chars: number): string {
+  return `[${chars} characters written to disk — read the file if you need them again]`;
+}
+const ELIDED_CONTENT_RE = /^\[\d+ characters written to disk — read the file if you need them again\]$/;
+
+/** True when a write_file/append_file call's content is the placeholder that
+ *  elideWrittenFileContent() leaves in history — the model copying its own
+ *  earlier call instead of the real content. Seen live: a session rewrote
+ *  wrangler.toml with exactly this placeholder seven times in a row,
+ *  destroying the file's real 70 characters, until the circuit breaker
+ *  stopped it. */
+export function isElidedContentWrite(toolName: string, argumentsJson: string): boolean {
+  if (!FILE_CONTENT_TOOLS.has(toolName)) return false;
+  try {
+    const content = JSON.parse(argumentsJson)?.content;
+    return typeof content === "string" && ELIDED_CONTENT_RE.test(content.trim());
+  } catch {
+    return false;
+  }
+}
+
 /** Replaces a completed file-write's `content` argument with a short
  *  marker, keeping everything else (tool name, path) intact so the
  *  conversation still reads as "I wrote this file". Safe because the
@@ -144,7 +165,7 @@ function elideWrittenFileContent(argumentsJson: string): string {
     const args = JSON.parse(argumentsJson);
     if (typeof args?.content !== "string" || args.content.length === 0) return argumentsJson;
     const chars = args.content.length;
-    return JSON.stringify({ ...args, content: `[${chars} characters written to disk — read the file if you need them again]` });
+    return JSON.stringify({ ...args, content: elidedContentMarker(chars) });
   } catch {
     return argumentsJson; // unparseable (shouldn't happen post-execution) — leave as is
   }
@@ -807,6 +828,21 @@ export class AgentLoop {
         }
 
         let content: string;
+        if (isElidedContentWrite(call.function.name, call.function.arguments)) {
+          content =
+            "ERROR: refused — the content argument is the placeholder that replaces an earlier write's content in this " +
+            "conversation, not real file content. Writing it would destroy the file. Call read_file on the path to see " +
+            "its current content, then write the actual content you intend.";
+          logFailure({
+            timestamp: new Date().toISOString(),
+            summary: `tool ${call.function.name} refused: placeholder content`,
+            toolName: call.function.name,
+            errorMessage: "content was the elided-write placeholder",
+          });
+          this.hasNewFailuresThisTurn = true;
+          this.messages.push({ role: "tool", tool_call_id: call.id, content });
+          continue;
+        }
         try {
           const result = await executeTool(call.function.name, call.function.arguments, this.opts.projectRoot);
           content = result.lineRange

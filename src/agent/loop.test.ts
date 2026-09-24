@@ -2092,3 +2092,36 @@ test("an over-long read_file result is cut at a line boundary and says which sta
     const body = toolMsg.slice(0, toolMsg.lastIndexOf("\n\n[showing"));
     assert.ok(body.endsWith(`const line${lastShown} = ${lastShown};`), `body ends with: ${body.slice(-40)}`);
   }));
+
+test("a write_file whose content is the elided-write placeholder is refused, and the file is left intact", () =>
+  withTempProject(async (dir) => {
+    // The live shape: the model copied its own earlier (elided) call and
+    // overwrote wrangler.toml with the placeholder text, seven times.
+    const path = join(dir, "wrangler.toml");
+    const original = 'name = "netproxy"\nmain = "src/workers/proxy.js"\ncompatibility_date = "2024-01-01"\n';
+    await writeFile(path, original);
+    const call = {
+      id: "w1",
+      type: "function" as const,
+      function: {
+        name: "write_file",
+        arguments: JSON.stringify({ path, content: "[70 characters written to disk — read the file if you need them again]" }),
+      },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call]), assistantMessage("ok")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+    });
+    await loop.send("fix the config");
+    assert.equal(await readFile(path, "utf8"), original, "the file must not be overwritten with the placeholder");
+    const toolMsg = String(turnRequests[1].messages.find((m) => m.role === "tool")!.content);
+    assert.match(toolMsg, /^ERROR: refused/);
+    assert.match(toolMsg, /read_file/);
+  }));
