@@ -1,6 +1,6 @@
 import { exec } from "node:child_process";
-import { appendFile, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { appendFile, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 import type { ToolDef } from "../backend/types.js";
 import { formatDiff } from "./diff.js";
@@ -281,6 +281,33 @@ export function setRunShellTimeoutForTests(ms: number): void {
  *  cap applies at all. Read only up to the cap directly instead. */
 const READ_FILE_MAX_BYTES = 5 * 1024 * 1024;
 
+/** Backups kept under .llamacli/state/backups/ before pruning the oldest. */
+export const MAX_FILE_BACKUPS = 200;
+
+/** Saves a file's current content before a tool overwrites or edits it,
+ *  and returns where (or null when there was nothing worth saving, or the
+ *  backup itself failed — it must never block the write). Twice in one
+ *  day a session overwrote a file's real content with an in-history
+ *  placeholder, and neither file was in git, so the content was gone. */
+export async function backupBeforeOverwrite(path: string, previous: string, next: string, projectRoot: string): Promise<string | null> {
+  if (!previous || previous === next) return null;
+  try {
+    const dir = join(projectRoot, ".llamacli", "state", "backups");
+    await mkdir(dir, { recursive: true });
+    const rel = isAbsolute(path) ? relative(projectRoot, path) : path;
+    const name = `${new Date().toISOString().replace(/[:.]/g, "-")}__${rel.replace(/[\\/:]/g, "_")}`;
+    const backupPath = join(dir, name);
+    await writeFile(backupPath, previous, "utf8");
+    const entries = (await readdir(dir)).sort();
+    for (const old of entries.slice(0, Math.max(0, entries.length - MAX_FILE_BACKUPS))) {
+      await unlink(join(dir, old)).catch(() => {});
+    }
+    return backupPath;
+  } catch {
+    return null;
+  }
+}
+
 export async function executeTool(name: string, argsJson: string, projectRoot: string = process.cwd()): Promise<ToolResult> {
   const args = JSON.parse(argsJson || "{}");
   switch (name) {
@@ -332,8 +359,12 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
       // threw ENOENT instead of just working, since writeFile() never
       // creates parent directories on its own.
       await mkdir(dirname(args.path), { recursive: true });
+      const backup = await backupBeforeOverwrite(args.path, before, args.content, projectRoot);
       await writeFile(args.path, args.content, "utf8");
-      return { content: `wrote ${args.path}`, diff: formatDiff(args.path, before, args.content) };
+      return {
+        content: backup ? `wrote ${args.path} (previous version saved to ${backup})` : `wrote ${args.path}`,
+        diff: formatDiff(args.path, before, args.content),
+      };
     }
     case "append_file": {
       const before = await readFile(args.path, "utf8").catch(() => "");
@@ -367,6 +398,7 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
         );
       }
       const updated = original.replace(args.old_text, args.new_text);
+      await backupBeforeOverwrite(args.path, original, updated, projectRoot);
       await writeFile(args.path, updated, "utf8");
       return { content: `edited ${args.path}`, diff: formatDiff(args.path, original, updated) };
     }

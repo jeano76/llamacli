@@ -12,6 +12,8 @@ import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { isBrowserAvailable } from "./tools/browser.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
+import { findOtherInstances, terminateInstance } from "./instanceGuard.js";
+import { createInterface } from "node:readline/promises";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -58,7 +60,35 @@ function exitAltScreen(): void {
   process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
 }
 
+/** Before taking over the screen: if llamacli is already running in this
+ *  project, ask whether to stop it (see instanceGuard.ts). Declining exits
+ *  instead of running two sessions side by side. */
+async function ensureSingleInstance(): Promise<void> {
+  const others = findOtherInstances(process.cwd(), process.pid, process.argv[1] ?? "");
+  if (others.length === 0) return;
+  process.stdout.write(
+    `이 프로젝트에서 llamacli가 이미 실행 중입니다 (PID ${others.join(", ")}).\n` +
+      "기존 프로세스를 종료하고 새로 시작할까요? 저장된 체크포인트는 그대로 남습니다.\n"
+  );
+  let answer = "";
+  if (process.stdin.isTTY) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    answer = (await rl.question("[y/N] ")).trim().toLowerCase();
+    rl.close();
+  }
+  if (answer !== "y" && answer !== "yes") {
+    process.stdout.write("새 세션을 시작하지 않고 종료합니다.\n");
+    process.exit(1);
+  }
+  for (const pid of others) {
+    const gone = await terminateInstance(pid);
+    process.stdout.write(gone ? `PID ${pid} 종료됨.\n` : `PID ${pid}를 종료하지 못했습니다.\n`);
+    if (!gone) process.exit(1);
+  }
+}
+
 async function main() {
+  await ensureSingleInstance();
   enterAltScreen();
   let cleanedUp = false;
   const cleanup = () => {

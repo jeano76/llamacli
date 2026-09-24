@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { executeTool, setRunShellTimeoutForTests, configureSkills } from "./index.js";
+import { executeTool, setRunShellTimeoutForTests, configureSkills, MAX_FILE_BACKUPS, backupBeforeOverwrite } from "./index.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "llamacli-tools-test-"));
@@ -286,4 +286,39 @@ test("read_file with start_line/end_line returns only those lines, plus the rang
     assert.deepEqual(whole.lineRange, { start: 1, end: 10, total: 10 });
 
     await assert.rejects(executeTool("read_file", JSON.stringify({ path, start_line: 11 }), dir), /past the end/);
+  }));
+
+test("write_file backs up the previous content before overwriting an existing file, and says where", () =>
+  withTempDir(async (dir) => {
+    const path = join(dir, "wrangler.toml");
+    await writeFile(path, 'name = "netproxy"\n');
+    const result = await executeTool("write_file", JSON.stringify({ path, content: "[70 characters written to disk]" }), dir);
+    const backups = await readdir(join(dir, ".llamacli", "state", "backups"));
+    assert.equal(backups.length, 1);
+    assert.match(backups[0], /__wrangler\.toml$/);
+    assert.equal(await readFile(join(dir, ".llamacli", "state", "backups", backups[0]), "utf8"), 'name = "netproxy"\n');
+    assert.match(result.content, /previous version saved to .*wrangler\.toml/);
+  }));
+
+test("write_file makes no backup for a new file, and edit_file backs up before editing", () =>
+  withTempDir(async (dir) => {
+    const path = join(dir, "a.txt");
+    const first = await executeTool("write_file", JSON.stringify({ path, content: "one\n" }), dir);
+    assert.equal(first.content, `wrote ${path}`);
+    await executeTool("edit_file", JSON.stringify({ path, old_text: "one", new_text: "two" }), dir);
+    const backups = await readdir(join(dir, ".llamacli", "state", "backups"));
+    assert.equal(backups.length, 1);
+    assert.equal(await readFile(join(dir, ".llamacli", "state", "backups", backups[0]), "utf8"), "one\n");
+  }));
+
+test(`backups are pruned to the newest ${MAX_FILE_BACKUPS}`, () =>
+  withTempDir(async (dir) => {
+    const path = join(dir, "f.txt");
+    for (let i = 0; i < MAX_FILE_BACKUPS + 5; i++) {
+      await backupBeforeOverwrite(path, `v${String(i).padStart(4, "0")}`, "next", dir);
+      await new Promise((r) => setTimeout(r, 2)); // distinct millisecond timestamps
+    }
+    const backups = (await readdir(join(dir, ".llamacli", "state", "backups"))).sort();
+    assert.equal(backups.length, MAX_FILE_BACKUPS);
+    assert.equal(await readFile(join(dir, ".llamacli", "state", "backups", backups[0]), "utf8"), "v0005");
   }));

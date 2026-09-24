@@ -2125,3 +2125,66 @@ test("a write_file whose content is the elided-write placeholder is refused, and
     assert.match(toolMsg, /^ERROR: refused/);
     assert.match(toolMsg, /read_file/);
   }));
+
+test("an unfinished plan does not re-inject a 'resuming previous session' message on every new message in the same process", () =>
+  withTempProject(async (dir) => {
+    // The live shape: a plan with a step that needs manual work stays
+    // incomplete at the end of every turn, so its plan-progress checkpoint
+    // stays on disk — and each new send() in the same process folded it
+    // back in as if resuming a previous session, repeating the same
+    // resume text before every user message.
+    const plan = {
+      id: "p1",
+      type: "function" as const,
+      function: {
+        name: "update_plan",
+        arguments: JSON.stringify({ steps: [{ description: "deploy", status: "done" }, { description: "DNS setup (manual)", status: "in_progress" }] }),
+      },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [plan]), assistantMessage("Please set up DNS manually."), assistantMessage("Still waiting on DNS.")],
+      tokenCounts: [1],
+    });
+    const statuses: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+      onStatus: (s) => statuses.push(s),
+    });
+    await loop.send("deploy it");
+    await loop.send("continue");
+    const resumeMessages = turnRequests[2].messages.filter((m) => typeof m.content === "string" && m.content.startsWith("[resuming"));
+    assert.equal(resumeMessages.length, 0, "the plan is live in this process; nothing to resume");
+    assert.ok(!statuses.some((s) => s.startsWith("[resuming")), `unexpected resume status: ${statuses.join(" | ")}`);
+    // ...while the checkpoint still stays on disk for crash recovery.
+    assert.ok(await readCheckpoint(dir));
+  }));
+
+test("the same assistant response repeated within a turn stops the turn, even when each comes with a different tool call", () =>
+  withTempProject(async (dir) => {
+    const step = (n: number) => ({
+      id: `u${n}`,
+      type: "function" as const,
+      function: { name: "update_plan", arguments: JSON.stringify({ steps: [{ description: `try ${n}`, status: "in_progress" }] }) },
+    });
+    const same = "I'll set up DNS through the dashboard now.";
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [1, 2, 3, 4, 5].map((n) => assistantMessage(same, [step(n)])),
+      tokenCounts: [1],
+    });
+    const statuses: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+      onStatus: (s) => statuses.push(s),
+    });
+    await loop.send("set up DNS");
+    assert.equal(turnRequests.length, 3, "should stop right after the third identical response");
+    assert.ok(statuses.some((s) => s.startsWith("[stopped] the model gave the same response 3 times")), statuses.join(" | "));
+  }));

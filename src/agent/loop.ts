@@ -97,6 +97,14 @@ function capReadFileResult(
   return `${body}\n\n[showing lines ${range.start}-${shownEnd} of ${range.total}${next}]`;
 }
 
+/** Repeated-response guard: the same assistant text REPEAT_LIMIT times
+ *  among the turn's last REPEAT_WINDOW assistant messages stops the turn. */
+const REPEAT_WINDOW = 6;
+const REPEAT_LIMIT = 3;
+function normalizeForRepeat(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
 /** Caps how much of `err.message` ever reaches an `onStatus` line.
  *
  *  Two real error shapes can make `err.message` itself enormous: a
@@ -293,6 +301,14 @@ export class AgentLoop {
    *  that new checkpoint must survive, so clearing afterward would be
    *  wrong. Returns whether there was anything to resume. */
   private async injectResumeContextIfPending(): Promise<boolean> {
+    // A plan-progress checkpoint this process wrote itself (the plan is
+    // still live in this.plan) is crash insurance for the NEXT process, not
+    // something to resume here. Reported live as the same prompt repeating:
+    // a plan with a manual step stayed unfinished at the end of every
+    // turn, and each new message re-injected "[resuming previous session]
+    // ..." before it. Leave the checkpoint on disk.
+    const pending = await readCheckpoint(this.opts.projectRoot);
+    if (pending?.reason === "plan-progress" && this.plan.length > 0) return false;
     const resumeText = await buildResumePrompt(this.opts.projectRoot);
     if (!resumeText) return false;
     this.opts.onStatus?.(resumeText);
@@ -469,6 +485,8 @@ export class AgentLoop {
     // append_file instead, so a multi-round recovery on one large file
     // builds it up correctly rather than each round overwriting the last.
     const salvagedCharsWrittenByPath = new Map<string, number>();
+    // Recent assistant texts in this turn, for repeatedResponse() below.
+    const recentAssistantTexts: string[] = [];
     turnLoop: while (true) {
       const { used: usedBeforeChat } = await this.maybeCompact();
 
@@ -731,6 +749,30 @@ export class AgentLoop {
       }
       this.messages.push(message);
       this.opts.onAssistantDone?.();
+
+      // The circuit breaker only watches tool calls; a model can also get
+      // stuck saying the same thing over and over (each time with some
+      // tool call), which it never sees. Stop the turn instead.
+      if (typeof message.content === "string" && message.content.trim()) {
+        recentAssistantTexts.push(normalizeForRepeat(message.content));
+        if (recentAssistantTexts.length > REPEAT_WINDOW) recentAssistantTexts.shift();
+        const latest = recentAssistantTexts[recentAssistantTexts.length - 1];
+        const repeats = recentAssistantTexts.filter((t) => t === latest).length;
+        if (repeats >= REPEAT_LIMIT) {
+          this.opts.onStatus?.(
+            `[stopped] the model gave the same response ${repeats} times in this turn — stopping so it doesn't keep looping. ` +
+              "Tell it what to do differently to continue."
+          );
+          logFailure({
+            timestamp: new Date().toISOString(),
+            summary: "repeated identical assistant response",
+            toolName: "chat",
+            errorMessage: `same response ${repeats} times in the last ${recentAssistantTexts.length}`,
+          });
+          this.hasNewFailuresThisTurn = true;
+          return;
+        }
+      }
 
       if (!message.tool_calls || message.tool_calls.length === 0) {
         // The turn ended cleanly (not interrupted by compaction — that
