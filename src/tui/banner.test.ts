@@ -1,34 +1,45 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, bannerFrame, bannerFrameCount } from "./banner.js";
+import { buildVersionString, bannerWordFrame, bannerWordCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
   assert.equal(buildVersionString(new Date(2026, 8, 24).getTime()), "v20260924");
 });
 
-test("bannerFrame reveals text as a one-directional wave — earlier characters stay settled, never revert to dim", () => {
-  const text = "Harness CLI";
-  const early = bannerFrame(text, 1);
-  const later = bannerFrame(text, 10);
-  // At tick 1 almost nothing is settled yet (dim/peak only).
-  assert.ok(!early.includes("\x1b[1;36m"));
-  // Once the wave has fully crossed, later ticks stop changing anything —
-  // revealed clamps at text.length, so the frame is stable (not literally
-  // all-settled: the trailing bandWidth stays the "peak" leading-edge
-  // color by design, same as App.tsx's shimmerBands).
-  assert.equal(later, bannerFrame(text, 100));
-  assert.ok(later.startsWith("\x1b[1;36mH"));
+test("bannerWordFrame reveals one word per tick, earlier words staying visible (settled) once revealed", () => {
+  const text = "Harness CLI v20260924";
+  assert.equal(bannerWordFrame(text, 0), "");
+  const one = bannerWordFrame(text, 1);
+  assert.match(one, /Harness/);
+  assert.doesNotMatch(one, /CLI/);
+  const two = bannerWordFrame(text, 2);
+  assert.match(two, /Harness/);
+  assert.match(two, /CLI/);
+  assert.doesNotMatch(two, /v20260924/);
+  const all = bannerWordFrame(text, bannerWordCount(text));
+  assert.match(all, /Harness/);
+  assert.match(all, /CLI/);
+  assert.match(all, /v20260924/);
 });
 
-test("bannerFrame is idempotent for the same (text, tick) and empty text renders as empty", () => {
-  assert.equal(bannerFrame("abc", 3), bannerFrame("abc", 3));
-  assert.equal(bannerFrame("", 3), "");
+test("bannerWordFrame clamps past the last word and handles empty text", () => {
+  const text = "Harness CLI";
+  assert.equal(bannerWordFrame(text, 50), bannerWordFrame(text, bannerWordCount(text)));
+  assert.equal(bannerWordFrame("", 3), "");
 });
 
-test("bannerFrameCount gives enough ticks for the wave to fully cross the text (some trailing chars stay the peak color by design, same as App.tsx's shimmerBands)", () => {
-  const text = "Harness CLI";
-  assert.equal(bannerFrameCount(text, 2), 6); // 11 chars / 2 per tick, rounded up
-  const finalFrame = bannerFrame(text, bannerFrameCount(text, 2));
-  assert.equal(finalFrame, bannerFrame(text, bannerFrameCount(text, 2) + 5), "further ticks change nothing once revealed is clamped");
+test("bannerWordCount counts words by splitting on spaces", () => {
+  assert.equal(bannerWordCount("Harness CLI v20260924"), 3);
+  assert.equal(bannerWordCount(""), 0);
+  assert.equal(bannerWordCount("one"), 1);
+});
+
+test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {
+  const frames = new Set<string>();
+  for (let t = 0; t <= bounceFrameCount(); t++) frames.add(bounceFrame(t));
+  // More than one distinct glyph — it's actually moving, not a static dot.
+  assert.ok(frames.size > 1);
+  const last = bounceFrame(bounceFrameCount());
+  assert.equal(bounceFrame(bounceFrameCount() + 10), last, "clamps to the resting frame once the bounce is over");
 });

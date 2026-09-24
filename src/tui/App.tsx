@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { bannerFrame, bannerFrameCount } from "./banner.js";
+import { bannerWordFrame, bannerWordCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -52,7 +52,7 @@ export interface AppProps {
    *  existed), `false` discards the checkpoint and starts fresh. */
   onResumeDecision: (resume: boolean) => void;
   /** "Harness CLI vYYYYMMDD" + the repo URL, animated at startup (see
-   *  banner.ts's bannerFrame) — computed in index.tsx (needs dist/index.js's
+   *  banner.ts's bannerWordFrame/bounceFrame) — computed in index.tsx (needs dist/index.js's
    *  own mtime for the version) and passed in rather than read here, so App
    *  stays pure UI, same as everything else index.tsx already loads before
    *  render(). Previously printed straight to the raw terminal before
@@ -444,25 +444,42 @@ export function App({
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
-  // The startup banner, animated the same reveal-wave way as reasoning
-  // text — see AppProps.startupBanner's doc comment for why this lives
-  // inside the log (a real, persistent line) rather than a raw stdout
-  // write before the alt-screen switch, which was invisible in practice.
+  // The startup banner: revealed one word at a time, then a small bouncing-
+  // ball flourish once the words are all in — see AppProps.startupBanner's
+  // doc comment for why this lives inside the log (a real, persistent
+  // line) rather than a raw stdout write before the alt-screen switch,
+  // which was invisible in practice.
   useEffect(() => {
     const bannerLineId = logIdCounter++;
     setLog((prev) => [
-      { id: bannerLineId, text: bannerFrame(startupBanner.text, 0), kind: "status" as const },
+      { id: bannerLineId, text: bannerWordFrame(startupBanner.text, 0), kind: "status" as const },
       { id: logIdCounter++, text: `\x1b[2m${startupBanner.repoUrl}\x1b[0m`, kind: "status" as const },
       ...prev,
     ]);
-    const frames = bannerFrameCount(startupBanner.text);
-    let tick = 0;
-    const id = setInterval(() => {
-      tick++;
-      setLog((prev) => prev.map((line) => (line.id === bannerLineId ? { ...line, text: bannerFrame(startupBanner.text, tick) } : line)));
-      if (tick >= frames) clearInterval(id);
-    }, 45);
-    return () => clearInterval(id);
+    const setBannerText = (text: string) =>
+      setLog((prev) => prev.map((line) => (line.id === bannerLineId ? { ...line, text } : line)));
+
+    const words = bannerWordCount(startupBanner.text);
+    let wordTick = 0;
+    let bounceId: ReturnType<typeof setInterval> | null = null;
+    const wordId = setInterval(() => {
+      wordTick++;
+      setBannerText(bannerWordFrame(startupBanner.text, wordTick));
+      if (wordTick >= words) {
+        clearInterval(wordId);
+        // The ball rides right after the fully-revealed text, on the same line.
+        let bounceTick = 0;
+        bounceId = setInterval(() => {
+          bounceTick++;
+          setBannerText(`${bannerWordFrame(startupBanner.text, words)}  ${bounceFrame(bounceTick)}`);
+          if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
+        }, 60);
+      }
+    }, 140);
+    return () => {
+      clearInterval(wordId);
+      if (bounceId !== null) clearInterval(bounceId);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Esc opens this Y/N confirmation instead of quitting immediately — a
