@@ -15,6 +15,9 @@ import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
 import { clearNotes } from "./compaction/notes.js";
 import { findOtherInstances, terminateInstance } from "./instanceGuard.js";
 import { createInterface } from "node:readline/promises";
+import { statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { bannerFrame, bannerFrameCount, buildVersionString } from "./tui/banner.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -109,7 +112,40 @@ async function ensureSingleInstance(): Promise<void> {
   }
 }
 
+const REPO_URL = "https://github.com/jeano76/llamacli";
+
+/** Requested directly: a colored startup banner, version as the build date
+ *  (v + dist/index.js's own mtime, since there's no separate build-info
+ *  step), and the repo URL — printed on the normal screen, before
+ *  enterAltScreen() switches over, so it's actually seen rather than
+ *  flashing and vanishing under the alt-screen buffer. Animated with the
+ *  same reveal-wave shape as the reasoning shimmer (see App.tsx's
+ *  shimmerBands / banner.ts's bannerFrame) for one consistent design
+ *  language. Skipped (plain, no animation) when stdout isn't a TTY — a
+ *  piped/redirected run has no terminal to animate into anyway. */
+async function printStartupBanner(): Promise<void> {
+  let version = "";
+  try {
+    version = buildVersionString(statSync(fileURLToPath(import.meta.url)).mtimeMs);
+  } catch {
+    // dist/index.js not found under this run mode (e.g. tsx dev) — banner
+    // just omits the version rather than failing startup over it.
+  }
+  const text = `Harness CLI${version ? ` ${version}` : ""}`;
+  if (!process.stdout.isTTY) {
+    process.stdout.write(`${text}\n${REPO_URL}\n`);
+    return;
+  }
+  const frames = bannerFrameCount(text);
+  for (let tick = 0; tick <= frames; tick++) {
+    process.stdout.write(`\r${bannerFrame(text, tick)}`);
+    await new Promise((resolve) => setTimeout(resolve, 45));
+  }
+  process.stdout.write(`\n\x1b[2m${REPO_URL}\x1b[0m\n\n`);
+}
+
 async function main() {
+  await printStartupBanner();
   await ensureSingleInstance();
   enterAltScreen();
   let cleanedUp = false;

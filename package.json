@@ -2,6 +2,7 @@
   "name": "llamacli",
   "version": "0.1.0",
   "description": "Local llama.cpp AI coding agent CLI (OpenAI-compatible, self-healing, memory-compaction with auto-resume)",
+  "repository": "https://github.com/jeano76/llamacli",
   "type": "module",
   "bin": {
     "llamacli": "./dist/index.js"
