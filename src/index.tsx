@@ -270,6 +270,7 @@ async function main() {
       const label = preview ? `${name}(${preview})` : name;
       (globalThis as any).__llamacli_ui?.pushTool(label);
     },
+    onToolCallDone: () => (globalThis as any).__llamacli_ui?.finalizeToolCall(),
     onDiff: (_path, diff) => (globalThis as any).__llamacli_ui?.pushDiff(diff),
     onToolResult: (command, output) => (globalThis as any).__llamacli_ui?.pushToolResult(command, output),
     onStatus: (s) => (globalThis as any).__llamacli_ui?.pushStatus(s),

@@ -257,6 +257,39 @@ test("with the default autoResume: true, a compaction that interrupts a tool cal
     assert.ok(secondRequest.messages.some((m) => typeof m.content === "string" && m.content.includes("update_plan")));
   }));
 
+test("onToolCallDone fires once per tool call, after onToolCall, for every tool (not just run_shell)", () =>
+  withTempProject(async (dir) => {
+    await writeFile(join(dir, "f.txt"), "file content", "utf8");
+    const readCall = {
+      id: "c1",
+      type: "function" as const,
+      function: { name: "read_file", arguments: JSON.stringify({ path: "f.txt" }) },
+    };
+    const shellCall = {
+      id: "c2",
+      type: "function" as const,
+      function: { name: "run_shell", arguments: JSON.stringify({ command: "echo x" }) },
+    };
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [readCall, shellCall]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const events: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+      onToolCall: (name) => events.push(`call:${name}`),
+      onToolCallDone: (name) => events.push(`done:${name}`),
+    });
+
+    await loop.send("go");
+
+    assert.deepEqual(events, ["call:read_file", "done:read_file", "call:run_shell", "done:run_shell"]);
+  }));
+
 test("onToolResult fires with a run_shell command's real output, and only for run_shell (not other tools)", () =>
   withTempProject(async (dir) => {
     await writeFile(join(dir, "f.txt"), "file content", "utf8");

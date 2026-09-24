@@ -93,7 +93,7 @@ let logIdCounter = 0;
 interface RenderedRow {
   key: string;
   text: string;
-  kind: LogLine["kind"] | "reasoning-folded" | "compaction-detail-folded" | "diff-folded" | "tool-result-folded";
+  kind: LogLine["kind"] | "reasoning-folded" | "compaction-detail-folded" | "diff-folded" | "tool-result-folded" | "tool-folded";
   lineId: number;
 }
 
@@ -303,7 +303,7 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
       </Text>
     );
   }
-  if (row.kind === "tool") {
+  if (row.kind === "tool" || row.kind === "tool-folded") {
     return (
       <Text key={row.key} color="magenta">
         {row.text}
@@ -605,6 +605,17 @@ export function App({
   // appending to, so successive deltas mutate one line instead of spawning
   // a new one per chunk.
   const streamingIdRef = useRef<number | null>(null);
+  // Tracks the most recently pushed tool-call line, so finalizeToolCall()
+  // (fired by loop.ts's onToolCallDone) knows which one just finished —
+  // tool calls run sequentially within a turn, never concurrently, so
+  // "most recent" is unambiguous.
+  const activeToolLineIdRef = useRef<number | null>(null);
+  // A tool-call line that has finished AND turned out to span more than
+  // one wrapped row folds down to a summary (see the row-building loop) —
+  // never while still running, only once finalizeToolCall() adds its id
+  // here. Still expandable again by click (expandedReasoningIds, shared
+  // with reasoning/compaction/tool-result's own fold state).
+  const [completedToolIds, setCompletedToolIds] = useState<Set<number>>(new Set());
   // A ref alone (reasoningStreamingIdRef below) doesn't trigger a re-render
   // on change, so the shimmer needs actual state to know THIS render's
   // active line and to drive its own timer.
@@ -736,6 +747,29 @@ export function App({
     setLog((prev) =>
       [...prev, { id: logIdCounter++, text: output, kind: "tool-result" as const, foldLabel }].slice(-MAX_LOG_ENTRIES)
     );
+  }
+
+  function pushTool(label: string) {
+    const id = logIdCounter++;
+    activeToolLineIdRef.current = id;
+    setLog((prev) => [...prev, { id, text: label, kind: "tool" as const }].slice(-MAX_LOG_ENTRIES));
+  }
+
+  // Marks the most recently pushed tool-call line as finished — requested
+  // directly: "툴 호출 명령어가 멀티 라인일결우에는 해당 명령어가 끝나면
+  // 폴딩으로 접어줘야해 다시 클릭하면 폴더를 열고". Only actually folds it
+  // if it turns out to span more than one wrapped line (checked in the
+  // row-building loop, same as tool-result) — while a call is still
+  // running it's never folded, only once onToolCallDone fires.
+  function finalizeToolCall() {
+    if (activeToolLineIdRef.current === null) return;
+    const id = activeToolLineIdRef.current;
+    activeToolLineIdRef.current = null;
+    setCompletedToolIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
   }
 
   // Folds every currently-expanded diff to its one-line summary. Diffs
@@ -1037,7 +1071,8 @@ export function App({
     collapseDiffs,
     setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
-    pushTool: (t: string) => pushLine(t, "tool"),
+    pushTool,
+    finalizeToolCall,
     pushDiff: (t: string) => pushLine(t, "diff"),
     setBusy,
     isBusy: () => busy,
@@ -1203,6 +1238,29 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "tool-result-folded", lineId: line.id });
       continue;
     }
+    // A multi-line tool-call label folds down once it's actually finished
+    // (completedToolIds, set by finalizeToolCall — see its own doc
+    // comment) — never while still running, and never at all if it only
+    // ever took one line in the first place.
+    if (line.kind === "tool") {
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      const foldable = completedToolIds.has(line.id) && cached.rows.length > 1;
+      if (!foldable) {
+        cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+        continue;
+      }
+      if (!expandedReasoningIds.has(line.id)) {
+        allRows.push({ key: `${line.id}-fold`, text: `▸ ${cached.rows[0]}… — 클릭해서 펼치기`, kind: "tool-folded", lineId: line.id });
+        continue;
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "tool-folded", lineId: line.id });
+      continue;
+    }
     // Diffs: opposite default from the two folds above (see
     // collapsedDiffIds's doc comment) — shown in full unless collapsed,
     // either by clicking or because the next command was submitted.
@@ -1292,6 +1350,8 @@ export function App({
             r.kind === "compaction-detail-folded" ||
             r.kind === "tool-result" ||
             r.kind === "tool-result-folded" ||
+            r.kind === "tool" ||
+            r.kind === "tool-folded" ||
             r.kind === "diff" ||
             r.kind === "diff-folded",
           isDiff: r.kind === "diff" || r.kind === "diff-folded",
