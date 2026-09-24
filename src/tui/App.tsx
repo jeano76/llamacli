@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, ART_WIDTH, LETTER_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, ART_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -502,25 +502,19 @@ export function App({
     // how the app's own name is written everywhere else).
     const CLI_TEXT = "CLI";
     const shineLines = [...HARNESS_ART, CLI_TEXT];
-    // The bright peak color is restricted to the LAST letter of HARNESS
-    // and to "CLI" — requested directly: "마지막 보라색 마지막 S 모양과
-    // CLI 문자까지만이야". Everywhere else in the art, a character goes
-    // straight from dim to settled with no purple flash along the way.
-    const lastLetterStartsAt = ART_WIDTH - LETTER_WIDTH;
-    const peakAllowed = (row: number, col: number) => row === HARNESS_ART.length || col >= lastLetterStartsAt;
     let shineTick = 0;
     let bounceId: ReturnType<typeof setInterval> | null = null;
     const shineTicks = shineMultilineFrameCount(shineLines);
     const shineId = setInterval(() => {
       shineTick++;
-      const frame = shineMultilineFrame(shineLines, shineTick, undefined, undefined, undefined, peakAllowed).split("\n");
+      const frame = shineMultilineFrame(shineLines, shineTick).split("\n");
       setLineText(artLineId, frame.slice(0, HARNESS_ART.length).join("\n"));
       setLineText(cliLineId, rightAlign(frame[HARNESS_ART.length], ART_WIDTH));
       if (shineTick >= shineTicks) {
         clearInterval(shineId);
-        // Keep CLI's just-settled (peak-colored) text as-is rather than
-        // re-emitting it plain — it should stay the same color it shined
-        // in with, not lose that the moment the version/ball join it.
+        // Keep CLI's just-settled text as-is rather than re-emitting it
+        // plain — it should stay the same (single, unified) color it
+        // shined in with, not lose that the moment the version/ball join it.
         const cliShined = frame[HARNESS_ART.length];
         let bounceTick = 0;
         bounceId = setInterval(() => {

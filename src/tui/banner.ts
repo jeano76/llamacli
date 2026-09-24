@@ -89,7 +89,7 @@ export function shineFrameCount(text: string, speed = 2): number {
  *  start revealing a little later than the one above, so the bright band
  *  reads as one light sweeping across the block on a slant (top-left
  *  toward bottom-right) rather than a straight vertical or per-row-parallel
- *  wave. Requested directly, through two rounds of clarification:
+ *  wave. Requested directly, through several rounds of clarification:
  *  - "글씨를 구성하는 문자 하나하나가 빛나는 효과를 Harness CLI 전체
  *    생겨야 하는거야" (each character's shine as one motion across the
  *    whole thing, not per line)
@@ -97,43 +97,24 @@ export function shineFrameCount(text: string, speed = 2): number {
  *    계열의 밝은색 블럭으로 좌측에서 우측으로 비스듬하게 이동이 되게
  *    되는거야" (a bright block of the same color family moving diagonally
  *    left-to-right, like reasoning's own sparkle)
+ *  - finally: "모서리 약한 흐릿한 색상바꾸는 효과는 없애고 글씨의 메인
+ *    색으로 모두 최종 통일되게 해줘" (drop the effect that changes some
+ *    characters to a faint different color — everything should end up
+ *    the SAME main color). Earlier passes tried a separate bright "peak"
+ *    color restricted to specific characters, which kept reading as two
+ *    (or more) different final colors instead of one; simplified to just
+ *    two states — DIM (not yet revealed) and SETTLED (revealed, the one
+ *    single final color) — so there's nothing left to look inconsistent.
  *  Monotonic per character (once revealed, never reverts to dim), same as
- *  every other shimmer in this app — only the shape of the sweep is new.
- *
- *  `peakAllowed(row, col)` restricts WHERE the bright peak color can show
- *  at all — requested directly: "마지막 보라색 마지막 S 모양과 CLI 문자
- *  까지만이야" (the final purple/peak color should only ever appear on
- *  the last "S" and on "CLI"). Where it returns false, a character goes
- *  straight from dim to settled, same as everywhere else — no peak flash.
- *  Where it returns true, the character STAYS peak once revealed (rather
- *  than fading on to settled after the band passes) — requested directly,
- *  clarifying the first version: "마지막 S와 CLI 전체가 같은 색이어야해
- *  지금 마지막 S의 구성이 두가지 색상으로 되어있어" (the whole last S and
- *  CLI should be ONE color — it was reading as two, since only the
- *  characters still inside the moving band were peak and the rest of that
- *  same letter had already faded to settled). Defaults to allowing peak
- *  everywhere, fading as usual (the plain, unrestricted sweep). */
-export function shineMultilineFrame(
-  lines: string[],
-  tick: number,
-  speed = 10,
-  bandWidth = 3,
-  slantPerRow = 1,
-  peakAllowed: (row: number, col: number) => boolean = () => true
-): string {
+ *  every other shimmer in this app — only the shape of the sweep is new. */
+export function shineMultilineFrame(lines: string[], tick: number, speed = 10, slantPerRow = 1): string {
   return lines
     .map((line, row) => {
       const effectiveTick = Math.max(0, tick - row * slantPerRow);
       const revealed = Math.min(line.length, effectiveTick * speed);
-      const peakStart = Math.max(0, revealed - bandWidth);
       let out = "";
       for (let i = 0; i < line.length; i++) {
-        const allowed = peakAllowed(row, i);
-        let color: string;
-        if (i >= revealed) color = DIM;
-        else if (allowed) color = PEAK; // stays peak for good once revealed — no fade to settled
-        else color = SETTLED; // never peak here at all, per peakAllowed
-        out += `${color}${line[i]}`;
+        out += `${i < revealed ? SETTLED : DIM}${line[i]}`;
       }
       return out + RESET;
     })

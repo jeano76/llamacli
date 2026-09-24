@@ -74,11 +74,11 @@ test("shineMultilineFrame staggers each row's start diagonally — a later row h
   const lines = ["AAAA", "BBBB", "CCCC"];
   // With a slant of 2 ticks/row, tick 1 is still before row 1's (and row
   // 2's) start — only row 0 should show any color yet.
-  const early = shineMultilineFrame(lines, 1, 1, 1, 2);
+  const early = shineMultilineFrame(lines, 1, 1, 2);
   const [row0, row1, row2] = early.split("\n");
-  assert.match(row0, /\x1b\[1;95m|\x1b\[1;36m/, "row 0 has started revealing immediately");
-  assert.doesNotMatch(row1, /\x1b\[1;95m|\x1b\[1;36m/, "row 1 hasn't started yet — the diagonal delay hasn't reached it");
-  assert.doesNotMatch(row2, /\x1b\[1;95m|\x1b\[1;36m/, "row 2 starts even later than row 1");
+  assert.match(row0, /\x1b\[1;36m/, "row 0 has started revealing immediately");
+  assert.doesNotMatch(row1, /\x1b\[1;36m/, "row 1 hasn't started yet — the diagonal delay hasn't reached it");
+  assert.doesNotMatch(row2, /\x1b\[1;36m/, "row 2 starts even later than row 1");
 
   const settled = shineMultilineFrame(lines, shineMultilineFrameCount(lines));
   assert.equal(settled, shineMultilineFrame(lines, shineMultilineFrameCount(lines) + 20), "clamps once every character has revealed");
@@ -96,19 +96,14 @@ test("shineMultilineFrameCount accounts for the LAST row's diagonal delay plus i
   assert.equal(shineMultilineFrameCount(lines, speed, slantPerRow), 2 * slantPerRow + Math.ceil(1 / speed));
 });
 
-test("shineMultilineFrame's peakAllowed restricts WHERE the bright peak color can appear — elsewhere a character goes straight from dim to settled", () => {
-  const lines = ["AAAAAAAAAA"]; // one row, 10 chars
-  // Peak only allowed in the last 3 columns.
-  const peakAllowed = (_row: number, col: number) => col >= 7;
-  // Pick a tick where the reveal wave's peak band would normally sit
-  // somewhere in the middle (columns 0-6, where peakAllowed says no).
-  const frame = shineMultilineFrame(lines, 1, 3, 3, 1, peakAllowed);
-  assert.doesNotMatch(frame, /\x1b\[1;95m/, "no peak color anywhere the predicate forbids it, even mid-reveal");
-
-  // Once the wave reaches the allowed region (near full reveal), peak
-  // should actually show up there.
-  const laterFrame = shineMultilineFrame(lines, 3, 3, 3, 1, peakAllowed);
-  assert.match(laterFrame, /\x1b\[1;95m/, "peak color shows up once the wave enters the allowed region");
+test("shineMultilineFrame has exactly one final color — no separate bright/peak highlight anywhere, ever", () => {
+  const lines = ["AAAAAAAAAA", "BBBBBBBBBB"];
+  // Across every tick of the animation, a revealed character is always
+  // the SAME settled color — never the bright magenta peak from earlier
+  // designs, which read as an inconsistent second color.
+  for (let t = 0; t <= shineMultilineFrameCount(lines) + 5; t++) {
+    assert.doesNotMatch(shineMultilineFrame(lines, t), /\x1b\[1;95m/, `tick ${t} must never use the peak color`);
+  }
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {
