@@ -242,6 +242,18 @@ export interface AgentLoopOptions {
   now?: () => number;
   /** Called for each incremental token/chunk of assistant text as it streams in. */
   onAssistantDelta?: (text: string) => void;
+  /** Streamed chain-of-thought (`reasoning_content`), separate from
+   *  onAssistantDelta's `content` — only fires when enableThinking is true.
+   *  Display-only: this text is never appended to the assistant message
+   *  that gets pushed into `this.messages`/history (see the streamChat doc
+   *  comment in openaiClient.ts for why) — the model already conditions on
+   *  it within the SAME generation by construction; re-feeding it as input
+   *  on a LATER turn would only cost tokens for no benefit. */
+  onReasoningDelta?: (text: string) => void;
+  /** Fires whenever the queued-message list changes (see queueMessage), so
+   *  the UI's own display of it (the /queue command) stays in sync with
+   *  the authoritative copy this class now owns. */
+  onQueueChange?: (queue: string[]) => void;
   /** Called once an assistant message (streamed or not) is fully received —
    *  the UI uses this to stop appending to the current line. */
   onAssistantDone?: () => void;
@@ -294,6 +306,13 @@ export class AgentLoop {
 
   /** Model-declared plan via the `update_plan` tool (PROMPT.md §2.2 steps). */
   private plan: Checkpoint["steps"] = [];
+  /** Messages typed while a turn is running. Owned here (not just mirrored
+   *  from the UI) so the turn loop can apply them at the next opportunity
+   *  — between tool-call rounds — rather than only after the ENTIRE turn
+   *  (every queued tool call included) finishes. Requested directly: a
+   *  message queued mid-turn used to wait behind whatever the turn was
+   *  already doing, however long that took. */
+  private queuedMessages: string[] = [];
   /** Consecutive post-edit-check failures, per file path — drives the
    *  escalating reflect-and-retry message (Aider's edit → validate →
    *  reflect → retry loop). Reset the moment a check on that path passes,
@@ -417,6 +436,15 @@ export class AgentLoop {
       if (resumed) await this.runUntilIdle();
       this.checkForRealtimeImprovementAfterTurn();
     });
+  }
+
+  /** Queues a message typed while a turn is running (see queuedMessages'
+   *  doc comment) — applied at the next turnLoop iteration, not held until
+   *  the whole turn ends. `send()` remains how a message submitted while
+   *  IDLE starts a turn; this is only for the busy case. */
+  queueMessage(text: string): void {
+    this.queuedMessages.push(text);
+    this.opts.onQueueChange?.(this.queuedMessages.slice());
   }
 
   async send(userText: string): Promise<void> {
@@ -554,6 +582,19 @@ export class AgentLoop {
     // Recent assistant texts in this turn, for repeatedResponse() below.
     const recentAssistantTexts: string[] = [];
     turnLoop: while (true) {
+      // Apply anything queued since the last request went out — before
+      // the model's next turn, not after the whole (possibly multi-tool-
+      // call) turn finishes. Drains everything waiting, in order: a user
+      // steering a task usually means every queued message together, not
+      // one per tool-call round.
+      if (this.queuedMessages.length > 0) {
+        for (const text of this.queuedMessages) {
+          this.opts.onStatus?.(`[applying queued message] ${text}`);
+          this.messages.push({ role: "user", content: text });
+        }
+        this.queuedMessages = [];
+        this.opts.onQueueChange?.([]);
+      }
       const verdict = this.progress.check(this.now());
       if (verdict === "nudge") {
         const guard = this.opts.progressGuard ?? DEFAULT_PROGRESS_GUARD;
@@ -617,6 +658,8 @@ export class AgentLoop {
             // throws instead of just skipping the chunk when it's missing.
             const delta = chunk.choices?.[0]?.delta;
             if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
+            const reasoning = (delta as any)?.reasoning_content;
+            if (typeof reasoning === "string" && reasoning) this.opts.onReasoningDelta?.(reasoning);
           }
         );
       } catch (err: any) {

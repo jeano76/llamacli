@@ -35,6 +35,16 @@ You can also remotely control a browser the user already has running with
 browser_screenshot. These attach to an existing tab only — never assume a browser is running,
 and never try to launch one yourself.`;
 
+// Appended only when enableThinking is on — requested directly: reasoning
+// is shown in the TUI (see App.tsx's "reasoning" log-line kind) as plain
+// dim text with no language hint of its own, and the model's default
+// reasoning language doesn't necessarily match what the user is typing in.
+const THINKING_LANGUAGE_SYSTEM_PROMPT = `
+
+Write your chain-of-thought reasoning in Korean (한국어). Your final answers and any text
+inside tool calls (code, commands, file content) are unaffected by this — write those in
+whatever language is otherwise correct for them.`;
+
 /**
  * Switches to the terminal's alternate screen buffer (the same mechanism
  * vim/htop/less use) so the app always starts drawing at a stable (1,1)
@@ -118,7 +128,12 @@ async function main() {
   const browserCfg = config.browser ?? { debugPort: 9222, host: "127.0.0.1" };
   const browserEnabled = config.browser?.enabled ?? (await isBrowserAvailable(browserCfg));
   const systemPrompt = injectSkillIndexIntoSystemPrompt(
-    injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT + (browserEnabled ? BROWSER_SYSTEM_PROMPT : ""), rules),
+    injectRulesIntoSystemPrompt(
+      BASE_SYSTEM_PROMPT +
+        (browserEnabled ? BROWSER_SYSTEM_PROMPT : "") +
+        (config.enableThinking ? THINKING_LANGUAGE_SYSTEM_PROMPT : ""),
+      rules
+    ),
     skillIndex
   );
   configureBrowserTools(browserCfg, projectRoot, browserEnabled);
@@ -176,7 +191,12 @@ async function main() {
     verify: config.verify?.afterEdit,
     gitCheckpoint: config.checkpoint?.git ?? false,
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
-    onAssistantDone: () => (globalThis as any).__llamacli_ui?.finalizeAssistant(),
+    onAssistantDone: () => {
+      (globalThis as any).__llamacli_ui?.finalizeAssistant();
+      (globalThis as any).__llamacli_ui?.finalizeReasoning();
+    },
+    onReasoningDelta: (t) => (globalThis as any).__llamacli_ui?.pushReasoningDelta(t),
+    onQueueChange: (q) => (globalThis as any).__llamacli_ui?.setQueue(q),
     onToolCall: (name, args) => {
       let preview = "";
       try {
@@ -295,6 +315,7 @@ async function main() {
           ui?.setBusy(false);
         }
       }}
+      onQueueMessage={(text) => loop.queueMessage(text)}
       onSlashCommand={(key) => {
         const ui = (globalThis as any).__llamacli_ui;
         switch (key) {

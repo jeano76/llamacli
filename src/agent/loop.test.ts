@@ -2382,3 +2382,50 @@ test("harness: gitCheckpoint commits a successful edit when enabled, and does no
     const { stdout: logOn } = await execAsync("git log --oneline", { cwd: dir });
     assert.equal(logOn.trim().split("\n").length, 1);
   }));
+
+test("harness: a message queued mid-turn reaches the model at the NEXT request, not only after the whole turn finishes", () =>
+  withTempProject(async (dir) => {
+    // A 3-round tool-call turn. The queued message is added right after
+    // round 1's response arrives (simulating the user typing while the
+    // agent is mid-turn) — it must show up in round 2's request, not wait
+    // until the turn (round 3, which stops requesting tools) is done.
+    const call = (id: string) => ({ id, type: "function" as const, function: { name: "run_shell", arguments: JSON.stringify({ command: "echo x" }) } });
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call("c1")]), assistantMessage(null, [call("c2")]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    // Gate round 1's response so we can deterministically queue the
+    // message after round 1's REQUEST has gone out but before its
+    // response (and therefore round 2) is processed — scriptedBackend
+    // resolves instantly otherwise, racing a timer-based approach.
+    let releaseRound1: () => void;
+    const gate = new Promise<void>((resolve) => (releaseRound1 = resolve));
+    const realChat = backend.chat.bind(backend);
+    let callIndex = 0;
+    backend.chat = async (req, onDelta) => {
+      const isFirst = callIndex++ === 0;
+      if (isFirst) await gate;
+      return realChat(req, onDelta);
+    };
+    const queueSnapshots: string[][] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+      onQueueChange: (q) => queueSnapshots.push(q),
+    });
+    const sendPromise = loop.send("start the task");
+    loop.queueMessage("actually, also check the logs");
+    releaseRound1!();
+    await sendPromise;
+
+    assert.equal(turnRequests.length, 3, "expected all 3 rounds to run");
+    const round2Has = turnRequests[1].messages.some((m) => m.role === "user" && m.content === "actually, also check the logs");
+    const round3Has = turnRequests[2].messages.some((m) => m.role === "user" && m.content === "actually, also check the logs");
+    assert.ok(round2Has, "expected the queued message in round 2's request (the next one after it was queued)");
+    assert.ok(round3Has, "once in history it stays for every later request too");
+    assert.ok(queueSnapshots.some((q) => q.length === 1), "onQueueChange must report it while queued");
+    assert.ok(queueSnapshots.at(-1)?.length === 0, "and report it drained once applied");
+  }));

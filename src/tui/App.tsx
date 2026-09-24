@@ -13,6 +13,9 @@ export interface AppProps {
   model: string;
   onSubmit: (text: string) => void;
   onSlashCommand: (key: string) => void;
+  /** A message typed while the agent is busy — applied at the next
+   *  opportunity mid-turn (AgentLoop.queueMessage), not held here. */
+  onQueueMessage: (text: string) => void;
   /** Called when the user confirms Esc → Y ("force quit, saving progress to
    *  resume later"). Wired in index.tsx to: cancel the in-flight turn (if
    *  one is running) or save the current conversation (if idle) — either
@@ -65,7 +68,7 @@ export function appendHistory(history: string[], text: string): string[] {
 interface LogLine {
   id: number;
   text: string;
-  kind: "user" | "assistant" | "status" | "tool" | "diff";
+  kind: "user" | "assistant" | "status" | "tool" | "diff" | "reasoning";
 }
 
 let logIdCounter = 0;
@@ -90,6 +93,11 @@ function wrapLogLine(line: LogLine, width: number): string[] {
   }
   if (line.kind === "user") return wrapToWidth(`❯ ${line.text}`, width);
   if (line.kind === "tool") return wrapToWidth(`⚡ ${line.text}`, width);
+  // Chain-of-thought, shown only when enableThinking is on (loop.ts's
+  // onReasoningDelta). Kept visually distinct (dim, prefixed) from the
+  // real answer so it reads as "thinking out loud", not the final reply —
+  // this is display-only and never re-enters the conversation.
+  if (line.kind === "reasoning") return wrapToWidth(`  ${line.text}`, width);
   return wrapToWidth(line.text, width);
 }
 
@@ -111,6 +119,13 @@ function renderRow(row: RenderedRow) {
   if (row.kind === "status") {
     return (
       <Text key={row.key} color="gray">
+        {row.text}
+      </Text>
+    );
+  }
+  if (row.kind === "reasoning") {
+    return (
+      <Text key={row.key} color="gray" dimColor italic>
         {row.text}
       </Text>
     );
@@ -186,6 +201,7 @@ export function App({
   model,
   onSubmit,
   onSlashCommand,
+  onQueueMessage,
   onForceQuit,
   onQuitWithoutSaving,
   initialHistory,
@@ -255,12 +271,16 @@ export function App({
   const [scrollOffset, setScrollOffset] = useState(0);
   // Messages typed while the agent is busy wait here instead of being sent
   // immediately; /queue inspects this list (PROMPT.md §6 message queue input).
+  // Authoritative copy now lives in AgentLoop (queueMessage/onQueueChange —
+  // see AppProps.onQueueMessage), so it's applied at the next turnLoop
+  // iteration instead of only after the whole turn finishes; this is a
+  // display-only mirror kept in sync via the __llamacli_ui.setQueue below.
   const [queue, setQueue] = useState<string[]>([]);
-  const wasBusyRef = useRef(false);
   // Tracks which log line the currently-streaming assistant message is
   // appending to, so successive deltas mutate one line instead of spawning
   // a new one per chunk.
   const streamingIdRef = useRef<number | null>(null);
+  const reasoningStreamingIdRef = useRef<number | null>(null);
   // How far scrollOffset can go before there's nothing further back to see —
   // updated every render (see below) rather than recomputed inside the key
   // handler, which would mean redoing the markdown/wrap rendering work
@@ -300,16 +320,21 @@ export function App({
     streamingIdRef.current = null;
   }
 
-  // Once the current turn finishes, automatically send the next queued message.
-  useEffect(() => {
-    if (wasBusyRef.current && !busy && queue.length > 0) {
-      const [next, ...rest] = queue;
-      setQueue(rest);
-      pushLine(`[sending from queue] ${next}`, "status");
-      onSubmit(next);
-    }
-    wasBusyRef.current = busy;
-  }, [busy]);
+  function pushReasoningDelta(text: string) {
+    setLog((prev) => {
+      if (reasoningStreamingIdRef.current !== null) {
+        return prev.map((line) => (line.id === reasoningStreamingIdRef.current ? { ...line, text: line.text + text } : line));
+      }
+      const id = logIdCounter++;
+      reasoningStreamingIdRef.current = id;
+      return [...prev, { id, text, kind: "reasoning" as const }].slice(-MAX_LOG_ENTRIES);
+    });
+  }
+
+  function finalizeReasoning() {
+    reasoningStreamingIdRef.current = null;
+  }
+
 
   // Echoes the startup resume question into the scrolling log as well as
   // showing it in the input box (see visibleInput below) — reported
@@ -500,7 +525,7 @@ export function App({
     if (key.return) {
       if (input.trim().length === 0) return;
       if (busy) {
-        setQueue((q) => [...q, input]);
+        onQueueMessage(input);
         pushLine(`[queued] ${input}`, "status");
       } else {
         pushLine(input, "user");
@@ -540,6 +565,9 @@ export function App({
   (globalThis as any).__llamacli_ui = {
     pushAssistantDelta,
     finalizeAssistant,
+    pushReasoningDelta,
+    finalizeReasoning,
+    setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
     pushTool: (t: string) => pushLine(t, "tool"),
     pushDiff: (t: string) => pushLine(t, "diff"),
