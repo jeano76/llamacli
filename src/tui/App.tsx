@@ -7,6 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
+import { bannerFrame, bannerFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -50,6 +51,16 @@ export interface AppProps {
    *  AgentLoop.resumeIfCheckpointExists(), same as before this prompt
    *  existed), `false` discards the checkpoint and starts fresh. */
   onResumeDecision: (resume: boolean) => void;
+  /** "Harness CLI vYYYYMMDD" + the repo URL, animated at startup (see
+   *  banner.ts's bannerFrame) — computed in index.tsx (needs dist/index.js's
+   *  own mtime for the version) and passed in rather than read here, so App
+   *  stays pure UI, same as everything else index.tsx already loads before
+   *  render(). Previously printed straight to the raw terminal before
+   *  enterAltScreen() switched buffers, which erased it a moment later —
+   *  reported directly ("최초 구동 로그가 나오지 않았어 화면 상단에
+   *  출력되어 있어야 하는데 없었어"). Now it's a real log line inside the
+   *  alt-screen app itself, so it survives like anything else in scrollback. */
+  startupBanner: { text: string; repoUrl: string };
 }
 
 /** Every prompt actually submitted counts, whether it was sent immediately
@@ -414,11 +425,33 @@ export function App({
   onHistoryChange,
   pendingResumeGoal,
   onResumeDecision,
+  startupBanner,
 }: AppProps) {
   const { stdout } = useStdout();
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
+  // The startup banner, animated the same reveal-wave way as reasoning
+  // text — see AppProps.startupBanner's doc comment for why this lives
+  // inside the log (a real, persistent line) rather than a raw stdout
+  // write before the alt-screen switch, which was invisible in practice.
+  useEffect(() => {
+    const bannerLineId = logIdCounter++;
+    setLog((prev) => [
+      { id: bannerLineId, text: bannerFrame(startupBanner.text, 0), kind: "status" as const },
+      { id: logIdCounter++, text: `\x1b[2m${startupBanner.repoUrl}\x1b[0m`, kind: "status" as const },
+      ...prev,
+    ]);
+    const frames = bannerFrameCount(startupBanner.text);
+    let tick = 0;
+    const id = setInterval(() => {
+      tick++;
+      setLog((prev) => prev.map((line) => (line.id === bannerLineId ? { ...line, text: bannerFrame(startupBanner.text, tick) } : line)));
+      if (tick >= frames) clearInterval(id);
+    }, 45);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Esc opens this Y/N confirmation instead of quitting immediately — a
   // single stray keystroke shouldn't be able to kill the app (mid-turn or
   // not). While this is true, useInput intercepts every key as part of the
