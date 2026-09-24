@@ -141,10 +141,13 @@ export function summarizeErrorForDisplay(message: string, maxLen = 300): string 
  *  call ARGUMENTS never were. */
 const FILE_CONTENT_TOOLS = new Set(["write_file", "append_file"]);
 
-function elidedContentMarker(chars: number): string {
-  return `[${chars} characters written to disk — read the file if you need them again]`;
+function elidedContentNote(chars: number): string {
+  return `${chars} characters written to disk; call read_file on the path to see them`;
 }
-const ELIDED_CONTENT_RE = /^\[\d+ characters written to disk — read the file if you need them again\]$/;
+// Any short bracketed "N characters ... written to disk ..." line, not just
+// the exact wording once used: live, the model reworded it ("…if you need
+// it again", with a made-up count) and the exact-match guard let it through.
+const ELIDED_CONTENT_RE = /^\[[^\]\n]*\bcharacters?\b[^\]\n]*\bwritten to disk\b[^\]\n]*\]$/i;
 
 /** True when a write_file/append_file call's content is the placeholder that
  *  elideWrittenFileContent() leaves in history — the model copying its own
@@ -162,18 +165,22 @@ export function isElidedContentWrite(toolName: string, argumentsJson: string): b
   }
 }
 
-/** Replaces a completed file-write's `content` argument with a short
- *  marker, keeping everything else (tool name, path) intact so the
- *  conversation still reads as "I wrote this file". Safe because the
- *  file itself is the source of truth from here on — the model can
- *  read_file it if it ever needs the content back, and the tool result
- *  ("wrote <path>") already confirms what happened. */
+/** Drops a completed file-write's `content` argument from history, leaving
+ *  the path and a `content_note` so the conversation still reads as "I
+ *  wrote this file". Safe because the file itself is the source of truth
+ *  from here on — the model can read_file it if it needs the content back.
+ *
+ *  The note is deliberately NOT put back under `content`: a placeholder
+ *  there is a ready-made argument, and live sessions copied their own
+ *  earlier calls and wrote it into files three times (once reworded, past
+ *  an exact-match guard). With no `content` at all, a copied call fails
+ *  with a clear error instead of writing anything. */
 function elideWrittenFileContent(argumentsJson: string): string {
   try {
     const args = JSON.parse(argumentsJson);
     if (typeof args?.content !== "string" || args.content.length === 0) return argumentsJson;
-    const chars = args.content.length;
-    return JSON.stringify({ ...args, content: elidedContentMarker(chars) });
+    const { content, ...rest } = args;
+    return JSON.stringify({ ...rest, content_note: elidedContentNote(content.length) });
   } catch {
     return argumentsJson; // unparseable (shouldn't happen post-execution) — leave as is
   }

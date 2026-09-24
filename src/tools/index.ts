@@ -308,6 +308,19 @@ export async function backupBeforeOverwrite(path: string, previous: string, next
   }
 }
 
+/** write_file/append_file must carry the content to write. A call without
+ *  it is usually the model copying one of its own earlier calls, whose
+ *  content loop.ts dropped from history after it ran (see
+ *  elideWrittenFileContent) — refuse clearly instead of writing nothing. */
+function requireContent(name: string, args: any): void {
+  if (typeof args?.content !== "string") {
+    throw new Error(
+      `${name} needs a string \`content\` argument with the text to write. ` +
+        "An earlier write's content is not kept in this conversation — call read_file on the path to see the file."
+    );
+  }
+}
+
 export async function executeTool(name: string, argsJson: string, projectRoot: string = process.cwd()): Promise<ToolResult> {
   const args = JSON.parse(argsJson || "{}");
   switch (name) {
@@ -352,6 +365,7 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
       return { content: await loadSkillBody(entry) };
     }
     case "write_file": {
+      requireContent(name, args);
       const before = await readFile(args.path, "utf8").catch(() => "");
       // Found auditing for the same class of gap as run_shell/CDP's
       // missing timeouts: writing a brand-new file in a directory that
@@ -367,6 +381,7 @@ export async function executeTool(name: string, argsJson: string, projectRoot: s
       };
     }
     case "append_file": {
+      requireContent(name, args);
       const before = await readFile(args.path, "utf8").catch(() => "");
       // Same directory-creation fix as write_file — a first append_file
       // call (e.g. after a truncated write_file never got to run) must

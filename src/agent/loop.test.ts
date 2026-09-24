@@ -2188,3 +2188,37 @@ test("the same assistant response repeated within a turn stops the turn, even wh
     assert.equal(turnRequests.length, 3, "should stop right after the third identical response");
     assert.ok(statuses.some((s) => s.startsWith("[stopped] the model gave the same response 3 times")), statuses.join(" | "));
   }));
+
+test("after a write, the history keeps no copyable content; a copied call fails instead of writing, and a reworded placeholder is refused", () =>
+  withTempProject(async (dir) => {
+    const path = join(dir, "ws_verify.mjs");
+    const real = "console.log('real content');\n".repeat(20);
+    const write = { id: "w1", type: "function" as const, function: { name: "write_file", arguments: JSON.stringify({ path, content: real }) } };
+    // The model copies its own earlier call as it now reads in history (no
+    // content field), then tries a reworded placeholder — both seen live.
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [write]), assistantMessage("ok"), assistantMessage("ok"), assistantMessage("ok")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+    });
+    await loop.send("write it");
+    const writtenCall = turnRequests[1].messages.find((m) => m.role === "assistant" && m.tool_calls)!.tool_calls![0];
+    const historyArgs = JSON.parse(writtenCall.function.arguments);
+    assert.equal(historyArgs.content, undefined, "content must not stay in history");
+    assert.match(historyArgs.content_note, /characters written to disk/);
+
+    // A verbatim copy of that history call:
+    const copied = await (await import("../tools/index.js")).executeTool("write_file", writtenCall.function.arguments, dir).catch((e: Error) => e);
+    assert.ok(copied instanceof Error && /needs a string `content`/.test(copied.message));
+    // A reworded placeholder:
+    const { isElidedContentWrite } = await import("./loop.js");
+    assert.equal(isElidedContentWrite("write_file", JSON.stringify({ path, content: "[3200 characters written to disk — read the file if you need it again]" })), true);
+    assert.equal(isElidedContentWrite("write_file", JSON.stringify({ path, content: "real code mentioning characters written to disk in a comment\nmore" })), false);
+    assert.equal(await readFile(path, "utf8"), real);
+  }));
