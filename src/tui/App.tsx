@@ -25,6 +25,9 @@ export interface AppProps {
    *  resume-confirmation prompt (pendingResumeGoal below) picks it back up
    *  with no extra wiring. */
   onForceQuit: () => void;
+  /** Esc or Ctrl-C while the quit-time save is still running: exit right
+   *  away without waiting for it (see index.tsx exitAfterSaving). */
+  onQuitWithoutSaving: () => void;
   /** Loaded once at startup (index.tsx) from .llamacli/state/prompt-history.json
    *  — kept as the initial value here rather than App loading it itself, so
    *  App stays pure UI/presentation and all filesystem I/O stays in
@@ -67,6 +70,55 @@ interface LogLine {
 
 let logIdCounter = 0;
 
+interface RenderedRow {
+  key: string;
+  text: string;
+  kind: LogLine["kind"];
+}
+
+/** Wraps one log entry into terminal rows (unpadded). */
+function wrapLogLine(line: LogLine, width: number): string[] {
+  if (line.kind === "diff") {
+    // Diff text carries its own ANSI color codes (formatDiff()): wrap
+    // ANSI-safely so an escape sequence is never torn apart mid-code.
+    return wrapAnsiSafe(line.text, width);
+  }
+  if (line.kind === "assistant") {
+    // Markdown with syntax-highlighted code; tables are clipped rather than
+    // wrapped, since wrapping a table row destroys its borders.
+    return wrapPreservingTables(renderMarkdown(line.text, width), width);
+  }
+  if (line.kind === "user") return wrapToWidth(`❯ ${line.text}`, width);
+  if (line.kind === "tool") return wrapToWidth(`⚡ ${line.text}`, width);
+  return wrapToWidth(line.text, width);
+}
+
+function renderRow(row: RenderedRow) {
+  if (row.kind === "user") {
+    return (
+      <Text key={row.key} color="cyan" bold>
+        {row.text}
+      </Text>
+    );
+  }
+  if (row.kind === "tool") {
+    return (
+      <Text key={row.key} color="magenta">
+        {row.text}
+      </Text>
+    );
+  }
+  if (row.kind === "status") {
+    return (
+      <Text key={row.key} color="gray">
+        {row.text}
+      </Text>
+    );
+  }
+  // diff / assistant carry their own ANSI styling
+  return <Text key={row.key}>{row.text}</Text>;
+}
+
 /** `input` is the raw text box content, which starts with "/" while the
  *  menu is open — everything after that is the filter query. Matches
  *  against the command's key (e.g. "improve-apply"), not its "/"-prefixed
@@ -78,12 +130,48 @@ export function filterMenuItems(input: string): SlashMenuItem[] {
   return SLASH_MENU_ITEMS.filter((item) => item.key.toLowerCase().includes(query));
 }
 
+/** Parses SGR mouse reports ("[<64;10;5M" — Ink strips the leading ESC and
+ *  can hand over several reports in one string) into a net scroll in rows:
+ *  positive = wheel up (scroll back), negative = wheel down. Returns null
+ *  when `input` isn't a mouse report at all, so it can fall through to
+ *  normal key handling. Clicks and releases count as 0. */
+export const WHEEL_SCROLL_ROWS = 3;
+export function parseMouseWheel(input: string): number | null {
+  const reports = [...input.matchAll(/\[<(\d+);\d+;\d+([Mm])/g)];
+  if (reports.length === 0) return null;
+  let rows = 0;
+  for (const [, code, kind] of reports) {
+    const button = Number(code);
+    if (kind !== "M" || (button & 64) === 0) continue; // not a wheel event
+    rows += (button & 1) === 0 ? WHEEL_SCROLL_ROWS : -WHEEL_SCROLL_ROWS;
+  }
+  return rows;
+}
+
+/** Log entries kept for scrollback. Rendering only ever builds React
+ *  elements for the visible window (see visibleRows below), so this bounds
+ *  memory, not render cost. */
+export const MAX_LOG_ENTRIES = 5000;
+
+/** Whether the terminal cursor should be hidden: it belongs only where the
+ *  user can type. Reported directly: while the agent worked with an empty
+ *  input box, the cursor sat blinking right next to the spinner. */
+export function shouldHideCursor(state: { quitting: boolean; busy: boolean; input: string }): boolean {
+  return state.quitting || (state.busy && state.input.length === 0);
+}
+
+/** Input-box text while progress is being saved before exit. */
+export function quittingStatusText(elapsedMs: number): string {
+  return `진행 상황 저장 중… ${Math.floor(elapsedMs / 1000)}초 · Esc: 저장하지 않고 바로 종료`;
+}
+
 export function App({
   cwd,
   model,
   onSubmit,
   onSlashCommand,
   onForceQuit,
+  onQuitWithoutSaving,
   initialHistory,
   onHistoryChange,
   pendingResumeGoal,
@@ -98,6 +186,18 @@ export function App({
   // not). While this is true, useInput intercepts every key as part of the
   // confirmation (see below) rather than normal typing/menu/etc.
   const [quitConfirmPending, setQuitConfirmPending] = useState(false);
+  // Set (to the start time) once a quit has been requested and progress is
+  // being saved. Saving can take a minute (it's a full compaction when
+  // idle), so this drives a dedicated animation with an elapsed-time count
+  // instead of leaving the app looking frozen — and while it's set, Esc or
+  // Ctrl-C quits immediately without waiting for the save.
+  const [quittingSince, setQuittingSince] = useState<number | null>(null);
+  const [, setQuitTick] = useState(0);
+  useEffect(() => {
+    if (quittingSince === null) return;
+    const id = setInterval(() => setQuitTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [quittingSince]);
   // Shown once at startup (initialized from the prop, which index.tsx only
   // sets when a checkpoint was actually found on disk) — intercepts input
   // the same way quitConfirmPending does, and is resolved before either the
@@ -154,9 +254,10 @@ export function App({
   // sizing a Page Up/Down jump) before logHeight is computed later in this
   // render, so it's carried over from the previous one instead.
   const logHeightRef = useRef(3);
+  const rowCacheRef = useRef(new Map<number, { text: string; width: number; rows: string[] }>());
 
   function pushLine(text: string, kind: LogLine["kind"]) {
-    setLog((prev) => [...prev, { id: logIdCounter++, text, kind }]);
+    setLog((prev) => [...prev, { id: logIdCounter++, text, kind }].slice(-MAX_LOG_ENTRIES));
   }
 
   function pushAssistantDelta(text: string) {
@@ -175,7 +276,7 @@ export function App({
       }
       const id = logIdCounter++;
       streamingIdRef.current = id;
-      return [...prev, { id, text: stripToolCallTemplateLeak(text), kind: "assistant" }];
+      return [...prev, { id, text: stripToolCallTemplateLeak(text), kind: "assistant" as const }].slice(-MAX_LOG_ENTRIES);
     });
   }
 
@@ -220,6 +321,26 @@ export function App({
   }, []);
 
   useInput((char, key) => {
+    // Mouse wheel (reporting enabled in index.tsx). Handled before
+    // anything else so a report can never be typed into the input box or
+    // answer a Y/N prompt.
+    const wheel = parseMouseWheel(char);
+    if (wheel !== null) {
+      if (wheel !== 0 && !menuOpen && quittingSince === null) {
+        setScrollOffset((s) => Math.max(0, Math.min(maxScrollRef.current, s + wheel)));
+      }
+      return;
+    }
+
+    // Saving before exit: only "quit now without saving" does anything.
+    if (quittingSince !== null) {
+      if (key.escape || (key.ctrl && char.toLowerCase() === "c")) {
+        pushLine("[quitting without waiting for the save]", "status");
+        onQuitWithoutSaving();
+      }
+      return;
+    }
+
     // Ink's default Ctrl-C-exits-the-app behavior is disabled in index.tsx
     // (exitOnCtrlC: false) specifically so this reaches here instead —
     // reported directly: some terminals/users treat Ctrl-C as copy, not an
@@ -408,6 +529,7 @@ export function App({
     pushDiff: (t: string) => pushLine(t, "diff"),
     setBusy,
     isBusy: () => busy,
+    beginQuitting: () => setQuittingSince((t) => t ?? Date.now()),
     setContextUsedRatio,
     setPlanProgress: (done: number, total: number) => setPlanProgress(total > 0 ? { done, total } : null),
     setCompactionStatus: (state: "running" | "complete" | "failed", timestamp: string) => setCompactionStatus({ state, timestamp }),
@@ -430,13 +552,17 @@ export function App({
   // reasonable width rather than squeezing the input box to near-nothing
   // to make room for it on a narrow terminal.
   const ESC_HINT = " (Esc to quit)";
-  const showEscHint = !quitConfirmPending && !resumeConfirmPending && columns >= 40;
+  const quitting = quittingSince !== null;
+  const showEscHint = !quitting && !quitConfirmPending && !resumeConfirmPending && columns >= 40;
   const QUIT_CONFIRM_TEXT = "강제 종료하시겠습니까? 진행 중인 작업은 저장되어 다음 실행 시 이어집니다. (Y/N)";
   const RESUME_CONFIRM_TEXT = pendingResumeGoal
     ? `이전 작업을 이어서 하시겠습니까? "${pendingResumeGoal}" (Y/N)`
     : "";
   const escHintWidth = showEscHint ? stringWidth(ESC_HINT) : 0;
-  const visibleInput = resumeConfirmPending
+  const quittingText = quitting ? quittingStatusText(Date.now() - quittingSince!) : "";
+  const visibleInput = quitting
+    ? tailToWidth(quittingText, maxInputWidth)
+    : resumeConfirmPending
     ? tailToWidth(RESUME_CONFIRM_TEXT, maxInputWidth)
     : quitConfirmPending
       ? tailToWidth(QUIT_CONFIRM_TEXT, maxInputWidth)
@@ -480,89 +606,39 @@ export function App({
     const inputRow = logHeight + 1 /* input box top border */ + 1; // 1-indexed content row
     const promptColumn =
       1 /* input box left border */ + 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
-    process.stdout.write(`\x1b[${inputRow};${promptColumn}H\x1b[?25h`);
+    const hideCursor = shouldHideCursor({ quitting, busy, input });
+    process.stdout.write(`\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`);
   });
 
-  // Slicing `log` itself by logHeight is wrong: a single multi-line diff
-  // entry expands into several rendered rows, so a naive slice can hand the
-  // fixed-height Box more rows than it can show — and since Box clips from
-  // the bottom, that clips off the MOST recent lines (e.g. a status message
-  // right after a diff) instead of showing them. Flatten to visual rows
-  // first, then slice by rendered row count so the tail is always what's
-  // visible. Pre-slice raw entries generously first so this stays cheap on
-  // long sessions instead of flattening the whole history every render.
-  const recentEntries = log.slice(-Math.max(logHeight * 5, 50));
+  // Every log entry is wrapped into terminal rows once and cached by id
+  // (recomputed only when its text or the width changes — e.g. the
+  // streaming assistant line), and React elements are built only for the
+  // visible window. Previously only the last max(logHeight*5, 50) entries
+  // were flattened at all, to keep each render cheap — which also capped
+  // how far PageUp could go: reported directly, older output of a long
+  // session couldn't be scrolled back to.
+  //
   // Ink/Yoga gives an empty-string <Text> ZERO rendered height — not one
-  // row like every other line — instead of a blank line taking up its own
-  // row. Confirmed directly (a minimal Ink render collapsed blank entries
-  // out of the layout entirely). That silently made the box's actual
-  // rendered height fall short of `logHeight` whenever a wrapped entry
-  // produced a blank line, and since the box is `justifyContent="flex-end"`,
-  // the shortfall showed up as a gap at the TOP instead of the bottom —
-  // reported directly as a blank area appearing even with a full screen of
-  // text. This got much more visible once markdown rendering (below) started
-  // inserting blank-line separators between blocks routinely, but it was
-  // always a latent risk for any multi-line diff/status content too. A
-  // single space renders as a real one-row-tall blank line instead.
+  // row like every other line — which made the flex-end log box fall short
+  // of `logHeight` and show a gap at the top. A single space renders as a
+  // real one-row blank line instead.
   const asRow = (s: string) => s || " ";
-  const visualRows = recentEntries.flatMap((line) => {
-    const width = Math.max(10, columns);
-    if (line.kind === "diff") {
-      // Diff text carries its own embedded ANSI color codes (added/removed
-      // lines) from formatDiff() — render it raw instead of through Ink's
-      // `color` prop, which would clash with the codes already inside it.
-      // Wrap with wrapAnsiSafe (not wrapToWidth): plain char-by-char
-      // wrapping tears an escape sequence like `\x1b[32m` into individual
-      // characters, corrupting it and miscounting its pieces as visible
-      // glyphs — this was previously just left unwrapped entirely to dodge
-      // that, which meant a long diff line could itself overflow the fixed
-      // layout height (the same class of bug fixed everywhere else).
-      return wrapAnsiSafe(line.text, width).map((wrapped, i) => (
-        <Text key={`${line.id}-${i}`}>{asRow(wrapped)}</Text>
-      ));
+  const width = Math.max(10, columns);
+  const rowCache = rowCacheRef.current;
+  const liveIds = new Set<number>();
+  const allRows: RenderedRow[] = [];
+  for (const line of log) {
+    liveIds.add(line.id);
+    let cached = rowCache.get(line.id);
+    if (!cached || cached.text !== line.text || cached.width !== width) {
+      cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+      rowCache.set(line.id, cached);
     }
-    if (line.kind === "assistant") {
-      // Reported directly: assistant text had no color/formatting at all,
-      // unlike Claude Code's own terminal output — fenced code blocks,
-      // bold, headings, lists all rendered as flat white text. Render
-      // through marked-terminal for real markdown + syntax-highlighted
-      // code, then wrap ANSI-safely for the same reason as the diff case
-      // above (renderMarkdown's output is full of color codes).
-      //
-      // `width` is passed through to renderMarkdown itself now (used for
-      // prose reflow — marked-terminal's own `width` option doesn't
-      // actually apply to tables at all, see wrapPreservingTables below),
-      // and the result goes through wrapPreservingTables rather than
-      // plain wrapAnsiSafe — reported directly, with a screenshot: a
-      // markdown table rendered with mangled, disjointed borders. See
-      // wrapPreservingTables's own comment for the root cause; the short
-      // version is that wrapping ANY table row, even ANSI-safely, still
-      // destroys its visual structure, so a table row is clipped instead.
-      return wrapPreservingTables(renderMarkdown(line.text, width), width).map((wrapped, i) => (
-        <Text key={`${line.id}-${i}`}>{asRow(wrapped)}</Text>
-      ));
-    }
-    if (line.kind === "user") {
-      return wrapToWidth(`❯ ${line.text}`, width).map((wrapped, i) => (
-        <Text key={`${line.id}-${i}`} color="cyan" bold>
-          {asRow(wrapped)}
-        </Text>
-      ));
-    }
-    if (line.kind === "tool") {
-      return wrapToWidth(`⚡ ${line.text}`, width).map((wrapped, i) => (
-        <Text key={`${line.id}-${i}`} color="magenta">
-          {asRow(wrapped)}
-        </Text>
-      ));
-    }
-    // status messages
-    return wrapToWidth(line.text, width).map((wrapped, i) => (
-      <Text key={`${line.id}-${i}`} color="gray">
-        {asRow(wrapped)}
-      </Text>
-    ));
-  });
+    cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind }));
+  }
+  if (rowCache.size > liveIds.size) {
+    for (const id of rowCache.keys()) if (!liveIds.has(id)) rowCache.delete(id);
+  }
 
   // Content rows available to the log itself (as opposed to the menu, or
   // the one-row scroll indicator below) — reserving a row for the
@@ -571,15 +647,15 @@ export function App({
   // scroll position, avoiding a circular "how much can I scroll depends on
   // whether I'm already scrolled" dependency.
   const scrollableContentRows = menuOpen ? Math.max(0, logHeight - menuBoxHeight) : Math.max(0, logHeight - 1);
-  const maxScroll = Math.max(0, visualRows.length - scrollableContentRows);
+  const maxScroll = Math.max(0, allRows.length - scrollableContentRows);
   maxScrollRef.current = maxScroll;
   const clampedScroll = menuOpen ? 0 : Math.min(scrollOffset, maxScroll);
   const showScrollIndicator = !menuOpen && clampedScroll > 0;
   const contentRows = menuOpen ? scrollableContentRows : logHeight - (showScrollIndicator ? 1 : 0);
-  const sliceEnd = visualRows.length - clampedScroll;
+  const sliceEnd = allRows.length - clampedScroll;
   const sliceStart = Math.max(0, sliceEnd - contentRows);
 
-  const inputBorderColor = quitConfirmPending || resumeConfirmPending
+  const inputBorderColor = quitting || quitConfirmPending || resumeConfirmPending
     ? "yellow"
     : busy
       ? "magenta"
@@ -609,7 +685,7 @@ export function App({
             )}
           </Text>
         )}
-        {visualRows.slice(sliceStart, sliceEnd)}
+        {allRows.slice(sliceStart, sliceEnd).map(renderRow)}
         {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
       </Box>
 
@@ -622,8 +698,8 @@ export function App({
         height={3}
         overflow="hidden"
       >
-        <Spinner active={busy} />
-        <Text color={quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {visibleInput}</Text>
+        <Spinner active={busy || quitting} />
+        <Text color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {visibleInput}</Text>
         {showEscHint && <Text dimColor>{ESC_HINT}</Text>}
       </Box>
 

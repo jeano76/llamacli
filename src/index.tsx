@@ -46,11 +46,16 @@ and never try to launch one yourself.`;
  * The original screen is restored on exit so nothing is left behind.
  */
 function enterAltScreen(): void {
-  process.stdout.write("\x1b[?1049h");
+  // Also turn on mouse reporting (button events, SGR encoding) so the
+  // wheel scrolls the log — the alt screen has no native scrollback, and
+  // PageUp/PageDown alone was reported as not enough. Side effect: the
+  // terminal's own click-drag text selection needs Shift held while this
+  // is on (standard for mouse-aware terminal apps).
+  process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h");
 }
 
 function exitAltScreen(): void {
-  process.stdout.write("\x1b[?25h\x1b[?1049l");
+  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
 }
 
 async function main() {
@@ -164,6 +169,40 @@ async function main() {
   // the separate explicit /improve-apply, never happens on quit itself.
   let quitConfirmed = false;
 
+  // Every quit path ends here: show the save-in-progress animation (App's
+  // quitting state), save, then ALWAYS exit — on success, on failure, or
+  // after QUIT_SAVE_TIMEOUT_MS at the latest. Reported live: saving could
+  // take minutes with nothing on screen but one status line (/quit waited
+  // in the task queue behind the whole running turn, then ran a full
+  // compaction), and there was no way to skip it, so quitting looked like
+  // a hang. A running turn is now cancelled (fast checkpoint write) rather
+  // than waited for, and Esc/Ctrl-C during the save quits without saving.
+  const QUIT_SAVE_TIMEOUT_MS = 180_000;
+  const exitNow = () => {
+    unmount();
+    // unmount() alone doesn't end the process: a lingering handle (the
+    // keep-alive connection pool, a timer) keeps Node running — reported
+    // live as quit appearing to work while the process stayed alive.
+    process.exit(0);
+  };
+  const exitAfterSaving = () => {
+    const ui = (globalThis as any).__llamacli_ui;
+    const save = ui?.isBusy?.() ? loop.cancelCurrentTurn() : loop.saveStateOnQuit();
+    ui?.beginQuitting?.();
+    const timeout = new Promise<void>((resolve) =>
+      setTimeout(() => {
+        ui?.pushStatus("[saving is taking too long — quitting without waiting for it]");
+        resolve();
+      }, QUIT_SAVE_TIMEOUT_MS)
+    );
+    Promise.race([
+      save.catch((err: any) =>
+        ui?.pushStatus(`[couldn't save progress: ${summarizeErrorForDisplay(err.message)}] quitting anyway.`)
+      ),
+      timeout,
+    ]).finally(exitNow);
+  };
+
   const { unmount } = render(
     // exitOnCtrlC: false — Ink's default behavior kills the whole process
     // the instant Ctrl-C is pressed, which conflicts with terminals/users
@@ -203,33 +242,11 @@ async function main() {
           .finally(() => ui?.setBusy(false));
       }}
       onForceQuit={() => {
-        const ui = (globalThis as any).__llamacli_ui;
-        // Mid-turn: cancel it (aborts the backend request, writes a
-        // resumable checkpoint) — matches the busy-specific path this used
-        // to be. Idle: save whatever conversation exists so far, the same
-        // mechanism /quit's own save-before-exit already uses. Either way,
-        // this is the "force" exit: no self-improvement-proposal gate (see
-        // AppProps.onForceQuit's doc comment) — just save and go.
-        const save = ui?.isBusy?.() ? loop.cancelCurrentTurn() : loop.saveStateOnQuit();
-        save
-          .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${summarizeErrorForDisplay(err.message)}] quitting anyway.`))
-          .finally(() => {
-            ui?.setBusy(false);
-            unmount();
-            // Reported live: force-quit appeared to work (the status line
-            // logged, Y/N dialog closed) but the process itself kept
-            // running and kept accepting/processing input afterward.
-            // unmount() only tears down the Ink render tree and releases
-            // stdin's raw-mode listener — it does NOT call process.exit(),
-            // and a lingering open handle (node-fetch's keep-alive
-            // connection pool, an in-flight timer) is enough to keep
-            // Node's event loop alive indefinitely on its own. The
-            // SIGINT/SIGTERM handlers above already call process.exit(0)
-            // explicitly for exactly this reason — this path needs the
-            // same explicit call, not just unmount() on its own.
-            process.exit(0);
-          });
+        // The "force" exit: no self-improvement-proposal gate (see
+        // AppProps.onForceQuit) — just save and go.
+        exitAfterSaving();
       }}
+      onQuitWithoutSaving={exitNow}
       onSubmit={async (text) => {
         const ui = (globalThis as any).__llamacli_ui;
         ui?.setBusy(true);
@@ -258,23 +275,9 @@ async function main() {
               // runs, success or not) — matches the rest of the app's
               // "an internal failure reports itself, never hangs the
               // whole thing" approach.
-              ui?.pushStatus("[saving progress before quitting...]");
-              loop
-                .saveStateOnQuit()
-                .catch((err: any) => ui?.pushStatus(`[couldn't save progress: ${summarizeErrorForDisplay(err.message)}] quitting anyway.`))
-                .finally(() => {
-                  unmount();
-                  // Reported live (via the sibling onForceQuit path, same
-                  // bug applies here): unmount() alone tears down the Ink
-                  // render tree but does NOT terminate the Node process —
-                  // a lingering open handle (node-fetch's keep-alive pool,
-                  // an in-flight timer) is enough to keep it running
-                  // indefinitely, silently accepting/processing further
-                  // input even though /quit appeared to have worked. The
-                  // SIGINT/SIGTERM handlers above already call
-                  // process.exit(0) explicitly for exactly this reason.
-                  process.exit(0);
-                });
+              // Save current progress first so the next launch resumes
+              // where this one left off (see exitAfterSaving above).
+              exitAfterSaving();
               break;
             }
             quitConfirmed = true;
