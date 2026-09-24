@@ -12,6 +12,7 @@ import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { isBrowserAvailable } from "./tools/browser.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
+import { clearNotes } from "./compaction/notes.js";
 import { findOtherInstances, terminateInstance } from "./instanceGuard.js";
 import { createInterface } from "node:readline/promises";
 
@@ -172,6 +173,7 @@ async function main() {
     },
     autoResume: config.compaction.autoResume,
     enableThinking: config.enableThinking ?? false,
+    verify: config.verify?.afterEdit,
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
     onAssistantDone: () => (globalThis as any).__llamacli_ui?.finalizeAssistant(),
     onToolCall: (name, args) => {
@@ -263,6 +265,7 @@ async function main() {
           // means the (now-stale) checkpoint sits on disk unused, not a
           // reason to block starting the session.
           clearCheckpoint(projectRoot).catch(() => {});
+          clearNotes(projectRoot).catch(() => {});
           return;
         }
         ui?.setBusy(true);

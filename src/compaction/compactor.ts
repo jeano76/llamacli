@@ -1,6 +1,7 @@
 import type { ChatMessage, ToolDef } from "../backend/types.js";
 import type { ModelBackend } from "../backend/types.js";
 import { Checkpoint, readCheckpoint, writeCheckpoint } from "./checkpoint.js";
+import { readNotes, stripNotesBlock } from "./notes.js";
 
 export interface CompactionThresholds {
   /** Fraction of the model's context window (0-1) that triggers auto-compaction. */
@@ -332,7 +333,10 @@ export async function runCompaction(
   // summary then replaces it (composeSystemMessage) rather than stacking.
   const originalSystem = messages.find((m) => m.role === "system");
   const originalSystemText = typeof originalSystem?.content === "string" ? originalSystem.content : "";
-  const previousSummary = splitSystemMessage(originalSystemText).summary;
+  // Working notes appended after the summary (loop.ts) are re-added fresh
+  // after this compaction; don't feed them into the summary as well.
+  const rawPreviousSummary = splitSystemMessage(originalSystemText).summary;
+  const previousSummary = rawPreviousSummary === null ? null : stripNotesBlock(rawPreviousSummary);
   const summaryInput = sanitizeForSummary([
     ...(previousSummary
       ? [{ role: "user" as const, content: `[Summary of even earlier conversation]\n${previousSummary}` }]
@@ -539,6 +543,7 @@ export async function buildResumePrompt(
   const checkpoint = await readCheckpoint(projectRoot);
   if (!checkpoint) return null;
   const includeSummary = opts.includeSummary ?? true;
+  const notes = includeSummary ? await readNotes(projectRoot) : "";
 
   const remaining = checkpoint.steps.filter((s) => s.status !== "done");
   // A checkpoint can now exist without any compaction ever having run
@@ -563,6 +568,7 @@ export async function buildResumePrompt(
             : checkpoint.summary
         }`
       : "",
+    includeSummary && notes ? `working notes (findings recorded before; trust these over re-deriving them):\n${notes}` : "",
     checkpoint.recentActions?.length ? `recent actions:\n${checkpoint.recentActions.map((a) => `- ${a}`).join("\n")}` : "",
     checkpoint.pendingToolCall
       ? `interrupted tool call: ${checkpoint.pendingToolCall.name} (${checkpoint.pendingToolCall.reason})`

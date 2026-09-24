@@ -142,6 +142,21 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "note",
+      description:
+        "Record a finding you must not lose: a root cause you identified, what you verified and how, a dead end " +
+        "to avoid. Notes are kept across context compaction; the rest of the conversation is only summarized. " +
+        "One short fact per call.",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "update_plan",
       description:
         "Declare or update your step-by-step plan for the current task. Call this " +
@@ -239,7 +254,7 @@ export const TOOL_DEFS: ToolDef[] = [
 
 /** Tools handled directly by the agent loop (they mutate its in-memory state)
  *  rather than by `executeTool`, which only touches the filesystem/shell. */
-export const AGENT_STATE_TOOLS = new Set(["update_plan"]);
+export const AGENT_STATE_TOOLS = new Set(["update_plan", "note"]);
 
 /** Tool calls whose `path` argument identifies a file the checkpoint should track. */
 export const FILE_TOOLS: Record<string, "modified" | "read"> = {

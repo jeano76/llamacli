@@ -17,6 +17,12 @@ export interface LlamacliConfig {
     threads: number;
     gpuLayers: number;
   };
+  /** Checks run after each file edit, keyed "*.ext" → command with {file}
+   *  (merged over the built-in ones in agent/harness.ts), or false to turn
+   *  them off. */
+  verify?: {
+    afterEdit?: Record<string, string> | false;
+  };
   compaction: {
     autoTriggerRatio: number;
     /** Auto-continue past a compaction that interrupts a tool call mid-turn

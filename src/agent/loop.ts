@@ -16,6 +16,16 @@ import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/
 import type { Checkpoint } from "../compaction/checkpoint.js";
 import { stripToolCallTemplateLeak } from "./textSanitize.js";
 import { salvagePartialFileWrite } from "./toolCallSalvage.js";
+import { existsSync } from "node:fs";
+import {
+  ProgressTracker,
+  DEFAULT_PROGRESS_GUARD,
+  progressNudgeText,
+  runPostEditCheck,
+  type ProgressGuardOptions,
+  type VerifyConfig,
+} from "./harness.js";
+import { appendNote, clearNotes, readNotes, NOTES_HEADER } from "../compaction/notes.js";
 
 // Sent as the `tools` field on every main-loop request (never on the
 // compaction summary request, which omits tools entirely) — computed once
@@ -141,6 +151,18 @@ export function summarizeErrorForDisplay(message: string, maxLen = 300): string 
  *  call ARGUMENTS never were. */
 const FILE_CONTENT_TOOLS = new Set(["write_file", "append_file"]);
 
+/** Tools that change a file on disk: progress signal + post-edit check. */
+const EDIT_TOOLS = new Set(["write_file", "append_file", "edit_file"]);
+
+function pathArg(argumentsJson: string): string | null {
+  try {
+    const p = JSON.parse(argumentsJson)?.path;
+    return typeof p === "string" && p ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 function elidedContentNote(chars: number): string {
   return `${chars} characters written to disk; call read_file on the path to see them`;
 }
@@ -196,6 +218,13 @@ export interface AgentLoopOptions {
    *  reason (an entire max_tokens budget spent on invisible
    *  `reasoning_content` before the tool call even began). */
   enableThinking?: boolean;
+  /** Per-extension checks run after each file edit (see harness.ts);
+   *  false turns them off. From config.yaml's verify.afterEdit. */
+  verify?: VerifyConfig;
+  /** No-progress guard thresholds (see harness.ts ProgressTracker). */
+  progressGuard?: ProgressGuardOptions;
+  /** Clock, injectable for tests. */
+  now?: () => number;
   /** Called for each incremental token/chunk of assistant text as it streams in. */
   onAssistantDelta?: (text: string) => void;
   /** Called once an assistant message (streamed or not) is fully received —
@@ -250,6 +279,10 @@ export class AgentLoop {
 
   /** Model-declared plan via the `update_plan` tool (PROMPT.md §2.2 steps). */
   private plan: Checkpoint["steps"] = [];
+  private progress!: ProgressTracker;
+  private now(): number {
+    return (this.opts.now ?? Date.now)();
+  }
   /** The session's task as the user stated it. Tracked explicitly because
    *  deriving it from `this.messages` stops working after the first
    *  compaction: the first user message left in the kept tail is then the
@@ -298,6 +331,7 @@ export class AgentLoop {
 
   constructor(private opts: AgentLoopOptions) {
     this.messages = [{ role: "system", content: opts.systemPrompt }];
+    this.progress = new ProgressTracker(opts.progressGuard ?? DEFAULT_PROGRESS_GUARD, this.now());
   }
 
   /** Reads back a checkpoint left by a compaction that abandoned work
@@ -358,6 +392,7 @@ export class AgentLoop {
     await this.enqueue(async () => {
       // See send()'s reset() call below for why this matters.
       this.breaker.reset();
+      this.progress.reset(this.now());
       const resumed = await this.injectResumeContextIfPending();
       if (resumed) await this.runUntilIdle();
       this.checkForRealtimeImprovementAfterTurn();
@@ -381,6 +416,7 @@ export class AgentLoop {
       // reset it at the start of each new turn so the clock (and the
       // repetitive-call detection window) restarts fresh every time.
       this.breaker.reset();
+      this.progress.reset(this.now());
       // A compaction can also fire *mid-session* (not just be left over
       // from a previous process) and abandon work — e.g. mid-tool-call-loop
       // below. Previously that resume context only ever got folded in on a
@@ -498,6 +534,25 @@ export class AgentLoop {
     // Recent assistant texts in this turn, for repeatedResponse() below.
     const recentAssistantTexts: string[] = [];
     turnLoop: while (true) {
+      const verdict = this.progress.check(this.now());
+      if (verdict === "nudge") {
+        const guard = this.opts.progressGuard ?? DEFAULT_PROGRESS_GUARD;
+        this.opts.onStatus?.("[progress check] no progress for a while — asking the model to state the cause and act.");
+        this.messages.push({ role: "user", content: progressNudgeText(guard.minutes, guard.compactions) });
+      } else if (verdict === "stop") {
+        this.opts.onStatus?.(
+          "[stopped] still no progress after a progress check — no edit to an existing file and no plan step completed. " +
+            "Tell it what to do next (its working notes are in .llamacli/state/notes.md)."
+        );
+        logFailure({
+          timestamp: new Date().toISOString(),
+          summary: "no progress after nudge",
+          toolName: "chat",
+          errorMessage: "progress guard stopped the turn",
+        });
+        this.hasNewFailuresThisTurn = true;
+        return;
+      }
       const { used: usedBeforeChat } = await this.maybeCompact();
 
       let res;
@@ -798,6 +853,7 @@ export class AgentLoop {
           if (this.plan.length > 0) {
             this.plan = [];
             await clearCheckpoint(this.opts.projectRoot);
+            await clearNotes(this.opts.projectRoot).catch(() => {});
           }
           this.opts.onPlanProgress?.(0, 0);
         }
@@ -895,6 +951,8 @@ export class AgentLoop {
           this.messages.push({ role: "tool", tool_call_id: call.id, content });
           continue;
         }
+        const editPath = EDIT_TOOLS.has(call.function.name) ? pathArg(call.function.arguments) : null;
+        const editedExisting = editPath !== null && existsSync(editPath);
         try {
           const result = await executeTool(call.function.name, call.function.arguments, this.opts.projectRoot);
           content = result.lineRange
@@ -910,6 +968,14 @@ export class AgentLoop {
           }
           this.recordFileTouch(call.function.name, call.function.arguments);
           this.pushExecutedToolLog(`${call.function.name}(${this.summarizeArgs(call.function.arguments)})`);
+          if (editPath !== null) {
+            // Only edits to files that already existed count as progress:
+            // throwaway scripts written and rerun (t2.js … t59.js, live)
+            // are new files every time.
+            if (editedExisting) this.progress.markProgress(this.now());
+            const check = await runPostEditCheck(editPath, this.opts.projectRoot, this.opts.verify, call.function.name === "append_file");
+            if (check) content = `${content}\n\n${check}`;
+          }
           // Drop the now-redundant copy of the file content from the
           // assistant message still sitting in `this.messages` (pushed
           // just above, before this batch ran) — see
@@ -941,9 +1007,21 @@ export class AgentLoop {
 
   /** Handles a tool call that mutates loop state rather than the filesystem/shell. */
   private async applyStateTool(name: string, argsJson: string): Promise<string> {
+    if (name === "note") {
+      try {
+        const { text } = JSON.parse(argsJson) as { text: string };
+        if (typeof text !== "string" || !text.trim()) return "ERROR: note needs a non-empty `text`";
+        await appendNote(this.opts.projectRoot, text);
+        return "noted (kept across compaction)";
+      } catch (err: any) {
+        return `ERROR: invalid note arguments: ${err.message}`;
+      }
+    }
     if (name === "update_plan") {
       try {
         const { steps } = JSON.parse(argsJson) as { steps: Checkpoint["steps"] };
+        const doneBefore = this.plan.filter((s) => s.status === "done").length;
+        if (steps.filter((s) => s.status === "done").length > doneBefore) this.progress.markProgress(this.now());
         this.plan = steps;
         // Persist immediately, independent of compaction — requested
         // directly: a plan should survive a hard kill (Ctrl-C at the OS
@@ -1243,6 +1321,13 @@ export class AgentLoop {
         budget.summaryMaxTokens
       );
       this.messages = messages;
+      this.progress.onCompaction();
+      // Working notes go back in with the summary, so what the model had
+      // established survives the compaction verbatim.
+      const notes = await readNotes(this.opts.projectRoot);
+      if (notes && typeof this.messages[0]?.content === "string") {
+        this.messages[0] = { ...this.messages[0], content: `${this.messages[0].content}\n\n${NOTES_HEADER}\n${notes}` };
+      }
       this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
       this.opts.onCompactionStatus?.("complete", checkpoint.timestamp);
     } catch (err: any) {
@@ -1322,6 +1407,7 @@ export class AgentLoop {
    *  the auto-cleanup block above but is invoked externally, by the user,
    *  rather than by the model finishing all its declared steps. */
   async clearPlan(): Promise<void> {
+    await clearNotes(this.opts.projectRoot).catch(() => {});
     this.plan = [];
     await clearCheckpoint(this.opts.projectRoot);
     this.opts.onPlanProgress?.(0, 0);

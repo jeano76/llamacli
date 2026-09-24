@@ -2253,3 +2253,53 @@ test("resuming in a NEW process carries the previous session's summary and recen
     assert.match(resume, /Continue the task from where it stopped/);
     assert.doesNotMatch(resume, /already done/);
   }));
+
+test("harness: notes survive compaction, edits get an auto-check result, and a stalled turn is nudged then stopped", () =>
+  withTempProject(async (dir) => {
+    // 1) note + auto-check, no compaction pressure.
+    const brokenJs = join(dir, "page.js");
+    await writeFile(brokenJs, "const ok = 1;\n");
+    const noteCall = { id: "n1", type: "function" as const, function: { name: "note", arguments: JSON.stringify({ text: "page script is one line; // comment swallows the rest" }) } };
+    const writeCall = {
+      id: "w1",
+      type: "function" as const,
+      function: { name: "write_file", arguments: JSON.stringify({ path: brokenJs, content: "function f() {if (x) {// c} else {y();}}\n" }) },
+    };
+    const a = scriptedBackend({ turnResponses: [assistantMessage(null, [noteCall, writeCall]), assistantMessage("done")], tokenCounts: [1] });
+    const loopA = new AgentLoop({ projectRoot: dir, model: "m", backend: a.backend, systemPrompt: "sys", thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 } });
+    await loopA.send("fix the page");
+    const toolMsgs = a.turnRequests[1].messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+    assert.match(toolMsgs[0], /noted/);
+    assert.match(toolMsgs[1], /\[auto-check: node --check\] FAILED/);
+
+    // Notes come back after a compaction, verbatim.
+    await loopA.forceCompact();
+    const sys = String((loopA as any).messages[0].content);
+    assert.match(sys, /Working notes/);
+    assert.match(sys, /page script is one line/);
+
+    // 2) Progress guard: every step compacts, nothing counts as progress.
+    let t = 0;
+    const call = (i: number) => ({ id: `s${i}`, type: "function" as const, function: { name: "run_shell", arguments: JSON.stringify({ command: `echo ${i}` }) } });
+    const b = scriptedBackend({
+      turnResponses: Array.from({ length: 12 }, (_, i) => assistantMessage(null, [call(i)])),
+      tokenCounts: [1000],
+    });
+    const statuses: string[] = [];
+    const loopB = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend: b.backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      autoResume: true,
+      progressGuard: { minutes: 1, compactions: 1 },
+      now: () => (t += 45_000), // 45s per clock read
+      onStatus: (s) => statuses.push(s),
+    });
+    await loopB.send("analyze");
+    assert.ok(statuses.some((s) => s.startsWith("[progress check]")), statuses.join(" | "));
+    assert.ok(statuses.some((s) => s.startsWith("[stopped] still no progress")), statuses.join(" | "));
+    const nudged = b.turnRequests.some((r) => r.messages.some((m) => typeof m.content === "string" && m.content.startsWith("[progress check]")));
+    assert.ok(nudged, "the nudge must reach the model");
+  }));
