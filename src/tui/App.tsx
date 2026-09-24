@@ -80,35 +80,40 @@ interface RenderedRow {
   lineId: number;
 }
 
-/** Splits `text` into bright/dim runs for the "thinking" shimmer — a band
- *  of brighter characters sweeping across the line, advancing one tick at
- *  a time. Only ever applied to the single reasoning line currently
- *  streaming (see the App component), so this never runs against settled
- *  text. Pure function: same (text, tick) always gives the same bands, so
- *  it has nothing to do with the row-wrap cache (keyed on text, not tick). */
-export function shimmerBands(text: string, tick: number, bandWidth = SHIMMER_BAND_WIDTH): { text: string; bright: boolean }[] {
+/** A single band's role in the "thinking" shimmer: `dim` hasn't been
+ *  reached by the reveal wave yet, `peak` is the wave's leading edge (the
+ *  brightest point right now), `settled` has already been passed by the
+ *  wave and — the point of this design — STAYS that way; it never reverts
+ *  to dim once revealed. */
+export type ShimmerRole = "dim" | "peak" | "settled";
+
+/** Splits `text` into runs for the reveal-wave shimmer: a one-directional
+ *  wave (never wraps, never goes backward) advances `speed` characters per
+ *  tick, so text already passed stays lit while text ahead of the wave is
+ *  still dim. Monotonic in `tick` for a fixed `text`, so a settled band
+ *  can never later render as dim again — the earlier design (a spotlight
+ *  cycling over otherwise-static text) reverted already-"read" text back
+ *  to dim every cycle, reported directly as looking wrong. Pure function:
+ *  same (text, tick) always gives the same bands, so it has nothing to do
+ *  with the row-wrap cache (keyed on text, not tick). */
+export function shimmerBands(
+  text: string,
+  tick: number,
+  bandWidth = SHIMMER_BAND_WIDTH,
+  speed = SHIMMER_SPEED_CHARS_PER_TICK
+): { text: string; role: ShimmerRole }[] {
   if (!text) return [];
-  const period = text.length + bandWidth;
-  const start = (tick % period) - bandWidth;
-  const end = start + bandWidth;
-  const bands: { text: string; bright: boolean }[] = [];
-  let cur = "";
-  let curBright: boolean | null = null;
-  for (let i = 0; i < text.length; i++) {
-    const bright = i >= start && i < end;
-    if (curBright === null) curBright = bright;
-    if (bright !== curBright) {
-      bands.push({ text: cur, bright: curBright });
-      cur = "";
-      curBright = bright;
-    }
-    cur += text[i];
-  }
-  if (cur) bands.push({ text: cur, bright: curBright! });
+  const revealed = Math.min(text.length, tick * speed);
+  const peakStart = Math.max(0, revealed - bandWidth);
+  const bands: { text: string; role: ShimmerRole }[] = [];
+  if (peakStart > 0) bands.push({ text: text.slice(0, peakStart), role: "settled" });
+  if (revealed > peakStart) bands.push({ text: text.slice(peakStart, revealed), role: "peak" });
+  if (revealed < text.length) bands.push({ text: text.slice(revealed), role: "dim" });
   return bands;
 }
 
 const SHIMMER_BAND_WIDTH = 10;
+const SHIMMER_SPEED_CHARS_PER_TICK = 2;
 export const SHIMMER_TICK_MS = 80;
 
 /** Wraps one log entry into terminal rows (unpadded). */
@@ -137,17 +142,27 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
   if (row.kind === "reasoning" && shimmerTick !== undefined) {
     return (
       <Text key={row.key}>
-        {shimmerBands(row.text, shimmerTick).map((b, i) =>
-          b.bright ? (
-            <Text key={i} color="cyan" italic>
-              {b.text}
-            </Text>
-          ) : (
+        {shimmerBands(row.text, shimmerTick).map((b, i) => {
+          if (b.role === "peak") {
+            return (
+              <Text key={i} color="cyan" bold italic>
+                {b.text}
+              </Text>
+            );
+          }
+          if (b.role === "settled") {
+            return (
+              <Text key={i} color="cyan" italic>
+                {b.text}
+              </Text>
+            );
+          }
+          return (
             <Text key={i} color="gray" dimColor italic>
               {b.text}
             </Text>
-          )
-        )}
+          );
+        })}
       </Text>
     );
   }
@@ -390,6 +405,9 @@ export function App({
       const id = logIdCounter++;
       reasoningStreamingIdRef.current = id;
       setThinkingLineId(id);
+      // A fresh reveal wave for the new line — reusing the running tick
+      // count would start it already partway (or fully) revealed.
+      setShimmerTick(0);
       return [...prev, { id, text, kind: "reasoning" as const }].slice(-MAX_LOG_ENTRIES);
     });
   }

@@ -123,25 +123,36 @@ test("the running-state key hint uses the long form when it fits, and a short on
   for (const cols of [20, 40, 60, 80, 120]) assert.ok(stringWidth(runHintText(cols)) <= cols - 1 || cols < 14);
 });
 
-test("shimmerBands splits text into a single moving bright band over an otherwise dim string", () => {
-  const text = "abcdefghijklmnopqrst"; // 20 chars, band width 10 (default)
-  const atStart = shimmerBands(text, 0);
-  // tick 0: band starts at -10 (fully before the string) -> nothing bright yet
-  assert.deepEqual(atStart, [{ text, bright: false }]);
+test("shimmerBands reveals text as a one-directional wave that never un-reveals already-passed text", () => {
+  const text = "abcdefghijklmnopqrst"; // 20 chars
+  const bw = 5, speed = 1;
 
-  const midway = shimmerBands(text, 15); // start = 15-10=5, end=15
-  assert.deepEqual(midway, [
-    { text: "abcde", bright: false },
-    { text: "fghijklmno", bright: true },
-    { text: "pqrst", bright: false },
+  // tick 0: nothing revealed yet — all dim.
+  assert.deepEqual(shimmerBands(text, 0, bw, speed), [{ text, role: "dim" }]);
+
+  // Partway: settled (already passed) + peak (leading edge) + dim (not yet reached).
+  const mid = shimmerBands(text, 8, bw, speed); // revealed=8, peakStart=3
+  assert.deepEqual(mid, [
+    { text: "abc", role: "settled" },
+    { text: "defgh", role: "peak" },
+    { text: "ijklmnopqrst", role: "dim" },
   ]);
-  const rejoined = midway.map((b) => b.text).join("");
-  assert.equal(rejoined, text, "bands must reconstruct the original text exactly");
+  assert.equal(mid.map((b) => b.text).join(""), text, "bands must reconstruct the original text exactly");
+
+  // Monotonic: a LATER tick must never move settled text back to dim —
+  // this is the whole point of the redesign (the earlier cyclic version did).
+  const later = shimmerBands(text, 12, bw, speed); // revealed=12, peakStart=7
+  const midSettledPrefix = text.slice(0, 3);
+  const laterSettledPrefix = later[0].text;
+  assert.ok(laterSettledPrefix.startsWith(midSettledPrefix), "everything settled at an earlier tick must still be settled (or further) later");
+
+  // Fully revealed: no dim band left, and it stays that way past the end.
+  const done = shimmerBands(text, 100, bw, speed);
+  assert.ok(!done.some((b) => b.role === "dim"));
+  assert.equal(shimmerBands(text, 1000, bw, speed).map((b) => b.text).join(""), text);
 });
 
-test("shimmerBands is empty for empty text and never throws for a tick beyond the text length", () => {
+test("shimmerBands is empty for empty text", () => {
   assert.deepEqual(shimmerBands("", 5), []);
-  const text = "hi";
-  const bands = shimmerBands(text, 9999);
-  assert.equal(bands.map((b) => b.text).join(""), text);
 });
+
