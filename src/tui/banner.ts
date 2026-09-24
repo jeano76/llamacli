@@ -16,6 +16,7 @@ export function buildVersionString(mtimeMs: number): string {
 const RESET = "\x1b[0m";
 const SETTLED = "\x1b[1;36m"; // bold cyan — matches the reasoning shimmer's settled color
 const PEAK = "\x1b[1;95m"; // bold bright magenta — the word currently landing
+const DIM = "\x1b[2;90m"; // dim gray — not yet reached (reasoning shimmer's own "unread" color)
 
 /** One frame of the word-by-word reveal: words already shown stay settled
  *  (cyan), the word that just landed this tick is highlighted (peak
@@ -59,6 +60,29 @@ export function bounceFrameCount(): number {
   return BOUNCE_HEIGHTS.length - 1;
 }
 
+/** One frame of a character-by-character reveal wave — the exact shining
+ *  effect reasoning text streams in with (App.tsx's shimmerBands), as raw
+ *  ANSI instead of React elements so it can be embedded directly into the
+ *  plain-string banner lines here. Requested directly: "구동 로그에
+ *  Thinking 시의 샤이닝 효과도 추가해줘" — used for the small "cli"
+ *  caption under the HARNESS wordmark. Monotonic in tick (a settled
+ *  character never reverts to dim). */
+export function shineFrame(text: string, tick: number, speed = 2, bandWidth = 4): string {
+  if (!text) return "";
+  const revealed = Math.min(text.length, tick * speed);
+  const peakStart = Math.max(0, revealed - bandWidth);
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const color = i < peakStart ? SETTLED : i < revealed ? PEAK : DIM;
+    out += `${color}${text[i]}`;
+  }
+  return out + RESET;
+}
+
+export function shineFrameCount(text: string, speed = 2): number {
+  return Math.ceil(text.length / speed);
+}
+
 /** Block-letter ASCII art, 5 rows tall — requested directly: "대문 로그를
  *  Ansi 의 아스키 코드를 이용해서 Harness 글자모양을 만들고 흔들리는 것은
  *  글씨 자체야" ("build the banner's 'Harness' shape out of ANSI/ASCII, and
@@ -99,7 +123,7 @@ export function buildArt(text: string): string[] {
   return rows;
 }
 
-export const HARNESS_ART = buildArt("HARNESS CLI");
+export const HARNESS_ART = buildArt("HARNESS");
 /** Every row of HARNESS_ART is the same width (buildArt pads letters to a
  *  fixed 5-column glyph) — used to right-align the caption line under it. */
 export const ART_WIDTH = HARNESS_ART[0].length;

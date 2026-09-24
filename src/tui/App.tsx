@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -476,35 +476,56 @@ export function App({
   // alt-screen switch, which was invisible in practice.
   useEffect(() => {
     const artLineId = logIdCounter++;
+    const cliLineId = logIdCounter++;
     const versionLineId = logIdCounter++;
     setLog((prev) => [
       { id: artLineId, text: shakeFrame(HARNESS_ART, 0), kind: "status" as const },
+      { id: cliLineId, text: "", kind: "status" as const },
       { id: logIdCounter++, text: rightAlign(`\x1b[2m${startupBanner.repoUrl}\x1b[0m`, ART_WIDTH), kind: "status" as const },
       { id: versionLineId, text: rightAlign(startupBanner.version, ART_WIDTH), kind: "status" as const },
       ...prev,
     ]);
     const setLineText = (id: number, text: string) => setLog((prev) => prev.map((line) => (line.id === id ? { ...line, text } : line)));
 
+    // Three phases, one after another (not simultaneous — several
+    // flourishes going at once reads as chaotic rather than a sequence of
+    // distinct little touches): the HARNESS wordmark shakes itself steady,
+    // then "cli" shines in underneath it (same reveal-wave reasoning text
+    // streams in with — requested directly: "구동 로그에 Thinking 시의
+    // 샤이닝 효과도 추가해줘"), then the version line's ball bounces.
+    // "CLI" is small plain text, not block art — sized down per "cli는
+    // 소문자로 좀 작게 해주고", then cased per the follow-up clarification
+    // "Harness CLI 처럼 대소문자 반영해줘": the acronym stays uppercase,
+    // matching how "Harness CLI" is written everywhere else (this repo's
+    // own name, package.json, the docs) rather than literally lowercased.
+    const CLI_TEXT = "CLI";
     let shakeTick = 0;
+    let shineId: ReturnType<typeof setInterval> | null = null;
     let bounceId: ReturnType<typeof setInterval> | null = null;
     const shakeId = setInterval(() => {
       shakeTick++;
       setLineText(artLineId, shakeFrame(HARNESS_ART, shakeTick));
       if (shakeTick >= shakeFrameCount()) {
         clearInterval(shakeId);
-        // The ball rides right after the version text, once the wordmark
-        // itself has settled — a shaking logo AND a bouncing ball going at
-        // once reads as chaotic rather than two distinct little flourishes.
-        let bounceTick = 0;
-        bounceId = setInterval(() => {
-          bounceTick++;
-          setLineText(versionLineId, rightAlign(`${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
-          if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
-        }, 60);
+        let shineTick = 0;
+        shineId = setInterval(() => {
+          shineTick++;
+          setLineText(cliLineId, rightAlign(shineFrame(CLI_TEXT, shineTick), ART_WIDTH));
+          if (shineTick >= shineFrameCount(CLI_TEXT)) {
+            clearInterval(shineId!);
+            let bounceTick = 0;
+            bounceId = setInterval(() => {
+              bounceTick++;
+              setLineText(versionLineId, rightAlign(`${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
+              if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
+            }, 60);
+          }
+        }, 90);
       }
     }, 90);
     return () => {
       clearInterval(shakeId);
+      if (shineId !== null) clearInterval(shineId);
       if (bounceId !== null) clearInterval(bounceId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

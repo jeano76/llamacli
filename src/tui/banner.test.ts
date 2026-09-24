@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
@@ -16,9 +16,9 @@ test("buildArt lays out each letter's glyph side by side, 5 rows tall, blank for
   assert.doesNotThrow(() => buildArt("H?"));
 });
 
-test("HARNESS_ART spells out HARNESS CLI (every row the same width, non-blank)", () => {
+test("HARNESS_ART spells out HARNESS (every row the same width, non-blank)", () => {
   assert.equal(HARNESS_ART.length, 5);
-  assert.deepEqual(HARNESS_ART, buildArt("HARNESS CLI"));
+  assert.deepEqual(HARNESS_ART, buildArt("HARNESS"));
   const widths = new Set(HARNESS_ART.map((row) => row.length));
   assert.equal(widths.size, 1, "every row must be the same width for the art to look like a rectangle");
   assert.ok(HARNESS_ART.some((row) => row.includes("█")), "the art must actually draw something, not be all spaces");
@@ -65,6 +65,20 @@ test("rightAlign pads plain text so it ends flush at the given width, ignoring A
 test("ART_WIDTH matches HARNESS_ART's actual row width, so a caption line right-aligned to it lines up", () => {
   assert.equal(ART_WIDTH, HARNESS_ART[0].length);
   assert.equal(rightAlign("x", ART_WIDTH).length, ART_WIDTH);
+});
+
+test("shineFrame reveals text as a one-directional wave, same shape as reasoning's own shimmer — never un-reveals once settled", () => {
+  const text = "CLI";
+  const early = shineFrame(text, 1);
+  const later = shineFrame(text, shineFrameCount(text));
+  assert.ok(!early.includes("\x1b[1;36m"), "almost nothing settled yet at the first tick");
+  assert.equal(later, shineFrame(text, shineFrameCount(text) + 50), "clamps once fully revealed, doesn't keep changing");
+  assert.notEqual(early, later);
+});
+
+test("shineFrameCount scales with text length and empty text needs no ticks", () => {
+  assert.equal(shineFrameCount(""), 0);
+  assert.equal(shineFrameCount("CLI", 2), 2); // 3 chars / 2 per tick, rounded up
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {
