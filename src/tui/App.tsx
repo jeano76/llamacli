@@ -76,9 +76,21 @@ let logIdCounter = 0;
 interface RenderedRow {
   key: string;
   text: string;
-  kind: LogLine["kind"];
+  kind: LogLine["kind"] | "reasoning-folded";
   lineId: number;
 }
+
+/** The single-line summary shown for a finished reasoning block once
+ *  folded (the default — see App's expandedReasoningIds). Carries its own
+ *  icon + a plain-language hint ("클릭해서 펼치기" — click to expand),
+ *  requested directly so the fold affordance isn't just an unlabeled
+ *  glyph. `foldToggleHint` is the matching label for the EXPANDED state,
+ *  used in the render branch below. */
+export function foldedReasoningSummary(text: string): string {
+  const chars = text.trim().length;
+  return `▸ 생각 과정 (${chars}자) — 클릭해서 펼치기`;
+}
+export const foldToggleHintExpanded = "  ▾ 클릭해서 접기";
 
 /** A single band's role in the "thinking" shimmer: `dim` hasn't been
  *  reached by the reveal wave yet, `peak` is the wave's leading edge (the
@@ -139,6 +151,13 @@ function wrapLogLine(line: LogLine, width: number): string[] {
 }
 
 function renderRow(row: RenderedRow, shimmerTick?: number) {
+  if (row.kind === "reasoning-folded") {
+    return (
+      <Text key={row.key} color="gray" dimColor>
+        {row.text}
+      </Text>
+    );
+  }
   if (row.kind === "reasoning" && shimmerTick !== undefined) {
     return (
       <Text key={row.key}>
@@ -188,11 +207,13 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
     );
   }
   if (row.kind === "reasoning") {
-    // Settled reasoning (the line finished, or shimmerTick not supplied —
-    // e.g. it scrolled out of the live streaming position): plain dim,
-    // matching every OTHER finished log entry once it stops changing.
+    // A finished reasoning block the user has expanded (see
+    // expandedReasoningIds) — kept at its settled shimmer color (cyan)
+    // rather than dimming back down once done. Reported directly: fading
+    // to dim on completion looked like the text itself had lost meaning,
+    // when it is exactly the text that was just highlighted revealing it.
     return (
-      <Text key={row.key} color="gray" dimColor italic>
+      <Text key={row.key} color="cyan" italic>
         {row.text}
       </Text>
     );
@@ -228,6 +249,22 @@ export function parseMouseWheel(input: string): number | null {
     rows += (button & 1) === 0 ? WHEEL_SCROLL_ROWS : -WHEEL_SCROLL_ROWS;
   }
   return rows;
+}
+
+/** Parses SGR mouse reports for a plain button PRESS (not the wheel, not a
+ *  drag/motion report, not a release) into 1-based (row, col) terminal
+ *  coordinates — absolute, since row 1 is the alt screen's top (see
+ *  index.tsx). Used to toggle a folded reasoning block on click. Several
+ *  reports can arrive in one input string, same as parseMouseWheel. */
+export function parseMouseClicks(input: string): { row: number; col: number }[] {
+  const clicks: { row: number; col: number }[] = [];
+  for (const [, code, colStr, rowStr, kind] of input.matchAll(/\[<(\d+);(\d+);(\d+)([Mm])/g)) {
+    if (kind !== "M") continue; // only presses — a release fires right after and would double-toggle
+    const button = Number(code);
+    if ((button & 64) !== 0 || (button & 32) !== 0) continue; // wheel, or drag/motion
+    clicks.push({ row: Number(rowStr), col: Number(colStr) });
+  }
+  return clicks;
 }
 
 /** Log entries kept for scrollback. Rendering only ever builds React
@@ -358,6 +395,16 @@ export function App({
     return () => clearInterval(id);
   }, [thinkingLineId]);
   const reasoningStreamingIdRef = useRef<number | null>(null);
+  // Finished reasoning blocks the user has clicked open — everything else
+  // finished renders as one folded summary line (foldedReasoningSummary).
+  // Requested directly: reasoning is useful to check but clutters the log
+  // once it's no longer the point of what's on screen.
+  const [expandedReasoningIds, setExpandedReasoningIds] = useState<Set<number>>(new Set());
+  // Rebuilt every render (see the allRows loop) so a click handler — which
+  // only runs later, async, in response to a real terminal event — can map
+  // the absolute terminal row it landed on back to a log line without
+  // recomputing the whole layout itself.
+  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean }[] }>({ firstRow: 1, entries: [] });
   // How far scrollOffset can go before there's nothing further back to see —
   // updated every render (see below) rather than recomputed inside the key
   // handler, which would mean redoing the markdown/wrap rendering work
@@ -447,10 +494,34 @@ export function App({
     // Mouse wheel (reporting enabled in index.tsx). Handled before
     // anything else so a report can never be typed into the input box or
     // answer a Y/N prompt.
-    const wheel = parseMouseWheel(char);
-    if (wheel !== null) {
-      if (wheel !== 0 && !menuOpen && quittingSince === null) {
+    // Every SGR mouse report (wheel, click, release, drag) matches this and
+    // must be fully consumed here regardless of which kind it is — parsing
+    // it as a wheel event alone first and only checking for a click on a
+    // separate early-return path meant a click's own "not a wheel" (0 rows)
+    // result from parseMouseWheel already returned before the click parser
+    // ever ran, so clicks did nothing. Verified against the real binary
+    // (pty + a real terminal emulator) that this was the actual cause.
+    if (/\[<\d+;\d+;\d+[Mm]/.test(char)) {
+      const wheel = parseMouseWheel(char);
+      if (wheel !== null && wheel !== 0 && !menuOpen && quittingSince === null) {
         setScrollOffset((s) => Math.max(0, Math.min(maxScrollRef.current, s + wheel)));
+      }
+      // A plain click: toggle a folded/expanded reasoning block if it
+      // landed on one of its rows. Ignored while the menu is open or
+      // saving (the map wasn't built for those layouts).
+      if (!menuOpen && quittingSince === null) {
+        const { firstRow, entries } = clickMapRef.current;
+        for (const { row } of parseMouseClicks(char)) {
+          const idx = row - firstRow;
+          const entry = idx >= 0 && idx < entries.length ? entries[idx] : undefined;
+          if (!entry?.foldable) continue;
+          setExpandedReasoningIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(entry.lineId)) next.delete(entry.lineId);
+            else next.add(entry.lineId);
+            return next;
+          });
+        }
       }
       return;
     }
@@ -747,6 +818,26 @@ export function App({
   const allRows: RenderedRow[] = [];
   for (const line of log) {
     liveIds.add(line.id);
+    // A finished (not actively streaming) reasoning block: fold to one
+    // summary row unless the user has expanded it. Handled here, outside
+    // the wrap cache below, since the cache is keyed on (text, width) —
+    // fold state isn't either of those, and re-deriving the fold decision
+    // fresh each render is cheap (no re-wrapping needed for the common,
+    // folded case).
+    if (line.kind === "reasoning" && line.id !== thinkingLineId) {
+      if (!expandedReasoningIds.has(line.id)) {
+        allRows.push({ key: `${line.id}-fold`, text: foldedReasoningSummary(line.text), kind: "reasoning-folded", lineId: line.id });
+        continue;
+      }
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "reasoning-folded", lineId: line.id });
+      continue;
+    }
     let cached = rowCache.get(line.id);
     if (!cached || cached.text !== line.text || cached.width !== width) {
       cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
@@ -778,6 +869,24 @@ export function App({
   const contentRows = menuOpen ? scrollableContentRows : logHeight - (showScrollIndicator ? 1 : 0) - hintRows;
   const sliceEnd = allRows.length - clampedScroll;
   const sliceStart = Math.max(0, sliceEnd - contentRows);
+
+  // Absolute terminal row of the first visible content row, for mapping a
+  // mouse click's (row, col) back to a log line. The log box is bottom-
+  // anchored (flex-end) at fixed height `logHeight` starting at terminal
+  // row 1 (the alt screen's origin — see index.tsx): any leftover space
+  // when there's less content than the box's height sits ABOVE it, not
+  // below, so the first content row isn't always row 1.
+  {
+    const visibleCount = sliceEnd - sliceStart;
+    const childrenHeight = (showScrollIndicator ? 1 : 0) + visibleCount + (menuOpen ? menuBoxHeight : 0) + hintRows;
+    const gap = Math.max(0, logHeight - childrenHeight);
+    clickMapRef.current = {
+      firstRow: 1 + gap + (showScrollIndicator ? 1 : 0),
+      entries: allRows
+        .slice(sliceStart, sliceEnd)
+        .map((r) => ({ lineId: r.lineId, foldable: r.kind === "reasoning" || r.kind === "reasoning-folded" })),
+    };
+  }
 
   const inputBorderColor = quitting || quitConfirmPending || resumeConfirmPending
     ? "yellow"

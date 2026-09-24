@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded } from "./App.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
 // Reported directly: the slash menu could only be driven with arrow keys —
@@ -156,3 +156,21 @@ test("shimmerBands is empty for empty text", () => {
   assert.deepEqual(shimmerBands("", 5), []);
 });
 
+
+test("parseMouseClicks reports a plain button press with its (row, col), and ignores wheel/drag/release", () => {
+  assert.deepEqual(parseMouseClicks("[<0;15;22M"), [{ row: 22, col: 15 }]);
+  assert.deepEqual(parseMouseClicks("[<0;15;22m"), [], "a release must not also toggle");
+  assert.deepEqual(parseMouseClicks("[<64;10;5M"), [], "a wheel report is not a click");
+  assert.deepEqual(parseMouseClicks("[<32;10;5M"), [], "a drag/motion report is not a click");
+  assert.deepEqual(parseMouseClicks("[<0;1;1M[<0;40;12M"), [
+    { row: 1, col: 1 },
+    { row: 12, col: 40 },
+  ]);
+  assert.deepEqual(parseMouseClicks("hello"), []);
+});
+
+test("foldedReasoningSummary and the expanded hint both name what a click does", () => {
+  assert.match(foldedReasoningSummary("x".repeat(42)), /42자/);
+  assert.match(foldedReasoningSummary("hi"), /펼치기/);
+  assert.match(foldToggleHintExpanded, /접기/);
+});
