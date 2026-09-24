@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { bannerWordFrame, bannerWordCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -51,16 +51,17 @@ export interface AppProps {
    *  AgentLoop.resumeIfCheckpointExists(), same as before this prompt
    *  existed), `false` discards the checkpoint and starts fresh. */
   onResumeDecision: (resume: boolean) => void;
-  /** "Harness CLI vYYYYMMDD" + the repo URL, animated at startup (see
-   *  banner.ts's bannerWordFrame/bounceFrame) — computed in index.tsx (needs dist/index.js's
+  /** The "HARNESS" wordmark is App's own ASCII art (banner.ts's
+   *  HARNESS_ART/shakeFrame) — this just carries the build-date version and
+   *  repo URL shown under it. Computed in index.tsx (needs dist/index.js's
    *  own mtime for the version) and passed in rather than read here, so App
    *  stays pure UI, same as everything else index.tsx already loads before
    *  render(). Previously printed straight to the raw terminal before
    *  enterAltScreen() switched buffers, which erased it a moment later —
    *  reported directly ("최초 구동 로그가 나오지 않았어 화면 상단에
-   *  출력되어 있어야 하는데 없었어"). Now it's a real log line inside the
-   *  alt-screen app itself, so it survives like anything else in scrollback. */
-  startupBanner: { text: string; repoUrl: string };
+   *  출력되어 있어야 하는데 없었어"). Now it's real log lines inside the
+   *  alt-screen app itself, so they survive like anything else in scrollback. */
+  startupBanner: { version: string; repoUrl: string };
 }
 
 /** Every prompt actually submitted counts, whether it was sent immediately
@@ -444,40 +445,42 @@ export function App({
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
-  // The startup banner: revealed one word at a time, then a small bouncing-
-  // ball flourish once the words are all in — see AppProps.startupBanner's
-  // doc comment for why this lives inside the log (a real, persistent
-  // line) rather than a raw stdout write before the alt-screen switch,
-  // which was invisible in practice.
+  // The startup banner: "HARNESS" as block-letter ASCII art that shakes
+  // itself steady, then a version/bounce line and the repo URL underneath —
+  // see AppProps.startupBanner's doc comment for why this lives inside the
+  // log (a real, persistent line) rather than a raw stdout write before the
+  // alt-screen switch, which was invisible in practice.
   useEffect(() => {
-    const bannerLineId = logIdCounter++;
+    const artLineId = logIdCounter++;
+    const versionLineId = logIdCounter++;
     setLog((prev) => [
-      { id: bannerLineId, text: bannerWordFrame(startupBanner.text, 0), kind: "status" as const },
+      { id: artLineId, text: shakeFrame(HARNESS_ART, 0), kind: "status" as const },
+      { id: versionLineId, text: startupBanner.version, kind: "status" as const },
       { id: logIdCounter++, text: `\x1b[2m${startupBanner.repoUrl}\x1b[0m`, kind: "status" as const },
       ...prev,
     ]);
-    const setBannerText = (text: string) =>
-      setLog((prev) => prev.map((line) => (line.id === bannerLineId ? { ...line, text } : line)));
+    const setLineText = (id: number, text: string) => setLog((prev) => prev.map((line) => (line.id === id ? { ...line, text } : line)));
 
-    const words = bannerWordCount(startupBanner.text);
-    let wordTick = 0;
+    let shakeTick = 0;
     let bounceId: ReturnType<typeof setInterval> | null = null;
-    const wordId = setInterval(() => {
-      wordTick++;
-      setBannerText(bannerWordFrame(startupBanner.text, wordTick));
-      if (wordTick >= words) {
-        clearInterval(wordId);
-        // The ball rides right after the fully-revealed text, on the same line.
+    const shakeId = setInterval(() => {
+      shakeTick++;
+      setLineText(artLineId, shakeFrame(HARNESS_ART, shakeTick));
+      if (shakeTick >= shakeFrameCount()) {
+        clearInterval(shakeId);
+        // The ball rides right after the version text, once the wordmark
+        // itself has settled — a shaking logo AND a bouncing ball going at
+        // once reads as chaotic rather than two distinct little flourishes.
         let bounceTick = 0;
         bounceId = setInterval(() => {
           bounceTick++;
-          setBannerText(`${bannerWordFrame(startupBanner.text, words)}  ${bounceFrame(bounceTick)}`);
+          setLineText(versionLineId, `${startupBanner.version}  ${bounceFrame(bounceTick)}`);
           if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
         }, 60);
       }
-    }, 140);
+    }, 90);
     return () => {
-      clearInterval(wordId);
+      clearInterval(shakeId);
       if (bounceId !== null) clearInterval(bounceId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

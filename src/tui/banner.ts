@@ -61,3 +61,59 @@ export function bounceFrame(tick: number): string {
 export function bounceFrameCount(): number {
   return BOUNCE_HEIGHTS.length - 1;
 }
+
+/** Block-letter ASCII art, 5 rows tall — requested directly: "대문 로그를
+ *  Ansi 의 아스키 코드를 이용해서 Harness 글자모양을 만들고 흔들리는 것은
+ *  글씨 자체야" ("build the banner's 'Harness' shape out of ANSI/ASCII, and
+ *  what shakes is the lettering itself") — replacing the earlier
+ *  small-text word-reveal, which wasn't actual letter shapes. Only the
+ *  letters this app's name needs; an unknown character renders as a blank
+ *  5x5 cell rather than throwing. */
+const GLYPHS: Record<string, string[]> = {
+  H: ["█   █", "█   █", "█████", "█   █", "█   █"],
+  A: [" ███ ", "█   █", "█████", "█   █", "█   █"],
+  R: ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+  N: ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
+  E: ["█████", "█    ", "████ ", "█    ", "█████"],
+  S: [" ████", "█    ", " ███ ", "    █", "████ "],
+};
+const BLANK_GLYPH = ["     ", "     ", "     ", "     ", "     "];
+const ART_ROWS = 5;
+
+/** Builds the 5-row block-letter art for `word` (letters side by side, one
+ *  space apart), uppercased. Pure so it — and the shake animation over it —
+ *  is unit-testable without a terminal. */
+export function buildArt(word: string): string[] {
+  const rows = new Array(ART_ROWS).fill("");
+  for (const ch of word.toUpperCase()) {
+    const glyph = GLYPHS[ch] ?? BLANK_GLYPH;
+    for (let r = 0; r < ART_ROWS; r++) {
+      rows[r] += (rows[r] ? " " : "") + glyph[r];
+    }
+  }
+  return rows;
+}
+
+export const HARNESS_ART = buildArt("HARNESS");
+
+const SHAKE_TICKS = 14;
+const ART_COLOR = "\x1b[1;36m"; // bold cyan, same settled color the rest of the app's animations use
+
+/** One frame of the shake: each row gets a small leading-space jitter that
+ *  decays tick by tick (amplitude 3 → 0) and staggers by row so the whole
+ *  word wobbles rather than moving as one rigid block, settling dead still
+ *  (offset 0) by SHAKE_TICKS. Deterministic in (tick, row) — same inputs,
+ *  same jitter, so it's testable without a terminal driving real timers. */
+export function shakeFrame(art: string[], tick: number): string {
+  const amplitude = Math.max(0, 3 - Math.floor(Math.min(tick, SHAKE_TICKS) / 4));
+  return art
+    .map((row, i) => {
+      const offset = amplitude > 0 ? Math.abs(((tick + i * 2) % (amplitude * 2 + 1)) - amplitude) : 0;
+      return `${ART_COLOR}${" ".repeat(offset)}${row}${RESET}`;
+    })
+    .join("\n");
+}
+
+export function shakeFrameCount(): number {
+  return SHAKE_TICKS;
+}

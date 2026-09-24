@@ -114,19 +114,19 @@ async function ensureSingleInstance(): Promise<void> {
 
 const REPO_URL = "https://github.com/jeano76/llamacli";
 
-/** "Harness CLI vYYYYMMDD" — version is dist/index.js's own mtime (no
- *  separate build-info step exists to read a date from). Computed here
- *  (needs fs access) and handed to App as a plain string, which animates
- *  it itself as a real log line — see AppProps.startupBanner's doc comment
- *  for why it's not a raw pre-alt-screen stdout write (that was invisible
- *  in practice: reported directly, "최초 구동 로그가 나오지 않았어"). */
-function startupBannerText(): string {
+/** "vYYYYMMDD" — dist/index.js's own mtime (no separate build-info step
+ *  exists to read a date from). Computed here (needs fs access) and handed
+ *  to App, which renders the "HARNESS" wordmark itself as ASCII art plus
+ *  this version line — see AppProps.startupBanner's doc comment for why
+ *  it's not a raw pre-alt-screen stdout write (that was invisible in
+ *  practice: reported directly, "최초 구동 로그가 나오지 않았어"). */
+function startupVersion(): string {
   try {
-    return `Harness CLI ${buildVersionString(statSync(fileURLToPath(import.meta.url)).mtimeMs)}`;
+    return buildVersionString(statSync(fileURLToPath(import.meta.url)).mtimeMs);
   } catch {
     // dist/index.js not found under this run mode (e.g. tsx dev) — banner
     // just omits the version rather than failing startup over it.
-    return "Harness CLI";
+    return "";
   }
 }
 
@@ -304,7 +304,7 @@ async function main() {
     <App
       cwd={projectRoot}
       model={config.model}
-      startupBanner={{ text: startupBannerText(), repoUrl: REPO_URL }}
+      startupBanner={{ version: startupVersion(), repoUrl: REPO_URL }}
       initialHistory={initialHistory}
       onHistoryChange={(history) => {
         // Fire-and-forget: a failed write here must never block sending a

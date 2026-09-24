@@ -1,38 +1,41 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, bannerWordFrame, bannerWordCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { buildVersionString, buildArt, HARNESS_ART, shakeFrame, shakeFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
   assert.equal(buildVersionString(new Date(2026, 8, 24).getTime()), "v20260924");
 });
 
-test("bannerWordFrame reveals one word per tick, earlier words staying visible (settled) once revealed", () => {
-  const text = "Harness CLI v20260924";
-  assert.equal(bannerWordFrame(text, 0), "");
-  const one = bannerWordFrame(text, 1);
-  assert.match(one, /Harness/);
-  assert.doesNotMatch(one, /CLI/);
-  const two = bannerWordFrame(text, 2);
-  assert.match(two, /Harness/);
-  assert.match(two, /CLI/);
-  assert.doesNotMatch(two, /v20260924/);
-  const all = bannerWordFrame(text, bannerWordCount(text));
-  assert.match(all, /Harness/);
-  assert.match(all, /CLI/);
-  assert.match(all, /v20260924/);
+test("buildArt lays out each letter's glyph side by side, 5 rows tall, blank for an unknown character", () => {
+  const art = buildArt("HA");
+  assert.equal(art.length, 5, "block-letter art is 5 rows tall");
+  // "H"'s glyph starts with a full-height vertical bar in column 0.
+  assert.ok(art.every((row) => row[0] === "█"), "H's left stroke should run the full height");
+  // An unrecognized character renders as blank space, not a crash.
+  assert.doesNotThrow(() => buildArt("H?"));
 });
 
-test("bannerWordFrame clamps past the last word and handles empty text", () => {
-  const text = "Harness CLI";
-  assert.equal(bannerWordFrame(text, 50), bannerWordFrame(text, bannerWordCount(text)));
-  assert.equal(bannerWordFrame("", 3), "");
+test("HARNESS_ART actually spells HARNESS (7 glyphs wide, non-blank)", () => {
+  assert.equal(HARNESS_ART.length, 5);
+  // 7 letters, each 5 wide, 1-space gaps between: 7*5 + 6 = 41 columns.
+  for (const row of HARNESS_ART) assert.equal(row.length, 41);
+  assert.ok(HARNESS_ART.some((row) => row.includes("█")), "the art must actually draw something, not be all spaces");
 });
 
-test("bannerWordCount counts words by splitting on spaces", () => {
-  assert.equal(bannerWordCount("Harness CLI v20260924"), 3);
-  assert.equal(bannerWordCount(""), 0);
-  assert.equal(bannerWordCount("one"), 1);
+test("shakeFrame jitters the art for a while and then settles perfectly still (no leading offset)", () => {
+  const art = ["abc", "def"];
+  const early = shakeFrame(art, 0);
+  const settled = shakeFrame(art, shakeFrameCount());
+  // The settled frame's plain text (ANSI stripped) must be exactly the
+  // original art, left-aligned — the shake must fully resolve, not leave
+  // a residual offset.
+  const stripped = settled.replace(/\x1b\[[0-9;]*m/g, "");
+  assert.equal(stripped, art.join("\n"));
+  // Further ticks past settling change nothing.
+  assert.equal(shakeFrame(art, shakeFrameCount() + 20), settled);
+  // It's an actual animation, not a no-op — early ticks differ from settled.
+  assert.notEqual(early, settled);
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {
