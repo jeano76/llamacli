@@ -7,7 +7,7 @@ import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { HARNESS_ART, ART_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 export interface AppProps {
   cwd: string;
@@ -52,7 +52,7 @@ export interface AppProps {
    *  existed), `false` discards the checkpoint and starts fresh. */
   onResumeDecision: (resume: boolean) => void;
   /** The "HARNESS" wordmark is App's own ASCII art (banner.ts's
-   *  HARNESS_ART/shakeFrame) — this just carries the build-date version and
+   *  HARNESS_ART/shineMultilineFrame) — this just carries the build-date version and
    *  repo URL shown under it. Computed in index.tsx (needs dist/index.js's
    *  own mtime for the version) and passed in rather than read here, so App
    *  stays pure UI, same as everything else index.tsx already loads before
@@ -469,8 +469,8 @@ export function App({
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
-  // The startup banner: "HARNESS" as block-letter ASCII art that shakes
-  // itself steady, then a version/bounce line and the repo URL underneath —
+  // The startup banner: "HARNESS" as block-letter ASCII art that shines
+  // itself in, then a version/bounce line and the repo URL underneath —
   // see AppProps.startupBanner's doc comment for why this lives inside the
   // log (a real, persistent line) rather than a raw stdout write before the
   // alt-screen switch, which was invisible in practice.
@@ -479,7 +479,7 @@ export function App({
     const cliLineId = logIdCounter++;
     const versionLineId = logIdCounter++;
     setLog((prev) => [
-      { id: artLineId, text: shakeFrame(HARNESS_ART, 0), kind: "status" as const },
+      { id: artLineId, text: HARNESS_ART.join("\n"), kind: "status" as const },
       { id: cliLineId, text: "", kind: "status" as const },
       { id: logIdCounter++, text: rightAlign(`\x1b[2m${startupBanner.repoUrl}\x1b[0m`, ART_WIDTH), kind: "status" as const },
       { id: versionLineId, text: rightAlign(startupBanner.version, ART_WIDTH), kind: "status" as const },
@@ -487,52 +487,40 @@ export function App({
     ]);
     const setLineText = (id: number, text: string) => setLog((prev) => prev.map((line) => (line.id === id ? { ...line, text } : line)));
 
-    // Three phases, one after another (not simultaneous — several
-    // flourishes going at once reads as chaotic rather than a sequence of
-    // distinct little touches): the HARNESS wordmark shakes itself steady,
-    // then the WHOLE "HARNESS CLI" text shines as ONE continuous
-    // character-by-character wave (not each row sweeping in parallel) —
-    // requested directly, refined twice: "구동 로그에 Thinking 시의
-    // 샤이닝 효과도 추가해줘" (add reasoning's shining effect here too),
-    // "Harnesss CLI 의 글씨 전체를 빛나는 효과를 Think 처럼 색갈변활르 줘"
-    // (the WHOLE text), then "글씨를 구성하는 문자 하나하나가 빛나는
-    // 효과를 Harness CLI 전체 생겨야 하는거야" (each character's shine
-    // as ONE sequence across the whole thing, not per line) — then the
-    // version line's ball bounces. "CLI" is small plain text, not block
-    // art (per "cli는 소문자로 좀 작게 해주고"), cased per the follow-up
-    // "Harness CLI 처럼 대소문자 반영해줘": the acronym stays uppercase.
+    // Two phases, one after another (not simultaneous — several flourishes
+    // going at once reads as chaotic): the WHOLE "HARNESS CLI" text shines
+    // in with one diagonal sweep (no shake — dropped per direct feedback:
+    // "지금처럼 좌우로 흔드는 애니메이션은 필요없고", replaced with "샤이닝
+    // 효과는 Think 할 때의 글씨의 반짝이는 효과처럼 같은 색상 계열의
+    // 밝은색 블럭으로 좌측에서 우측으로 비스듬하게 이동이 되게 되는거야" —
+    // a bright block of the same color family moving diagonally
+    // left-to-right, same as reasoning's own shimmer), then the version
+    // line's ball bounces. "CLI" stays small plain text, not block art
+    // (per "cli는 소문자로 좀 작게 해주고"), and uppercase (per "Harness
+    // CLI 처럼 대소문자 반영해줘": the acronym stays uppercase, matching
+    // how the app's own name is written everywhere else).
     const CLI_TEXT = "CLI";
     const shineLines = [...HARNESS_ART, CLI_TEXT];
-    let shakeTick = 0;
-    let shineId: ReturnType<typeof setInterval> | null = null;
+    let shineTick = 0;
     let bounceId: ReturnType<typeof setInterval> | null = null;
-    const shakeId = setInterval(() => {
-      shakeTick++;
-      setLineText(artLineId, shakeFrame(HARNESS_ART, shakeTick));
-      if (shakeTick >= shakeFrameCount()) {
-        clearInterval(shakeId);
-        let shineTick = 0;
-        const shineTicks = shineMultilineFrameCount(shineLines);
-        shineId = setInterval(() => {
-          shineTick++;
-          const frame = shineMultilineFrame(shineLines, shineTick).split("\n");
-          setLineText(artLineId, frame.slice(0, HARNESS_ART.length).join("\n"));
-          setLineText(cliLineId, rightAlign(frame[HARNESS_ART.length], ART_WIDTH));
-          if (shineTick >= shineTicks) {
-            clearInterval(shineId!);
-            let bounceTick = 0;
-            bounceId = setInterval(() => {
-              bounceTick++;
-              setLineText(versionLineId, rightAlign(`${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
-              if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
-            }, 60);
-          }
-        }, 90);
+    const shineTicks = shineMultilineFrameCount(shineLines);
+    const shineId = setInterval(() => {
+      shineTick++;
+      const frame = shineMultilineFrame(shineLines, shineTick).split("\n");
+      setLineText(artLineId, frame.slice(0, HARNESS_ART.length).join("\n"));
+      setLineText(cliLineId, rightAlign(frame[HARNESS_ART.length], ART_WIDTH));
+      if (shineTick >= shineTicks) {
+        clearInterval(shineId);
+        let bounceTick = 0;
+        bounceId = setInterval(() => {
+          bounceTick++;
+          setLineText(versionLineId, rightAlign(`${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
+          if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
+        }, 60);
       }
     }, 90);
     return () => {
-      clearInterval(shakeId);
-      if (shineId !== null) clearInterval(shineId);
+      clearInterval(shineId);
       if (bounceId !== null) clearInterval(bounceId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

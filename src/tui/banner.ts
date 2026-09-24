@@ -1,8 +1,10 @@
 /** The startup banner shown once, inside the app's own log (see App.tsx's
  *  mount effect and AppProps.startupBanner): "HARNESS" as block-letter
- *  ASCII art that shakes itself steady, then a version line with a small
- *  bouncing-ball flourish, right-aligned to the art's own width. Pure ANSI
- *  + pure functions so the animation is unit-testable without a terminal. */
+ *  ASCII art with a diagonal shine sweep (no shake — dropped per direct
+ *  feedback: "지금처럼 좌우로 흔드는 애니메이션은 필요없고"), then a
+ *  version line with a small bouncing-ball flourish, right-aligned to the
+ *  art's own width. Pure ANSI + pure functions so the animation is
+ *  unit-testable without a terminal. */
 import stringWidth from "string-width";
 
 /** `vYYYYMMDD` from a file's mtime — used with dist/index.js's own mtime as
@@ -83,36 +85,38 @@ export function shineFrameCount(text: string, speed = 2): number {
   return Math.ceil(text.length / speed);
 }
 
-/** shineFrame over MULTIPLE lines treated as ONE continuous character
- *  stream — a single wave reading through every character of the whole
- *  block in order (row 0 left-to-right, then row 1, ...), not each row
- *  sweeping in parallel. Requested directly, clarifying an earlier
- *  (row-parallel) attempt: "Harness CLI 는 그대로 ascii code 와 Ansi
- *  적용을 하는데 글씨를 구성하는 문자 하나하나가 빛나는 효과를 Harness
- *  CLI 전체 생겨야 하는거야" (each individual character's shine should
- *  happen across the WHOLE "Harness CLI" as one sequence, not per line).
- *  Newlines themselves don't consume a reveal slot. */
-export function shineMultilineFrame(lines: string[], tick: number, speed = 8, bandWidth = 10): string {
-  const totalChars = lines.reduce((n, l) => n + l.length, 0);
-  const revealed = Math.min(totalChars, tick * speed);
-  const peakStart = Math.max(0, revealed - bandWidth);
-  let pos = 0;
-  const outLines: string[] = [];
-  for (const line of lines) {
-    let out = "";
-    for (const ch of line) {
-      const color = pos < peakStart ? SETTLED : pos < revealed ? PEAK : DIM;
-      out += `${color}${ch}`;
-      pos++;
-    }
-    outLines.push(out + RESET);
-  }
-  return outLines.join("\n");
+/** shineFrame over MULTIPLE lines, staggered diagonally by row — later rows
+ *  start revealing a little later than the one above, so the bright band
+ *  reads as one light sweeping across the block on a slant (top-left
+ *  toward bottom-right) rather than a straight vertical or per-row-parallel
+ *  wave. Requested directly, through two rounds of clarification:
+ *  - "글씨를 구성하는 문자 하나하나가 빛나는 효과를 Harness CLI 전체
+ *    생겨야 하는거야" (each character's shine as one motion across the
+ *    whole thing, not per line)
+ *  - "샤이닝 효과는 Think 할 때의 글씨의 반짝이는 효과처럼 같은 색상
+ *    계열의 밝은색 블럭으로 좌측에서 우측으로 비스듬하게 이동이 되게
+ *    되는거야" (a bright block of the same color family moving diagonally
+ *    left-to-right, like reasoning's own sparkle)
+ *  Monotonic per character (once revealed, never reverts to dim), same as
+ *  every other shimmer in this app — only the shape of the sweep is new. */
+export function shineMultilineFrame(lines: string[], tick: number, speed = 3, bandWidth = 6, slantPerRow = 2): string {
+  return lines
+    .map((line, row) => {
+      const effectiveTick = Math.max(0, tick - row * slantPerRow);
+      const revealed = Math.min(line.length, effectiveTick * speed);
+      const peakStart = Math.max(0, revealed - bandWidth);
+      let out = "";
+      for (let i = 0; i < line.length; i++) {
+        const color = i < peakStart ? SETTLED : i < revealed ? PEAK : DIM;
+        out += `${color}${line[i]}`;
+      }
+      return out + RESET;
+    })
+    .join("\n");
 }
 
-export function shineMultilineFrameCount(lines: string[], speed = 8): number {
-  const totalChars = lines.reduce((n, l) => n + l.length, 0);
-  return Math.ceil(totalChars / speed);
+export function shineMultilineFrameCount(lines: string[], speed = 3, slantPerRow = 2): number {
+  return Math.max(0, ...lines.map((line, row) => row * slantPerRow + Math.ceil(line.length / speed)));
 }
 
 /** Block-letter ASCII art, 5 rows tall — requested directly: "대문 로그를
@@ -142,7 +146,7 @@ const ART_ROWS = 5;
 
 /** Builds the 5-row block-letter art for `text` (letters side by side, one
  *  space apart; a literal space becomes a narrower word gap), uppercased.
- *  Pure so it — and the shake animation over it — is unit-testable without
+ *  Pure so it — and the shine animation over it — is unit-testable without
  *  a terminal. */
 export function buildArt(text: string): string[] {
   const rows = new Array(ART_ROWS).fill("");
@@ -170,24 +174,3 @@ export function rightAlign(text: string, width: number): string {
   return " ".repeat(pad) + text;
 }
 
-const SHAKE_TICKS = 14;
-const ART_COLOR = "\x1b[1;36m"; // bold cyan, same settled color the rest of the app's animations use
-
-/** One frame of the shake: each row gets a small leading-space jitter that
- *  decays tick by tick (amplitude 3 → 0) and staggers by row so the whole
- *  word wobbles rather than moving as one rigid block, settling dead still
- *  (offset 0) by SHAKE_TICKS. Deterministic in (tick, row) — same inputs,
- *  same jitter, so it's testable without a terminal driving real timers. */
-export function shakeFrame(art: string[], tick: number): string {
-  const amplitude = Math.max(0, 3 - Math.floor(Math.min(tick, SHAKE_TICKS) / 4));
-  return art
-    .map((row, i) => {
-      const offset = amplitude > 0 ? Math.abs(((tick + i * 2) % (amplitude * 2 + 1)) - amplitude) : 0;
-      return `${ART_COLOR}${" ".repeat(offset)}${row}${RESET}`;
-    })
-    .join("\n");
-}
-
-export function shakeFrameCount(): number {
-  return SHAKE_TICKS;
-}

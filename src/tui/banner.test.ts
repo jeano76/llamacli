@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shakeFrame, shakeFrameCount, shineFrame, shineFrameCount, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { buildVersionString, buildArt, HARNESS_ART, ART_WIDTH, rightAlign, shineFrame, shineFrameCount, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 
 test("buildVersionString formats a file mtime as vYYYYMMDD, zero-padded", () => {
   assert.equal(buildVersionString(new Date(2026, 0, 5).getTime()), "v20260105");
@@ -31,21 +31,6 @@ test("buildArt gives a literal space a narrower gap than a real letter's own bla
   const spaceWidth = buildArt(" ")[0].length;
   const blankLetterWidth = buildArt("?")[0].length;
   assert.ok(spaceWidth < blankLetterWidth, "a word-gap space should be narrower than a blank letter cell");
-});
-
-test("shakeFrame jitters the art for a while and then settles perfectly still (no leading offset)", () => {
-  const art = ["abc", "def"];
-  const early = shakeFrame(art, 0);
-  const settled = shakeFrame(art, shakeFrameCount());
-  // The settled frame's plain text (ANSI stripped) must be exactly the
-  // original art, left-aligned — the shake must fully resolve, not leave
-  // a residual offset.
-  const stripped = settled.replace(/\x1b\[[0-9;]*m/g, "");
-  assert.equal(stripped, art.join("\n"));
-  // Further ticks past settling change nothing.
-  assert.equal(shakeFrame(art, shakeFrameCount() + 20), settled);
-  // It's an actual animation, not a no-op — early ticks differ from settled.
-  assert.notEqual(early, settled);
 });
 
 test("rightAlign pads plain text so it ends flush at the given width, ignoring ANSI codes in the width count", () => {
@@ -81,14 +66,15 @@ test("shineFrameCount scales with text length and empty text needs no ticks", ()
   assert.equal(shineFrameCount("CLI", 2), 2); // 3 chars / 2 per tick, rounded up
 });
 
-test("shineMultilineFrame treats every line as ONE continuous character stream, reading through row 0 fully before row 1 starts", () => {
-  const lines = ["AAAA", "BBBB"];
-  // At a small tick (with the default speed/bandWidth), only row 0 should
-  // have started revealing — row 1 must still be entirely unrevealed (dim).
-  const early = shineMultilineFrame(lines, 1, 1, 1);
-  const [row0, row1] = early.split("\n");
-  assert.match(row0, /\x1b\[1;95m|\x1b\[1;36m/, "row 0 has started revealing");
-  assert.doesNotMatch(row1, /\x1b\[1;95m|\x1b\[1;36m/, "row 1 hasn't started yet — it's still fully dim");
+test("shineMultilineFrame staggers each row's start diagonally — a later row hasn't started revealing while an earlier one has", () => {
+  const lines = ["AAAA", "BBBB", "CCCC"];
+  // With a slant of 2 ticks/row, tick 1 is still before row 1's (and row
+  // 2's) start — only row 0 should show any color yet.
+  const early = shineMultilineFrame(lines, 1, 1, 1, 2);
+  const [row0, row1, row2] = early.split("\n");
+  assert.match(row0, /\x1b\[1;95m|\x1b\[1;36m/, "row 0 has started revealing immediately");
+  assert.doesNotMatch(row1, /\x1b\[1;95m|\x1b\[1;36m/, "row 1 hasn't started yet — the diagonal delay hasn't reached it");
+  assert.doesNotMatch(row2, /\x1b\[1;95m|\x1b\[1;36m/, "row 2 starts even later than row 1");
 
   const settled = shineMultilineFrame(lines, shineMultilineFrameCount(lines));
   assert.equal(settled, shineMultilineFrame(lines, shineMultilineFrameCount(lines) + 20), "clamps once every character has revealed");
@@ -96,8 +82,14 @@ test("shineMultilineFrame treats every line as ONE continuous character stream, 
   assert.equal(strippedSettled, lines.join("\n"));
 });
 
-test("shineMultilineFrameCount scales with the TOTAL character count across all lines combined, not any single line", () => {
-  assert.equal(shineMultilineFrameCount(["ab", "abcdef"], 2), Math.ceil((2 + 6) / 2));
+test("shineMultilineFrameCount accounts for the LAST row's diagonal delay plus its own reveal time, not just the longest line", () => {
+  // A short last row still needs its full diagonal delay before it can
+  // even start, so the total can be longer than reading every line's own
+  // shineFrameCount in isolation would suggest.
+  const lines = ["a", "a", "a"];
+  const slantPerRow = 2;
+  const speed = 1;
+  assert.equal(shineMultilineFrameCount(lines, speed, slantPerRow), 2 * slantPerRow + Math.ceil(1 / speed));
 });
 
 test("bounceFrame plays a decaying up-down sequence and settles on a final frame past its length", () => {
