@@ -291,6 +291,13 @@ export interface AgentLoopOptions {
    *  vs kept/summarized — lets the UI show compaction's before/after
    *  instead of it being a black box. */
   onCompactionDetail?: (detail: CompactionDetail) => void;
+  /** Fires right as the model is about to start processing the next
+   *  command — a fresh send(), or a queued message being drained into an
+   *  already-running turn. Used by the TUI to fold expanded diffs back
+   *  down (see App.tsx's collapseDiffs) — requested directly to trigger on
+   *  this, not on the human's Enter keypress itself (a queued/auto-resumed
+   *  command the model picks up on its own never goes through that key). */
+  onTurnStart?: () => void;
   /** When a compaction interrupts a tool call mid-turn (checkpoint written,
    *  batch abandoned — see the maybeCompact() call site below), immediately
    *  fold the checkpoint's resume prompt back in and keep the same turn
@@ -460,6 +467,7 @@ export class AgentLoop {
   }
 
   async send(userText: string): Promise<void> {
+    this.opts.onTurnStart?.();
     await this.enqueue(async () => {
       // The circuit breaker is created once per AgentLoop (i.e. once per
       // process) and never reset anywhere before this — its 30-minute
@@ -600,6 +608,7 @@ export class AgentLoop {
       // steering a task usually means every queued message together, not
       // one per tool-call round.
       if (this.queuedMessages.length > 0) {
+        this.opts.onTurnStart?.();
         for (const text of this.queuedMessages) {
           this.opts.onStatus?.(`[applying queued message] ${text}`);
           this.messages.push({ role: "user", content: text });

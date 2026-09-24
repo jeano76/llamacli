@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk } from "./App.js";
 import { formatDiff } from "../tools/diff.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
@@ -167,6 +167,27 @@ test("shimmerBands is empty for empty text", () => {
   assert.deepEqual(shimmerBands("", 5), []);
 });
 
+
+test("bufferMouseChunk reassembles a SGR mouse report split across two stdin chunks, instead of leaking the fragment as typed text", () => {
+  // Reported directly: under fast scrolling/clicking, a chunk boundary can
+  // land mid-escape-sequence and the trailing half appeared as literal
+  // ANSI garbage in the prompt box.
+  const full = "\x1b[<35;10;20M";
+  const splitAt = 7;
+  const first = bufferMouseChunk("", full.slice(0, splitAt));
+  assert.equal(first.action, "wait", "the first half alone isn't a complete report yet");
+  const second = bufferMouseChunk(full.slice(0, splitAt), full.slice(splitAt));
+  assert.equal(second.action, "process");
+  assert.equal((second as { action: "process"; text: string }).text, full, "the two halves must reassemble to the original report");
+});
+
+test("bufferMouseChunk processes a complete report immediately with nothing buffered, and discards an over-long non-report rather than buffering forever", () => {
+  const complete = bufferMouseChunk("", "\x1b[<0;5;5M");
+  assert.equal(complete.action, "process");
+
+  const garbage = bufferMouseChunk("", "\x1b[<" + "9".repeat(100));
+  assert.equal(garbage.action, "discard");
+});
 
 test("parseMouseClicks reports a plain button press with its (row, col), and ignores wheel/drag/release", () => {
   assert.deepEqual(parseMouseClicks("[<0;15;22M"), [{ row: 22, col: 15 }]);

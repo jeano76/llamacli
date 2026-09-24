@@ -363,6 +363,19 @@ export function parseMouseWheel(input: string): number | null {
  *  coordinates — absolute, since row 1 is the alt screen's top (see
  *  index.tsx). Used to toggle a folded reasoning block on click. Several
  *  reports can arrive in one input string, same as parseMouseWheel. */
+/** Decides what to do with a raw stdin chunk that might be (part of) a SGR
+ *  mouse report, given whatever was already buffered from a previous call —
+ *  see mouseBufferRef's doc comment in App for why this exists at all (a
+ *  chunk boundary landing mid-escape-sequence). Pure so the reassembly
+ *  logic is testable without driving a real useInput handler. */
+export type MouseBufferOutcome = { action: "process"; text: string } | { action: "wait" } | { action: "discard" };
+export function bufferMouseChunk(buffered: string, chunk: string): MouseBufferOutcome {
+  const combined = buffered + chunk;
+  if (/\[<\d+;\d+;\d+[Mm]/.test(combined)) return { action: "process", text: combined };
+  if (combined.length < 64) return { action: "wait" };
+  return { action: "discard" };
+}
+
 export function parseMouseClicks(input: string): { row: number; col: number }[] {
   const clicks: { row: number; col: number }[] = [];
   for (const [, code, colStr, rowStr, kind] of input.matchAll(/\[<(\d+);(\d+);(\d+)([Mm])/g)) {
@@ -549,6 +562,15 @@ export function App({
     firstRow: 1,
     entries: [],
   });
+  // Holds a SGR mouse report that arrived split across two raw stdin
+  // chunks — reported directly ("마우스 클릭 또는 휠을 내리면 프롬포트창에
+  // 안시코드가 찍혀"): under fast scrolling/clicking, a chunk boundary can
+  // land mid-escape-sequence, and the trailing half (e.g. a bare "6M") no
+  // longer matches the mouse-report regex on its own, so it was falling
+  // through to the plain "insert this character" branch and appearing as
+  // literal text in the prompt. Buffered here and reassembled on the next
+  // useInput call instead of being typed.
+  const mouseBufferRef = useRef("");
   // How far scrollOffset can go before there's nothing further back to see —
   // updated every render (see below) rather than recomputed inside the key
   // handler, which would mean redoing the markdown/wrap rendering work
@@ -624,6 +646,23 @@ export function App({
     );
   }
 
+  // Folds every currently-expanded diff to its one-line summary. Diffs
+  // default to expanded (the point is to actually see the change), but
+  // shouldn't sit taking up the whole log forever — requested directly to
+  // fold them once the MODEL starts on the next command ("다음 명령어를
+  // 모델이 처리 시작하면 닫힘으로"), not when the human merely presses
+  // Enter (an earlier version of this folded on the keypress itself, which
+  // was explicitly called out as wrong — a queued/auto-resumed command the
+  // model picks up on its own never went through that keypress at all).
+  // Wired to loop.ts's onTurnStart (index.tsx). Still re-expandable by click.
+  function collapseDiffs() {
+    setCollapsedDiffIds((prev) => {
+      const next = new Set(prev);
+      for (const line of log) if (line.kind === "diff") next.add(line.id);
+      return next;
+    });
+  }
+
 
   // Echoes the startup resume question into the scrolling log as well as
   // showing it in the input box (see visibleInput below) — reported
@@ -650,7 +689,24 @@ export function App({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useInput((char, key) => {
+  useInput((rawChar, key) => {
+    // Reassemble a mouse report split across chunk boundaries (see
+    // mouseBufferRef's doc comment) before anything else looks at it.
+    let char = rawChar;
+    if (mouseBufferRef.current || /\x1b\[</.test(char)) {
+      const outcome = bufferMouseChunk(mouseBufferRef.current, char);
+      if (outcome.action === "process") {
+        mouseBufferRef.current = "";
+        char = outcome.text;
+      } else {
+        // "wait": still incomplete, buffered for the next call. "discard":
+        // not actually a mouse report (or corrupted) — dropped. Either way,
+        // don't type this fragment or treat it as a real key.
+        if (outcome.action === "wait") mouseBufferRef.current = mouseBufferRef.current + char;
+        else mouseBufferRef.current = "";
+        return;
+      }
+    }
     // Mouse wheel (reporting enabled in index.tsx). Handled before
     // anything else so a report can never be typed into the input box or
     // answer a Y/N prompt.
@@ -841,16 +897,6 @@ export function App({
 
     if (key.return) {
       if (input.trim().length === 0) return;
-      // Diffs default to expanded so the change is actually visible right
-      // away, but shouldn't stay taking up the whole log forever — folding
-      // them the moment the next command is entered (rather than needing a
-      // click) was requested directly ("기본적으로는 화면에 펼짐으로
-      // 나타내고 다음 명령어 진입시 닫힘으로"). Still re-expandable by click.
-      setCollapsedDiffIds((prev) => {
-        const next = new Set(prev);
-        for (const line of log) if (line.kind === "diff") next.add(line.id);
-        return next;
-      });
       if (busy) {
         onQueueMessage(input);
         pushLine(`[queued] ${input}`, "status");
@@ -896,6 +942,7 @@ export function App({
     finalizeReasoning,
     pushCompactionDetail,
     pushToolResult,
+    collapseDiffs,
     setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
     pushTool: (t: string) => pushLine(t, "tool"),

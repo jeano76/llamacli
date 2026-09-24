@@ -2466,6 +2466,7 @@ test("harness: a message queued mid-turn reaches the model at the NEXT request, 
       return realChat(req, onDelta);
     };
     const queueSnapshots: string[][] = [];
+    let turnStartCount = 0;
     const loop = new AgentLoop({
       projectRoot: dir,
       model: "m",
@@ -2473,8 +2474,10 @@ test("harness: a message queued mid-turn reaches the model at the NEXT request, 
       systemPrompt: "sys",
       thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
       onQueueChange: (q) => queueSnapshots.push(q),
+      onTurnStart: () => turnStartCount++,
     });
     const sendPromise = loop.send("start the task");
+    assert.equal(turnStartCount, 1, "onTurnStart must fire right as send() starts processing the new command");
     loop.queueMessage("actually, also check the logs");
     releaseRound1!();
     await sendPromise;
@@ -2486,4 +2489,8 @@ test("harness: a message queued mid-turn reaches the model at the NEXT request, 
     assert.ok(round3Has, "once in history it stays for every later request too");
     assert.ok(queueSnapshots.some((q) => q.length === 1), "onQueueChange must report it while queued");
     assert.ok(queueSnapshots.at(-1)?.length === 0, "and report it drained once applied");
+    // Fired once for send() itself and once when the queued message was
+    // drained into round 2 — not on every tool-call round in between (round
+    // 3 had nothing queued to drain).
+    assert.equal(turnStartCount, 2, "onTurnStart should also fire when the queued message is drained into the turn");
   }));

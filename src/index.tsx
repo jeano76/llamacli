@@ -249,6 +249,7 @@ async function main() {
     onPlanProgress: (done, total) => (globalThis as any).__llamacli_ui?.setPlanProgress(done, total),
     onCompactionStatus: (status, timestamp) => (globalThis as any).__llamacli_ui?.setCompactionStatus(status, timestamp),
     onCompactionDetail: (detail) => (globalThis as any).__llamacli_ui?.pushCompactionDetail(detail),
+    onTurnStart: () => (globalThis as any).__llamacli_ui?.collapseDiffs(),
   });
 
   // Session-end self-improvement gate (PROMPT.md §3): if failures were
