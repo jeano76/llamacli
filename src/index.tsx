@@ -27,7 +27,13 @@ context compaction, so work can resume accurately after it.
 While investigating or debugging, call the note tool the moment you establish something worth
 not re-deriving: a root cause, a verified fact, a dead end already ruled out. Do this as you go,
 not only once told to — context compaction keeps only a summary of the conversation, but a note
-survives it word for word.`;
+survives it word for word.
+
+If you need a one-off script to test or reproduce something, reuse the SAME filename for every
+attempt (overwrite it) instead of a new incrementing name (test1.js, test2.js, ...), and delete
+it once you are done with it. Leaving a trail of one-off scripts behind is a sign you are stuck
+re-testing the same thing rather than making progress — if that is happening, use note and step
+back instead of writing another one.`;
 
 // Only appended when the browser tools are actually enabled (config.yaml's
 // browser.enabled). Describing tools the model wasn't given is both

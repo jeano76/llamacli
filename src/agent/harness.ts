@@ -82,7 +82,9 @@ export function progressNudgeText(minutes: number, compactions: number): string 
     `[progress check] About ${minutes} minutes and ${compactions} context compactions have passed with no edit to an ` +
     "existing file and no plan step completed. Stop investigating. Record what you have established with note() — " +
     "notes survive compaction, the conversation does not. Then state the most likely root cause in one or two " +
-    "sentences and either apply a fix now, or ask the user for the information you are missing."
+    "sentences and either apply a fix now, or ask the user for the information you are missing. If you have been " +
+    "writing a series of one-off test/debug scripts, that is itself a sign of this — delete them and change approach " +
+    "rather than writing another one."
   );
 }
 
