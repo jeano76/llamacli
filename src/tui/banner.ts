@@ -151,24 +151,21 @@ export function shineMultilineFrameCount(lines: string[], speed = 10, slantPerRo
  *  small-text word-reveal, which wasn't actual letter shapes. Only the
  *  letters this app's name needs; an unknown character renders as a blank
  *  5x5 cell rather than throwing. */
-// Corners softened from a hard █ to the light-shade ░ — requested
-// directly, twice: "Ascii ansi 코드로 작성된 글씨의 디자인이 너무
-// 기계적인데 이쁜게 통통하게 만들어줘" (too mechanical — make it cute
-// and chubby/rounded), then "좀더 통통하게 해줘" (even more so — the
-// medium ▓ shade the first pass used wasn't soft enough). A plain
-// rectangular block-letter font reads as sharp and mechanical; rounding
-// just the four outer corners of each 5x5 glyph fakes a rounded-corner look
-// without redesigning every stroke.
+// Plain solid block letters — the corner-softening (a lighter ░ shade at
+// the four outer corners of each glyph, tried as a "chubbier" look) was
+// removed per direct feedback: "아스키 문자구성의 HARNESS 의 모서리
+// 색상바꾸는 효과는 없애죠" (drop the effect that changes the color of
+// HARNESS's corners).
 const GLYPHS: Record<string, string[]> = {
-  H: ["░   ░", "█   █", "█████", "█   █", "░   ░"],
-  A: [" ███ ", "█   █", "█████", "█   █", "░   ░"],
-  R: ["░███ ", "█   █", "████ ", "█  █ ", "░   ░"],
-  N: ["░   ░", "██  █", "█ █ █", "█  ██", "░   ░"],
-  E: ["░███░", "█    ", "████ ", "█    ", "░███░"],
-  S: [" ███░", "█    ", " ███ ", "    █", "░███ "],
-  C: [" ███░", "█    ", "█    ", "█    ", " ███░"],
-  L: ["░    ", "█    ", "█    ", "█    ", "░███░"],
-  I: ["░███░", "  █  ", "  █  ", "  █  ", "░███░"],
+  H: ["█   █", "█   █", "█████", "█   █", "█   █"],
+  A: [" ███ ", "█   █", "█████", "█   █", "█   █"],
+  R: ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+  N: ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
+  E: ["█████", "█    ", "████ ", "█    ", "█████"],
+  S: [" ████", "█    ", " ███ ", "    █", "████ "],
+  C: [" ████", "█    ", "█    ", "█    ", " ████"],
+  L: ["█    ", "█    ", "█    ", "█    ", "█████"],
+  I: ["█████", "  █  ", "  █  ", "  █  ", "█████"],
 };
 const BLANK_GLYPH = ["     ", "     ", "     ", "     ", "     "];
 // Narrower than a letter's own blank — a full 5-wide gap between WORDS (as
