@@ -17,6 +17,7 @@ import { findOtherInstances, terminateInstance } from "./instanceGuard.js";
 import { createInterface } from "node:readline/promises";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
 
@@ -142,17 +143,18 @@ function startupVersion(): string {
  *  running file is a .tsx source file, not the built dist/index.js this
  *  mechanism updates. */
 async function maybeSelfUpdateAndRestart(): Promise<void> {
-  let binPath: string;
+  let entryPath: string;
   try {
-    binPath = fileURLToPath(import.meta.url);
+    entryPath = fileURLToPath(import.meta.url);
   } catch {
     return;
   }
-  if (!binPath.endsWith(".js")) return;
-  const result = await checkAndApplyUpdate(binPath).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
+  if (!entryPath.endsWith(".js")) return;
+  const distDir = dirname(entryPath);
+  const result = await checkAndApplyUpdate(distDir).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
   if (!result.updated) return;
   process.stdout.write(`[self-update] ${result.reason} — restarting...\n`);
-  spawnRestart(binPath);
+  spawnRestart(entryPath);
   process.exit(0);
 }
 
