@@ -18,6 +18,7 @@ import { createInterface } from "node:readline/promises";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { buildVersionString } from "./tui/banner.js";
+import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -130,7 +131,33 @@ function startupVersion(): string {
   }
 }
 
+/** Requested directly: "CLI 구동시 신규 버전의 바이너리가 github에
+ *  존재를 하면 해당 버전을 업데이트하고 cli는 재구동을 하는 기능을 넣어줘"
+ *  — checked once, right at startup, before anything else touches the
+ *  screen or the project. checkAndApplyUpdate() itself never installs
+ *  anything that fails either hash check (see its own doc comment) — a
+ *  failure here (offline, GitHub unreachable, hash mismatch) is silent and
+ *  this process just continues running as-is, never blocking startup on a
+ *  network call succeeding. Skipped entirely under `tsx` (dev mode): the
+ *  running file is a .tsx source file, not the built dist/index.js this
+ *  mechanism updates. */
+async function maybeSelfUpdateAndRestart(): Promise<void> {
+  let binPath: string;
+  try {
+    binPath = fileURLToPath(import.meta.url);
+  } catch {
+    return;
+  }
+  if (!binPath.endsWith(".js")) return;
+  const result = await checkAndApplyUpdate(binPath).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
+  if (!result.updated) return;
+  process.stdout.write(`[self-update] ${result.reason} — restarting...\n`);
+  spawnRestart(binPath);
+  process.exit(0);
+}
+
 async function main() {
+  await maybeSelfUpdateAndRestart();
   await ensureSingleInstance();
   enterAltScreen();
   let cleanedUp = false;
