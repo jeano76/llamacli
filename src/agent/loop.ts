@@ -316,7 +316,10 @@ export class AgentLoop {
     // ..." before it. Leave the checkpoint on disk.
     const pending = await readCheckpoint(this.opts.projectRoot);
     if (pending?.reason === "plan-progress" && this.plan.length > 0) return false;
-    const resumeText = await buildResumePrompt(this.opts.projectRoot);
+    const systemText = typeof this.messages[0]?.content === "string" ? this.messages[0].content : "";
+    const resumeText = await buildResumePrompt(this.opts.projectRoot, {
+      includeSummary: splitSystemMessage(systemText).summary === null,
+    });
     if (!resumeText) return false;
     this.opts.onStatus?.(resumeText);
     // Must be role "user", not "system": this.messages already starts with
@@ -1009,8 +1012,14 @@ export class AgentLoop {
   /** Falls back to "every executed tool call so far = a done step" when the
    *  model never called update_plan, so steps are never silently empty. */
   private currentSteps(): Checkpoint["steps"] {
-    if (this.plan.length > 0) return this.plan;
-    return this.executedToolLog.map((description) => ({ description, status: "done" as const }));
+    return this.plan;
+  }
+
+  /** Without a plan, the latest tool calls are what shows where the work
+   *  was. They used to be stored as "done" steps, which made a resume
+   *  report that everything was already finished. */
+  private recentActions(): string[] | undefined {
+    return this.plan.length > 0 ? undefined : this.executedToolLog.slice(-15);
   }
 
   private currentFiles(): Checkpoint["files"] {
@@ -1040,6 +1049,7 @@ export class AgentLoop {
         reason: "manual",
         goal: this.currentGoalSummary(),
         steps: this.currentSteps(),
+        recentActions: this.recentActions(),
         files: this.currentFiles(),
         pendingToolCall: null,
         mustPreserve: [],
@@ -1215,6 +1225,7 @@ export class AgentLoop {
       reason,
       goal: this.currentGoalSummary(),
       steps: this.currentSteps(),
+        recentActions: this.recentActions(),
       files: this.currentFiles(),
       pendingToolCall,
       mustPreserve: [],

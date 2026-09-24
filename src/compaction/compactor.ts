@@ -424,6 +424,12 @@ export async function runCompaction(
   // second system-role message breaks chat-template-enforcing backends, so this
   // concatenates into the existing single system slot instead of adding another.
   const systemContent = composeSystemMessage(originalSystemText, summaryText);
+  // Store the summary with the checkpoint too: a resume in a new process
+  // (after /quit, a crash, a restart) has none of this conversation, and
+  // without it the resumed model had only a goal line and a file list —
+  // live, it answered "No response requested." and stopped.
+  const finalCheckpoint: Checkpoint = res.choices[0]?.message.content ? { ...checkpoint, summary: summaryText } : checkpoint;
+  if (finalCheckpoint !== checkpoint) await writeCheckpoint(projectRoot, finalCheckpoint);
 
   // keepTail's cut point is purely size-based and can land between a
   // `tool_calls`-bearing assistant message and its matching `tool` response,
@@ -468,7 +474,7 @@ export async function runCompaction(
 
   const compactedMessages: ChatMessage[] = [{ role: "system", content: systemContent }, ...tail];
 
-  return { messages: compactedMessages, checkpoint };
+  return { messages: compactedMessages, checkpoint: finalCheckpoint };
 }
 
 const SUMMARY_HEADER = "[Compacted history summary]";
@@ -521,9 +527,18 @@ export function stripResumePrefix(goal: string): string {
  * short resume announcement + the injected system reminder that drives the
  * agent to continue the interrupted work rather than wait for new input.
  */
-export async function buildResumePrompt(projectRoot: string): Promise<string | null> {
+/** Cap on how much of a stored summary goes into a resume message. */
+const RESUME_SUMMARY_MAX_CHARS = 4000;
+
+export async function buildResumePrompt(
+  projectRoot: string,
+  // False when the live conversation already carries the summary (a
+  // mid-session resume right after compaction), so it isn't sent twice.
+  opts: { includeSummary?: boolean } = {}
+): Promise<string | null> {
   const checkpoint = await readCheckpoint(projectRoot);
   if (!checkpoint) return null;
+  const includeSummary = opts.includeSummary ?? true;
 
   const remaining = checkpoint.steps.filter((s) => s.status !== "done");
   // A checkpoint can now exist without any compaction ever having run
@@ -535,13 +550,27 @@ export async function buildResumePrompt(projectRoot: string): Promise<string | n
     `[${resumeReasonText}] previous goal: ${stripResumePrefix(checkpoint.goal)}`,
     remaining.length
       ? `remaining steps:\n${remaining.map((s) => `- (${s.status}) ${s.description}`).join("\n")}`
-      : "All steps were already done — re-verifying before wrapping up.",
+      : checkpoint.steps.length
+        ? "All plan steps were already done — re-verifying before wrapping up."
+        : // No plan was declared. Saying "all steps done" here (the tool
+          // log used to be stored as done steps) told the model there was
+          // nothing left to do.
+          "No plan was recorded for this work.",
+    includeSummary && checkpoint.summary
+      ? `summary of the previous session:\n${
+          checkpoint.summary.length > RESUME_SUMMARY_MAX_CHARS
+            ? checkpoint.summary.slice(0, RESUME_SUMMARY_MAX_CHARS) + " …"
+            : checkpoint.summary
+        }`
+      : "",
+    checkpoint.recentActions?.length ? `recent actions:\n${checkpoint.recentActions.map((a) => `- ${a}`).join("\n")}` : "",
     checkpoint.pendingToolCall
       ? `interrupted tool call: ${checkpoint.pendingToolCall.name} (${checkpoint.pendingToolCall.reason})`
       : "",
     checkpoint.files.length
       ? `files touched:\n${checkpoint.files.map((f) => `- (${f.status}) ${f.path}`).join("\n")}`
       : "",
+    "Continue the task from where it stopped. If it is already complete, verify that and report the result.",
   ].filter(Boolean);
 
   return lines.join("\n\n");

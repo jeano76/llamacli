@@ -922,3 +922,24 @@ test("a compacted conversation always contains a user message, since some chat t
       await rm(dir, { recursive: true, force: true });
     }
   })());
+
+test("buildResumePrompt leaves the summary out when the live conversation already carries it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+  try {
+    await writeCheckpoint(dir, {
+      version: 1,
+      timestamp: new Date().toISOString(),
+      reason: "auto-threshold",
+      goal: "g",
+      steps: [],
+      files: [],
+      pendingToolCall: null,
+      mustPreserve: [],
+      summary: "THE-SUMMARY",
+    });
+    assert.match((await buildResumePrompt(dir))!, /THE-SUMMARY/);
+    assert.doesNotMatch((await buildResumePrompt(dir, { includeSummary: false }))!, /THE-SUMMARY/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

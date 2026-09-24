@@ -2222,3 +2222,34 @@ test("after a write, the history keeps no copyable content; a copied call fails 
     assert.equal(isElidedContentWrite("write_file", JSON.stringify({ path, content: "real code mentioning characters written to disk in a comment\nmore" })), false);
     assert.equal(await readFile(path, "utf8"), real);
   }));
+
+test("resuming in a NEW process carries the previous session's summary and recent actions, and never claims everything was done", () =>
+  withTempProject(async (dir) => {
+    // Session A: no plan, a few tool calls, then /quit (saveStateOnQuit
+    // compacts, which stores the summary with the checkpoint).
+    const call = (id: string, cmd: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "run_shell", arguments: JSON.stringify({ command: cmd }) },
+    });
+    const a = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call("c1", "echo one"), call("c2", "echo two")]), assistantMessage("working on it")],
+      tokenCounts: [1],
+      summaryText: "SESSION-A-SUMMARY: fixed the WebSocket handshake; ws_verify.mjs still fails on reconnect.",
+    });
+    const loopA = new AgentLoop({ projectRoot: dir, model: "m", backend: a.backend, systemPrompt: "sys", thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 } });
+    await loopA.send("continue the improvement work");
+    await loopA.saveStateOnQuit();
+
+    // Session B: a fresh process resumes from the checkpoint.
+    const b = scriptedBackend({ turnResponses: [assistantMessage("resuming the reconnect fix")], tokenCounts: [1] });
+    const loopB = new AgentLoop({ projectRoot: dir, model: "m", backend: b.backend, systemPrompt: "sys", thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 } });
+    await loopB.resumeIfCheckpointExists();
+
+    const resume = String(b.turnRequests[0].messages.find((m) => m.role === "user" && String(m.content).startsWith("[resuming"))!.content);
+    assert.match(resume, /SESSION-A-SUMMARY/);
+    assert.match(resume, /recent actions:[\s\S]*echo two/);
+    assert.match(resume, /No plan was recorded/);
+    assert.match(resume, /Continue the task from where it stopped/);
+    assert.doesNotMatch(resume, /already done/);
+  }));

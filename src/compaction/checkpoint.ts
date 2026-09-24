@@ -32,6 +32,12 @@ export interface Checkpoint {
   } | null;
   /** Facts/decisions that must survive summarization losslessly. */
   mustPreserve: string[];
+  /** The compaction summary, added once it has been generated, so a resume
+   *  in a NEW process knows what the previous one did (its conversation is
+   *  gone). Absent on checkpoints written before summarizing. */
+  summary?: string;
+  /** The last tool calls, when no plan was declared (steps is then empty). */
+  recentActions?: string[];
 }
 
 function checkpointPath(projectRoot: string): string {
