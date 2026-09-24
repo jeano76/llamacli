@@ -174,6 +174,7 @@ async function main() {
     autoResume: config.compaction.autoResume,
     enableThinking: config.enableThinking ?? false,
     verify: config.verify?.afterEdit,
+    gitCheckpoint: config.checkpoint?.git ?? false,
     onAssistantDelta: (t) => (globalThis as any).__llamacli_ui?.pushAssistantDelta(t),
     onAssistantDone: () => (globalThis as any).__llamacli_ui?.finalizeAssistant(),
     onToolCall: (name, args) => {

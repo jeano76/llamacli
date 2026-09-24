@@ -26,6 +26,7 @@ import {
   type VerifyConfig,
 } from "./harness.js";
 import { appendNote, clearNotes, readNotes, NOTES_HEADER } from "../compaction/notes.js";
+import { gitCheckpoint } from "./gitCheckpoint.js";
 
 // Sent as the `tools` field on every main-loop request (never on the
 // compaction summary request, which omits tools entirely) — computed once
@@ -154,6 +155,16 @@ const FILE_CONTENT_TOOLS = new Set(["write_file", "append_file"]);
 /** Tools that change a file on disk: progress signal + post-edit check. */
 const EDIT_TOOLS = new Set(["write_file", "append_file", "edit_file"]);
 
+/** How many CONSECUTIVE failed checks on the same file before the reflect
+ *  message escalates from "here's the error" to "stop and rethink". */
+const REFLECT_RETRY_ESCALATE_AT = 3;
+
+function ordinal(n: number): string {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return `${n}${s[(v - 20) % 10] ?? s[v] ?? s[0]}`;
+}
+
 function pathArg(argumentsJson: string): string | null {
   try {
     const p = JSON.parse(argumentsJson)?.path;
@@ -223,6 +234,10 @@ export interface AgentLoopOptions {
   verify?: VerifyConfig;
   /** No-progress guard thresholds (see harness.ts ProgressTracker). */
   progressGuard?: ProgressGuardOptions;
+  /** Aider-style auto-commit of each successful edit (see gitCheckpoint.ts).
+   *  Off by default — see that file's doc comment for why. From
+   *  config.yaml's checkpoint.git. */
+  gitCheckpoint?: boolean;
   /** Clock, injectable for tests. */
   now?: () => number;
   /** Called for each incremental token/chunk of assistant text as it streams in. */
@@ -279,6 +294,11 @@ export class AgentLoop {
 
   /** Model-declared plan via the `update_plan` tool (PROMPT.md §2.2 steps). */
   private plan: Checkpoint["steps"] = [];
+  /** Consecutive post-edit-check failures, per file path — drives the
+   *  escalating reflect-and-retry message (Aider's edit → validate →
+   *  reflect → retry loop). Reset the moment a check on that path passes,
+   *  or the path stops being edited (implicitly, since it only grows). */
+  private consecutiveCheckFailures = new Map<string, number>();
   private progress!: ProgressTracker;
   private now(): number {
     return (this.opts.now ?? Date.now)();
@@ -969,12 +989,40 @@ export class AgentLoop {
           this.recordFileTouch(call.function.name, call.function.arguments);
           this.pushExecutedToolLog(`${call.function.name}(${this.summarizeArgs(call.function.arguments)})`);
           if (editPath !== null) {
-            // Only edits to files that already existed count as progress:
-            // throwaway scripts written and rerun (t2.js … t59.js, live)
-            // are new files every time.
-            if (editedExisting) this.progress.markProgress(this.now());
             const check = await runPostEditCheck(editPath, this.opts.projectRoot, this.opts.verify, call.function.name === "append_file");
+            const checkFailed = check?.includes("FAILED") ?? false;
+            // Progress requires the edit to have LANDED clean: a check
+            // failure must not count, or a model stuck failing the same
+            // validation forever resets the no-progress clock on every
+            // attempt and the guard never fires. Reported live: exactly
+            // this let a session "edit" a file with a stray // comment
+            // for 40 minutes without ever being flagged as stuck.
+            if (editedExisting && !checkFailed) this.progress.markProgress(this.now());
             if (check) content = `${content}\n\n${check}`;
+
+            // Aider's edit → validate → reflect → retry loop: turn a
+            // check failure into an explicit, escalating instruction
+            // rather than a passive result the model may or may not act
+            // on. Resets to 0 the moment a check on this path passes.
+            const prevFails = this.consecutiveCheckFailures.get(editPath) ?? 0;
+            if (checkFailed) {
+              const fails = prevFails + 1;
+              this.consecutiveCheckFailures.set(editPath, fails);
+              if (fails >= REFLECT_RETRY_ESCALATE_AT) {
+                content =
+                  `${content}\n\n[reflect] This is the ${ordinal(fails)} consecutive failed check on this exact file — ` +
+                  "repeating the same edit will not help. Stop, re-read the actual error above line by line, and change " +
+                  "your approach before touching this file again.";
+              }
+            } else if (prevFails > 0) {
+              this.consecutiveCheckFailures.delete(editPath);
+            }
+
+            if (!checkFailed && this.opts.gitCheckpoint) {
+              const label = `llamacli: ${call.function.name} ${this.summarizeArgs(call.function.arguments)}`.slice(0, 72);
+              const cp = await gitCheckpoint(editPath, label, this.opts.projectRoot);
+              if (cp.committed) content = `${content}\n\n[checkpoint] committed as ${cp.hash} — revertable with git revert/reset.`;
+            }
           }
           // Drop the now-redundant copy of the file content from the
           // assistant message still sitting in `this.messages` (pushed

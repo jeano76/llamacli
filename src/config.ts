@@ -23,6 +23,11 @@ export interface LlamacliConfig {
   verify?: {
     afterEdit?: Record<string, string> | false;
   };
+  /** Aider-style auto-commit of each successful edit. Off by default — see
+   *  agent/gitCheckpoint.ts's doc comment. */
+  checkpoint?: {
+    git?: boolean;
+  };
   compaction: {
     autoTriggerRatio: number;
     /** Auto-continue past a compaction that interrupts a tool call mid-turn

@@ -2303,3 +2303,82 @@ test("harness: notes survive compaction, edits get an auto-check result, and a s
     const nudged = b.turnRequests.some((r) => r.messages.some((m) => typeof m.content === "string" && m.content.startsWith("[progress check]")));
     assert.ok(nudged, "the nudge must reach the model");
   }));
+
+test("harness: a failing post-edit check does not count as progress, so the guard still fires despite continuous edits", () =>
+  withTempProject(async (dir) => {
+    const path = join(dir, "broken.js");
+    await writeFile(path, "const ok = 1;\n");
+    // The same broken content written repeatedly — node --check fails every
+    // time (a stray // comment eating the rest of a one-line script, the
+    // live shape). If a failing check still counted as progress, the guard
+    // would never fire no matter how long this runs.
+    const badContent = "function f() {if (x) {// c} else {y();}}\n";
+    const writeCall = (i: number) => ({
+      id: `w${i}`,
+      type: "function" as const,
+      function: { name: "write_file", arguments: JSON.stringify({ path, content: badContent }) },
+    });
+    let t = 0;
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: Array.from({ length: 12 }, (_, i) => assistantMessage(null, [writeCall(i)])),
+      tokenCounts: [1],
+    });
+    const statuses: string[] = [];
+    // A large window (no compaction pressure) isolates what's under test —
+    // whether a failing check counts as progress — from compaction timing.
+    // compactions: 0 makes the guard purely time-based here.
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 1_000_000 },
+      progressGuard: { minutes: 1, compactions: 0 },
+      now: () => (t += 45_000),
+      onStatus: (s) => statuses.push(s),
+    });
+    await loop.send("fix it");
+
+    const toolMsgs = turnRequests.flatMap((r) => r.messages).filter((m) => m.role === "tool").map((m) => String(m.content));
+    assert.ok(toolMsgs.some((c) => c.includes("FAILED")), "expected at least one FAILED check result");
+    assert.ok(
+      toolMsgs.some((c) => c.includes("consecutive failed check") && c.includes("3rd")),
+      `expected an escalated reflect message by the 3rd failure, got: ${JSON.stringify(toolMsgs)}`
+    );
+    assert.ok(statuses.some((s) => s.startsWith("[stopped] still no progress")), `expected the guard to fire despite repeated edits, got: ${statuses.join(" | ")}`);
+  }));
+
+test("harness: gitCheckpoint commits a successful edit when enabled, and does nothing when it is not", () =>
+  withTempProject(async (dir) => {
+    const { exec } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execAsync = promisify(exec);
+    await execAsync("git init -q", { cwd: dir });
+    await execAsync('git config user.email t@t.com && git config user.name t', { cwd: dir });
+
+    const path = join(dir, "a.js");
+    const makeCall = (id: string) => ({ id, type: "function" as const, function: { name: "write_file", arguments: JSON.stringify({ path, content: "const a = 1;\n" }) } });
+    const { backend, turnRequests } = scriptedBackend({ turnResponses: [assistantMessage(null, [makeCall("w1")]), assistantMessage("ok")], tokenCounts: [1] });
+
+    const loopOff = new AgentLoop({ projectRoot: dir, model: "m", backend, systemPrompt: "sys", thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 } });
+    await loopOff.send("write it");
+    const offMsg = String(turnRequests[1].messages.find((m) => m.role === "tool")!.content);
+    assert.doesNotMatch(offMsg, /\[checkpoint\]/);
+    const { stdout: logOff } = await execAsync("git log --oneline", { cwd: dir }).catch(() => ({ stdout: "" }));
+    assert.equal(logOff.trim(), "");
+
+    const { backend: backend2, turnRequests: reqs2 } = scriptedBackend({ turnResponses: [assistantMessage(null, [makeCall("w2")]), assistantMessage("ok")], tokenCounts: [1] });
+    const loopOn = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend: backend2,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 24576 },
+      gitCheckpoint: true,
+    });
+    await loopOn.send("write it");
+    const onMsg = String(reqs2[1].messages.find((m) => m.role === "tool")!.content);
+    assert.match(onMsg, /\[checkpoint\] committed as [0-9a-f]{7,}/);
+    const { stdout: logOn } = await execAsync("git log --oneline", { cwd: dir });
+    assert.equal(logOn.trim().split("\n").length, 1);
+  }));
