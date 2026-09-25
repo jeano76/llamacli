@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput, useStdout } from "ink";
 import stringWidth from "string-width";
+import stripAnsi from "strip-ansi";
 import { StatusBar } from "./StatusBar.js";
 import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
@@ -973,7 +974,7 @@ export function App({
           setMenuIndex(0); // narrower/wider filter — re-highlight the top match
         }
       } else if (char && !key.ctrl && !key.meta) {
-        setInput((s) => s + char);
+        setInput((s) => s + stripAnsi(char));
         setMenuIndex(0);
       }
       return;
@@ -1059,7 +1060,18 @@ export function App({
       setInput("/");
       return;
     }
-    setInput((s) => s + char);
+    // A pasted string can carry raw ANSI escape codes (color codes copied
+    // along with colored terminal output, a diff, `ls --color`, etc.) —
+    // reported directly as garbled characters and a misaligned input box.
+    // The input box renders plain text with wrapToWidth (not the ANSI-
+    // aware wrapAnsiSafe used for the log area, since a prompt has no
+    // business containing color in the first place), which naively wraps
+    // one raw character at a time and tears an escape sequence apart
+    // mid-code — the broken remainder then renders as literal garbage.
+    // Strip control codes at the point of entry instead of trying to wrap
+    // them correctly: a prompt is plain text, so there's nothing worth
+    // preserving.
+    setInput((s) => s + stripAnsi(char));
   });
 
   // TODO: replace with a proper imperative handle / event emitter once the
