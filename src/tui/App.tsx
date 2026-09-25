@@ -673,6 +673,9 @@ export function App({
   // render, so it's carried over from the previous one instead.
   const logHeightRef = useRef(3);
   const rowCacheRef = useRef(new Map<number, { text: string; width: number; rows: string[] }>());
+  // The terminal row of the input box's top border, from the PREVIOUS
+  // render — see the cursor-positioning effect below for why this exists.
+  const prevInputTopBorderRowRef = useRef<number | null>(null);
 
   function pushLine(text: string, kind: LogLine["kind"]) {
     setLog((prev) => [...prev, { id: logIdCounter++, text, kind }].slice(-MAX_LOG_ENTRIES));
@@ -1168,9 +1171,37 @@ export function App({
   // backspace-only (no interior cursor movement), so the cursor always
   // sits at the end of the LAST visual line of the input box.
   useEffect(() => {
+    const inputTopBorderRow = logHeight + 1;
+    // The log↔input boundary moves whenever inputLines.length changes
+    // (the input box grows/shrinks and logHeight shrinks/grows to match —
+    // their sum is always exactly `rows`, so no gap opens at the bottom of
+    // the terminal, but the ROW at which one ends and the other begins
+    // shifts). This is the same class of bug already hit twice in this
+    // file when a box's height changed frame-to-frame (da7d893, 11a5ee1):
+    // Ink's own incremental diff doesn't always fully overwrite a row that
+    // held one box's content in the previous frame and now belongs to the
+    // other box, leaving a stale fragment of the old row visible — exactly
+    // what was reported as the running line "floating" above a gap.
+    // Ink has already committed its own frame by the time this effect
+    // runs (effects fire after paint), so explicitly blanking every row
+    // the boundary swept across is safe: it can only ever erase a stale
+    // leftover, never something Ink still needs to show, since whichever
+    // box now owns that row will redraw it on the very next state change
+    // (the input box border itself needs no redraw from us because a
+    // completely blank row includes no content Ink was relying on).
+    const prevInputTopBorderRow = prevInputTopBorderRowRef.current;
+    if (prevInputTopBorderRow !== null && prevInputTopBorderRow !== inputTopBorderRow) {
+      const lo = Math.min(prevInputTopBorderRow, inputTopBorderRow);
+      const hi = Math.max(prevInputTopBorderRow, inputTopBorderRow);
+      let clearSeq = "";
+      for (let r = lo; r < hi; r++) clearSeq += `\x1b[${r};1H\x1b[2K`;
+      process.stdout.write(clearSeq);
+    }
+    prevInputTopBorderRowRef.current = inputTopBorderRow;
+
     const lastLineIndex = inputLines.length - 1;
     const lastLine = inputLines[lastLineIndex] ?? "";
-    const inputRow = logHeight + 1 /* input box top border */ + 1 /* first content row */ + lastLineIndex;
+    const inputRow = inputTopBorderRow + 1 /* first content row */ + lastLineIndex;
     // Only the first content row is prefixed with the spinner + a leading
     // space (see the input Box's JSX below); every wrapped continuation
     // line starts flush after the border+padding instead.
