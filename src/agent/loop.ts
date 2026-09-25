@@ -575,6 +575,20 @@ export class AgentLoop {
     // as a real failure, not retry forever.
     const MAX_TOOL_CALL_TRUNCATION_RETRIES = 5;
     let toolCallTruncationRetries = 0;
+    // Reported live: a chat request timed out at CHAT_FETCH_TIMEOUT_MS
+    // waiting just to CONNECT, not because the backend was down, but
+    // because a local single-slot llama-server (--parallel 1) was still
+    // busy serving a long-running request the agent's own run_shell tool
+    // call had kicked off moments earlier against that same server (a
+    // test script exercising the local model). openaiClient.ts's own
+    // comment on CHAT_FETCH_TIMEOUT_MS already documents that requests
+    // "compete for the single inference slot and can queue for a while
+    // under load" — but the code gave up on the very first timeout
+    // instead of allowing for exactly that queuing. One bounded retry
+    // gives a still-busy-but-alive slot a second chance before this
+    // surfaces as a real, turn-ending failure.
+    const MAX_BACKEND_TIMEOUT_RETRIES = 1;
+    let backendTimeoutRetries = 0;
     // Reported live: the text nudge alone was not enough — a real retry
     // regenerated the EXACT same content and got cut off at the EXACT
     // same character column as the first attempt, twice, because nothing
@@ -896,6 +910,20 @@ export class AgentLoop {
                 `call write_file once with the FIRST chunk (this creates/overwrites the file), then call append_file once per remaining chunk, in order, ` +
                 `until the full content has been written. Each individual call's content argument must stay under the ${chunkCharBudget}-character limit.`,
           });
+          continue;
+        }
+        // A connection-phase timeout specifically (not a hard connection
+        // refusal/DNS failure) is the queuing scenario described above,
+        // not necessarily a dead backend — worth one retry before giving
+        // up on the turn.
+        if (
+          backendTimeoutRetries < MAX_BACKEND_TIMEOUT_RETRIES &&
+          /chat stream connection timed out after/i.test(err.message)
+        ) {
+          backendTimeoutRetries++;
+          this.opts.onStatus?.(
+            `[backend busy] connection to the model backend timed out (likely still serving another request against the same server) — retrying (${backendTimeoutRetries}/${MAX_BACKEND_TIMEOUT_RETRIES}).`
+          );
           continue;
         }
         // A network/backend failure here must never crash the whole CLI —

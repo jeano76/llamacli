@@ -875,6 +875,81 @@ test("a context-overflow error forces compaction and retries instead of just end
     assert.ok(!statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
   }));
 
+test("a chat-stream connection timeout (backend busy on a single-slot server) is retried once before giving up", () =>
+  withTempProject(async (dir) => {
+    // Only the real turn request (called WITH tools) exercises the retry
+    // path under test — a background compaction summary request (called
+    // WITHOUT tools) can incidentally fire too depending on how big the
+    // tool schema happens to be, and must not be counted or made to throw
+    // here, or this test would flake on that unrelated concern instead of
+    // testing the connection-timeout retry itself.
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          throw new Error("chat stream connection timed out after 120000ms");
+        }
+        return { choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }] };
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 8_000 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.equal(turnCallCount, 2, "expected exactly one retry after the connection timeout");
+    assert.ok(statusMessages.some((s) => s.includes("[backend busy]") && s.includes("retrying (1/1)")));
+    assert.ok(!statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
+  }));
+
+test("a chat-stream connection timeout that persists past the single retry is reported as a real failure", () =>
+  withTempProject(async (dir) => {
+    // See the note in the previous test — only count/fail the real turn
+    // request (called WITH tools), not an incidental no-tools compaction
+    // summary request.
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnCallCount++;
+        throw new Error("chat stream connection timed out after 120000ms");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 8_000 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.equal(turnCallCount, 2, "initial call + exactly one retry, then give up");
+    assert.ok(statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
+  }));
+
 test("a context-overflow error that persists even after tightening the kept-context budget down to the floor is reported, not retried forever", () =>
   withTempProject(async (dir) => {
     let turnCallCount = 0;
