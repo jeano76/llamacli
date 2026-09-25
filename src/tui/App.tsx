@@ -14,7 +14,10 @@ export interface AppProps {
   cwd: string;
   model: string;
   onSubmit: (text: string) => void;
-  onSlashCommand: (key: string) => void;
+  /** Fires for a slash command selected from the menu. `argument` is the text
+   *  after the command key (e.g. "/fastcheck foo" → argument "foo"), or "" for
+   *  commands with no arguments; lets arg-taking commands read their input. */
+  onSlashCommand: (key: string, argument?: string) => void;
   /** A message typed while the agent is busy — applied at the next
    *  opportunity mid-turn (AgentLoop.queueMessage), not held here. */
   onQueueMessage: (text: string) => void;
@@ -957,7 +960,9 @@ export function App({
             "status"
           );
         } else {
-          onSlashCommand(item.key);
+          // Pass everything after the command key as its argument, so
+          // commands that take text (e.g. "/fastcheck <question>") can read it.
+          onSlashCommand(item.key, input.slice(item.key.length + 1));
         }
       } else if (key.escape) {
         setMenuOpen(false);

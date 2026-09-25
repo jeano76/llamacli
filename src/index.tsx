@@ -17,7 +17,8 @@ import { findOtherInstances, terminateInstance } from "./instanceGuard.js";
 import { createInterface } from "node:readline/promises";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
+import { dirname, resolve as pathResolve } from "node:path";
+import { spawn, ChildProcess } from "node:child_process";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
 
@@ -238,6 +239,90 @@ async function main() {
     // Non-llama.cpp backend, or /props unavailable — config value stands.
   }
 
+  // --- laya (fast System-1) before-turn gate wiring ----------------------- #
+  // The gate is a no-op callback unless config.laya.enabled. `/fastcheck on|off`
+  // flips this flag at runtime (no restart): once on, the first turn of every
+  // subsequent message runs a laya round-trip BEFORE Ornith; the model then sees
+  // the honest System-1 read and decides whether to trust it. Off => the callback
+  // returns immediately and no health/server check is attempted at all. The Python
+  // script owns server boot + config IO, so this only spawns it with a bounded
+  // timeout and degrades silently on any failure (a hung/failed server must never
+  // block or crash a turn — the normal Ornith run always proceeds).
+  const layaEnabled = Boolean(config.laya?.enabled ?? false);
+  let runtimeEnabled = layaEnabled;            // toggled by /fastcheck |off|on|
+  /** Default cap, seconds, for a laya round-trip when config.yaml doesn't set
+   *  `laya.timeoutSeconds`. A hung server must never block a turn. */
+  const DEFAULT_LAYA_TIMEOUT_SECONDS = 30;
+  const LAYA_TIMEOUT_MS = (config.laya?.timeoutSeconds ?? DEFAULT_LAYA_TIMEOUT_SECONDS) * 1000;
+  const layaScriptPath = pathResolve(projectRoot, "scripts/laya_integration.py");
+
+  /** Spawn the laya integration script with a hard timeout. All config writes,
+   *  server boot and health checks live in Python; Node only runs it and reads
+   *  stdout, killing the process if it outlives LAYA_TIMEOUT_MS so a hung script
+   *  can never wedge the TUI or block a turn. Resolves with stdout on success
+   *  (exit 0) and rejects otherwise — callers catch everything. */
+  const runLayaScript = (args: string[]): Promise<{ stdout: string }> =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const child: ChildProcess = spawn("python3", [layaScriptPath, ...args], {
+        timeout: LAYA_TIMEOUT_MS,
+      });
+      // `child.kill(timeout:true)` is Node < 18.0 semantics; use a manual timer
+      // that kills the process and resolves as an error so callers treat it like
+      // any other failure (silent fall back — Ornith still runs).
+      timer = setTimeout(() => {
+        settled = true;
+        child.kill("SIGTERM");
+        reject(new Error(`laya script timed out after ${LAYA_TIMEOUT_MS}ms`));
+      }, LAYA_TIMEOUT_MS);
+
+      let out = "";
+      child.on("error", (err) => {
+        if (!settled) { clearTimeout(timer); settled = true; reject(err); }
+      });
+      child.stdout?.on("data", (d: Buffer) => { out += String(d); });
+      child.on("exit", (code) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          // Only treat exit code 0 as success; anything else is a silent fall
+          // back so the normal turn proceeds unchanged.
+          code === 0 ? resolve({ stdout: out }) : reject(new Error(`laya script exited with code ${code}`));
+        }
+      });
+    });
+
+  const runLayaGate = async (userText: string): Promise<void> => {
+    if (!runtimeEnabled) return;              // off => instant no-op (no checks)
+    try {
+      await runLayaScript(["fastcheck", "--text", userText]);
+      // On success the script has already surfaced laya's verdict to the TUI via
+      // its own stdout capture; nothing more to push here.
+    } catch {
+      // Any failure (nonzero exit, timeout, spawn error) => silent fall back:
+      // Ornith still runs the turn unchanged. Never throw past here.
+    }
+  };
+
+  // Agent-trace: evaluate a run_shell tool RESULT after it returns (laya's
+  // typed-decisions checkpoint). Fire-and-forget — never awaited, so it can
+  // never block or slow an Ornith turn. Silently ignored on any failure
+  // (disabled gate, missing server, timeout) and when output is empty. Uses
+  // the same bounded-spawn primitive as the gate; a success just needs to be
+  // surfaced to the user via onStatus.
+  const runLayaTrace = (command: string, output: string): void => {
+    if (!runtimeEnabled) return;              // off => instant no-op (no checks)
+    if (!output || !output.trim()) return;    // nothing to evaluate
+    try {
+      runLayaScript(["trace", "--tool", "run_shell", "--summary", output])
+        .then((r) => (globalThis as any).__llamacli_ui?.pushStatus(r.stdout.trim()))
+        .catch(() => {});                      // silent fall back, never throw
+    } catch {
+      // Any spawn failure => silent fall back. Never propagate here.
+    }
+  };
+
   const loop = new AgentLoop({
     projectRoot,
     model: config.model,
@@ -272,7 +357,11 @@ async function main() {
     },
     onToolCallDone: () => (globalThis as any).__llamacli_ui?.finalizeToolCall(),
     onDiff: (_path, diff) => (globalThis as any).__llamacli_ui?.pushDiff(diff),
-    onToolResult: (command, output) => (globalThis as any).__llamacli_ui?.pushToolResult(command, output),
+    onToolResult: (command, output) => {
+      // After a run_shell result lands, trace it in the background for observability.
+      runLayaTrace(command, output);
+      (globalThis as any).__llamacli_ui?.pushToolResult(command, output);
+    },
     onStatus: (s) => (globalThis as any).__llamacli_ui?.pushStatus(s),
     onContextUsage: (used, total) =>
       (globalThis as any).__llamacli_ui?.setContextUsedRatio(total > 0 ? Math.min(1, used / total) : 0),
@@ -280,6 +369,7 @@ async function main() {
     onCompactionStatus: (status, timestamp) => (globalThis as any).__llamacli_ui?.setCompactionStatus(status, timestamp),
     onCompactionDetail: (detail) => (globalThis as any).__llamacli_ui?.pushCompactionDetail(detail),
     onTurnStart: () => (globalThis as any).__llamacli_ui?.collapseDiffs(),
+    layaGate: runLayaGate,
   });
 
   // Session-end self-improvement gate (PROMPT.md §3): if failures were
@@ -383,7 +473,7 @@ async function main() {
         }
       }}
       onQueueMessage={(text) => loop.queueMessage(text)}
-      onSlashCommand={(key) => {
+      onSlashCommand={async (key, argument = "") => {
         const ui = (globalThis as any).__llamacli_ui;
         switch (key) {
           case "quit": {
@@ -498,6 +588,52 @@ async function main() {
               .catch((err: any) => ui?.pushStatus(`[error] failed to clear plan: ${summarizeErrorForDisplay(err.message)}`));
             break;
           // "queue" is handled locally inside App (needs the live queue state).
+          // laya: /fastcheck toggles the before-turn gate at runtime and runs
+          // one-time ad-hoc questions. First word selects the sub-command;
+          // anything else is treated as an ad-hoc question text (always works,
+          // regardless of on/off state). The enable/disable/status branches are
+          // delegated to the Python script so YAML is never hand-edited here.
+          case "fastcheck": {
+            // `argument` is the text typed after "/fastcheck" — a bare word
+            // ("on"/"off"/"status") or an ad-hoc question. Split just once; the
+            // rest is preserved verbatim for the ad-hoc-question path below.
+            const tokens = argument.trim().split(/\s+/);
+            const sub = (tokens[0] ?? "").toLowerCase();
+            if (sub === "") {
+              ui?.pushStatus(
+                [
+                  "/fastcheck — laya before-turn gate (see docs/fastcheck-toggle-directive.md)",
+                  "  /fastcheck on            run a laya round-trip before each turn",
+                  "  /fastcheck off           stop the gate immediately (no restart needed)",
+                  "  /fastcheck status        show enabled state + integration health",
+                  "  /fastcheck <question>    ask laya one time now, no matter on/off",
+                ].join("\n")
+              );
+              break;
+            }
+            ui?.setBusy(true);
+            try {
+              if (sub === "on" || sub === "enable") {
+                // enable takes no argument; the script decides install guidance.
+                await runLayaScript(["enable"]);
+                runtimeEnabled = true;   // immediate: next turn already gated
+              } else if (sub === "off" || sub === "disable") {
+                await runLayaScript(["disable"]);
+                runtimeEnabled = false;  // immediate no-op, incl. no health check
+              } else if (sub === "status" || sub === "state") {
+                await runLayaScript(["status"]);
+              } else {
+                // ad-hoc question: always works regardless of on/off state;
+                // `argument` is the full verbatim text after "/fastcheck".
+                await runLayaScript(["fastcheck", "--text", argument.trim()]);
+              }
+            } catch (err: any) {
+              ui?.pushStatus(`[laya error] ${summarizeErrorForDisplay(err.message)}`);
+            } finally {
+              ui?.setBusy(false);
+            }
+            break;
+          }
         }
       }}
     />,

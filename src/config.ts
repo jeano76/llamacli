@@ -84,6 +84,24 @@ export interface LlamacliConfig {
    *  worth the budget); llamacli then also streams the reasoning to the UI
    *  rather than going silent. */
   enableThinking?: boolean;
+  /** Optional laya (fast, CPU "System 1") decision helper. Off by default —
+   *  see docs/skill-integration-review.md. `layaGate` in loop.ts is wired
+   *  from this section via index.tsx. */
+  laya?: {
+    /** Master switch (default false). When false, no gate callback is built. */
+    enabled?: boolean;
+    /** Whether the merge gate may short-circuit System 2 for simple tasks. */
+    shortCircuit?: boolean;
+    /** Hard cap, in seconds, on a laya round-trip (§7). Used to bound the
+     *  subprocess timeout so a hung server never blocks a turn. */
+    timeoutSeconds?: number;
+    /** Question type: "noul" (default yes/no) | choice | score. */
+    questionType?: string;
+    /** Short-circuit min action-tendency (see short_circuit_verdict). */
+    actProbabilityThreshold?: number;
+    /** Short-circuit min calibrated confidence. */
+    confidenceThreshold?: number;
+  };
 }
 
 export const DEFAULT_CONFIG: LlamacliConfig = {

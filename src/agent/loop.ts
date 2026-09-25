@@ -314,6 +314,19 @@ export interface AgentLoopOptions {
    *  previous process) already does this unconditionally — this extends the
    *  same behavior to a compaction that fires live, mid-session. */
   autoResume?: boolean;
+  /** Optional fast-check gate: an async callback invoked ONCE at the start
+   *  of each fresh user turn (here, before any tool work) so it can short-
+   *  circuit a low-complexity task with a quick decision instead of spending
+   *  the full model budget. Off by default — wired from config.yaml's `laya`
+   *  section via index.tsx. Deliberately failure-tolerant: any throw/reject
+   *  is swallowed (with a logged status line) so a disabled/broken gate can
+   *  never interrupt an ordinary Ornith turn. */
+  /** Optional before-turn "System 1" gate. Receives the user's raw input and,
+   *  when enabled, may run a fast pre-check whose verdict is surfaced to the
+   *  model (via UI) before Ornith turns — but its signature returns void and is
+   *  never awaited-fatal: any throw/reject is swallowed so an ordinary turn
+   *  always proceeds. */
+  layaGate?: (userText: string) => Promise<void>;
 }
 
 /**
@@ -498,6 +511,18 @@ export class AgentLoop {
       // session silently dropped it instead of picking the interrupted work
       // back up, even though a checkpoint was sitting on disk the whole
       // time. Check every time, not just at startup.
+      // Fast-check gate (laya integration): run ONCE per fresh turn, before
+      // any model tool work. Off by default; when present it may decide the
+      // task is simple enough to answer directly and skip the full turn.
+      // Always failure-tolerant — a disabled/errored gate must never break an
+      // ordinary turn, so swallow its errors here (status line only).
+      // Gate receives the real user text so laya can evaluate it directly.
+      try {
+        await this.opts.layaGate?.(userText);
+      } catch (e) {
+        this.opts.onStatus?.("laya gate skipped (using full model): " +
+          (e instanceof Error ? e.message : String(e)));
+      }
       await this.injectResumeContextIfPending();
       this.goal ??= userText.trim().slice(0, 200) || null;
       this.messages.push({ role: "user", content: userText });
