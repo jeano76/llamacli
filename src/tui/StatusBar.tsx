@@ -90,7 +90,8 @@ function gaugeColor(ratio: number): string {
 export function statusBarFieldWidth(columns: number): number {
   const planSlotWidth = hasRoomForPlanSlot(columns) ? 1 /* space before it */ + PLAN_PROGRESS_WIDTH : 0;
   const compactionSlotWidth = hasRoomForCompactionSlot(columns) ? 1 /* space before it */ + COMPACTION_STATUS_WIDTH : 0;
-  const fixedWidth = 2 /* paddingX */ + GAUGE_WIDTH + 5 /* " 100%" */ + planSlotWidth + compactionSlotWidth + 4 /* inter-field gaps */;
+  // 2 paddingX + 2 "│ " + gauge + " 100%" + slots + inter-field gaps (4)
+  const fixedWidth = 2 /* paddingX */ + 2 /* "│ " */ + GAUGE_WIDTH + 5 /* " 100%" */ + planSlotWidth + compactionSlotWidth + 4 /* inter-field gaps */;
   return Math.max(8, Math.floor((columns - fixedWidth) / 2));
 }
 
@@ -100,7 +101,7 @@ export function statusBarFieldWidth(columns: number): number {
  *  and break the "this row never wraps" guarantee the whole layout here
  *  depends on. */
 export function formatPlanProgress(planProgress: { done: number; total: number } | null): string {
-  if (!planProgress) return "";
+  if (!planProgress || planProgress.total <= 0) return "";
   const text = `${planProgress.done}/${planProgress.total}`;
   return text.length <= PLAN_PROGRESS_WIDTH ? text : "";
 }
@@ -113,19 +114,18 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
 
   return (
     <Box justifyContent="space-between" paddingX={1} height={1} overflow="hidden">
-      <Box>
-        <Text color="blue">◆ </Text>
+      <Text>
         <Text dimColor>{tailToWidth(cwd, fieldWidth)}</Text>
-      </Box>
-      <Box>
+      </Text>
+      <Text>
         <Text dimColor>│ </Text>
         <Text color="cyan">{tailToWidth(model, fieldWidth)}</Text>
-      </Box>
+      </Text>
       <Box>
         {hasRoomForPlanSlot(columns) && (
           <>
             <Text color={planText ? "cyan" : undefined} dimColor={!planText}>
-              {planText ? `📋 ${planText}`.padStart(PLAN_PROGRESS_WIDTH) : "".padStart(PLAN_PROGRESS_WIDTH)}
+              {planText ? planText.padStart(PLAN_PROGRESS_WIDTH) : "".padStart(PLAN_PROGRESS_WIDTH)}
             </Text>
             <Text> </Text>
           </>
@@ -138,7 +138,6 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
             <Text> </Text>
           </>
         )}
-        <Text dimColor>│ </Text>
         <Text color={gaugeColor(contextUsedRatio)}>{renderGauge(contextUsedRatio)}</Text>
         <Text dimColor> {Math.round(contextUsedRatio * 100)}%</Text>
       </Box>

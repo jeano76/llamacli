@@ -17,7 +17,7 @@ test("statusBarFieldWidth never lets cwd+model+gauge(+plan-progress+compaction-s
     const compactionSlot = hasRoomForCompactionSlot(columns) ? 10 + 1 : 0; // slot + its leading space
     // Simulate the worst case: both fields maxed out at fieldWidth.
     const totalUsed =
-      2 /* paddingX */ + fieldWidth + fieldWidth + planSlot + compactionSlot + 12 /* gauge */ + 5 /* " 100%" */ + 4 /* gaps */;
+      2 /* paddingX */ + 2 /* "│ " */ + fieldWidth + fieldWidth + planSlot + compactionSlot + 12 /* gauge */ + 5 /* " 100%" */ + 4 /* gaps */;
     assert.ok(totalUsed <= columns + 4, `columns=${columns}, fieldWidth=${fieldWidth}, totalUsed=${totalUsed}`);
   }
 });
