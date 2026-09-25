@@ -1084,12 +1084,6 @@ export function App({
 
   const rows = stdout?.rows ?? 24;
   const columns = stdout?.columns ?? 80;
-  // The input row must always be exactly one terminal row. Ink wraps a
-  // <Text> that's wider than the terminal instead of clipping it, so a long
-  // typed line silently grew this row to several — and since the total
-  // layout height is fixed (see logHeight below), that overflow scrolled
-  // the real terminal, leaving ghosting when it shrank back down. Truncate
-  // to what actually fits instead of ever letting the input Text wrap.
   // Reserves 2 extra columns for the input box's own left+right border
   // characters (see the bordered Box below) on top of its padding/spinner/space.
   const maxInputWidth = Math.max(10, columns - 6);
@@ -1099,13 +1093,38 @@ export function App({
     ? `이전 작업을 이어서 하시겠습니까? "${pendingResumeGoal}" (Y/N)`
     : "";
   const quittingText = quitting ? quittingStatusText(Date.now() - quittingSince!) : "";
-  const visibleInput = quitting
+  // The three confirmation/status prompts are always a single fixed message,
+  // so they keep the old right-truncated single-line behavior (tailToWidth).
+  // The real user-typed `input`, however, now grows the box instead of
+  // silently truncating: reported directly — pasting or typing past one
+  // line used to either get cut with no way to see the rest, or (before
+  // that) broke the fixed layout outright when Ink auto-wrapped a <Text>
+  // wider than the terminal (see the removed comment this replaced). A
+  // literal "\n" already lands in `input` as-is (Ctrl+J, or embedded in a
+  // pasted multi-line string — see useInput below), so wrapping it here is
+  // what actually turns that into visible multi-line growth instead of a
+  // broken row.
+  const singleLineStatus = quitting
     ? tailToWidth(quittingText, maxInputWidth)
     : resumeConfirmPending
     ? tailToWidth(RESUME_CONFIRM_TEXT, maxInputWidth)
     : quitConfirmPending
       ? tailToWidth(QUIT_CONFIRM_TEXT, maxInputWidth)
-      : tailToWidth(input, maxInputWidth);
+      : null;
+  // Caps how tall the input box can grow: bounded by both an absolute
+  // sanity limit and however many rows are actually available above the
+  // fixed chrome (top+bottom border + status bar = 3, plus at least 3 rows
+  // kept for the log) — never allowed to push the total layout past `rows`.
+  const maxInputVisibleLines = Math.max(1, Math.min(8, rows - 6));
+  const inputLines =
+    singleLineStatus !== null
+      ? [singleLineStatus]
+      : (() => {
+          const wrapped = wrapToWidth(input, maxInputWidth);
+          return wrapped.length <= maxInputVisibleLines
+            ? wrapped
+            : wrapped.slice(wrapped.length - maxInputVisibleLines);
+        })();
 
   // logHeight is a CONSTANT, independent of menu state — this is the outer
   // log-area Box's actual `height`, and it must never change, because
@@ -1132,19 +1151,33 @@ export function App({
   // therefore always exactly `logHeight`, so nothing below it ever needs
   // to move, and nothing is permanently reserved when the menu is closed.
   const menuBoxHeight = SLASH_MENU_ITEMS.length + 2; // round border top+bottom
-  // Fixed chrome below the log area: input box top border(1) + content(1) +
-  // bottom border(1) + status bar(1).
-  const logHeight = Math.max(3, rows - 4);
+  // Chrome below the log area: input box top border(1) + content(inputLines.length)
+  // + bottom border(1) + status bar(1). Unlike menuBoxHeight above, this is
+  // NOT held fixed — an input box that grows to show a multi-line prompt
+  // must borrow real rows from the log area (there's nowhere else for them
+  // to come from), so logHeight intentionally shrinks/grows with
+  // inputLines.length. maxInputVisibleLines already keeps at least 3 rows
+  // for the log no matter how tall the input gets.
+  const logHeight = Math.max(3, rows - 3 - inputLines.length);
   logHeightRef.current = logHeight;
 
   // Absolute cursor positioning, reliable because index.tsx switches to the
   // terminal's alternate screen buffer before rendering (giving row 1 a
   // fixed, known meaning) and the app's total height is now provably
-  // constant every frame regardless of menu state.
+  // constant every frame regardless of menu state. Editing is append/
+  // backspace-only (no interior cursor movement), so the cursor always
+  // sits at the end of the LAST visual line of the input box.
   useEffect(() => {
-    const inputRow = logHeight + 1 /* input box top border */ + 1; // 1-indexed content row
+    const lastLineIndex = inputLines.length - 1;
+    const lastLine = inputLines[lastLineIndex] ?? "";
+    const inputRow = logHeight + 1 /* input box top border */ + 1 /* first content row */ + lastLineIndex;
+    // Only the first content row is prefixed with the spinner + a leading
+    // space (see the input Box's JSX below); every wrapped continuation
+    // line starts flush after the border+padding instead.
     const promptColumn =
-      1 /* input box left border */ + 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(visibleInput) + 1;
+      lastLineIndex === 0
+        ? 1 /* left border */ + 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(lastLine) + 1
+        : 1 /* left border */ + 1 /* paddingX */ + stringWidth(lastLine) + 1;
     const hideCursor = shouldHideCursor({ quitting, busy, input });
     process.stdout.write(`\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`);
   });
@@ -1399,16 +1432,30 @@ export function App({
       </Box>
 
       {/* The prompt input lives INSIDE this bordered box, not below it —
-       *  the border is the visible edge of the actual input area. */}
+       *  the border is the visible edge of the actual input area. Grows
+       *  with inputLines.length (see logHeight above, which shrinks to
+       *  make room) instead of staying pinned to one row — a multi-line
+       *  prompt is now genuinely multi-line instead of being silently
+       *  truncated to its tail. Only the first row carries the spinner +
+       *  leading space; wrapped continuation rows are flush left (matches
+       *  the cursor-column math in the positioning effect above). */}
       <Box
         borderStyle="round"
         borderColor={inputBorderColor}
         paddingX={1}
-        height={3}
+        height={2 + inputLines.length}
         overflow="hidden"
+        flexDirection="column"
       >
-        <Spinner active={busy || quitting} />
-        <Text color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {visibleInput}</Text>
+        <Box>
+          <Spinner active={busy || quitting} />
+          <Text color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {inputLines[0] ?? ""}</Text>
+        </Box>
+        {inputLines.slice(1).map((line, i) => (
+          <Text key={i} color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}>
+            {line}
+          </Text>
+        ))}
       </Box>
 
       <StatusBar
