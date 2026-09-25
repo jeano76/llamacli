@@ -1533,45 +1533,70 @@ export class AgentLoop {
       pendingToolCall,
       mustPreserve: [],
     };
-    try {
-      const budget = await this.postCompactionBudget(tailBudgetFraction);
-      const { messages, checkpoint, detail } = await runCompaction(
-        this.opts.projectRoot,
-        this.messages,
-        this.opts.backend,
-        this.opts.model,
-        partial,
-        this.opts.thresholds.contextWindowTokens,
-        budget.tailBudgetFraction,
-        budget.summaryMaxTokens
-      );
-      this.messages = messages;
-      this.progress.onCompaction();
-      // Working notes go back in with the summary, so what the model had
-      // established survives the compaction verbatim.
-      const notes = await readNotes(this.opts.projectRoot);
-      if (notes && typeof this.messages[0]?.content === "string") {
-        this.messages[0] = { ...this.messages[0], content: `${this.messages[0].content}\n\n${NOTES_HEADER}\n${notes}` };
+    // The compaction summary request is a chat() call like any other, so it
+    // can hit the exact same two transient, non-deterministic backend
+    // failures the main turn loop already retries once (connection timeout
+    // from a busy single-slot server; llama.cpp's own UTF-8 byte-split
+    // crash) — but this catch block had NO retry at all, so a compaction
+    // that raced a busy slot failed immediately and permanently for that
+    // trigger (falls through to "continuing with the current context",
+    // silently skipping the compaction the caller actually needed).
+    // Reported live: repeated "[compaction failed] chat timed out after
+    // 120000ms" on a session sharing the server with other active llamacli
+    // processes. One bounded retry, same transient-failure patterns as
+    // runUntilIdle's turn-loop catch.
+    const MAX_COMPACTION_RETRIES = 1;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const budget = await this.postCompactionBudget(tailBudgetFraction);
+        const { messages, checkpoint, detail } = await runCompaction(
+          this.opts.projectRoot,
+          this.messages,
+          this.opts.backend,
+          this.opts.model,
+          partial,
+          this.opts.thresholds.contextWindowTokens,
+          budget.tailBudgetFraction,
+          budget.summaryMaxTokens
+        );
+        this.messages = messages;
+        this.progress.onCompaction();
+        // Working notes go back in with the summary, so what the model had
+        // established survives the compaction verbatim.
+        const notes = await readNotes(this.opts.projectRoot);
+        if (notes && typeof this.messages[0]?.content === "string") {
+          this.messages[0] = { ...this.messages[0], content: `${this.messages[0].content}\n\n${NOTES_HEADER}\n${notes}` };
+        }
+        this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
+        this.opts.onCompactionStatus?.("complete", checkpoint.timestamp);
+        this.opts.onCompactionDetail?.(detail);
+        return;
+      } catch (err: any) {
+        const isTransient =
+          /chat stream connection timed out after|invalid UTF-8 byte/i.test(err.message ?? "");
+        if (isTransient && attempt < MAX_COMPACTION_RETRIES) {
+          this.opts.onStatus?.(
+            `[compaction] the backend hit a transient error (${summarizeErrorForDisplay(err.message)}) — retrying (${attempt + 1}/${MAX_COMPACTION_RETRIES}).`
+          );
+          continue;
+        }
+        // The checkpoint file itself is already written by this point
+        // (runCompaction writes it before making the summary request), so
+        // nothing is lost — just don't crash, and don't pretend the
+        // conversation was compacted when it wasn't.
+        this.opts.onStatus?.(
+          `[compaction failed] ${summarizeErrorForDisplay(err.message)} — checkpoint was saved, but the conversation wasn't summarized; continuing with the current context.`
+        );
+        this.opts.onCompactionStatus?.("failed", new Date().toISOString());
+        logFailure({
+          timestamp: new Date().toISOString(),
+          summary: "compaction summary request failed",
+          toolName: "compact",
+          errorMessage: err.message,
+        });
+        this.hasNewFailuresThisTurn = true;
+        return;
       }
-      this.opts.onStatus?.(`[compaction complete] ${checkpoint.timestamp}`);
-      this.opts.onCompactionStatus?.("complete", checkpoint.timestamp);
-      this.opts.onCompactionDetail?.(detail);
-    } catch (err: any) {
-      // The checkpoint file itself is already written by this point
-      // (runCompaction writes it before making the summary request), so
-      // nothing is lost — just don't crash, and don't pretend the
-      // conversation was compacted when it wasn't.
-      this.opts.onStatus?.(
-        `[compaction failed] ${summarizeErrorForDisplay(err.message)} — checkpoint was saved, but the conversation wasn't summarized; continuing with the current context.`
-      );
-      this.opts.onCompactionStatus?.("failed", new Date().toISOString());
-      logFailure({
-        timestamp: new Date().toISOString(),
-        summary: "compaction summary request failed",
-        toolName: "compact",
-        errorMessage: err.message,
-      });
-      this.hasNewFailuresThisTurn = true;
     }
   }
 

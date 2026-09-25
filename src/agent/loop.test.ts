@@ -987,6 +987,92 @@ test("a llama.cpp UTF-8 byte-split crash (nlohmann::json) is retried once before
     assert.ok(!statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
   }));
 
+test("compact()'s own summary request retries once on the same transient backend failures as the main turn loop", () =>
+  withTempProject(async (dir) => {
+    // maybeCompact() forces compact() before the turn's own (with-tools)
+    // chat() call runs, so a huge fake tokenize() count is enough to
+    // trigger it on the very first iteration without needing to build up
+    // real history first.
+    let summaryCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          summaryCallCount++;
+          if (summaryCallCount === 1) {
+            throw new Error("chat stream connection timed out after 120000ms");
+          }
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        return { choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }] };
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 99; // >= contextWindowTokens * autoTriggerRatio below, every call
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.equal(summaryCallCount, 2, "expected exactly one retry of the compaction summary request");
+    assert.ok(statusMessages.some((s) => s.includes("[compaction]") && s.includes("transient error") && s.includes("retrying (1/1)")));
+    assert.ok(statusMessages.some((s) => s.includes("[compaction complete]")));
+    assert.ok(!statusMessages.some((s) => s.includes("[compaction failed]")));
+  }));
+
+test("compact()'s own summary request reports [compaction failed] (not silently swallowed) once its retry is also exhausted", () =>
+  withTempProject(async (dir) => {
+    // This test's own failed-compaction attempt logs to the module-level
+    // failure log (see hermes/selfHeal.ts) that triggerRealtimeImprovementCheck()
+    // reads — a leftover entry from an EARLIER test in this file can push
+    // it over the "this pattern recurs" threshold and fire an extra,
+    // unrelated background chat() call, inflating summaryCallCount. Start
+    // from a clean log so this test only ever counts its own two calls.
+    clearFailureLog();
+    let summaryCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          summaryCallCount++;
+          throw new Error("chat stream connection timed out after 120000ms");
+        }
+        return { choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }] };
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 99;
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    // Compaction failing must never crash send() itself — the turn
+    // continues with the un-compacted context (see compact()'s catch).
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.equal(summaryCallCount, 2, "initial attempt + exactly one retry, then give up");
+    assert.ok(statusMessages.some((s) => s.includes("[compaction failed]")));
+  }));
+
 test("a context-overflow error that persists even after tightening the kept-context budget down to the floor is reported, not retried forever", () =>
   withTempProject(async (dir) => {
     let turnCallCount = 0;
