@@ -950,6 +950,43 @@ test("a chat-stream connection timeout that persists past the single retry is re
     assert.ok(statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
   }));
 
+test("a llama.cpp UTF-8 byte-split crash (nlohmann::json) is retried once before giving up", () =>
+  withTempProject(async (dir) => {
+    let turnCallCount = 0;
+    const statusMessages: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+        if (!req.tools) {
+          return { choices: [{ message: { role: "assistant", content: "summary" }, finish_reason: "stop" }] };
+        }
+        turnCallCount++;
+        if (turnCallCount === 1) {
+          throw new Error(
+            'chat stream failed: 500 {"error":{"code":500,"message":"[json.exception.type_error.316] invalid UTF-8 byte at index 7849: 0xED"}}'
+          );
+        }
+        return { choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }] };
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 8_000 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+
+    await assert.doesNotReject(() => loop.send("do something"));
+
+    assert.equal(turnCallCount, 2, "expected exactly one retry after the UTF-8 split crash");
+    assert.ok(statusMessages.some((s) => s.includes("[backend error]") && s.includes("retrying (1/1)")));
+    assert.ok(!statusMessages.some((s) => s.includes("[error] couldn't reach the model backend")));
+  }));
+
 test("a context-overflow error that persists even after tightening the kept-context budget down to the floor is reported, not retried forever", () =>
   withTempProject(async (dir) => {
     let turnCallCount = 0;

@@ -589,6 +589,20 @@ export class AgentLoop {
     // surfaces as a real, turn-ending failure.
     const MAX_BACKEND_TIMEOUT_RETRIES = 1;
     let backendTimeoutRetries = 0;
+    // Reported live: llama-server (llama.cpp, via nlohmann::json — this is
+    // NOT a llamacli/JS error, the message format is that library's own)
+    // returned HTTP 500 with `[json.exception.type_error.316] invalid
+    // UTF-8 byte at index N: 0xED` — a known llama.cpp class of bug where a
+    // multi-byte UTF-8 character (0xED is a lead byte of the 3-byte range
+    // Korean Hangul syllables encode into) gets split across a token/SSE
+    // chunk boundary during streaming, and the server crashes trying to
+    // JSON-serialize the resulting invalid partial byte sequence. Sampling
+    // makes token boundaries non-deterministic, so a retry's tokens don't
+    // necessarily split at the same byte — worth one bounded retry rather
+    // than immediately ending the turn over what's very likely a
+    // one-off, server-side streaming artifact.
+    const MAX_UTF8_SPLIT_RETRIES = 1;
+    let utf8SplitRetries = 0;
     // Reported live: the text nudge alone was not enough — a real retry
     // regenerated the EXACT same content and got cut off at the EXACT
     // same character column as the first attempt, twice, because nothing
@@ -923,6 +937,20 @@ export class AgentLoop {
           backendTimeoutRetries++;
           this.opts.onStatus?.(
             `[backend busy] connection to the model backend timed out (likely still serving another request against the same server) — retrying (${backendTimeoutRetries}/${MAX_BACKEND_TIMEOUT_RETRIES}).`
+          );
+          continue;
+        }
+        // A llama.cpp-side UTF-8 byte-split crash (see the counter's doc
+        // comment above) — non-deterministic across retries since it
+        // depends on exactly where sampling happened to cut a multi-byte
+        // character, so a retry has a real chance of not hitting it again.
+        if (
+          utf8SplitRetries < MAX_UTF8_SPLIT_RETRIES &&
+          /invalid UTF-8 byte/i.test(err.message)
+        ) {
+          utf8SplitRetries++;
+          this.opts.onStatus?.(
+            `[backend error] the model backend hit an internal UTF-8 encoding error (llama.cpp-side, not this CLI) — retrying (${utf8SplitRetries}/${MAX_UTF8_SPLIT_RETRIES}).`
           );
           continue;
         }
