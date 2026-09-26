@@ -10,6 +10,8 @@ import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
 import { HARNESS_ART, ART_WIDTH, LETTER_WIDTH, SETTLED, BALL_COLOR, RESET, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 import { supportsAnsiTui } from "./ansiSupport.js";
+import { existsSync } from "node:fs";
+import { isLikelyPaste, looksLikePastedFilePath, formatPasteLabel, findTrailingPlaceholder, substitutePlaceholders } from "./pasteChip.js";
 
 export interface AppProps {
   cwd: string;
@@ -472,6 +474,13 @@ export function App({
 }: AppProps) {
   const { stdout } = useStdout();
   const [input, setInput] = useState("");
+  // Requested directly: pasting shouldn't dump raw text straight into the
+  // input box — a pasted block is appended as a short placeholder label
+  // instead (see pasteChip.ts's doc comment for the full design), with the
+  // real content kept here, mapped by that label, until the prompt is
+  // actually submitted (or the label itself is backspaced away).
+  const [pastedBlocks, setPastedBlocks] = useState<Map<string, string>>(new Map());
+  const pasteCounterRef = useRef(1);
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
   // The startup banner: "HARNESS" as block-letter ASCII art that shines
@@ -1033,23 +1042,31 @@ export function App({
 
     if (key.return) {
       if (input.trim().length === 0) return;
+      // The model (and history — recalling it later must give back the
+      // real text, not a label whose backing content is about to be
+      // dropped below) always gets the REAL pasted content; only the
+      // on-screen log line keeps the compact placeholder, matching what
+      // was actually visible while composing it instead of dumping a
+      // potentially huge block into the transcript.
+      const resolvedInput = substitutePlaceholders(input, pastedBlocks);
       if (busy) {
-        onQueueMessage(input);
+        onQueueMessage(resolvedInput);
         pushLine(`[queued] ${input}`, "status");
       } else {
         pushLine(input, "user");
-        onSubmit(input);
+        onSubmit(resolvedInput);
       }
       // Every actually-submitted prompt (sent now or queued) joins history —
       // see appendHistory's doc comment on why both count.
       setHistory((h) => {
-        const next = appendHistory(h, input);
+        const next = appendHistory(h, resolvedInput);
         onHistoryChange(next);
         return next;
       });
       setHistoryIndex(-1);
       setHistoryDraft("");
       setInput("");
+      setPastedBlocks(new Map());
       // A message you just sent should be visible without having to
       // manually scroll back down for it — snap back to the live tail,
       // matching how a normal chat/terminal view behaves.
@@ -1057,7 +1074,19 @@ export function App({
       return;
     }
     if (key.backspace || key.delete) {
-      setInput((s) => s.slice(0, -1));
+      // A pasted block is one atomic unit to delete, not one character at
+      // a time — see pasteChip.ts's doc comment.
+      const trailingPlaceholder = findTrailingPlaceholder(input, pastedBlocks);
+      if (trailingPlaceholder) {
+        setInput((s) => s.slice(0, s.length - trailingPlaceholder.length));
+        setPastedBlocks((m) => {
+          const next = new Map(m);
+          next.delete(trailingPlaceholder);
+          return next;
+        });
+      } else {
+        setInput((s) => s.slice(0, -1));
+      }
       return;
     }
     if (char === "/" && input.length === 0) {
@@ -1077,7 +1106,20 @@ export function App({
     // Strip control codes at the point of entry instead of trying to wrap
     // them correctly: a prompt is plain text, so there's nothing worth
     // preserving.
-    setInput((s) => s + stripAnsi(char));
+    const sanitized = stripAnsi(char);
+    // A real clipboard paste lands here as one single (often long)
+    // string, rather than one useInput call per character the way actual
+    // typing does — see pasteChip.ts's doc comment for the full design
+    // and why a short burst of a few characters is deliberately left as
+    // plain text instead.
+    if (isLikelyPaste(sanitized)) {
+      const isPath = looksLikePastedFilePath(sanitized) && existsSync(sanitized.trim());
+      const label = formatPasteLabel(sanitized, pasteCounterRef.current++, isPath);
+      setPastedBlocks((m) => new Map(m).set(label, sanitized));
+      setInput((s) => s + label);
+    } else {
+      setInput((s) => s + sanitized);
+    }
   });
 
   // TODO: replace with a proper imperative handle / event emitter once the
