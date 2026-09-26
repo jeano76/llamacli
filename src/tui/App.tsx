@@ -107,7 +107,8 @@ interface RenderedRow {
     | "tool-result-folded"
     | "tool-folded"
     | "user-paste-folded"
-    | "user-paste-expanded";
+    | "user-paste-expanded"
+    | "status-folded";
   lineId: number;
 }
 
@@ -324,7 +325,7 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
       </Text>
     );
   }
-  if (row.kind === "status") {
+  if (row.kind === "status" || row.kind === "status-folded") {
     return (
       <Text key={row.key} color="gray">
         {row.text}
@@ -1458,6 +1459,35 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "compaction-detail-folded", lineId: line.id });
       continue;
     }
+    // Requested directly: "저 설치는 폴딩으로 해서 펼침을 하면 진행
+    // 프로그래스를 확인하게 해줘" — a multi-line status push (e.g. laya's
+    // install/boot progress log via pushStatus) used to always render in
+    // full, unfoldable. Same fold-when-multi-line, click-to-expand pattern
+    // as tool-result below — an ordinary short one-line status is left
+    // alone (folding a single line to a one-line summary is pure friction).
+    if (line.kind === "status") {
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      if (cached.rows.length <= 1) {
+        cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+        continue;
+      }
+      if (!expandedReasoningIds.has(line.id)) {
+        allRows.push({
+          key: `${line.id}-fold`,
+          text: line.foldLabel ?? `▸ 진행 상황 (${cached.rows.length}줄) — 클릭해서 펼치기`,
+          kind: "status-folded",
+          lineId: line.id,
+        });
+        continue;
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "status-folded", lineId: line.id });
+      continue;
+    }
     if (line.kind === "tool-result") {
       let cached = rowCache.get(line.id);
       if (!cached || cached.text !== line.text || cached.width !== width) {
@@ -1636,7 +1666,9 @@ export function App({
             r.kind === "diff" ||
             r.kind === "diff-folded" ||
             r.kind === "user-paste-folded" ||
-            r.kind === "user-paste-expanded",
+            r.kind === "user-paste-expanded" ||
+            r.kind === "status" ||
+            r.kind === "status-folded",
           isDiff: r.kind === "diff" || r.kind === "diff-folded",
           isPaste: r.kind === "user-paste-folded" || r.kind === "user-paste-expanded",
         })),

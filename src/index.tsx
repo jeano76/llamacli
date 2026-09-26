@@ -378,17 +378,28 @@ async function main() {
   const LAYA_TIMEOUT_MS = (config.laya?.timeoutSeconds ?? DEFAULT_LAYA_TIMEOUT_SECONDS) * 1000;
   const layaScriptPath = resolveLayaScriptPath();
 
+  // Reported directly, live: "[laya error] laya script timed out after
+  // 30000ms" — the very first real `/fastcheck on` install (pip installing
+  // laya[serve]'s torch+CUDA deps) got killed mid-install by the same 30s
+  // bound meant for an ordinary per-turn gate round-trip. That bound is
+  // right for the gate (a hung check must never wedge a turn) but far too
+  // short for a one-time install that can legitimately take minutes —
+  // install_laya() itself already allows up to 600s for the pip step.
+  const LAYA_INSTALL_TIMEOUT_MS = 10 * 60 * 1000; // matches install_laya()'s own pip timeout=600
+
   /** Spawn the laya integration script with a hard timeout. All config writes,
    *  server boot and health checks live in Python; Node only runs it and reads
-   *  stdout, killing the process if it outlives LAYA_TIMEOUT_MS so a hung script
+   *  stdout, killing the process if it outlives the timeout so a hung script
    *  can never wedge the TUI or block a turn. Resolves with stdout on success
-   *  (exit 0) and rejects otherwise — callers catch everything. */
-  const runLayaScript = (args: string[]): Promise<{ stdout: string }> =>
+   *  (exit 0) and rejects otherwise — callers catch everything. `timeoutMs`
+   *  overrides LAYA_TIMEOUT_MS for calls that legitimately need longer (the
+   *  install-triggering call below uses LAYA_INSTALL_TIMEOUT_MS). */
+  const runLayaScript = (args: string[], timeoutMs: number = LAYA_TIMEOUT_MS): Promise<{ stdout: string }> =>
     new Promise((resolve, reject) => {
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
       const child: ChildProcess = spawn("python3", [layaScriptPath, ...args], {
-        timeout: LAYA_TIMEOUT_MS,
+        timeout: timeoutMs,
       });
       // `child.kill(timeout:true)` is Node < 18.0 semantics; use a manual timer
       // that kills the process and resolves as an error so callers treat it like
@@ -396,8 +407,8 @@ async function main() {
       timer = setTimeout(() => {
         settled = true;
         child.kill("SIGTERM");
-        reject(new Error(`laya script timed out after ${LAYA_TIMEOUT_MS}ms`));
-      }, LAYA_TIMEOUT_MS);
+        reject(new Error(`laya script timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
 
       let out = "";
       child.on("error", (err) => {
@@ -757,7 +768,11 @@ async function main() {
                 if (enableResult.stdout) {
                   ui?.pushStatus(enableResult.stdout);
                 }
-                const fastcheckResult = await runLayaScript(["fastcheck"]);
+                // This specific call can trigger a real install (pip installing
+                // laya[serve]) — the ordinary per-turn LAYA_TIMEOUT_MS (30s) is
+                // nowhere near enough for that, see LAYA_INSTALL_TIMEOUT_MS's doc
+                // comment.
+                const fastcheckResult = await runLayaScript(["fastcheck"], LAYA_INSTALL_TIMEOUT_MS);
                 // Surface install/boot progress + the gate verdict from stdout so
                 // the user sees what happened even on this enabling turn.
                 if (fastcheckResult.stdout) {
