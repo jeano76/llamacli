@@ -18,7 +18,7 @@ import { createInterface } from "node:readline/promises";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
 import { supportsAnsiTui } from "./tui/ansiSupport.js";
@@ -91,7 +91,21 @@ function enterAltScreen(): void {
   // PageUp/PageDown alone was reported as not enough. Side effect: the
   // terminal's own click-drag text selection needs Shift held while this
   // is on (standard for mouse-aware terminal apps).
-  process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+  //
+  // Reported directly: "입력 프롬프트가 화면 제일 하단 좌측에 있는 경우도
+  // 있고 하단이 갑자기 깜빡이는 경우도 있고" — App.tsx's own per-render
+  // effect is what actually moves the cursor onto the input line (and
+  // hides/shows it), but that effect only runs AFTER React's first paint.
+  // Between switching to the alt screen and that first effect firing, the
+  // real terminal cursor sits wherever Ink's own sequential top-to-bottom
+  // writes happened to leave it — trailing the last line it printed, i.e.
+  // bottom-left — fully visible and blinking there by the terminal's own
+  // default, until our effect catches up and moves/hides it. Hiding it
+  // immediately here (before Ink ever renders a single frame) closes that
+  // window entirely: the cursor stays hidden by default the whole time,
+  // and only ever becomes visible again where App.tsx's effect explicitly
+  // puts it, on the input line — never at some transient wrong spot.
+  process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l");
 }
 
 function exitAltScreen(): void {
@@ -141,6 +155,34 @@ function startupVersion(): string {
     // dist/index.js not found under this run mode (e.g. tsx dev) — banner
     // just omits the version rather than failing startup over it.
     return "";
+  }
+}
+
+/** Reported directly: "윈도우즈에서 프롬프트에서 한글을 입력시 일부
+ *  문자코드가 깨지는 경우 강제 종료가 되는거 같은데?" — Ink already calls
+ *  stdin.setEncoding('utf8') (which correctly buffers a multi-byte UTF-8
+ *  sequence split across chunk boundaries via Node's own StringDecoder),
+ *  so that's not the failure mode here. The much more likely cause on
+ *  Windows specifically: the console's ACTIVE CODE PAGE isn't UTF-8
+ *  (65001) — on an older conhost / non-Windows-Terminal session, keyboard
+ *  input for multi-byte characters (Korean, or any non-ASCII text) can get
+ *  encoded by the OS using whatever legacy codepage is active (e.g. CP949)
+ *  instead of UTF-8, and Node — expecting UTF-8 — decodes those bytes into
+ *  garbage/replacement characters, or lone surrogates, before this process
+ *  ever sees valid text. `chcp` changes the ACTIVE CONSOLE's codepage (the
+ *  same console handle the parent shell is attached to), not just this
+ *  child process's own environment, so running it once here fixes it for
+ *  the whole session exactly like running `chcp 65001` manually before
+ *  launching would — done synchronously, before anything else touches
+ *  stdin, and best-effort (never blocks or fails startup: an older/locked-
+ *  down `chcp`, or none at all, just leaves the codepage as whatever it
+ *  already was). */
+function ensureWindowsUtf8Console(): void {
+  if (process.platform !== "win32") return;
+  try {
+    execFileSync("chcp", ["65001"], { stdio: "ignore", shell: true });
+  } catch {
+    // Best-effort only — see doc comment above.
   }
 }
 
@@ -201,6 +243,7 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
 }
 
 async function main() {
+  ensureWindowsUtf8Console();
   await maybeSelfUpdateAndRestart();
   await ensureSingleInstance();
   const projectRoot = process.cwd();
