@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AgentLoop, summarizeErrorForDisplay } from "./loop.js";
+import { AgentLoop, summarizeErrorForDisplay, setCompactionRetryBackoffMsForTests } from "./loop.js";
 import { readCheckpoint, writeCheckpoint, Checkpoint } from "../compaction/checkpoint.js";
 import { clearFailureLog } from "../hermes/selfHeal.js";
 import type {
@@ -989,6 +989,10 @@ test("a llama.cpp UTF-8 byte-split crash (nlohmann::json) is retried once before
 
 test("compact()'s own summary request retries once on the same transient backend failures as the main turn loop", () =>
   withTempProject(async (dir) => {
+    // Real backoff delays (2s/5s/10s) would make this test slow for no
+    // reason — inject an instant one. Reset after so later tests get the
+    // real defaults.
+    setCompactionRetryBackoffMsForTests([0, 0, 0]);
     // maybeCompact() forces compact() before the turn's own (with-tools)
     // chat() call runs, so a huge fake tokenize() count is enough to
     // trigger it on the very first iteration without needing to build up
@@ -1024,8 +1028,8 @@ test("compact()'s own summary request retries once on the same transient backend
 
     await assert.doesNotReject(() => loop.send("do something"));
 
-    assert.equal(summaryCallCount, 2, "expected exactly one retry of the compaction summary request");
-    assert.ok(statusMessages.some((s) => s.includes("[compaction]") && s.includes("transient error") && s.includes("retrying (1/1)")));
+    assert.equal(summaryCallCount, 2, "expected exactly one retry of the compaction summary request (succeeded on the first)");
+    assert.ok(statusMessages.some((s) => s.includes("[compaction]") && s.includes("transient error") && s.includes("(1/3)")));
     assert.ok(statusMessages.some((s) => s.includes("[compaction complete]")));
     assert.ok(!statusMessages.some((s) => s.includes("[compaction failed]")));
   }));
@@ -1039,6 +1043,7 @@ test("compact()'s own summary request reports [compaction failed] (not silently 
     // unrelated background chat() call, inflating summaryCallCount. Start
     // from a clean log so this test only ever counts its own two calls.
     clearFailureLog();
+    setCompactionRetryBackoffMsForTests([0, 0, 0]);
     let summaryCallCount = 0;
     const statusMessages: string[] = [];
     const backend: ModelBackend = {
@@ -1069,7 +1074,7 @@ test("compact()'s own summary request reports [compaction failed] (not silently 
     // continues with the un-compacted context (see compact()'s catch).
     await assert.doesNotReject(() => loop.send("do something"));
 
-    assert.equal(summaryCallCount, 2, "initial attempt + exactly one retry, then give up");
+    assert.equal(summaryCallCount, 4, "initial attempt + 3 retries, then give up");
     assert.ok(statusMessages.some((s) => s.includes("[compaction failed]")));
   }));
 

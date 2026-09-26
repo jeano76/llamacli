@@ -134,6 +134,14 @@ function normalizeForRepeat(text: string): string {
  *  cleanly and `/quit` still worked. `logFailure()` still gets the
  *  untouched original (debugging/self-improvement needs the real text);
  *  only what's shown to the user goes through this. */
+// Growing backoff between compact()'s retries on a transient backend error
+// (see its own doc comment). Exported/settable so tests can run this near-
+// instantly instead of eating the real 2s/5s/10s delays.
+export let COMPACTION_RETRY_BACKOFF_MS = [2000, 5000, 10000];
+export function setCompactionRetryBackoffMsForTests(backoffMs: number[]): void {
+  COMPACTION_RETRY_BACKOFF_MS = backoffMs;
+}
+
 export function summarizeErrorForDisplay(message: string, maxLen = 300): string {
   if (message.length <= maxLen) return message;
   const omitted = message.length - maxLen;
@@ -1568,9 +1576,17 @@ export class AgentLoop {
     // silently skipping the compaction the caller actually needed).
     // Reported live: repeated "[compaction failed] chat timed out after
     // 120000ms" on a session sharing the server with other active llamacli
-    // processes. One bounded retry, same transient-failure patterns as
-    // runUntilIdle's turn-loop catch.
-    const MAX_COMPACTION_RETRIES = 1;
+    // processes. A single IMMEDIATE retry (the original fix) turned out not
+    // to be enough — this machine's own self-improve log recorded the exact
+    // same "compact timed out after 120000ms" pattern recurring 37 times
+    // across one long session sharing a single-slot server with several
+    // other concurrent llamacli/laya processes all day. An immediate retry
+    // re-issues into the SAME still-busy slot if the congestion is a
+    // sustained period rather than a brief blip — it only helps the blip
+    // case. Raised to 3 retries with a growing backoff (2s/5s/10s) between
+    // attempts, so a sustained busy period gets a real chance to clear
+    // before the next try instead of being hammered immediately.
+    const MAX_COMPACTION_RETRIES = 3;
     for (let attempt = 0; ; attempt++) {
       try {
         const budget = await this.postCompactionBudget(tailBudgetFraction);
@@ -1600,9 +1616,11 @@ export class AgentLoop {
         const isTransient =
           /chat stream connection timed out after|invalid UTF-8 byte/i.test(err.message ?? "");
         if (isTransient && attempt < MAX_COMPACTION_RETRIES) {
+          const backoffMs = COMPACTION_RETRY_BACKOFF_MS[Math.min(attempt, COMPACTION_RETRY_BACKOFF_MS.length - 1)];
           this.opts.onStatus?.(
-            `[compaction] the backend hit a transient error (${summarizeErrorForDisplay(err.message)}) — retrying (${attempt + 1}/${MAX_COMPACTION_RETRIES}).`
+            `[compaction] the backend hit a transient error (${summarizeErrorForDisplay(err.message)}) — retrying in ${backoffMs / 1000}s (${attempt + 1}/${MAX_COMPACTION_RETRIES}).`
           );
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;
         }
         // The checkpoint file itself is already written by this point
