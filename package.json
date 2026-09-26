@@ -8,7 +8,7 @@
     "llamacli": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && mkdir -p dist/skills/builtin && cp src/skills/builtin/*.md dist/skills/builtin/ && mkdir -p dist/scripts && cp scripts/laya_integration.py dist/scripts/ && chmod +x dist/index.js && node scripts/update-bin.mjs",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/skills/builtin && cp src/skills/builtin/*.md dist/skills/builtin/ && mkdir -p dist/scripts && cp scripts/laya_integration.py dist/scripts/ && cp scripts/_laya_install_helpers.py dist/scripts/ && chmod +x dist/index.js && node scripts/update-bin.mjs",
     "dev": "tsx src/index.tsx",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",

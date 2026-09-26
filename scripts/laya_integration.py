@@ -21,6 +21,7 @@ Commands
     disable     Disable the gate in config and stop (no health check).
     status      Print enabled state + integration health. Never fails on degraded.
     fastcheck --text "<user text>"   The gate itself: evaluate userText, print a verdict.
+    trace --tool <name> --summary "<output>"  Evaluate a tool-call result after the turn (progress surfaced to the UI window).
 
 The real laya system is an LLM-agent framework; here we implement a small,
 self-contained evaluator so the feature works end-to-end even when no server is
@@ -32,10 +33,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil  # noqa: F401 -- re-exported for install helpers (uv/venv discovery)
 import subprocess
 import sys
 import time
+import urllib.error  # noqa: F401 -- kept for parity; health probes use _laya_install_helpers
+import urllib.request  # noqa: F401
 from pathlib import Path
+
+# Project-local install/start helpers (isolated at the laya layer). Reused by
+# cmd_fastcheck (install/boot when server is missing) and cmd_trace. See
+# `_laya_install_helpers.py`.
+from _laya_install_helpers import (  # noqa: E402
+    install_laya,
+    start_laya,
+    venv_available,
+    venv_python_path,
+    LAYA_VENV_NAME,
+)
+
+HEALTH_TIMEOUT = 1.0  # seconds; how long to wait when probing the /health endpoint
 
 
 # --------------------------------------------------------------------------- #
@@ -227,7 +244,7 @@ def locate_server() -> bool:
     ready instead of a bare "unknown":
 
         1. LAYA_SERVER_URL env or config's baseUrl (if it exposes a laya health path).
-        2. A virtualenv named `.venv-laya` at project root with a `laya` entrypoint.
+        2. A virtualenv named `.llamacli/laya-venv` at project root with a `laya` entrypoint.
         3. A local server on the common ports we expect laya to use.
 
     Returns an object {ok, reason}. Never raises for the caller's status line.
@@ -242,16 +259,17 @@ def locate_server() -> bool:
                 return {"ok": True, "reason": "server healthy", "url": probe}
 
     root = Path.cwd()
-    venv_bin = root / ".venv-laya" / "bin"
+    venv_bin = root / LAYA_VENV_NAME / "bin"
     entrypoints = list(venv_bin.glob("laya*")) if venv_bin.exists() else []
     if entrypoints:
         return {
             "ok": True,
             "reason": "server reachable (local venv)",
-            "url": str(root / ".venv-laya"),
+            "url": str(root / LAYA_VENV_NAME),
         }
 
-    for port in ("8794", "8099"):
+    # Probe the default port, then a legacy fallback.
+    for port in (os.environ.get("LAYA_ENDPOINT", "8099"), "8794"):
         probe = f"http://127.0.0.1:{port}/health"
         if _http_ok(probe):
             return {"ok": True, "reason": "server healthy", "url": probe}
@@ -283,6 +301,30 @@ def _http_ok(url: str, timeout: float = 0.5) -> bool:
         return False
 
 
+def endpoint(cfg: dict) -> str:
+    """Best-known laya base URL (env > config baseUrl)."""
+    url = (
+        os.environ.get("LAYA_SERVER_URL")
+        or cfg.get("baseUrl")
+        or f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}"
+    )
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url.rstrip("/")
+
+
+def health(cfg: dict, timeout: float = HEALTH_TIMEOUT) -> dict | None:
+    """GET /health on the endpoint; returns parsed JSON or None. Never raises."""
+    url = f"{endpoint(cfg)}/health"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return None
+
+
 def boot_server(laya_settings: dict, timeout_seconds: int) -> dict:
     """Attempt to start the laya server if possible, then wait up to `timeout_seconds`.
 
@@ -293,7 +335,7 @@ def boot_server(laya_settings: dict, timeout_seconds: int) -> dict:
     url = os.environ.get("LAYA_SERVER_URL") or (cfg.get("baseUrl") if isinstance(cfg, dict) else None)
 
     root = Path.cwd()
-    venv_bin = root / ".venv-laya" / "bin"
+    venv_bin = root / LAYA_VENV_NAME / "bin"
 
     proc = None
     try:
@@ -313,7 +355,7 @@ def boot_server(laya_settings: dict, timeout_seconds: int) -> dict:
                 env=env,
             )
         # 3. Wait for health on whatever URL we expect.
-        wait_url = url + "/health" if url else (f"http://127.0.0.1:8794/health")
+        wait_url = url + "/health" if url else (f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}/health")
         deadline = time.time() + max(1, timeout_seconds)
         while time.time() < deadline:
             if _http_ok(wait_url):
@@ -389,6 +431,68 @@ def evaluate(text: str, laya_settings: dict) -> dict:
     return {"decision": decision, "reason": _explain(decision, has_code_tool, is_simple), "confidence": round(confidence, 3)}
 
 
+def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
+    """Return a laya health {ok, reason} object.
+
+    Strategy (least invasive first):
+
+    1. Boot anything already installed via this tool's project-local venv and
+       wait for it to become healthy.
+    2. Otherwise report what is missing (`venv`, `entrypoint`, or `endpoint`) so
+       the caller can surface install guidance — never raises, never crashes a
+       turn just because laya is absent.
+    """
+
+    url = os.environ.get("LAYA_SERVER_URL") or cfg.get("baseUrl") or None
+    root = Path.cwd()
+
+    # A configured remote endpoint is authoritative; nothing to boot locally.
+    if url and _http_ok(url + "/health"):
+        return {"ok": True, "reason": "server healthy", "url": url}
+
+    venv_root = root / LAYA_VENV_NAME
+    if not venv_available(venv_root):
+        # Nothing installed yet: surface exactly what the user needs to do.
+        missing = []
+        if cfg.get("baseUrl"):
+            missing.append(f"configured remote endpoint {cfg['baseUrl']} is unhealthy")
+        else:
+            missing.append(f"laya not installed (run `/fastcheck on` to install into <project>/.llamacli/{LAYA_VENV_NAME.split('/')[-1]})")
+        return {"ok": False, "reason": "; ".join(missing), "url": url}
+
+    proc = None
+    try:
+        entrypoints = list((venv_root / "bin").glob("laya*")) if (venv_root / "bin").exists() else []
+        env = dict(os.environ)
+        env["LAYA_BOOT"] = "1"
+        # Prefer an explicit remote URL; otherwise boot the project-local venv.
+        proc = None
+        if entrypoints and not url:
+            target_venv_python = venv_python_path(venv_root) or (str((venv_root / "bin" / "python3")) if (venv_root / "bin").exists() else sys.executable)
+            proc = subprocess.Popen(
+                [target_venv_python, "-m", "laya", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        # Wait for health on whatever URL we expect.
+        wait_url = url + "/health" if url else (f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}/health")
+        deadline = time.time() + max(1, timeout_seconds)
+        while time.time() < deadline:
+            if _http_ok(wait_url):
+                return {"ok": True, "reason": "server healthy", "url": wait_url}
+            time.sleep(0.3)
+    finally:
+        if proc is not None:
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                proc.terminate()
+
+    info = locate_server()  # final authoritative read for the reported reason
+    return {"ok": info.get("ok", False), "reason": info.get("reason", "server unreachable"), "url": wait_url}
+
+
 def _reliable_signal(text: str) -> bool:
     """True when we have enough signal to trust the verdict."""
     if len(text.strip()) < 2:
@@ -416,12 +520,15 @@ def _verdict_prose(text: str, verdict: dict, short_circuit: bool) -> str:
     if decision == "degraded":
         return "[laya] gate degraded — no reliable signal; proceeding with full turn"
     if decision == "short-circuit":
-        marker = "[laya short-circuit] proceed directly: %s" % verdict.get("reason", "").strip()
-    else:  # proceed
-        marker = "[laya] continue normal turn: %s" % verdict.get("reason", "").strip()
-    if short_circuit:
-        return "SHORTCIRCUIT\n%s" % marker
-    return marker
+        marker = "\n[laya short-circuit]\n" if short_circuit else ""
+        reason = verdict.get("reason", "")
+        return f"[laya]{marker}gate: {decision}: {reason}".rstrip()
+
+    reason = verdict.get("reason", "")
+    if decision == "proceed":
+        return f"[laya] gate: proceed — {reason}"
+    # degraded handled above; default to proceed prose.
+    return "[laya] gate: proceed (default)"
 
 
 # --------------------------------------------------------------------------- #
@@ -470,21 +577,97 @@ def cmd_status(path: Path) -> int:
 
 
 def cmd_fastcheck(path: Path, text: str) -> int:
+    """Run the laya System-1 gate. Returns an exit code (always 0 — never crash a turn).
+
+
+    Progress is printed line-by-line so Node can surface it to the user via the
+    output window (`pushStatus`). Nothing here should ever raise; the turn must
+    keep going regardless of whether/when laya is reachable.
+    """
+
     settings = laya_section(path)
     if not settings.get("enabled", False):
         # Gate is off; do nothing but report so the marker line stays honest.
         print("[laya] gate disabled — full turn (no System-1 evaluation).")
         return 0
 
-    # Try to bring a server up; best-effort, bounded by Node's timeout anyway.
-    health = boot_server(settings, int(settings.get("timeoutSeconds", DEFAULTS["timeoutSeconds"])))
-    if not health.get("ok"):
-        # Not installed/configured: degrade to safe proceed rather than crash the turn.
-        print(f"[laya] server unavailable ({health['reason']}) — proceeding with full turn.")
+    timeout_seconds = int(settings.get("timeoutSeconds", DEFAULTS["timeoutSeconds"]))
+    venv_root = Path.cwd() / LAYA_VENV_NAME
+    installed = bool(venv_available(venv_root))
+
+    if not installed:
+        # Laya is not present in this project: tell the user we cannot gate yet.
+        print(f"[laya] gate enabled but laya is not installed for this project "
+              f"(<project>/.llamacli/{LAYA_VENV_NAME.split('/')[-1]}/).")
+        print("[laya] install with `/fastcheck on` to create the project-local venv.")
+        print("[laya] gating — proceeding with full turn until laya is available.")
         return 0
+
+    installed = True
+    print(f"[laya] found project-local venv at {venv_root} (progress: installing OK)")
+    if not _http_ok((endpoint(settings) + "/health")):
+        print("[laya] starting server... (progress: booting laya serve)")
+        health = bootstrap_laya(settings, timeout_seconds)
+        if not health.get("ok"):
+            # Installed but could not become healthy; degrade to safe proceed.
+            print(f"[laya] server unavailable ({health['reason']}) — proceeding with full turn.")
+            return 0
 
     verdict = evaluate(text, settings)
     print(_verdict_prose(text, verdict, bool(settings.get("shortCircuit", True))))
+    return 0
+
+
+def cmd_trace(path: Path, tool: str, summary: str) -> int:
+    """Evaluate a tool-call result (after the turn). Degrades to Ornith on any failure.
+
+    Progress is printed line-by-line so Node can surface it to the user via the
+    output window (`pushStatus`). Never raises — returns 0 and falls back silently.
+
+    The agent-trace evaluation itself lives in the plugin script (the source of truth
+    for the laya router wiring). We do NOT duplicate that here; we only handle
+    readiness + progress printing, then delegate by invoking the project-local venv's
+    python against the plugin script with the same arguments. This keeps install/start
+    logic isolated at the laya layer and Node-side changes minimal.
+    """
+
+    settings = laya_section(path)
+    if not settings.get("enabled", False):
+        return 0  # gate off — run unchanged (no evaluation).
+
+    venv_root = Path.cwd() / LAYA_VENV_NAME
+    print(f"[laya] agent-trace — checking install... (progress: inspecting laya installation)")
+    if not venv_available(venv_root):
+        # Nothing to do; Ornith path runs unchanged.
+        return 0
+
+    print("[laya] agent-trace — starting serve... (progress: booting laya serve)")
+    health = bootstrap_laya(settings, DEFAULTS["timeoutSeconds"])
+    if not health.get("ok"):
+        print(f"[laya] server unavailable ({health['reason']}) — proceeding with full turn.")
+        return 0
+
+    # Invoke the plugin script through the project-local venv python. This is the
+    # isolated, laya-layer path; the repo-root script never re-implements the router.
+    try:
+        venv_py = str(venv_python_path(venv_root))
+        plugin_script = str(Path(__file__).parent.parent / "plugin" / "laya" / "scripts" / "laya_integration.py")
+        proc_argv = [venv_py, plugin_script, "trace", "--tool", tool, "--summary", summary]
+    except Exception as exc:  # pragma: no cover - defensive only
+        print(f"[laya] agent-trace — could not start ({exc}); proceeding with full turn.")
+        return 0
+
+    try:
+        proc = subprocess.run(proc_argv, capture_output=True, text=True)
+    except Exception as exc:  # pragma: no cover - defensive only
+        print(f"[laya] agent-trace — spawn failed ({exc}); proceeding with full turn.")
+        return 0
+
+    stdout = (proc.stdout or "").strip()
+    if stdout:
+        print(stdout)
+    else:
+        print("[laya] agent-trace — no decisive signal; proceeding with full turn.")
     return 0
 
 
@@ -496,7 +679,7 @@ def main(argv=None) -> int:
     # callers pass only the command (+ optional --text), while tests may append
     # `--config path` to any invocation. This keeps one flag rather than two,
     # which argparse otherwise rejects as conflicting.
-    KNOWN = ("enable", "disable", "status", "fastcheck")
+    KNOWN = ("enable", "disable", "status", "fastcheck", "trace")
     cmd_index = next((i for i, a in enumerate(argv) if a in KNOWN), None)
     global_argv = argv[:cmd_index] if cmd_index is not None else argv
     command_argv = argv[cmd_index + 1:] if cmd_index is not None else []
@@ -523,7 +706,14 @@ def main(argv=None) -> int:
     try:
         p_cmd = argparse.ArgumentParser(prog=command)
         if command == "fastcheck":
-            p_cmd.add_argument("--text", required=True, metavar='"user text"')
+            # `--text` is optional for fastcheck: a bare `fastcheck` (no text)
+            # only triggers install/boot when the gate was just enabled; with
+            # present text it runs the actual System-1 evaluation. Node relies on
+            # this so `/fastcheck on` can trigger setup without supplying text.
+            p_cmd.add_argument("--text", required=False, default="", metavar='"user text"')
+        if command == "trace":
+            p_cmd.add_argument("--tool", required=True, help="the tool name that produced output, e.g. run_shell")
+            p_cmd.add_argument("--summary", required=True, help="human-readable summary of what the output was")
         p_cmd.add_argument("--config", help="Override config.yaml path (tests).")
         cargs = p_cmd.parse_args(command_argv)
     except SystemExit:
@@ -545,6 +735,8 @@ def main(argv=None) -> int:
             return cmd_status(path)
         if command == "fastcheck":
             return cmd_fastcheck(path, getattr(cargs, "text", ""))
+        if command == "trace":
+            return cmd_trace(path, getattr(cargs, "tool", ""), getattr(cargs, "summary", ""))
     except Exception as exc:  # pragma: no cover - never let a bug kill the caller's status line
         # Surface the problem as stderr + non-zero so Node falls back silently.
         print(f"laya error: {exc}", file=sys.stderr)

@@ -415,15 +415,20 @@ async function main() {
       });
     });
 
-  const runLayaGate = async (userText: string): Promise<void> => {
-    if (!runtimeEnabled) return;              // off => instant no-op (no checks)
+  const runLayaGate = async (userText: string): Promise<{ skip: boolean }> => {
+    if (!runtimeEnabled) return { skip: false };   // off => instant no-op (no checks)
     try {
-      await runLayaScript(["fastcheck", "--text", userText]);
-      // On success the script has already surfaced laya's verdict to the TUI via
-      // its own stdout capture; nothing more to push here.
+      const { stdout } = await runLayaScript(["fastcheck", "--text", userText]);
+      // _verdict_prose() emits "SHORTCIRCUIT\n[laya short-circuit] ... " on the
+      // first line when laya judges the task simple enough to skip System 2.
+      if (/^short-circuit$/i.test(stdout.split(/\r?\n/)[0].trim())) {
+        return { skip: true };                       // let loop.ts skip Ornith
+      }
+      return { skip: false };                        // "proceed"/"degraded"/off => proceed
     } catch {
       // Any failure (nonzero exit, timeout, spawn error) => silent fall back:
       // Ornith still runs the turn unchanged. Never throw past here.
+      return { skip: false };
     }
   };
 
@@ -742,8 +747,22 @@ async function main() {
             ui?.setBusy(true);
             try {
               if (sub === "on" || sub === "enable") {
-                // enable takes no argument; the script decides install guidance.
-                await runLayaScript(["enable"]);
+                // Enabling also boots/installs the laya server (if missing) so the
+                // feature works immediately. Enable first (so cmd_fastcheck's
+                // enabled-gate passes and it proceeds to install/boot), then run the
+                // fastcheck round-trip which surfaces install/boot progress + success
+                // via pushStatus; on success we flip the gate on so the very next
+                // turn is already System-1 gated.
+                const enableResult = await runLayaScript(["enable"]);
+                if (enableResult.stdout) {
+                  ui?.pushStatus(enableResult.stdout);
+                }
+                const fastcheckResult = await runLayaScript(["fastcheck"]);
+                // Surface install/boot progress + the gate verdict from stdout so
+                // the user sees what happened even on this enabling turn.
+                if (fastcheckResult.stdout) {
+                  ui?.pushStatus(fastcheckResult.stdout);
+                }
                 runtimeEnabled = true;   // immediate: next turn already gated
               } else if (sub === "off" || sub === "disable") {
                 await runLayaScript(["disable"]);

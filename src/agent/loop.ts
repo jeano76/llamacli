@@ -334,7 +334,15 @@ export interface AgentLoopOptions {
    *  model (via UI) before Ornith turns — but its signature returns void and is
    *  never awaited-fatal: any throw/reject is swallowed so an ordinary turn
    *  always proceeds. */
-  layaGate?: (userText: string) => Promise<void>;
+  /** Before taking over a fresh turn, the optional laya (fast "System 1")
+   *  gate evaluates whether the task is simple enough to skip the full
+   *  (slow, System 2 / Ornith) turn. Returns {skip:true} to answer directly;
+   *  {skip:false} (or any error) to proceed normally with Ornith. When
+   *  non-skip, an optional `reason` explains the verdict ("degraded" /
+   *  "truthful" prose) and is surfaced so reduced-quality answers aren't silent.
+   *  The callback never throws — a disabled/errored gate must not break an
+   *  ordinary turn. */
+  layaGate?: (userText: string) => Promise<{ skip: boolean; reason?: string }>;
 }
 
 /**
@@ -549,16 +557,36 @@ export class AgentLoop {
       // back up, even though a checkpoint was sitting on disk the whole
       // time. Check every time, not just at startup.
       // Fast-check gate (laya integration): run ONCE per fresh turn, before
-      // any model tool work. Off by default; when present it may decide the
-      // task is simple enough to answer directly and skip the full turn.
-      // Always failure-tolerant — a disabled/errored gate must never break an
-      // ordinary turn, so swallow its errors here (status line only).
-      // Gate receives the real user text so laya can evaluate it directly.
+      // any model tool work. Off by default; when it decides the task is
+      // simple enough to answer directly it returns {skip:true}, which skips
+      // the full (slow, System 2) turn and Ornith entirely. Always
+      // failure-tolerant — a disabled/errored gate must never break an ordinary
+      // turn, so its errors are swallowed here (status line only). Gate
+      // receives the real user text so laya can evaluate it directly.
+      // Gate returns one of: {skip:true} (answer directly), {skip:false,
+      // reason}, or {skip:false, degraded:true, reason}. Surface the verdict
+      // prose so it is visible in the output window.
+      let gateResult;
       try {
-        await this.opts.layaGate?.(userText);
+        gateResult = await this.opts.layaGate?.(userText);
       } catch (e) {
         this.opts.onStatus?.("laya gate skipped (using full model): " +
           (e instanceof Error ? e.message : String(e)));
+        gateResult = undefined;
+      }
+      if (!gateResult || gateResult.skip === false) {
+        // Non-skip verdict: keep the slow turn, but surface WHY laya didn't
+        // short-circuit — "degraded"/"truthful" prose especially must reach the
+        // user so a reduced-quality answer isn't a silent surprise.
+        const reason = (gateResult?.reason ?? "").trim();
+        if (reason) this.opts.onStatus?.(reason);
+      } else if (gateResult.skip === true && !gateResult.reason) {
+        this.opts.onStatus?.("laya gate: task judged simple enough to skip full model");
+        return;                        // short-circuit: answer without Ornith
+      } else if (gateResult.skip === true && gateResult.reason) {
+        // Short-circuit with an explicit reason: surface it, then stop.
+        this.opts.onStatus?.(gateResult.reason.trim() || "laya gate: task judged simple enough to skip full model");
+        return;
       }
       await this.injectResumeContextIfPending();
       this.goal ??= userText.trim().slice(0, 200) || null;
