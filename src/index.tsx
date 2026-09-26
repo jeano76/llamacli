@@ -21,6 +21,7 @@ import { dirname, resolve as pathResolve } from "node:path";
 import { spawn, ChildProcess } from "node:child_process";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
+import { supportsAnsiTui } from "./tui/ansiSupport.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -76,6 +77,14 @@ whatever language is otherwise correct for them.`;
  * The original screen is restored on exit so nothing is left behind.
  */
 function enterAltScreen(): void {
+  // Reported directly: on a terminal that doesn't actually interpret ANSI
+  // escapes (legacy Windows cmd.exe, a WSL window whose console didn't
+  // negotiate VT mode, output piped through something that mangles control
+  // sequences), these bytes show up as literal stray characters instead of
+  // switching screens — see ansiSupport.ts's doc comment. Skip entirely
+  // rather than risk it; the app still works, just without the alt-screen
+  // origin-stability/scrollback niceties described below.
+  if (!supportsAnsiTui()) return;
   // Also turn on mouse reporting (button events, SGR encoding) so the
   // wheel scrolls the log — the alt screen has no native scrollback, and
   // PageUp/PageDown alone was reported as not enough. Side effect: the
@@ -85,6 +94,7 @@ function enterAltScreen(): void {
 }
 
 function exitAltScreen(): void {
+  if (!supportsAnsiTui()) return;
   process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
 }
 

@@ -9,6 +9,7 @@ import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
 import { HARNESS_ART, ART_WIDTH, LETTER_WIDTH, SETTLED, BALL_COLOR, RESET, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { supportsAnsiTui } from "./ansiSupport.js";
 
 export interface AppProps {
   cwd: string;
@@ -1206,6 +1207,16 @@ export function App({
     // box now owns that row will redraw it on the very next state change
     // (the input box border itself needs no redraw from us because a
     // completely blank row includes no content Ink was relying on).
+    // Reported directly: on a terminal that doesn't actually interpret ANSI
+    // escapes, every one of these raw writes shows up as literal stray
+    // characters in the prompt instead of moving the cursor/clearing a row
+    // — see ansiSupport.ts's doc comment. Skip the whole block: Ink's own
+    // (safer, if slightly less precise) redraw still applies either way.
+    if (!supportsAnsiTui()) {
+      prevInputTopBorderRowRef.current = inputTopBorderRow;
+      return;
+    }
+
     const prevInputTopBorderRow = prevInputTopBorderRowRef.current;
     if (prevInputTopBorderRow !== null && prevInputTopBorderRow !== inputTopBorderRow) {
       const lo = Math.min(prevInputTopBorderRow, inputTopBorderRow);
