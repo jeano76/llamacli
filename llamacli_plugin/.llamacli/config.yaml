@@ -1,0 +1,14 @@
+backend: openai-compatible
+model: /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+baseUrl: http://127.0.0.1:8080
+compaction:
+  autoTriggerRatio: 0.7   # 기본값. 0.4로 낮췄던 적 있으나 실사용해보니 컴팩션이 너무
+                          # 자주 걸린다는 피드백으로 되돌림 (2026-09-26). 요약 예산이
+                          # 이제 실제 요약 분량에 비례해 줄어들도록 고쳐졌으니(runCompaction의
+                          # SUMMARY_COMPRESSION_RATIO), 짧게 자주 끊을 필요성 자체가 줄었음.
+  autoResume: true
+laya:
+  enabled: true
+  baseUrl: http://127.0.0.1:8000
+  minSwapKb: 1000
+  minRamKb: 1000

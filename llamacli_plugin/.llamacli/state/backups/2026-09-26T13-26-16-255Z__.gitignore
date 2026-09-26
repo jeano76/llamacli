@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Benchmark / probe run logs (transitional artifacts)
+_phase2_run.log
+_phase2_hypothesis.log
+_*_probe.py
+_*_run.log
+_*_hypothesis.log
+
+# OS editor cruft
+*.swp
+.DS_Store

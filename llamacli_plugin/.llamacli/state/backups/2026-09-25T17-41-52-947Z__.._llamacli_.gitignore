@@ -3,6 +3,3 @@ dist/
 .llamacli/state/
 *.log
 .claude/
-__pycache__/
-*.pyc
-.venv/

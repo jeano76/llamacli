@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Benchmark / run logs (transient outputs)
+_*.log
+*_phase2_hypothesis.log
+
+# Local state that may contain secrets
+config.yaml.bak
+.llamacli/state/*.json

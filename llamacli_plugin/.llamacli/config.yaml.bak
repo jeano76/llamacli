@@ -1,0 +1,23 @@
+backend: openai-compatible
+model: /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+compaction:
+  autoTriggerRatio: 0.7
+  autoResume: true
+llama:
+  binPath: llama-server
+  modelPath: ''
+  port: 8081
+  contextSize: 8192
+  threads: 4
+  gpuLayers: 0
+browser:
+  debugPort: 9222
+  host: 127.0.0.1
+baseUrl: http://127.0.0.1:8080
+laya:
+  enabled: true         # MVP §2.1: merge-style gate armed; degrades to Ornith on any failure
+  shortCircuit: false   # §3.4: off by default (merge-style review gate only)
+  timeoutSeconds: 3     # hard cap on /v1/systemone round-trip (§7)
+  questionType: noul    # "noul" (default yes/no) | choice | score
+  actProbabilityThreshold: 0.85   # §3.4 min action-tendency for short-circuit
+  confidenceThreshold: 0.7        # §3.4 min calibrated confidence for short-circuit

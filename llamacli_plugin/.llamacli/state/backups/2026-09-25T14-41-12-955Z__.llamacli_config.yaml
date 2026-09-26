@@ -1,0 +1,19 @@
+backend: openai-compatible
+model: /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+compaction:
+  autoTriggerRatio: 0.7
+  autoResume: true
+llama:
+  binPath: llama-server
+  modelPath: ''
+  port: 8081
+  contextSize: 8192
+  threads: 4
+  gpuLayers: 0
+browser:
+  debugPort: 9222
+  host: 127.0.0.1
+baseUrl: http://127.0.0.1:8080
+laya:
+  enabled: false
+  shortCircuit: false
