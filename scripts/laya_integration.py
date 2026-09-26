@@ -596,12 +596,19 @@ def cmd_fastcheck(path: Path, text: str) -> int:
     installed = bool(venv_available(venv_root))
 
     if not installed:
-        # Laya is not present in this project: tell the user we cannot gate yet.
+        # Reported directly: "/fastcheck on" only ever printed "install with
+        # /fastcheck on" — the exact command that was just run — and never
+        # actually installed anything, since install_laya() was imported but
+        # never called anywhere. Actually trigger it now; it prints its own
+        # progress line-by-line (venv creation, then `pip install laya[serve]`,
+        # which can take a while — that IS the visible progress, there's no
+        # separate percentage to report on top of it).
         print(f"[laya] gate enabled but laya is not installed for this project "
               f"(<project>/.llamacli/{LAYA_VENV_NAME.split('/')[-1]}/).")
-        print("[laya] install with `/fastcheck on` to create the project-local venv.")
-        print("[laya] gating — proceeding with full turn until laya is available.")
-        return 0
+        installed = install_laya()
+        if not installed:
+            print("[laya] install failed — gating — proceeding with full turn until laya is available.")
+            return 0
 
     installed = True
     print(f"[laya] found project-local venv at {venv_root} (progress: installing OK)")

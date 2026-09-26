@@ -71,10 +71,18 @@ def default_config_path():
 
 
 def _default_venv_root(venv_root=None):
-    """Resolve the laya venv root (defaults to project-local `.llamacli/laya-venv`)."""
+    """Resolve the laya venv root (defaults to project-local `.llamacli/laya-venv`).
+
+    LAYA_VENV_NAME already includes the ".llamacli/" prefix — do not prepend
+    it again here (was doubling to ".llamacli/.llamacli/laya-venv", a real
+    bug: install_laya() below shared the same mistake, so a fresh install
+    landed at a path venv_available()'s explicit-override callers in
+    laya_integration.py never checked, making the venv look permanently
+    "not installed" even right after a successful install).
+    """
     if venv_root is not None:
         return Path(venv_root)
-    return Path.cwd() / ".llamacli" / LAYA_VENV_NAME
+    return Path.cwd() / LAYA_VENV_NAME
 
 
 def venv_available(venv_root: Optional[os.PathLike[str]] = None) -> bool:
@@ -106,13 +114,57 @@ def venv_python_path(venv_root: Optional[os.PathLike[str]] = None):
     return root / "bin" / "python" if os.name != "nt" else root / "Scripts" / "python.exe"
 
 
+def _install_lock_path() -> Path:
+    return _default_venv_root().parent / ".laya-install.lock"
+
+
 def install_laya() -> bool:
     """Create project-local venv and install laya[serve] (uv if available).
 
     Isolated at the laya layer only. On any failure print an actionable message
     and return False; core llamacli and the Ornith path stay untouched.
+
+    Reported directly: "이미 설치중인데 다시 설치커멘더가 오면 이미
+    설치중이라고 알려줘야해" — pip-installing laya[serve] can take minutes
+    (torch + CUDA deps), and a user re-running `/fastcheck on` while that's
+    still going used to just kick off a second, fully redundant install
+    racing the first (same venv, two concurrent `pip install` processes). A
+    simple lock file (PID + timestamp) makes a second call recognize this
+    and say so instead of racing — removed in every exit path (success,
+    failure, or a stale lock from a process that no longer exists).
     """
-    base = Path.cwd() / ".llamacli" / LAYA_VENV_NAME
+    lock_path = _install_lock_path()
+    if lock_path.exists():
+        still_running = False
+        lock_pid = None
+        try:
+            lock_pid = int(lock_path.read_text().strip().split()[0])
+            os.kill(lock_pid, 0)  # no exception raised => that PID is alive
+            still_running = True
+        except ProcessLookupError:
+            still_running = False  # that PID is gone — stale lock, proceed and overwrite it
+        except PermissionError:
+            still_running = True  # PID exists, just owned by someone else — still in progress
+        except (ValueError, IndexError):
+            still_running = False  # malformed lock file — treat as stale
+        if still_running:
+            who = f"PID {lock_pid}" if lock_pid is not None else "another process"
+            print(f"[laya] already installing ({who}) — please wait for it to finish.")
+            return False
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(f"{os.getpid()} {time.time()}")
+    try:
+        return _install_laya_locked()
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _install_laya_locked() -> bool:
+    # Must match _default_venv_root()'s resolution exactly, or a successful
+    # install lands somewhere venv_available()'s callers never look — see
+    # that function's doc comment for the double-prefix bug this once had.
+    base = _default_venv_root()
     python = base / "bin" / "python" if os.name != "nt" else base / "Scripts" / "python.exe"
 
     print("[laya] creating project-local virtual environment ...")
@@ -127,15 +179,20 @@ def install_laya() -> bool:
 
     print("[laya] installing laya[serve] (PyPI) ...")
     if shutil.which("uv"):
-        installer = ["uv", "pip", "install", "laya[serve]"]
+        # `uv pip install` only auto-detects the CONVENTIONAL `.venv` — ours
+        # lives at a project-local, non-standard path, so it must be told
+        # explicitly which interpreter to target or it fails outright with
+        # "No virtual environment found" (confirmed live) instead of
+        # installing into the venv install_laya() just created.
+        installer = ["uv", "pip", "install", "--python", str(python), "laya[serve]"]
     else:
         installer = [str(python), "-m", "pip", "install", "laya[serve]"]
     try:
         subprocess.run(installer, check=True, capture_output=True, timeout=600)  # noqa: S603
     except Exception as exc:  # noqa: BLE001
         print(f"[laya] install failed. Fix manually with:\n"
-              f"    uv venv .llamacli/{LAYA_VENV_NAME}\n"
-              f"    uv pip install laya[serve]\n(detail: {exc})", file=sys.stderr)
+              f"    uv venv {base}\n"
+              f"    uv pip install --python {python} laya[serve]\n(detail: {exc})", file=sys.stderr)
         return False
 
     if not venv_available():
