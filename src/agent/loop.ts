@@ -494,6 +494,35 @@ export class AgentLoop {
     this.opts.onQueueChange?.(this.queuedMessages.slice());
   }
 
+  /** Reported directly: "컴팩션 하고나면 왜 다음 프롬프트시 시간이 소요가 되지?"
+   *  — even with the cache-prefix fix (runCompaction keeping the original
+   *  system message verbatim), the turn AFTER a compaction still opens with
+   *  a brand-new system message (base + new summary), which is genuinely
+   *  new text llama-server has never seen — an unavoidable cache miss if
+   *  compaction only ever runs synchronously inside the next send().
+   *
+   *  Call this right after a turn finishes (while the UI sits idle waiting
+   *  for the user's next message — reading the reply, typing, etc.) to run
+   *  that same compaction NOW instead, during otherwise-wasted idle time.
+   *  Fire-and-forget by design: it's chained onto the same `enqueue` queue
+   *  `send()` itself uses, so if the user's next message arrives before
+   *  this finishes, that `send()` call simply queues behind it (same
+   *  serialization guarantee as any other queued task — never a concurrent
+   *  mutation of `this.messages`) instead of redoing the same compaction
+   *  redundantly a moment later. Errors are swallowed exactly like a
+   *  disabled/errored layaGate: a failed warm-up must never surface as a
+   *  crash or block the next real turn — the ordinary auto-threshold check
+   *  inside send() still runs as a fallback either way. */
+  warmCompactIfNeeded(): void {
+    this.enqueue(async () => {
+      await this.maybeCompact();
+    }).catch(() => {
+      // Swallowed: the next send() re-checks and retries synchronously if
+      // this attempt failed, exactly as if warmCompactIfNeeded had never
+      // been called.
+    });
+  }
+
   async send(userText: string): Promise<void> {
     await this.enqueue(async () => {
       // The circuit breaker is created once per AgentLoop (i.e. once per

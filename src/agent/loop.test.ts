@@ -2747,3 +2747,77 @@ test("harness: a message queued mid-turn reaches the model at the NEXT request, 
     // maybeFireTurnStart) — all 3 rounds here each produce something.
     assert.equal(turnStartCount, 3, "onTurnStart should fire once per round, on its first delta");
   }));
+
+test("warmCompactIfNeeded runs a queued compaction during idle time between turns, instead of waiting for the next send()", () =>
+  withTempProject(async (dir) => {
+    // Reported directly: "컴팩션 하고나면 왜 다음 프롬프트시 시간이 소요가
+    // 되지?" — even with the cache-prefix fix in compactor.ts, the turn
+    // right after a compaction still opens with brand-new system-message
+    // text, an unavoidable cache miss if compaction only ever runs
+    // synchronously inside the next send(). warmCompactIfNeeded lets the
+    // caller (index.tsx) trigger that same compaction during the idle gap
+    // between turns instead — while the UI is just waiting for the next
+    // keystroke — so the cost is paid then, not at the start of the next
+    // real turn.
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      // 1: top-of-turn check during send() -> low, no compact, turn proceeds.
+      // 2: warmCompactIfNeeded's own check -> high, compacts.
+      tokenCounts: [1, 1000],
+    });
+    const statusMessages: string[] = [];
+    let compactionCompleted = false;
+    let resolveCompactionDone: () => void;
+    const compactionDone = new Promise<void>((resolve) => {
+      resolveCompactionDone = resolve;
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onStatus: (s) => statusMessages.push(s),
+      onCompactionStatus: (status) => {
+        if (status === "complete") {
+          compactionCompleted = true;
+          resolveCompactionDone();
+        }
+      },
+    });
+
+    await loop.send("do the thing");
+    assert.ok(!compactionCompleted, "the turn's own (low) top-of-turn check must not have triggered a compaction");
+
+    loop.warmCompactIfNeeded();
+    await compactionDone;
+
+    assert.ok(compactionCompleted, "warmCompactIfNeeded should have run a compaction using the next (high) tokenize reading");
+    assert.ok(statusMessages.some((s) => s.includes("compaction complete")));
+  }));
+
+test("warmCompactIfNeeded is a no-op when context usage is already under the auto-trigger threshold", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("done"), assistantMessage("done again")],
+      tokenCounts: [1, 1, 1], // all readings stay well under the threshold
+    });
+    let compactionRan = false;
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onCompactionStatus: () => {
+        compactionRan = true;
+      },
+    });
+
+    await loop.send("do the thing");
+    loop.warmCompactIfNeeded();
+    // Let the queued (no-op) task actually run before asserting.
+    await loop.send("another message that should not need to compact either");
+
+    assert.ok(!compactionRan, "warmCompactIfNeeded must not force a compaction when nothing crossed the threshold");
+  }));

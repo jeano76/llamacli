@@ -470,6 +470,12 @@ async function main() {
           ui?.pushStatus(`[error] ${summarizeErrorForDisplay(err.message)}`);
         } finally {
           ui?.setBusy(false);
+          // The turn just ended — the UI is about to sit idle waiting for
+          // the next keystroke (reading the reply, typing, etc). If this
+          // turn already pushed context usage past the auto-threshold, do
+          // that compaction NOW instead of leaving it for the next send()
+          // to pay for synchronously. See warmCompactIfNeeded's doc comment.
+          loop.warmCompactIfNeeded();
         }
       }}
       onQueueMessage={(text) => loop.queueMessage(text)}
