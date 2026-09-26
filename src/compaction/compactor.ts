@@ -370,9 +370,27 @@ export async function runCompaction(
   ]);
 
   const defaultSummaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(contextWindowTokens * 0.25)));
-  const summaryMaxTokens = summaryMaxTokensCap
+  const windowBasedCap = summaryMaxTokensCap
     ? Math.max(128, Math.min(defaultSummaryMaxTokens, summaryMaxTokensCap))
     : defaultSummaryMaxTokens;
+  // Reported directly: "컴팩션을 전체를 하는게 아니라 실제 있는 데이터 만큼만
+  // 하면 안될까" — windowBasedCap above is sized purely from the context
+  // window, with zero regard for how much history is ACTUALLY being
+  // summarized. A compaction firing early (a small autoTriggerRatio, or
+  // just a quiet session with little to say) still got handed the full
+  // window-sized budget, free to generate up to thousands of tokens
+  // regardless of whether there were only a handful of short messages to
+  // condense — wasting real generation time (and, worse, real turns at
+  // the single inference slot other requests queue behind) on a summary
+  // far longer than the source material could ever justify. A summary is
+  // expected to meaningfully compress its input, so cap it at a fraction
+  // of the ACTUAL input size too — whichever cap is tighter wins. Only
+  // ever tightens windowBasedCap (a large `toSummarize` still falls back
+  // to it via the outer Math.min), so the existing large-history behavior
+  // is unchanged.
+  const summaryInputTokens = summaryInput.reduce((n, m) => n + estimateTextTokens(messageText(m)), 0);
+  const SUMMARY_COMPRESSION_RATIO = 0.35;
+  const summaryMaxTokens = Math.max(128, Math.min(windowBasedCap, Math.ceil(summaryInputTokens * SUMMARY_COMPRESSION_RATIO)));
 
   // The summary request is itself a request against the same window. On the
   // overflow-retry path the history being summarized can be close to the

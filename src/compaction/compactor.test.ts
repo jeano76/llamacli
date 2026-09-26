@@ -302,6 +302,18 @@ test("runCompaction returns a detail report naming what was dropped and what rep
 // the single inference slot forever, invisibly. Caught live via GET /slots
 // showing a real compaction summary request's n_decoded climbing past 700
 // with max_tokens/n_predict both -1 — this request path had no cap at all.
+// Large enough (~282,000 chars ≈ 70,500 estimated tokens at the ASCII
+// 4-chars/token ratio) for two things the window-math tests below need at
+// once: (1) past the 4096/0.35 ≈ 11,703-token point where the proportional
+// summary cap would otherwise still bind tighter than the window-based
+// ceiling; and (2) past selectKeptTail's own tail budget even at a huge
+// (200,000-token) context window (budgetTokens there is ~60,000 tokens,
+// via availableForTail = window*0.75 and DEFAULT_TAIL_BUDGET_FRACTION=0.4),
+// so this message actually lands in toSummarize instead of being kept
+// whole as the tail — which would make toSummarize empty and collapse
+// summaryMaxTokens straight to the 128 floor for the wrong reason.
+const LONG_FILLER_TEXT = "The quick brown fox jumps over the lazy dog. ".repeat(6000);
+
 test("runCompaction sets max_tokens on the summary request, scaled to the real context window", () =>
   (async () => {
     const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
@@ -309,7 +321,7 @@ test("runCompaction sets max_tokens on the summary request, scaled to the real c
       const { backend, lastRequest } = strictNoToolsBackend();
       const messages: ChatMessage[] = [
         { role: "system", content: "sys" },
-        { role: "user", content: "hello" },
+        { role: "user", content: LONG_FILLER_TEXT },
         { role: "assistant", content: "hi" },
       ];
       const partial = {
@@ -337,7 +349,17 @@ test("runCompaction's summary max_tokens has a floor for a small context window,
     const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
     try {
       const { backend, lastRequest } = strictNoToolsBackend();
-      const messages: ChatMessage[] = [{ role: "system", content: "sys" }, { role: "user", content: "hi" }];
+      // A trailing short assistant turn (matching the previous test's shape)
+      // matters here: with only a single non-system message, selectKeptTail's
+      // cut-index logic keeps that lone message as the tail in its entirety
+      // (nothing left to summarize) at any window size, which would make
+      // toSummarize empty and always hit this test's tiny 128 floor for the
+      // wrong reason — not the window-based math this test targets.
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: LONG_FILLER_TEXT },
+        { role: "assistant", content: "hi" },
+      ];
       const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
 
       await runCompaction(dir, messages, backend, "m", partial, 512); // tiny window
@@ -345,6 +367,43 @@ test("runCompaction's summary max_tokens has a floor for a small context window,
 
       await runCompaction(dir, messages, backend, "m", partial, 200_000); // huge window
       assert.equal(lastRequest()!.max_tokens, 4096); // ceiling, not 50000
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("runCompaction's summary max_tokens is scaled down when there's little history to actually summarize, regardless of how large the context window is", () =>
+  (async () => {
+    // Reported directly: "컴팩션을 전체를 하는게 아니라 실제 있는 데이터
+    // 만큼만 하면 안될까" — a compaction firing on a quiet session with
+    // only a couple of short messages used to get handed the FULL
+    // window-sized budget (up to 4096 tokens) regardless of there being
+    // almost nothing to condense, letting a verbose model burn real
+    // generation time on a summary far longer than the source material
+    // could ever justify.
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      // A tiny amount of real history: well under the ~11,750-token
+      // LONG_FILLER_TEXT the other two tests use to keep the window-based
+      // ceiling/floor as the binding constraint instead.
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+      ];
+      const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      // A large window (16384 -> windowBasedCap 4096) that would have won
+      // outright under the old window-only sizing.
+      await runCompaction(dir, messages, backend, "m", partial, 16384);
+      const maxTokens = lastRequest()!.max_tokens!;
+      assert.ok(
+        maxTokens < 4096,
+        `expected the tiny actual history to tighten max_tokens well below the window ceiling, got ${maxTokens}`
+      );
+      // Still never below the absolute floor.
+      assert.ok(maxTokens >= 128, `expected the floor to still apply, got ${maxTokens}`);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
