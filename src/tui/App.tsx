@@ -477,10 +477,14 @@ export function shouldHideCursor(state: { quitting: boolean; busy: boolean; inpu
   return state.quitting || (state.busy && state.input.length === 0);
 }
 
-/** The key-hint line shown under the log while the agent is running (never
- *  inside the input box: it used to sit next to the prompt and take width
- *  from it, which threw off the input's width/cursor math — reported
- *  directly). Picks the long form when it fits the terminal width. */
+/** The key-hint line shown as a placeholder inside the (empty) input box
+ *  while the agent is running — requested directly, moved back in from its
+ *  previous home below the log ("도구 사용도 출력도 ...는 프롬프트 창에
+ *  약간 회색 글씨로"). Only ever rendered in place of the input box's own
+ *  text (never alongside it — see showRunHint's `input === ""` guard), so
+ *  it can't collide with the real width/cursor math the way an earlier
+ *  attempt at putting it inside the box once did. Picks the long form when
+ *  it fits the given width. */
 export function runHintText(columns: number): string {
   // With mouse reporting on (wheel scrollback), plain clicks go to the app;
   // holding Shift hands them back to the terminal, so Shift+drag selects and
@@ -1229,9 +1233,11 @@ export function App({
   // scroll behavior).
   const rows = Math.max(1, (stdout?.rows ?? 24) - 1);
   const columns = stdout?.columns ?? 80;
-  // Reserves 2 extra columns for the input box's own left+right border
-  // characters (see the bordered Box below) on top of its padding/spinner/space.
-  const maxInputWidth = Math.max(10, columns - 6);
+  // Reserves paddingX (1 each side) + the first line's leading space (see
+  // the bordered Box below) — no border columns anymore now that the input
+  // box's left/right vertical borders are off (borderLeft/borderRight
+  // false), and no spinner column either (moved to the status bar).
+  const maxInputWidth = Math.max(10, columns - 3);
   const quitting = quittingSince !== null;
   const QUIT_CONFIRM_TEXT = "강제 종료하시겠습니까? 진행 중인 작업은 저장되어 다음 실행 시 이어집니다. (Y/N)";
   const RESUME_CONFIRM_TEXT = pendingResumeGoal
@@ -1362,10 +1368,13 @@ export function App({
     // spinner frame changed; moved to the status bar instead (see
     // StatusBar.tsx), which isn't something you're reading character by
     // character while typing.
+    // No left border column anymore (borderLeft={false} above) — the box's
+    // interior now starts right at paddingX, one column earlier than when
+    // a vertical border character used to sit in column 1.
     const promptColumn =
       lastLineIndex === 0
-        ? 1 /* left border */ + 1 /* paddingX */ + 1 /* leading space */ + stringWidth(lastLine) + 1
-        : 1 /* left border */ + 1 /* paddingX */ + stringWidth(lastLine) + 1;
+        ? 1 /* paddingX */ + 1 /* leading space */ + stringWidth(lastLine) + 1
+        : 1 /* paddingX */ + stringWidth(lastLine) + 1;
     const hideCursor = shouldHideCursor({ quitting, busy, input });
     lastCursorWriteRef.current = `\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`;
     process.stdout.write(lastCursorWriteRef.current);
@@ -1581,10 +1590,19 @@ export function App({
   // scrollOffset > 0) keeps maxScrollRef consistent regardless of current
   // scroll position, avoiding a circular "how much can I scroll depends on
   // whether I'm already scrolled" dependency.
-  // One row at the bottom of the log area goes to the key hint, only while
-  // the agent is running.
-  const showRunHint = busy && !quitting && !quitConfirmPending && !resumeConfirmPending && !menuOpen;
-  const hintRows = showRunHint ? 1 : 0;
+  // Requested directly: the "실행 중 · Esc: 강제종료 ..." hint now lives
+  // INSIDE the (empty) input box as a placeholder-style notice, in gray,
+  // rather than taking its own row below the log — see the input Box's
+  // first line below. It only shows while there's genuinely nothing else
+  // to show there: busy, no dialog/menu stealing the box, and the input is
+  // actually empty. That last condition is what makes it disappear
+  // "naturally" exactly as requested — the instant the user types
+  // anything, recalls a history entry (Up/Down), or the turn finishes and
+  // busy drops, the very same input-is-empty (or busy) check that shows it
+  // stops being true, no separate dismiss logic needed. No row reserved
+  // for it anymore since it's sharing the input box's own first line.
+  const showRunHint = busy && !quitting && !quitConfirmPending && !resumeConfirmPending && !menuOpen && input === "";
+  const hintRows = 0;
   const scrollableContentRows = menuOpen
     ? Math.max(0, logHeight - menuBoxHeight)
     : Math.max(0, logHeight - 1 - hintRows);
@@ -1667,7 +1685,6 @@ export function App({
             renderRow(row, row.lineId === thinkingLineId || row.lineId === streamingAssistantId ? shimmerTick : undefined)
           )}
         {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
-        {showRunHint && <Text dimColor>{runHintText(columns)}</Text>}
       </Box>
 
       {/* The prompt input lives INSIDE this bordered box, not below it —
@@ -1681,13 +1698,25 @@ export function App({
       <Box
         borderStyle="round"
         borderColor={inputBorderColor}
+        // Requested directly: match Claude Code's input box — only the
+        // top/bottom lines (spanning the full width, no corner-to-corner
+        // side pillars) instead of a fully boxed-in rectangle.
+        borderLeft={false}
+        borderRight={false}
         paddingX={1}
         height={2 + inputLines.length}
         overflow="hidden"
         flexDirection="column"
       >
         <Box>
-          <Text color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {inputLines[0] ?? ""}</Text>
+          {showRunHint ? (
+            // maxInputWidth (not raw columns) — this now renders inside the
+            // same padded box the input text itself is bounded by, so it
+            // must fit the same budget or it would overflow past the edge.
+            <Text dimColor>{runHintText(maxInputWidth)}</Text>
+          ) : (
+            <Text color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {inputLines[0] ?? ""}</Text>
+          )}
         </Box>
         {inputLines.slice(1).map((line, i) => (
           <Text key={i} color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}>
