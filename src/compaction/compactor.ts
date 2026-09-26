@@ -1,7 +1,7 @@
 import type { ChatMessage, ToolDef } from "../backend/types.js";
 import type { ModelBackend } from "../backend/types.js";
 import { Checkpoint, readCheckpoint, writeCheckpoint } from "./checkpoint.js";
-import { readNotes, stripNotesBlock } from "./notes.js";
+import { readNotes } from "./notes.js";
 
 export interface CompactionThresholds {
   /** Fraction of the model's context window (0-1) that triggers auto-compaction. */
@@ -352,22 +352,13 @@ export async function runCompaction(
     : ".";
   // selectKeptTail() never puts the system message into toSummarize (so the
   // base prompt isn't summarized into the summary and re-appended to itself
-  // on every pass), which also means the PREVIOUS summary would never reach
-  // the summary model — each compaction would silently forget everything
-  // the last one had condensed. Hand it over explicitly instead; the new
-  // summary then replaces it (composeSystemMessage) rather than stacking.
+  // on every pass). originalSystemText already carries any previous summary
+  // forward (composeSystemMessage stacks base + [Summary] on every pass), so
+  // it doesn't need to be re-injected separately here as long as the system
+  // message below is kept verbatim — see the cache-prefix note below.
   const originalSystem = messages.find((m) => m.role === "system");
   const originalSystemText = typeof originalSystem?.content === "string" ? originalSystem.content : "";
-  // Working notes appended after the summary (loop.ts) are re-added fresh
-  // after this compaction; don't feed them into the summary as well.
-  const rawPreviousSummary = splitSystemMessage(originalSystemText).summary;
-  const previousSummary = rawPreviousSummary === null ? null : stripNotesBlock(rawPreviousSummary);
-  const summaryInput = sanitizeForSummary([
-    ...(previousSummary
-      ? [{ role: "user" as const, content: `[Summary of even earlier conversation]\n${previousSummary}` }]
-      : []),
-    ...toSummarize,
-  ]);
+  const summaryInput = sanitizeForSummary(toSummarize);
 
   const defaultSummaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(contextWindowTokens * 0.25)));
   const windowBasedCap = summaryMaxTokensCap
@@ -399,21 +390,30 @@ export async function runCompaction(
   // messages (after the previous summary, which condenses them anyway)
   // until the input fits.
   const inputBudget = Math.max(256, contextWindowTokens - summaryMaxTokens - 512);
-  const firstDroppable = previousSummary ? 1 : 0;
   while (
-    summaryInput.length > firstDroppable + 1 &&
+    summaryInput.length > 1 &&
     summaryInput.reduce((n, m) => n + estimateTextTokens(messageText(m)), 0) > inputBudget
   ) {
-    summaryInput.splice(firstDroppable, 1);
+    summaryInput.splice(0, 1);
   }
 
+  // Reported directly: "컴팩션 하고나면 왜 다음 프롬프트시 시간이 소요가 되지?"
+  // — the summary request used to open with a BRAND NEW system message
+  // ("Summarize the following conversation...") instead of the real
+  // originalSystemText the just-completed turn actually used. That made
+  // this request's very first token diverge from everything llama-server
+  // had cached, so it paid a full prefill of the entire toSummarize history
+  // with zero cache reuse. Keeping originalSystemText verbatim as the
+  // system message here means this request's prefix ([system] + toSummarize)
+  // is byte-for-byte a PREFIX of the real turn that was just processed (that
+  // turn's messages were [system, ...toSummarize, ...keepTail, ...]), so
+  // llama-server's prompt cache can serve everything up through the end of
+  // toSummarize from cache instead of recomputing it. The "please
+  // summarize" instruction moves to a trailing user message instead of
+  // living in the system role, since changing the system message is exactly
+  // what would break that prefix match.
   const summaryRequest: ChatMessage[] = [
-    {
-      role: "system",
-      content:
-        "Summarize the following conversation for context compaction. " +
-        "Preserve verbatim any user-stated constraints, decisions" + mustPreserveClause,
-    },
+    { role: "system", content: originalSystemText },
     ...summaryInput,
   ];
   // The request must END with a user turn asking for the summary. When the
@@ -424,13 +424,11 @@ export async function runCompaction(
   // message returned an echo of the tool-call text; ending on a user
   // request returned an actual summary. Live, one compaction's summary
   // request generated a single token, so everything it replaced was lost.
-  const SUMMARY_INSTRUCTION = "Now write the summary of the conversation above. Output only the summary.";
-  const lastInput = summaryRequest[summaryRequest.length - 1];
-  if (lastInput.role === "user" && typeof lastInput.content === "string") {
-    summaryRequest[summaryRequest.length - 1] = { ...lastInput, content: `${lastInput.content}\n\n${SUMMARY_INSTRUCTION}` };
-  } else {
-    summaryRequest.push({ role: "user", content: SUMMARY_INSTRUCTION });
-  }
+  const SUMMARY_INSTRUCTION =
+    "Summarize the conversation above for context compaction. Preserve verbatim any user-stated constraints, decisions" +
+    mustPreserveClause +
+    "\n\nNow write the summary of the conversation above. Output only the summary.";
+  summaryRequest.push({ role: "user", content: SUMMARY_INSTRUCTION });
 
   // Never leave this unset — same reasoning, and the exact same failure
   // mode, as loop.ts's main-turn request: without max_tokens, llama-server

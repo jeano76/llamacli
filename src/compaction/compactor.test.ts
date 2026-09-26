@@ -409,6 +409,41 @@ test("runCompaction's summary max_tokens is scaled down when there's little hist
     }
   })());
 
+test("runCompaction's summary request preserves the original system message verbatim, as a cache-reuse-friendly prefix", () =>
+  (async () => {
+    // Reported directly: "컴팩션 하고나면 왜 다음 프롬프트시 시간이 소요가 되지?"
+    // — the summary request used to always open with a brand-new system
+    // message ("Summarize the following conversation..."), which meant its
+    // very first token diverged from anything llama-server had cached for
+    // the turn that had just completed, forcing a full prefill of the whole
+    // history being summarized. Keeping originalSystemText verbatim as this
+    // request's system message means [system, ...toSummarize] is a literal
+    // PREFIX of the just-completed turn's own prompt, so llama-server's
+    // cache can serve it instead of recomputing it.
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      const ORIGINAL_SYSTEM = "You are a coding assistant. Some base rules here.";
+      const messages: ChatMessage[] = [
+        { role: "system", content: ORIGINAL_SYSTEM },
+        { role: "user", content: "please investigate the slow endpoint" },
+        { role: "assistant", content: "looking into it now" },
+      ];
+      const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      await runCompaction(dir, messages, backend, "m", partial, 16384);
+      const sent = lastRequest()!;
+      assert.equal(sent.messages[0].role, "system");
+      assert.equal(
+        sent.messages[0].content,
+        ORIGINAL_SYSTEM,
+        "the summary request's system message must be byte-identical to the real turn's, or the cache prefix breaks"
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
 test("runCompaction preserves the original system prompt (base prompt + injected project rules) across compaction, not just the summary", () =>
   (async () => {
     const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
@@ -844,7 +879,7 @@ test("buildResumePrompt never nests a previous resume message inside the goal", 
   }
 });
 
-test("a second runCompaction feeds the previous summary to the summary model and replaces it, instead of losing or stacking it", () =>
+test("a second runCompaction feeds the previous summary (via the preserved system message) to the summary model and replaces it, instead of losing or stacking it", () =>
   (async () => {
     const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
     try {
@@ -869,7 +904,16 @@ test("a second runCompaction feeds the previous summary to the summary model and
 
       const secondInput = requests[1].messages.map((m) => m.content).join("\n");
       assert.ok(secondInput.includes("SUMMARY-1"), "previous summary must reach the summary model");
-      assert.ok(!secondInput.includes("BASE"), "the base system prompt must not be summarized");
+      // BASE legitimately appears now — as the request's (unchanged) system
+      // message, so llama-server's prompt cache can reuse it — but only
+      // ONCE, as context, never duplicated into the summarized content the
+      // model is asked to condense.
+      assert.equal(
+        requests[1].messages.filter((m) => typeof m.content === "string" && m.content.includes("BASE")).length,
+        1,
+        "the base system prompt must appear exactly once (as system context), not be duplicated into summarized content"
+      );
+      assert.equal(requests[1].messages[0].role, "system");
       const sys = second.messages[0].content as string;
       assert.equal(sys, "BASE\n\n[Compacted history summary]\nSUMMARY-2\n\nsecond paragraph 2");
     } finally {
