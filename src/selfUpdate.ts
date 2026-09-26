@@ -87,6 +87,13 @@ export async function checkAndApplyUpdate(
     archiveUrl?: string;
     manifestTimeoutMs?: number;
     archiveTimeoutMs?: number;
+    // Reported directly: the update-and-restart transition looked like a
+    // malfunction — the process just silently exited back to a bare shell
+    // prompt with nothing explaining why. Fired once an update is actually
+    // confirmed available (never on "already up to date" or a failure), so
+    // the caller can announce it clearly BEFORE the download/verify/install
+    // work starts, not only after everything already succeeded.
+    onUpdateFound?: (manifest: UpdateManifest) => void;
   } = {}
 ): Promise<SelfUpdateResult> {
   const fetchImpl = opts.fetchImpl ?? fetch;
@@ -112,6 +119,8 @@ export async function checkAndApplyUpdate(
   if (!updateAvailable(localSha256, manifest)) {
     return { updated: false, reason: "already up to date" };
   }
+
+  opts.onUpdateFound?.(manifest);
 
   let downloaded: Buffer;
   try {

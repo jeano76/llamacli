@@ -195,3 +195,67 @@ test("checkAndApplyUpdate fails gracefully (not a throw) when there's no local h
     assert.equal(result.updated, false);
     assert.match(result.reason, /local build hash/);
   }));
+
+test("checkAndApplyUpdate calls onUpdateFound exactly once, before the archive download, only when an update is actually available", () =>
+  withTempDir(async (distDir) => {
+    // Reported directly: "업데이트 시작과 종료를 명시적으로 알려줘야
+    // 하고" — the caller (index.tsx) needs a hook to announce the update
+    // BEFORE the download/verify/install work starts, not only after
+    // everything already finished, or the process-exit-and-restart
+    // transition reads as a crash instead of an update in progress.
+    await writeFile(join(distDir, "index.js"), "old index.js", "utf8");
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "b".repeat(64), "utf8");
+
+    const { bytes: newArchive, sha256: newSha256 } = await buildFixtureArchive({ "index.js": "new index.js" });
+    const manifestBody = JSON.stringify({ version: "v20260925", sha256: newSha256 });
+
+    const calls: string[] = [];
+    const foundManifests: Array<{ version: string; sha256: string }> = [];
+    const fetchImpl = (async (url: string) => {
+      calls.push(url.endsWith("manifest.json") ? "manifest" : "archive");
+      if (url.endsWith("manifest.json")) return { ok: true, status: 200, text: async () => manifestBody } as Response;
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => newArchive.buffer.slice(newArchive.byteOffset, newArchive.byteOffset + newArchive.byteLength),
+      } as Response;
+    }) as typeof fetch;
+
+    const result = await checkAndApplyUpdate(distDir, {
+      fetchImpl,
+      onUpdateFound: (manifest) => foundManifests.push(manifest),
+    });
+
+    assert.equal(result.updated, true);
+    assert.equal(foundManifests.length, 1, "onUpdateFound must fire exactly once");
+    assert.equal(foundManifests[0].version, "v20260925");
+    // The callback must fire before the archive is fetched, not after —
+    // that's the entire point (announce before the work, not after).
+    assert.deepEqual(calls, ["manifest", "archive"]);
+  }));
+
+test("checkAndApplyUpdate never calls onUpdateFound when already up to date", () =>
+  withTempDir(async (distDir) => {
+    await writeFile(join(distDir, "index.js"), "old index.js", "utf8");
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "a".repeat(64), "utf8");
+    const fetchImpl = (async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ version: "v1", sha256: "a".repeat(64) }) }) as Response) as typeof fetch;
+
+    let fired = false;
+    const result = await checkAndApplyUpdate(distDir, { fetchImpl, onUpdateFound: () => { fired = true; } });
+
+    assert.equal(result.updated, false);
+    assert.equal(fired, false);
+  }));
+
+test("checkAndApplyUpdate never calls onUpdateFound when the manifest fetch itself fails", () =>
+  withTempDir(async (distDir) => {
+    await writeFile(join(distDir, "index.js"), "old index.js", "utf8");
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "b".repeat(64), "utf8");
+    const fetchImpl = (async () => { throw new Error("network unreachable"); }) as unknown as typeof fetch;
+
+    let fired = false;
+    const result = await checkAndApplyUpdate(distDir, { fetchImpl, onUpdateFound: () => { fired = true; } });
+
+    assert.equal(result.updated, false);
+    assert.equal(fired, false);
+  }));

@@ -162,9 +162,39 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
   }
   if (!entryPath.endsWith(".js")) return;
   const distDir = dirname(entryPath);
-  const result = await checkAndApplyUpdate(distDir).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
+  // Reported directly: this whole transition (the process exits, a new one
+  // starts) looked like a malfunction — the terminal just silently dropped
+  // back to a bare shell prompt with no explanation, before the new
+  // process's own alt-screen even had a chance to appear. Announce it in
+  // two explicit, unmistakable stages instead of one terse line printed
+  // only after everything already finished:
+  let announcedUpdateFound = false;
+  const result = await checkAndApplyUpdate(distDir, {
+    onUpdateFound: (manifest) => {
+      announcedUpdateFound = true;
+      process.stdout.write(
+        "\n" +
+          "==================== llamacli 자동 업데이트 ====================\n" +
+          `새 버전(${manifest.version})을 발견했습니다. 지금 다운로드하고 검증합니다.\n` +
+          "완료되면 이 프로그램이 자동으로 종료됐다가 다시 시작됩니다 — 화면이\n" +
+          "잠깐 사라졌다가 나타나는 것은 오작동이 아니라 정상적인 업데이트\n" +
+          "과정이니 그대로 기다려 주세요.\n" +
+          "==================================================================\n\n"
+      );
+    },
+  }).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
   if (!result.updated) return;
-  process.stdout.write(`[self-update] ${result.reason} — restarting...\n`);
+  process.stdout.write(
+    `[self-update] ${result.reason} — 업데이트가 끝났습니다. 지금 바로 새 버전으로 재시작합니다...\n`
+  );
+  // Give the terminal a moment to actually paint the message above before
+  // this process exits — reported directly that the prior single-line,
+  // immediate-exit version was too easy to miss even when correct, which
+  // is exactly what made the whole transition read as broken rather than
+  // as an update in progress.
+  if (announcedUpdateFound) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
   spawnRestart(entryPath);
   process.exit(0);
 }
