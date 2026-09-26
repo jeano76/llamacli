@@ -29,7 +29,7 @@ shell 도구로 **항상 `--no-check`와 함께** 실행하세요 (붙이면, �
 터미널이 붙어 있지 않습니다):
 
 ```bash
-python3 /home/jeano/llamacli/llamacli_plugin/scripts/laya_integration.py fastcheck \
+python3 /home/jeano/llamacli/plugin/laya/scripts/laya_integration.py fastcheck \
   --text "<짧고 독립적인 yes/no 또는 다지선다 질문>" \
   --no-check
 ```
@@ -88,7 +88,7 @@ HuggingFace 체크포인트 다운로드, GPU VRAM 부족 시 CPU 폴백)은 스
 laya가 이 환경에 있는지 확인만 하고 싶으면:
 
 ```bash
-python3 /home/jeano/llamacli/llamacli_plugin/scripts/laya_integration.py status
+python3 /home/jeano/llamacli/plugin/laya/scripts/laya_integration.py status
 # -> {"enabled": true, "installed": false, "running": false, ...} (JSON, 읽기 전용·안전)
 ```
 

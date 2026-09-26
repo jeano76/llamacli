@@ -13,7 +13,7 @@ verdicts/confidences across the Phase-2 A/B + delete cases. Each input runs 3x.
 """
 
 import sys
-sys.path.insert(0, "/home/jeano/llamacli/llamacli_plugin/scripts")
+sys.path.insert(0, "/home/jeano/llamacli/plugin/laya/scripts")
 import laya_integration as L
 
 

@@ -19,7 +19,7 @@
 
 ## 2. 버전관리 공백 — 지금 고친 것들이 전부 디스크에만 있고 사라질 위험
 
-`/home/jeano/llamacli_plugin`가 git 저장소가 아니라서(`.git` 없음), 오늘 고친
+`/home/jeano/llamacli/plugin/laya`가 git 저장소가 아니라서(`.git` 없음), 오늘 고친
 아래 항목들이 **전부 커밋되지 않은 디스크 상태로만 존재**합니다:
 - `scripts/laya_integration.py`의 short-circuit 프롬프트 수정
 - `scripts/laya_integration.py`의 agent-trace 질문 타입 수정
@@ -28,7 +28,7 @@
 프로세스가 재시작되거나, 파일이 실수로 덮어써지거나, 디스크 문제가 생기면 이
 수정사항들은 전부 그냥 사라집니다. 다음을 진행하세요:
 
-1. `/home/jeano/llamacli_plugin`에서 `git init`
+1. `/home/jeano/llamacli/plugin/laya`에서 `git init`
 2. `.gitignore`를 만들어 `.venv/`, `__pycache__/`, `.llamacli/state/backups/`
    등 재생성 가능한 파일은 제외
 3. 지금까지의 작업 상태를 첫 커밋으로 남기기
