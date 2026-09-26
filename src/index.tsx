@@ -393,12 +393,28 @@ async function main() {
    *  can never wedge the TUI or block a turn. Resolves with stdout on success
    *  (exit 0) and rejects otherwise — callers catch everything. `timeoutMs`
    *  overrides LAYA_TIMEOUT_MS for calls that legitimately need longer (the
-   *  install-triggering call below uses LAYA_INSTALL_TIMEOUT_MS). */
-  const runLayaScript = (args: string[], timeoutMs: number = LAYA_TIMEOUT_MS): Promise<{ stdout: string }> =>
+   *  install-triggering call below uses LAYA_INSTALL_TIMEOUT_MS).
+   *
+   *  Reported directly: "로그가 나오지 않는데?" — this used to only ever
+   *  hand the caller the FULL accumulated stdout once the process exited,
+   *  so a multi-minute install (pip installing torch+CUDA) showed nothing
+   *  at all until it was completely done. `onLine`, when given, is called
+   *  with each COMPLETE line as it actually arrives, so a caller that wants
+   *  to show live progress (the install-triggering call below) can push
+   *  each line the moment it's printed instead of waiting for the end.
+   *  `-u` (unbuffered) is required on top of this — Python fully buffers
+   *  stdout by default whenever it isn't a real TTY (i.e. always, here,
+   *  since Node pipes it), so without it every print() would still sit in
+   *  Python's OWN buffer regardless of how promptly Node reads it. */
+  const runLayaScript = (
+    args: string[],
+    timeoutMs: number = LAYA_TIMEOUT_MS,
+    onLine?: (line: string) => void
+  ): Promise<{ stdout: string }> =>
     new Promise((resolve, reject) => {
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
-      const child: ChildProcess = spawn("python3", [layaScriptPath, ...args], {
+      const child: ChildProcess = spawn("python3", ["-u", layaScriptPath, ...args], {
         timeout: timeoutMs,
       });
       // `child.kill(timeout:true)` is Node < 18.0 semantics; use a manual timer
@@ -411,14 +427,26 @@ async function main() {
       }, timeoutMs);
 
       let out = "";
+      let lineBuf = "";
       child.on("error", (err) => {
         if (!settled) { clearTimeout(timer); settled = true; reject(err); }
       });
-      child.stdout?.on("data", (d: Buffer) => { out += String(d); });
+      child.stdout?.on("data", (d: Buffer) => {
+        const chunk = String(d);
+        out += chunk;
+        if (!onLine) return;
+        lineBuf += chunk;
+        const lines = lineBuf.split("\n");
+        lineBuf = lines.pop() ?? ""; // last element: not newline-terminated yet — keep buffering it
+        for (const line of lines) onLine(line);
+      });
       child.on("exit", (code) => {
         if (!settled) {
           settled = true;
           clearTimeout(timer);
+          // Flush a final line that never got a trailing newline (common:
+          // the process's very last print() before exiting).
+          if (onLine && lineBuf) onLine(lineBuf);
           // Only treat exit code 0 as success; anything else is a silent fall
           // back so the normal turn proceeds unchanged.
           code === 0 ? resolve({ stdout: out }) : reject(new Error(`laya script exited with code ${code}`));
@@ -771,13 +799,13 @@ async function main() {
                 // This specific call can trigger a real install (pip installing
                 // laya[serve]) — the ordinary per-turn LAYA_TIMEOUT_MS (30s) is
                 // nowhere near enough for that, see LAYA_INSTALL_TIMEOUT_MS's doc
-                // comment.
-                const fastcheckResult = await runLayaScript(["fastcheck"], LAYA_INSTALL_TIMEOUT_MS);
-                // Surface install/boot progress + the gate verdict from stdout so
-                // the user sees what happened even on this enabling turn.
-                if (fastcheckResult.stdout) {
-                  ui?.pushStatus(fastcheckResult.stdout);
-                }
+                // comment. onLine pushes each progress line the moment it's
+                // printed (see runLayaScript's doc comment) — reported directly
+                // ("로그가 나오지 않는데?"): without this, nothing appeared for
+                // however many minutes the install actually took.
+                await runLayaScript(["fastcheck"], LAYA_INSTALL_TIMEOUT_MS, (line) => {
+                  if (line.trim()) ui?.pushStatus(line);
+                });
                 runtimeEnabled = true;   // immediate: next turn already gated
               } else if (sub === "off" || sub === "disable") {
                 await runLayaScript(["disable"]);
