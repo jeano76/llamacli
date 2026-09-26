@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk, looksLikePartialMouseSequenceStart } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk } from "./App.js";
 import { formatDiff } from "../tools/diff.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
@@ -210,46 +210,14 @@ test("bufferMouseChunk processes a complete report immediately with nothing buff
   assert.equal(garbage.action, "discard");
 });
 
-test("looksLikePartialMouseSequenceStart recognizes a bare ESC or ESC+[ fragment, and nothing else", () => {
-  // Reported directly: garbled fragments (e.g. ";1;5m", stray "[붙여넣기 ...]"
-  // placeholders) showed up in the input box while just MOVING the mouse —
-  // motion reports fire continuously, so a read() boundary landing INSIDE
-  // the 2-3 byte "\x1b[<" lead-in (before the entry check's own full-match
-  // regex would ever fire) is far more likely than with occasional clicks.
-  assert.equal(looksLikePartialMouseSequenceStart("\x1b"), true);
-  assert.equal(looksLikePartialMouseSequenceStart("\x1b["), true);
-  // A complete lead-in, or a normal keystroke, is not "partial" — the
-  // existing full-match regex (or normal typing) already handles those.
-  assert.equal(looksLikePartialMouseSequenceStart("\x1b[<"), false);
-  assert.equal(looksLikePartialMouseSequenceStart("a"), false);
-  assert.equal(looksLikePartialMouseSequenceStart(""), false);
-});
-
-test("scenario: a mouse report split right after ESC, or right after ESC+[ (before '<' ever arrives), still reassembles correctly end to end", () => {
-  // This is the exact gap the fix closes: bufferMouseChunk's own full-match
-  // regex requires "\x1b[<" together to recognize a report is IN PROGRESS,
-  // so a split landing strictly before that 3-byte lead-in completes was
-  // invisible to it — the real useInput callback's entry check needed
-  // looksLikePartialMouseSequenceStart to even call bufferMouseChunk at all
-  // for the first fragment. Simulates that combined entry logic here.
-  const full = "\x1b[<35;10;20M";
-  for (const splitAt of [1, 2]) {
-    let buffered = "";
-    for (const chunk of [full.slice(0, splitAt), full.slice(splitAt)]) {
-      const shouldBuffer = buffered !== "" || /\x1b\[</.test(chunk) || looksLikePartialMouseSequenceStart(chunk);
-      assert.ok(shouldBuffer, `splitAt=${splitAt}: chunk ${JSON.stringify(chunk)} should have entered buffering`);
-      const outcome = bufferMouseChunk(buffered, chunk);
-      if (outcome.action === "process") {
-        assert.equal(outcome.text, full, `splitAt=${splitAt}: must reassemble to the original report`);
-        buffered = "";
-      } else {
-        assert.equal(outcome.action, "wait", `splitAt=${splitAt}: an incomplete fragment must wait, never discard this early`);
-        buffered = buffered + chunk;
-      }
-    }
-    assert.equal(buffered, "", `splitAt=${splitAt}: must have fully resolved by the end, nothing left dangling`);
-  }
-});
+// looksLikePartialMouseSequenceStart and its tests were REVERTED — reported
+// directly: after it shipped, backspace stopped responding at all after
+// recalling a history entry (Up/Down). See the (now-removed) function's
+// former doc comment location in App.tsx for the root cause: an arrow key
+// can arrive as raw, not-yet-decoded bytes under the same chunk-boundary
+// hazard the mouse fix was targeting, and once mistaken for "maybe a mouse
+// report" and buffered, every subsequent keystroke got silently absorbed
+// into the same stuck buffer.
 
 test("parseMouseClicks reports a plain button press with its (row, col), and ignores wheel/drag/release", () => {
   assert.deepEqual(parseMouseClicks("[<0;15;22M"), [{ row: 22, col: 15 }]);

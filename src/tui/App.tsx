@@ -428,31 +428,25 @@ export function bufferMouseChunk(buffered: string, chunk: string): MouseBufferOu
   return { action: "discard" };
 }
 
-/** Reported directly: garbled fragments like ";1;5m" and "[붙여넣기 #1: 1줄,
- *  8바이트]" placeholders showed up in the input box while just moving the
- *  mouse (SGR motion reports fire continuously while dragging/moving, far
- *  more often than the occasional click/wheel event) — the entry check
- *  below only started buffering once a chunk already contained the FULL
- *  "\x1b[<" lead-in together; a high-volume stream of reports is much more
- *  likely to have a read() boundary land INSIDE that 2-3 byte lead-in
- *  (bare "\x1b", or "\x1b["), and those fragments fell straight through as
- *  literal typed/pasted text instead of ever starting the reassembly.
- *
- *  Safe to broaden: Ink's own keypress parser (use-input.js) already
- *  decodes and clears `input` to '' for every key it recognizes as a named
- *  key (arrows, Escape, Home/End, ...) before this callback ever sees it,
- *  and strips a leading ESC byte from anything else single-key-shaped —
- *  so a bare "\x1b" or "\x1b[" reaching this callback as literal chunk
- *  content is never a real recognized keystroke to begin with; it can
- *  only be genuinely undecoded escape-sequence bytes (a mouse report,
- *  given we're the ones who turned mouse reporting on, or otherwise
- *  unrecognized garbage either way). Once buffered, mouseBufferRef being
- *  non-empty already pulls in every subsequent fragment regardless of
- *  its own shape (see the entry check's `mouseBufferRef.current ||` half)
- *  — so only the FIRST fragment of a split needs this widened check. */
-export function looksLikePartialMouseSequenceStart(chunk: string): boolean {
-  return chunk === "\x1b" || chunk === "\x1b[";
-}
+/** REVERTED — reported directly: after this shipped, backspace stopped
+ *  responding at all after recalling a history entry (Up/Down), for a long
+ *  stretch of subsequent keystrokes. Root cause: the assumption below
+ *  ("a bare ESC/ESC+[ reaching this callback can only be a mouse report,
+ *  since Ink already decodes real keys before we see them") only holds
+ *  when the real key's OWN escape sequence arrives in one piece. Under the
+ *  exact same read()-boundary chunking this was meant to fix for mouse
+ *  reports, an arrow key (or Home/End/...) can ALSO arrive split as raw,
+ *  not-yet-decoded bytes — Ink can't recognize a key from a partial
+ *  sequence either, so it falls through here too. Once that first
+ *  fragment ("\x1b" or "\x1b[") got treated as "maybe a mouse report" and
+ *  buffered, `mouseBufferRef` being non-empty pulled in EVERY subsequent
+ *  keystroke (including backspace) into the same buffer, silently eating
+ *  each one, until 64 characters finally accumulated and it gave up. A
+ *  functional keyboard lockup is far worse than the cosmetic mouse-report
+ *  fragment leak this was fixing, so back to the original, narrower entry
+ *  check below (only a chunk that already contains the full "\x1b[<"
+ *  lead-in together starts buffering) — see bufferMouseChunk's own doc
+ *  comment for the reassembly logic that's still intact for that case. */
 
 export function parseMouseClicks(input: string): { row: number; col: number }[] {
   const clicks: { row: number; col: number }[] = [];
@@ -899,7 +893,7 @@ export function App({
     // Reassemble a mouse report split across chunk boundaries (see
     // mouseBufferRef's doc comment) before anything else looks at it.
     let char = rawChar;
-    if (mouseBufferRef.current || /\x1b\[</.test(char) || looksLikePartialMouseSequenceStart(char)) {
+    if (mouseBufferRef.current || /\x1b\[</.test(char)) {
       const outcome = bufferMouseChunk(mouseBufferRef.current, char);
       if (outcome.action === "process") {
         mouseBufferRef.current = "";
