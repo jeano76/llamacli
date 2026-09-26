@@ -1,6 +1,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { tailToWidth } from "./textWidth.js";
+import { Spinner } from "./Spinner.js";
 
 export interface StatusBarProps {
   cwd: string;
@@ -21,6 +22,15 @@ export interface StatusBarProps {
    *  which is the same overflow-then-ghosting bug the input line and slash
    *  menu had (see App.tsx). */
   columns: number;
+  /** Requested directly: the busy-spinner used to sit at the front of the
+   *  prompt input box, but its own animation right next to typed text made
+   *  the whole line look like it was trembling as the frame changed. Moved
+   *  here instead — right in front of the model name, replacing the plain
+   *  "│" divider with an animated frame while the model is actually
+   *  working, back to "│" once it's idle. Not something read character by
+   *  character while composing, so the same animation reads as normal
+   *  motion here instead of visual noise. */
+  busy: boolean;
 }
 
 const GAUGE_WIDTH = 12;
@@ -106,7 +116,7 @@ export function formatPlanProgress(planProgress: { done: number; total: number }
   return text.length <= PLAN_PROGRESS_WIDTH ? text : "";
 }
 
-export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns }: StatusBarProps) {
+export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns, busy }: StatusBarProps) {
   const fieldWidth = statusBarFieldWidth(columns);
   const planText = formatPlanProgress(planProgress);
   const compactionText = formatCompactionStatus(compactionStatus);
@@ -118,7 +128,8 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
         <Text dimColor>{tailToWidth(cwd, fieldWidth)}</Text>
       </Text>
       <Text>
-        <Text dimColor>│ </Text>
+        {busy ? <Spinner active /> : <Text dimColor>│</Text>}
+        <Text> </Text>
         <Text color="cyan">{tailToWidth(model, fieldWidth)}</Text>
       </Text>
       <Box>

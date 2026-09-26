@@ -3,7 +3,6 @@ import { Box, Text, useInput, useStdout } from "ink";
 import stringWidth from "string-width";
 import stripAnsi from "strip-ansi";
 import { StatusBar } from "./StatusBar.js";
-import { Spinner } from "./Spinner.js";
 import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
@@ -100,7 +99,15 @@ let logIdCounter = 0;
 interface RenderedRow {
   key: string;
   text: string;
-  kind: LogLine["kind"] | "reasoning-folded" | "compaction-detail-folded" | "diff-folded" | "tool-result-folded" | "tool-folded";
+  kind:
+    | LogLine["kind"]
+    | "reasoning-folded"
+    | "compaction-detail-folded"
+    | "diff-folded"
+    | "tool-result-folded"
+    | "tool-folded"
+    | "user-paste-folded"
+    | "user-paste-expanded";
   lineId: number;
 }
 
@@ -303,7 +310,7 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
       </Text>
     );
   }
-  if (row.kind === "user") {
+  if (row.kind === "user" || row.kind === "user-paste-folded" || row.kind === "user-paste-expanded") {
     return (
       <Text key={row.key} color="cyan" bold>
         {row.text}
@@ -680,6 +687,16 @@ export function App({
   // Requested directly: reasoning is useful to check but clutters the log
   // once it's no longer the point of what's on screen.
   const [expandedReasoningIds, setExpandedReasoningIds] = useState<Set<number>>(new Set());
+  // Requested directly: a submitted message containing a paste chip
+  // ("[붙여넣기 #N: ...]") should be click-to-expand/collapse in the log,
+  // same as reasoning/diffs/tool results — folded (the raw placeholder) by
+  // default, expanding to the real pasted content on click. Needs
+  // pastedBlocks to still hold that label's real content at render time,
+  // which is why submitting a message no longer clears it (see key.return
+  // below) — only the composing-time label->content map, not the log's
+  // own permanent record of what was actually sent, would otherwise be
+  // able to answer "what was really in that chip" once it's in the log.
+  const [expandedPasteLineIds, setExpandedPasteLineIds] = useState<Set<number>>(new Set());
   // Diffs are the opposite default: shown expanded (visible right away,
   // since that's the point — the user asked to actually see the change),
   // and only fold down once the next command is submitted (see the Return
@@ -690,7 +707,7 @@ export function App({
   // only runs later, async, in response to a real terminal event — can map
   // the absolute terminal row it landed on back to a log line without
   // recomputing the whole layout itself.
-  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean; isDiff: boolean }[] }>({
+  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean; isDiff: boolean; isPaste: boolean }[] }>({
     firstRow: 1,
     entries: [],
   });
@@ -716,6 +733,9 @@ export function App({
   // The terminal row of the input box's top border, from the PREVIOUS
   // render — see the cursor-positioning effect below for why this exists.
   const prevInputTopBorderRowRef = useRef<number | null>(null);
+  // The exact escape sequence last written to position/show-or-hide the
+  // cursor — see the periodic self-healing re-write effect below.
+  const lastCursorWriteRef = useRef<string | null>(null);
 
   function pushLine(text: string, kind: LogLine["kind"]) {
     setLog((prev) => [...prev, { id: logIdCounter++, text, kind }].slice(-MAX_LOG_ENTRIES));
@@ -900,10 +920,11 @@ export function App({
           const idx = row - firstRow;
           const entry = idx >= 0 && idx < entries.length ? entries[idx] : undefined;
           if (!entry?.foldable) continue;
-          // Diffs track their FOLDED ids (default expanded); everything
-          // else tracks its EXPANDED ids (default folded) — see
-          // collapsedDiffIds/expandedReasoningIds's own doc comments.
-          const setFn = entry.isDiff ? setCollapsedDiffIds : setExpandedReasoningIds;
+          // Diffs track their FOLDED ids (default expanded); paste chips
+          // and everything else track their EXPANDED ids (default folded)
+          // — see collapsedDiffIds/expandedPasteLineIds/expandedReasoningIds's
+          // own doc comments.
+          const setFn = entry.isDiff ? setCollapsedDiffIds : entry.isPaste ? setExpandedPasteLineIds : setExpandedReasoningIds;
           setFn((prev) => {
             const next = new Set(prev);
             if (next.has(entry.lineId)) next.delete(entry.lineId);
@@ -1092,7 +1113,11 @@ export function App({
       setHistoryIndex(-1);
       setHistoryDraft("");
       setInput("");
-      setPastedBlocks(new Map());
+      // pastedBlocks is deliberately NOT cleared here — the log line just
+      // pushed above keeps the placeholder label, and expanding it later
+      // (see expandedPasteLineIds) needs this map to still have that
+      // label's real content. pasteCounterRef keeps every label unique
+      // regardless of how long this map keeps growing across the session.
       // A message you just sent should be visible without having to
       // manually scroll back down for it — snap back to the live tail,
       // matching how a normal chat/terminal view behaves.
@@ -1316,16 +1341,44 @@ export function App({
     const lastLineIndex = inputLines.length - 1;
     const lastLine = inputLines[lastLineIndex] ?? "";
     const inputRow = inputTopBorderRow + 1 /* first content row */ + lastLineIndex;
-    // Only the first content row is prefixed with the spinner + a leading
-    // space (see the input Box's JSX below); every wrapped continuation
-    // line starts flush after the border+padding instead.
+    // Only the first content row is prefixed with a leading space (see the
+    // input Box's JSX below); every wrapped continuation line starts flush
+    // after the border+padding instead. The busy-spinner used to live here
+    // too — reported directly that its own animation right next to typed
+    // text made the whole prompt line look like it was "trembling" as the
+    // spinner frame changed; moved to the status bar instead (see
+    // StatusBar.tsx), which isn't something you're reading character by
+    // character while typing.
     const promptColumn =
       lastLineIndex === 0
-        ? 1 /* left border */ + 1 /* paddingX */ + 1 /* spinner */ + 1 /* leading space */ + stringWidth(lastLine) + 1
+        ? 1 /* left border */ + 1 /* paddingX */ + 1 /* leading space */ + stringWidth(lastLine) + 1
         : 1 /* left border */ + 1 /* paddingX */ + stringWidth(lastLine) + 1;
     const hideCursor = shouldHideCursor({ quitting, busy, input });
-    process.stdout.write(`\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`);
+    lastCursorWriteRef.current = `\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`;
+    process.stdout.write(lastCursorWriteRef.current);
   });
+
+  // Reported directly: the blinking cursor sometimes ends up sitting
+  // outside the prompt box, for no identifiable trigger — the effect above
+  // already re-runs after every single render (no dependency array), which
+  // should always keep it correct, but if some render doesn't actually
+  // fire it (or Ink's own paint moves the real cursor afterward, e.g.
+  // while drawing a log update, without a React state change following it
+  // to re-trigger the effect), there's currently nothing to correct it
+  // until the next state change happens to come along. A cheap self-
+  // healing safety net: periodically re-issue the SAME escape sequence the
+  // effect above most recently computed (never recomputed here — this
+  // must never be a second, independently-computed source of truth that
+  // could disagree with it), capping how long any such drift could
+  // possibly remain visible.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!supportsAnsiTui() || !lastCursorWriteRef.current) return;
+      process.stdout.write(lastCursorWriteRef.current);
+    }, 400);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Every log entry is wrapped into terminal rows once and cached by id
   // (recomputed only when its text or the width changes — e.g. the
@@ -1456,6 +1509,31 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "diff-folded", lineId: line.id });
       continue;
     }
+    // A submitted message containing a paste chip: folded by default (the
+    // raw placeholder, exactly as it looked while composing), expanding to
+    // the real pasted content on click — see expandedPasteLineIds's doc
+    // comment. Detected by whether resolving placeholders actually changes
+    // anything, rather than a separate "does this line have a chip" flag,
+    // since pastedBlocks is the only thing that knows what a label maps to.
+    if (line.kind === "user") {
+      const resolvedText = substitutePlaceholders(line.text, pastedBlocks);
+      if (resolvedText !== line.text) {
+        const expanded = expandedPasteLineIds.has(line.id);
+        const displayText = expanded ? resolvedText : line.text;
+        let cached = rowCache.get(line.id);
+        if (!cached || cached.text !== displayText || cached.width !== width) {
+          cached = { text: displayText, width, rows: wrapLogLine({ ...line, text: displayText }, width).map(asRow) };
+          rowCache.set(line.id, cached);
+        }
+        cached.rows.forEach((text, i) =>
+          allRows.push({ key: `${line.id}-${i}`, text, kind: expanded ? "user-paste-expanded" : "user-paste-folded", lineId: line.id })
+        );
+        if (expanded) {
+          allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "user-paste-folded", lineId: line.id });
+        }
+        continue;
+      }
+    }
     // The currently-streaming assistant line gets the same shining
     // reveal-wave effect reasoning already has (see streamingAssistantId's
     // doc comment) — plain wrapping, not markdown, while it's playing:
@@ -1531,8 +1609,11 @@ export function App({
             r.kind === "tool" ||
             r.kind === "tool-folded" ||
             r.kind === "diff" ||
-            r.kind === "diff-folded",
+            r.kind === "diff-folded" ||
+            r.kind === "user-paste-folded" ||
+            r.kind === "user-paste-expanded",
           isDiff: r.kind === "diff" || r.kind === "diff-folded",
+          isPaste: r.kind === "user-paste-folded" || r.kind === "user-paste-expanded",
         })),
     };
   }
@@ -1593,7 +1674,6 @@ export function App({
         flexDirection="column"
       >
         <Box>
-          <Spinner active={busy || quitting} />
           <Text color={quitting || quitConfirmPending || resumeConfirmPending ? "yellow" : undefined}> {inputLines[0] ?? ""}</Text>
         </Box>
         {inputLines.slice(1).map((line, i) => (
@@ -1610,6 +1690,7 @@ export function App({
         planProgress={planProgress}
         compactionStatus={compactionStatus}
         columns={columns}
+        busy={busy}
       />
     </Box>
   );
