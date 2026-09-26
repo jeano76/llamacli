@@ -408,6 +408,32 @@ export function bufferMouseChunk(buffered: string, chunk: string): MouseBufferOu
   return { action: "discard" };
 }
 
+/** Reported directly: garbled fragments like ";1;5m" and "[붙여넣기 #1: 1줄,
+ *  8바이트]" placeholders showed up in the input box while just moving the
+ *  mouse (SGR motion reports fire continuously while dragging/moving, far
+ *  more often than the occasional click/wheel event) — the entry check
+ *  below only started buffering once a chunk already contained the FULL
+ *  "\x1b[<" lead-in together; a high-volume stream of reports is much more
+ *  likely to have a read() boundary land INSIDE that 2-3 byte lead-in
+ *  (bare "\x1b", or "\x1b["), and those fragments fell straight through as
+ *  literal typed/pasted text instead of ever starting the reassembly.
+ *
+ *  Safe to broaden: Ink's own keypress parser (use-input.js) already
+ *  decodes and clears `input` to '' for every key it recognizes as a named
+ *  key (arrows, Escape, Home/End, ...) before this callback ever sees it,
+ *  and strips a leading ESC byte from anything else single-key-shaped —
+ *  so a bare "\x1b" or "\x1b[" reaching this callback as literal chunk
+ *  content is never a real recognized keystroke to begin with; it can
+ *  only be genuinely undecoded escape-sequence bytes (a mouse report,
+ *  given we're the ones who turned mouse reporting on, or otherwise
+ *  unrecognized garbage either way). Once buffered, mouseBufferRef being
+ *  non-empty already pulls in every subsequent fragment regardless of
+ *  its own shape (see the entry check's `mouseBufferRef.current ||` half)
+ *  — so only the FIRST fragment of a split needs this widened check. */
+export function looksLikePartialMouseSequenceStart(chunk: string): boolean {
+  return chunk === "\x1b" || chunk === "\x1b[";
+}
+
 export function parseMouseClicks(input: string): { row: number; col: number }[] {
   const clicks: { row: number; col: number }[] = [];
   for (const [, code, colStr, rowStr, kind] of input.matchAll(/\[<(\d+);(\d+);(\d+)([Mm])/g)) {
@@ -836,7 +862,7 @@ export function App({
     // Reassemble a mouse report split across chunk boundaries (see
     // mouseBufferRef's doc comment) before anything else looks at it.
     let char = rawChar;
-    if (mouseBufferRef.current || /\x1b\[</.test(char)) {
+    if (mouseBufferRef.current || /\x1b\[</.test(char) || looksLikePartialMouseSequenceStart(char)) {
       const outcome = bufferMouseChunk(mouseBufferRef.current, char);
       if (outcome.action === "process") {
         mouseBufferRef.current = "";
