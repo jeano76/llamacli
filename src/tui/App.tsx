@@ -1103,7 +1103,25 @@ export function App({
     setCompactionStatus: (state: "running" | "complete" | "failed", timestamp: string) => setCompactionStatus({ state, timestamp }),
   };
 
-  const rows = stdout?.rows ?? 24;
+  // Reported directly: llamacli flickers, especially noticeable on Windows
+  // consoles/WSL windows. Traced to Ink itself (node_modules/ink/build/ink.js
+  // onRender): whenever the rendered tree's height is >= the terminal's row
+  // count, Ink can't safely do its normal cheap redraw (move cursor up N
+  // lines, erase, rewrite only what changed) — it falls back to a full
+  // `clearTerminal` + redraw of the ENTIRE screen instead. The root Box below
+  // is given height={rows} with overflow="hidden", so its rendered output is
+  // exactly `rows` lines tall — which trips that `outputHeight >= stdout.rows`
+  // check on literally every single render. Combined with the startup
+  // banner's shimmer animation (an 80ms setInterval — see SHIMMER_TICK_MS),
+  // that's a full-screen clear roughly 12 times a second during the intro,
+  // visibly flickering (worse on Windows terminals, which paint escape
+  // sequences slower than a typical Linux terminal emulator). Reserving one
+  // row of headroom (`rows - 1`) keeps outputHeight strictly below
+  // stdout.rows, so Ink takes its cheap incremental-diff path instead —
+  // this one row was never guaranteed visible content anyway (any terminal
+  // this app runs in reserves at least the bottom row for its own cursor/
+  // scroll behavior).
+  const rows = Math.max(1, (stdout?.rows ?? 24) - 1);
   const columns = stdout?.columns ?? 80;
   // Reserves 2 extra columns for the input box's own left+right border
   // characters (see the bordered Box below) on top of its padding/spinner/space.
