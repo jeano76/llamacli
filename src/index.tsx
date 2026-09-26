@@ -186,6 +186,36 @@ function ensureWindowsUtf8Console(): void {
   }
 }
 
+/** Reported directly: "llamacli에서 fastcheck on 또는 off 등의 명령어가
+ *  동작하지 않아" — the laya integration script used to be resolved
+ *  relative to `projectRoot` (the directory llamacli happens to be RUN
+ *  from), so `/fastcheck` only ever worked in the couple of project
+ *  directories that happened to already have their own copy of this
+ *  script sitting at their root. Confirmed live: running from any other
+ *  directory, `python3 <projectRoot>/scripts/laya_integration.py enable`
+ *  fails with "can't open file" (ENOENT), silently, every time.
+ *
+ *  The script belongs to the llamacli INSTALLATION, not to whatever
+ *  project it's currently pointed at — resolve it the same way
+ *  maybeSelfUpdateAndRestart resolves its own install directory: next to
+ *  the running entry point. Ships as dist/scripts/laya_integration.py
+ *  (copied there by `npm run build`, so it travels with every self-update
+ *  same as every other dist/ file); under `tsx` (dev mode) the entry
+ *  point is src/index.tsx and the script sits one level up at the project
+ *  root's own scripts/, unchanged from before. */
+function resolveLayaScriptPath(): string {
+  let entryPath: string;
+  try {
+    entryPath = fileURLToPath(import.meta.url);
+  } catch {
+    entryPath = "";
+  }
+  const entryDir = dirname(entryPath || pathResolve("src", "index.tsx"));
+  return entryPath.endsWith(".js")
+    ? pathResolve(entryDir, "scripts", "laya_integration.py") // dist/index.js -> dist/scripts/...
+    : pathResolve(entryDir, "..", "scripts", "laya_integration.py"); // src/index.tsx -> <root>/scripts/...
+}
+
 /** Requested directly: "CLI 구동시 신규 버전의 바이너리가 github에
  *  존재를 하면 해당 버전을 업데이트하고 cli는 재구동을 하는 기능을 넣어줘"
  *  — checked once, right at startup, before anything else touches the
@@ -346,7 +376,7 @@ async function main() {
    *  `laya.timeoutSeconds`. A hung server must never block a turn. */
   const DEFAULT_LAYA_TIMEOUT_SECONDS = 30;
   const LAYA_TIMEOUT_MS = (config.laya?.timeoutSeconds ?? DEFAULT_LAYA_TIMEOUT_SECONDS) * 1000;
-  const layaScriptPath = pathResolve(projectRoot, "scripts/laya_integration.py");
+  const layaScriptPath = resolveLayaScriptPath();
 
   /** Spawn the laya integration script with a hard timeout. All config writes,
    *  server boot and health checks live in Python; Node only runs it and reads
