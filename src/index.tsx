@@ -22,6 +22,7 @@ import { spawn, ChildProcess } from "node:child_process";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
 import { supportsAnsiTui } from "./tui/ansiSupport.js";
+import { installCrashHandlers } from "./crashHandler.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -202,6 +203,7 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
 async function main() {
   await maybeSelfUpdateAndRestart();
   await ensureSingleInstance();
+  const projectRoot = process.cwd();
   enterAltScreen();
   let cleanedUp = false;
   const cleanup = () => {
@@ -218,8 +220,15 @@ async function main() {
     cleanup();
     process.exit(0);
   });
-
-  const projectRoot = process.cwd();
+  // Reported directly: "llamacli 를 윈도우즈 쉘에서 프롬프트를 입력했는데
+  // 왜 바로 쉘 프롬프트로 떨어지지?" — with no top-level crash handler,
+  // ANY error thrown outside the one try/catch around loop.send() below
+  // (a React render error, a rejected promise from a fire-and-forget
+  // callback, a Windows-specific spawn/path failure) hit Node's default
+  // handler and the process just vanished — see crashHandler.ts's own doc
+  // comment for why the crash message itself can be silently lost on
+  // Windows specifically, and how this avoids that.
+  installCrashHandlers(projectRoot, cleanup);
   const { config, setupMessage } = await loadConfig(projectRoot);
   const rules = await loadRules(projectRoot);
   const skillIndex = await loadSkillIndex(projectRoot);
