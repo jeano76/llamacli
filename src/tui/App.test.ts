@@ -51,6 +51,27 @@ test("filterMenuItems matches the plan-clear command", () => {
   );
 });
 
+test("filterMenuItems still matches once an argument is typed after the command name — the exact bug reported live", () => {
+  // Reported directly: "flastcheck on 입력의 동작등이 될수 없어" —
+  // "/fastcheck on" used to filter against the query "fastcheck on" in
+  // full (argument included), which no command's key contains, dropping
+  // to "No matching commands" and silently breaking Enter.
+  assert.deepEqual(
+    filterMenuItems("/fastcheck on").map((i) => i.key),
+    ["fastcheck"]
+  );
+  assert.deepEqual(
+    filterMenuItems("/fastcheck status").map((i) => i.key),
+    ["fastcheck"]
+  );
+  // An ad-hoc question after /fastcheck is free text, often containing
+  // words that would otherwise accidentally match some OTHER command.
+  assert.deepEqual(
+    filterMenuItems("/fastcheck is this a quit-worthy risk?").map((i) => i.key),
+    ["fastcheck"]
+  );
+});
+
 // Prompt history (Up/Down arrow) backing logic — the actual key handling
 // itself isn't unit-testable without a full Ink render (same limitation as
 // filterMenuItems above), so this covers the pure append/cap/dedupe rule

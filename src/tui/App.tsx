@@ -373,8 +373,21 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
  *  against the command's key (e.g. "improve-apply"), not its "/"-prefixed
  *  label, so typing "imp" also finds "/improve-apply" via a plain
  *  substring check — simple and predictable over fuzzier matching. */
+/** Reported directly: "flastcheck on 입력의 동작등이 될수 없어" — confirmed
+ *  live. Every registered command's own `key` is a single token (no
+ *  embedded spaces — even "plan clear" is `key: "plan-clear"`), but the
+ *  query used to be the ENTIRE text after "/", argument included. The
+ *  instant you typed a space and started an argument ("/fastcheck on"),
+ *  the query became "fastcheck on" — which no item's key contains — so
+ *  the menu dropped to "No matching commands" and Enter did nothing at
+ *  all, even though "/fastcheck" alone matched perfectly a moment before.
+ *  Only the first whitespace-delimited token is a command name; anything
+ *  after the first space is always argument text, never part of what
+ *  should narrow the match. */
 export function filterMenuItems(input: string): SlashMenuItem[] {
-  const query = input.slice(1).toLowerCase();
+  const raw = input.slice(1);
+  const firstSpace = raw.search(/\s/);
+  const query = (firstSpace === -1 ? raw : raw.slice(0, firstSpace)).toLowerCase();
   if (!query) return SLASH_MENU_ITEMS;
   return SLASH_MENU_ITEMS.filter((item) => item.key.toLowerCase().includes(query));
 }
