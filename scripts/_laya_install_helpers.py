@@ -207,7 +207,7 @@ def _install_laya_locked() -> bool:
 
 
 def start_laya(cfg):
-    """Start ``<venv-python> -m laya serve``; return (proc, port).
+    """Start the `laya-serve` console script; return (proc, port).
 
     Progress is printed live so the UI output window shows install/boot status.
     On failure print an actionable message and raise; core llamacli untouched.
@@ -217,7 +217,11 @@ def start_laya(cfg):
         raise RuntimeError("laya venv not found; run 'install' first")
 
     port = int(os.environ.get("LAYA_PORT", "8099"))
-    cmd = [str(python), "-m", "laya", "serve"]
+    # Confirmed live: `<python> -m laya serve` fails outright — "No module
+    # named laya.__main__; 'laya' is a package and cannot be directly
+    # executed". The actual server entry point is the `laya-serve` console
+    # script installed alongside `python` in the same venv's bin/.
+    cmd = [str(python.parent / "laya-serve")]
     env = dict(os.environ, LAYA_PORT=str(port))
     if os.environ.get("LAYA_API_KEY"):
         env["LAYA_API_KEY"] = os.environ["LAYA_API_KEY"]

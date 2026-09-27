@@ -461,46 +461,69 @@ def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
         return {"ok": False, "reason": "; ".join(missing), "url": url}
 
     proc = None
-    try:
-        entrypoints = list((venv_root / "bin").glob("laya*")) if (venv_root / "bin").exists() else []
-        env = dict(os.environ)
-        env["LAYA_BOOT"] = "1"
-        # Prefer an explicit remote URL; otherwise boot the project-local venv.
-        proc = None
-        if entrypoints and not url:
-            target_venv_python = venv_python_path(venv_root) or (str((venv_root / "bin" / "python3")) if (venv_root / "bin").exists() else sys.executable)
-            proc = subprocess.Popen(
-                [target_venv_python, "-m", "laya", "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=env,
-            )
-        # Wait for health on whatever URL we expect.
-        wait_url = url + "/health" if url else (f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}/health")
-        deadline = time.time() + max(1, timeout_seconds)
-        started = time.time()
-        # Reported directly: "서버 구동 과정에 프로그래스 안내도 없고" —
-        # loading the actual model(s) behind /health can genuinely take
-        # 10-20+ seconds (confirmed live: GPU OOM fallback to CPU, then
-        # several "Fetching N files" downloads) and this loop printed
-        # nothing at all while it waited, indistinguishable from a hang.
-        # One line every ~3s, not every 0.3s poll — frequent enough to show
-        # it's alive, not so frequent it floods the log.
-        next_report_at = started + 3.0
-        while time.time() < deadline:
-            if _http_ok(wait_url):
-                return {"ok": True, "reason": "server healthy", "url": wait_url}
-            now = time.time()
-            if now >= next_report_at:
-                print(f"[laya] waiting for server to become healthy... ({int(now - started)}s elapsed)")
-                next_report_at = now + 3.0
-            time.sleep(0.3)
-    finally:
-        if proc is not None:
-            try:
-                proc.wait(timeout=1)
-            except Exception:
-                proc.terminate()
+    booted = False
+    entrypoints = list((venv_root / "bin").glob("laya*")) if (venv_root / "bin").exists() else []
+    env = dict(os.environ)
+    env["LAYA_BOOT"] = "1"
+    # Prefer an explicit remote URL; otherwise boot the project-local venv.
+    if entrypoints and not url:
+        # Confirmed live: `python -m laya serve` fails outright —
+        # "No module named laya.__main__; 'laya' is a package and cannot be
+        # directly executed". `laya` (bin/laya -> laya.cli.main) is a
+        # different one-off text-routing CLI, not the server either. The
+        # actual server entry point is the `laya-serve` console script
+        # (bin/laya-serve -> laya.serve.main), already found by the
+        # `entrypoints` glob above.
+        laya_serve_bin = venv_root / "bin" / "laya-serve"
+        proc = subprocess.Popen(
+            [str(laya_serve_bin)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,  # survives this script's own exit, not tied to its process group
+        )
+    # Wait for health on whatever URL we expect.
+    wait_url = url + "/health" if url else (f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}/health")
+    deadline = time.time() + max(1, timeout_seconds)
+    started = time.time()
+    # Reported directly: "서버 구동 과정에 프로그래스 안내도 없고" —
+    # loading the actual model(s) behind /health can genuinely take
+    # 10-20+ seconds (confirmed live: GPU OOM fallback to CPU, then
+    # several "Fetching N files" downloads) and this loop printed
+    # nothing at all while it waited, indistinguishable from a hang.
+    # One line every ~3s, not every 0.3s poll — frequent enough to show
+    # it's alive, not so frequent it floods the log.
+    next_report_at = started + 3.0
+    while time.time() < deadline:
+        if _http_ok(wait_url):
+            booted = True
+            break
+        now = time.time()
+        if now >= next_report_at:
+            print(f"[laya] waiting for server to become healthy... ({int(now - started)}s elapsed)")
+            next_report_at = now + 3.0
+        time.sleep(0.3)
+
+    if booted:
+        # Reported directly: curl to the port came back empty right after a
+        # "ready" gate result. Root cause — this used to be a try/finally
+        # that ALWAYS ran `proc.wait(timeout=1)` then `.terminate()` on the
+        # TimeoutExpired that a genuinely still-running (healthy!) server
+        # always raises there, killing the very server this function had
+        # just confirmed was healthy, on every single successful boot.
+        # The whole point of booting it is to leave it running so the NEXT
+        # per-turn gate check doesn't have to reboot (10-30s) from scratch —
+        # nothing here should ever terminate a server we just verified.
+        return {"ok": True, "reason": "server healthy", "url": wait_url}
+
+    # Deadline passed without becoming healthy — this attempt failed; if we
+    # spawned a process for it, it's stuck/broken (or still loading past our
+    # patience) rather than left orphaned indefinitely.
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001 - best-effort cleanup only
+            pass
 
     info = locate_server()  # final authoritative read for the reported reason
     return {"ok": info.get("ok", False), "reason": info.get("reason", "server unreachable"), "url": wait_url}
