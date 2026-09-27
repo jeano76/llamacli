@@ -1,11 +1,17 @@
 backend: openai-compatible
 baseUrl: http://127.0.0.1:8080
-model: /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
-
-compaction:
-  autoTriggerRatio: 0.70
-  autoResume: true
-
 browser:
   debugPort: 9222
   host: 127.0.0.1
+compaction:
+  autoResume: true
+  autoTriggerRatio: 0.7
+model: /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+laya:
+  actProbabilityThreshold: 0.2
+  confidenceThreshold: 0.65
+  enabled: false
+  questionType: noul
+  shortCircuit: true
+  timeoutSeconds: 30
+  venvPath: /home/jeano/llamacli/.llamacli/laya-venv

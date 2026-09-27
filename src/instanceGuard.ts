@@ -14,6 +14,12 @@ export function findOtherInstances(projectRoot: string, selfPid: number, selfScr
   if (!self) return [];
   const root = realpathOrNull(projectRoot) ?? projectRoot;
   const found: number[] = [];
+  // Ancestors of `self` share the same project dir and often run the same
+  // script (e.g. the parent that launched us, or a shared agent/IDE host), so
+  // they look like sibling instances but aren't — skipping them avoids the
+  // "already running" false positive on our own session tree. Descendants are
+  // already excluded by `pid === selfPid`'s intent plus this ancestor walk.
+  const ancestors = collectAncestors(selfPid);
   let entries: string[];
   try {
     entries = readdirSync("/proc");
@@ -23,7 +29,7 @@ export function findOtherInstances(projectRoot: string, selfPid: number, selfScr
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
-    if (pid === selfPid) continue;
+    if (pid === selfPid || ancestors.has(pid)) continue;
     try {
       if (readlinkSync(`/proc/${pid}/cwd`) !== root) continue;
       const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
@@ -33,6 +39,30 @@ export function findOtherInstances(projectRoot: string, selfPid: number, selfScr
     }
   }
   return found;
+}
+
+/** The chain of ancestors of `pid` (parent, grandparent, ... up to PID 1),
+ *  excluding `pid` itself. Used so we don't report our own session tree as a
+ *  competing instance. Reads /proc/<pid>/stat's ppid field; tolerant of races
+ *  (a process that exits mid-walk just stops the walk). */
+function collectAncestors(pid: number): Set<number> {
+  const ancestors = new Set<number>();
+  let cur: number | undefined = pid;
+  let guard = 0;
+  while (cur && cur !== 1 && !ancestors.has(cur) && guard++ < 64) {
+    try {
+      const stat: string = readFileSync(`/proc/${cur}/stat`, "utf8");
+      // Field after the trailing ")"; split on whitespace, index [1] is ppid.
+      const fields: string[] = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/);
+      const parent: number = Number(fields[1]);
+      if (!parent) break;
+      ancestors.add(parent);
+      cur = parent;
+    } catch {
+      break; // process gone or unreadable — stop the walk.
+    }
+  }
+  return ancestors;
 }
 
 function realpathOrNull(path: string): string | null {
