@@ -86,7 +86,7 @@ export function appendHistory(history: string[], text: string): string[] {
 interface LogLine {
   id: number;
   text: string;
-  kind: "user" | "assistant" | "status" | "tool" | "diff" | "reasoning" | "compaction-detail" | "tool-result";
+  kind: "user" | "assistant" | "status" | "tool" | "diff" | "reasoning" | "compaction-detail" | "tool-result" | "gate";
   /** Precomputed folded-state label for kinds whose fold summary can't be
    *  derived from `text` alone (e.g. "compaction-detail", whose text is the
    *  full expanded body). Unused for "reasoning", which derives its own via
@@ -104,6 +104,7 @@ interface RenderedRow {
     | "reasoning-folded"
     | "compaction-detail-folded"
     | "diff-folded"
+    | "gate-folded"
     | "tool-result-folded"
     | "tool-folded"
     | "user-paste-folded"
@@ -174,6 +175,19 @@ export function foldedToolResultSummary(command: string, output: string): string
 export function foldedDiffSummary(diffText: string): string {
   const { path, added, removed } = parseDiffStats(diffText);
   return `▸ diff: ${path} (+${added} -${removed}) — 클릭해서 펼치기`;
+}
+
+/** Folded summary line for the LAYA/fastcheck gate (see src/index.tsx's
+ *  runLayaGate) — a single stable-id log line that accumulates, across every
+ *  prompt in the session, the performance gain of each short-circuited gate.
+ *  The text already carries the per-run verdict and score/conf; this only
+ *  supplies the collapsed label + click affordance. Starts expanded on first
+ *  output (App's firstSeen set), then folds like tool-result/reasoning and
+ *  re-expands by click, so cumulative output stays one growing line rather
+ *  than spamming a new row each run. */
+export function foldedGateSummary(text: string): string {
+  const chars = text.trim().length;
+  return `▸ laya 성능 요약 (${chars}자) — 클릭해서 펼치기`;
 }
 
 /** A single band's role in the "thinking" shimmer: `dim` hasn't been
@@ -328,6 +342,15 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
   if (row.kind === "status" || row.kind === "status-folded") {
     return (
       <Text key={row.key} color="gray">
+        {row.text}
+      </Text>
+    );
+  }
+  // LAYA gate summary — green to read like a performance/stat line, not an
+  // error or tool label. Both the folded hint and the expanded rows share it.
+  if (row.kind === "gate" || row.kind === "gate-folded") {
+    return (
+      <Text key={row.key} color="green">
         {row.text}
       </Text>
     );
@@ -528,6 +551,13 @@ export function App({
   const pasteCounterRef = useRef(1);
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
+  // Gate lines (LAYA/fastcheck) expand the moment they first appear, then
+  // fold on subsequent prompts until clicked — so a single stable-id line
+  // stays one growing summary rather than re-expanding every run. Mirrors
+  // reasoning/tool-result's expanded-vs-folded tracking but keyed on "first
+  // seen" here (a gate is never collapsed-then-reexpanded for content; its
+  // text only grows, via pushGateLog above).
+  const [firstSeen, setFirstSeen] = useState<Set<number>>(new Set());
   // The startup banner: "HARNESS" as block-letter ASCII art that shines
   // itself in, then a version/bounce line and the repo URL underneath —
   // see AppProps.startupBanner's doc comment for why this lives inside the
@@ -719,7 +749,7 @@ export function App({
   // only runs later, async, in response to a real terminal event — can map
   // the absolute terminal row it landed on back to a log line without
   // recomputing the whole layout itself.
-  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean; isDiff: boolean; isPaste: boolean }[] }>({
+  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean; isDiff: boolean; isPaste: boolean; isGate: boolean }[] }>({
     firstRow: 1,
     entries: [],
   });
@@ -822,6 +852,25 @@ export function App({
     setLog((prev) =>
       [...prev, { id: logIdCounter++, text: output, kind: "tool-result" as const, foldLabel }].slice(-MAX_LOG_ENTRIES)
     );
+  }
+
+  // Appends (or extends, when `id` already exists) the LAYA/fastcheck gate's
+  // cumulative performance line — a single stable-id log row that grows with
+  // each short-circuited run. The text carries verdict + score/conf; the
+  // fold label is derived from it via foldedGateSummary. Passed to loop.ts as
+  // opts.onGateVerdict so gate results reach the TUI.
+  function pushGateLog(payload: { id?: number; text: string }) {
+    const foldLabel = foldedGateSummary(payload.text);
+    setLog((prev) => {
+      if (payload.id != null) {
+        const existing = prev.find((l) => l.id === payload.id && l.kind === "gate");
+        if (existing) {
+          return prev.map((l) => (l.id === payload.id ? { ...l, text: payload.text } : l)).slice(-MAX_LOG_ENTRIES);
+        }
+      }
+      const id = payload.id ?? logIdCounter++;
+      return [...prev, { id, text: payload.text, kind: "gate" as const, foldLabel }].slice(-MAX_LOG_ENTRIES);
+    });
   }
 
   function pushTool(label: string) {
@@ -935,8 +984,16 @@ export function App({
           // Diffs track their FOLDED ids (default expanded); paste chips
           // and everything else track their EXPANDED ids (default folded)
           // — see collapsedDiffIds/expandedPasteLineIds/expandedReasoningIds's
-          // own doc comments.
-          const setFn = entry.isDiff ? setCollapsedDiffIds : entry.isPaste ? setExpandedPasteLineIds : setExpandedReasoningIds;
+          // own doc comments. Gate lines are the sole exception: they expand
+          // the moment they first appear, then fold until clicked, tracked by
+          // which ids have been seen at least once (firstSeen).
+          const setFn = entry.isDiff
+            ? setCollapsedDiffIds
+            : entry.isGate
+              ? setFirstSeen
+              : entry.isPaste
+                ? setExpandedPasteLineIds
+                : setExpandedReasoningIds;
           setFn((prev) => {
             const next = new Set(prev);
             if (next.has(entry.lineId)) next.delete(entry.lineId);
@@ -1194,9 +1251,23 @@ export function App({
     finalizeReasoning,
     pushCompactionDetail,
     pushToolResult,
+    pushGateLog,
     collapseDiffs,
     setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
+    onGateVerdict: (gate: { verdict?: string; score?: number; conf?: number; gateId?: number }) => {
+      // A short-circuit verdict surfaced as a non-folded status line by the
+      // loop (the always-visible "laya gate: <verdict>"); here we also fold
+      // the growing cumulative perf log keyed by its stable gateId, so every
+      // subsequent fastcheck short-circuit in the session appends to the SAME
+      // single summary instead of spawning a new line each time.
+      const text = [
+        `laya gate: ${gate.verdict ?? "judged simple enough to skip full model"}`,
+        typeof gate.score === "number" ? `score=${gate.score.toFixed(3)}` : null,
+        typeof gate.conf === "number" ? `conf=${gate.conf.toFixed(3)}` : null,
+      ].filter(Boolean).join("  ");
+      pushGateLog({ id: gate.gateId, text });
+    },
     pushTool,
     finalizeToolCall,
     pushDiff: (t: string) => pushLine(t, "diff"),
@@ -1495,6 +1566,35 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "tool-result-folded", lineId: line.id });
       continue;
     }
+    // LAYA gate summary — a single stable-id log line that accumulates the
+    // performance gain of every fastcheck short-circuit. Folded by default
+    // (expanded on first output, folded on subsequent prompts, clickable to
+    // re-expand) so it stays one growing line rather than spamming the view.
+    if (line.kind === "gate") {
+      let cached = rowCache.get(line.id);
+      if (!cached || cached.text !== line.text || cached.width !== width) {
+        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
+        rowCache.set(line.id, cached);
+      }
+      const expanded = firstSeen.has(line.id); // expanded the moment it first appears
+      if (!cached.rows.length) continue; // nothing to render yet
+      if (!expanded && cached.rows.length <= 1) {
+        cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+        continue;
+      }
+      if (!expanded) {
+        allRows.push({
+          key: `${line.id}-fold`,
+          text: line.foldLabel ?? "▸ laya 성능 요약 — 클릭해서 펼치기",
+          kind: "gate-folded",
+          lineId: line.id,
+        });
+        continue;
+      }
+      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "gate-folded", lineId: line.id });
+      continue;
+    }
     // A multi-line tool-call label folds down once it's actually finished
     // (completedToolIds, set by finalizeToolCall — see its own doc
     // comment) — never while still running, and never at all if it only
@@ -1647,10 +1747,13 @@ export function App({
             r.kind === "diff-folded" ||
             r.kind === "user-paste-folded" ||
             r.kind === "user-paste-expanded" ||
+            r.kind === "gate" ||
+            r.kind === "gate-folded" ||
             r.kind === "status" ||
             r.kind === "status-folded",
           isDiff: r.kind === "diff" || r.kind === "diff-folded",
           isPaste: r.kind === "user-paste-folded" || r.kind === "user-paste-expanded",
+          isGate: r.kind === "gate" || r.kind === "gate-folded",
         })),
     };
   }

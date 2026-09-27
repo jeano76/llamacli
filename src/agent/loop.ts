@@ -342,7 +342,12 @@ export interface AgentLoopOptions {
    *  "truthful" prose) and is surfaced so reduced-quality answers aren't silent.
    *  The callback never throws — a disabled/errored gate must not break an
    *  ordinary turn. */
-  layaGate?: (userText: string) => Promise<{ skip: boolean; reason?: string }>;
+  layaGate?: (userText: string) => Promise<{ skip: boolean; reason?: string; verdict?: string; score?: number; conf?: number; gateId?: number }>;
+  // Fired once per short-circuit verdict (skip:true) with the same payload
+  // layaGate returned. Lets the UI append a stable-id cumulative perf line
+  // even though the foldable summary is rendered elsewhere — see App.tsx's
+  // pushGateLog / onGateVerdict wiring.
+  onGateVerdict?: (result: { verdict?: string; score?: number; conf?: number; gateId?: number }) => void;
 }
 
 /**
@@ -581,11 +586,26 @@ export class AgentLoop {
         const reason = (gateResult?.reason ?? "").trim();
         if (reason) this.opts.onStatus?.(reason);
       } else if (gateResult.skip === true && !gateResult.reason) {
-        this.opts.onStatus?.("laya gate: task judged simple enough to skip full model");
+        // Short-circuit without an explicit reason: report the verdict prose
+        // as a plain (non-folded) status line so it's always visible, then fold
+        // the growing cumulative summary. gateId is stable across runs so the
+        // folded line stays one entry. onGateVerdict lets the UI surface the
+        // cumulative per-gate perf log keyed by that same id.
+        if (gateResult.verdict) {
+          this.opts.onStatus?.(`laya gate: ${gateResult.verdict}`);
+          this.opts.onGateVerdict?.({ ...gateResult });
+        } else {
+          this.opts.onStatus?.("laya gate: task judged simple enough to skip full model");
+        }
         return;                        // short-circuit: answer without Ornith
       } else if (gateResult.skip === true && gateResult.reason) {
         // Short-circuit with an explicit reason: surface it, then stop.
-        this.opts.onStatus?.(gateResult.reason.trim() || "laya gate: task judged simple enough to skip full model");
+        if (gateResult.verdict) {
+          this.opts.onStatus?.(`laya gate: ${gateResult.verdict}`);
+          this.opts.onGateVerdict?.({ ...gateResult });
+        } else {
+          this.opts.onStatus?.(gateResult.reason.trim() || "laya gate: task judged simple enough to skip full model");
+        }
         return;
       }
       await this.injectResumeContextIfPending();

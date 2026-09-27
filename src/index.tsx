@@ -372,6 +372,11 @@ async function main() {
   // block or crash a turn — the normal Ornith run always proceeds).
   const layaEnabled = Boolean(config.laya?.enabled ?? false);
   let runtimeEnabled = layaEnabled;            // toggled by /fastcheck |off|on|
+  // Stable per-session id for the LAYA gate's cumulative perf line. Assigned
+  // once, on the first short-circuit, so loop.ts (which pushes a foldable
+  // summary keyed by this id via App.pushGateLog) keeps appending to ONE
+  // growing line across every fastcheck run instead of spawning one per run.
+  let layaGateId = 0;
   /** Default cap, seconds, for a laya round-trip when config.yaml doesn't set
    *  `laya.timeoutSeconds`. A hung server must never block a turn. */
   const DEFAULT_LAYA_TIMEOUT_SECONDS = 30;
@@ -454,16 +459,36 @@ async function main() {
       });
     });
 
-  const runLayaGate = async (userText: string): Promise<{ skip: boolean }> => {
+  const runLayaGate = async (userText: string): Promise<{
+    skip: boolean; verdict?: string; score?: number; conf?: number; gateId?: number;
+  }> => {
     if (!runtimeEnabled) return { skip: false };   // off => instant no-op (no checks)
     try {
       const { stdout } = await runLayaScript(["fastcheck", "--text", userText]);
-      // _verdict_prose() emits "SHORTCIRCUIT\n[laya short-circuit] ... " on the
-      // first line when laya judges the task simple enough to skip System 2.
-      if (/^short-circuit$/i.test(stdout.split(/\r?\n/)[0].trim())) {
-        return { skip: true };                       // let loop.ts skip Ornith
+      // _verdict_prose() emits its verdict token on the FIRST line —
+      // SHORTCIRCUIT | PROCEED | DEGRADED | TRUTHFUL (case-insensitive), then
+      // a "[laya ...]" body line when short-circuiting. The same helper also
+      // appends " (score={s:.3f}, conf={c:.3f})" to the prose, so parse those
+      // from anywhere on the first physical line too. A verdict is reported as
+      // a non-folded status line; gateId makes loop.ts fold a cumulative summary.
+      const lines = stdout.split(/\r?\n/);
+      const firstLine = (lines[0] ?? "").trim();
+      const mVerdict = /SHORTCIRCUIT|PROCEED|DEGRADED|TRUTHFUL/i.exec(firstLine);
+      const verdict = mVerdict ? mVerdict[0].toLowerCase() : undefined;
+      const mScore = /(?:^|\s)score=([\d.]+)/i.exec(stdout);
+      const mConf = /(?:^|\s)conf=([\d.]+)/i.exec(stdout);
+      const score = mScore ? Number(mScore[1]) : undefined;
+      const conf = mConf ? Number(mConf[1]) : undefined;
+
+      if (/^short-circuit$/i.test(firstLine)) {
+        // Assign the stable id exactly once so every subsequent run appends to
+        // the same foldable perf line.
+        if (layaGateId === 0) layaGateId = 1;
+        return { skip: true, verdict, score, conf, gateId: layaGateId };   // let loop.ts skip Ornith
       }
-      return { skip: false };                        // "proceed"/"degraded"/off => proceed
+      // A proceed/degraded/truthful verdict carries no id (nothing to fold —
+      // the slow turn still ran). Surface prose only when present.
+      return { skip: false, verdict, score, conf };
     } catch {
       // Any failure (nonzero exit, timeout, spawn error) => silent fall back:
       // Ornith still runs the turn unchanged. Never throw past here.
@@ -536,6 +561,10 @@ async function main() {
     onCompactionDetail: (detail) => (globalThis as any).__llamacli_ui?.pushCompactionDetail(detail),
     onTurnStart: () => (globalThis as any).__llamacli_ui?.collapseDiffs(),
     layaGate: runLayaGate,
+    // Gate results reach the TUI through App's dispatch (onGateVerdict →
+    // pushGateLog), which keeps the gate line a single stable-id cumulative
+    // summary across every fastcheck short-circuit.
+    onGateVerdict: (result) => (globalThis as any).__llamacli_ui?.onGateVerdict(result),
   });
 
   // Session-end self-improvement gate (PROMPT.md §3): if failures were
