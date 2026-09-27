@@ -495,6 +495,64 @@ export function shouldHideCursor(state: { quitting: boolean; busy: boolean; inpu
   return state.quitting || (state.busy && state.input.length === 0);
 }
 
+/** Ctrl/Alt+Left word-jump target: skip any whitespace immediately behind
+ *  the cursor, then skip the non-whitespace run behind that — matching a
+ *  normal shell/editor's "back one word" instead of stopping on every
+ *  space. */
+export function wordLeft(text: string, pos: number): number {
+  let i = pos;
+  while (i > 0 && /\s/.test(text[i - 1])) i--;
+  while (i > 0 && !/\s/.test(text[i - 1])) i--;
+  return i;
+}
+
+/** Ctrl/Alt+Right word-jump target: mirror of wordLeft. */
+export function wordRight(text: string, pos: number): number {
+  let i = pos;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  while (i < text.length && !/\s/.test(text[i])) i++;
+  return i;
+}
+
+/** Maps a character offset into `text` to the (row, col) it lands on once
+ *  wrapped by wrapToWidth(text, maxWidth) — same splitting rules (split on
+ *  "\n" first, then hard-wrap each paragraph by display width), so the
+ *  interior cursor added alongside left/right-arrow support can be placed
+ *  on the exact row/col this renders, not just at the end of the last line. */
+export function cursorRowCol(text: string, maxWidth: number, pos: number): { row: number; col: number } {
+  const width = Math.max(1, maxWidth);
+  const paragraphs = text.split("\n");
+  let absOffset = 0;
+  let row = 0;
+  for (const paragraph of paragraphs) {
+    if (stringWidth(paragraph) <= width) {
+      if (pos <= absOffset + paragraph.length) return { row, col: pos - absOffset };
+      absOffset += paragraph.length + 1; // +1 for the consumed "\n"
+      row += 1;
+      continue;
+    }
+    let current = "";
+    let currentWidth = 0;
+    let lineStartOffset = absOffset;
+    for (const ch of Array.from(paragraph)) {
+      const w = stringWidth(ch);
+      if (currentWidth + w > width && current.length > 0) {
+        if (pos <= lineStartOffset + current.length) return { row, col: pos - lineStartOffset };
+        row += 1;
+        lineStartOffset += current.length;
+        current = "";
+        currentWidth = 0;
+      }
+      current += ch;
+      currentWidth += w;
+    }
+    if (pos <= lineStartOffset + current.length) return { row, col: pos - lineStartOffset };
+    absOffset = lineStartOffset + current.length + 1;
+    row += 1;
+  }
+  return { row: Math.max(0, row - 1), col: 0 };
+}
+
 /** The key-hint line shown as a placeholder inside the (empty) input box
  *  while the agent is running — requested directly, moved back in from its
  *  previous home below the log ("도구 사용도 출력도 ...는 프롬프트 창에
@@ -542,6 +600,14 @@ export function App({
 }: AppProps) {
   const { stdout } = useStdout();
   const [input, setInput] = useState("");
+  // Character offset into `input` where the next typed/deleted char lands.
+  // Reported directly: 화살표 키로 단어 사이 이동이 안 됨 — editing used to be
+  // append/backspace-at-the-end ONLY (no interior cursor at all), so
+  // left/right arrow had nothing to move. Kept in sync with every setInput
+  // call below: typing/paste insert at cursorPos then advance it by the
+  // inserted length; backspace/delete remove the char behind/ahead of it;
+  // history recall and submit reset it to the new text's end (0 on clear).
+  const [cursorPos, setCursorPos] = useState(0);
   // Requested directly: pasting shouldn't dump raw text straight into the
   // input box — a pasted block is appended as a short placeholder label
   // instead (see pasteChip.ts's doc comment for the full design), with the
@@ -1078,6 +1144,7 @@ export function App({
         if (!item) return; // no match under the current filter — nothing to select
         setMenuOpen(false);
         setInput("");
+        setCursorPos(0);
         if (item.key === "queue") {
           pushLine(
             queue.length
@@ -1093,6 +1160,7 @@ export function App({
       } else if (key.escape) {
         setMenuOpen(false);
         setInput("");
+        setCursorPos(0);
       } else if (key.backspace || key.delete) {
         // Backspacing the "/" itself closes the menu — matches typing "/"
         // to open it being the exact inverse action, rather than leaving
@@ -1100,12 +1168,15 @@ export function App({
         if (input.length <= 1) {
           setMenuOpen(false);
           setInput("");
+          setCursorPos(0);
         } else {
           setInput((s) => s.slice(0, -1));
+          setCursorPos((p) => Math.max(0, p - 1));
           setMenuIndex(0); // narrower/wider filter — re-highlight the top match
         }
       } else if (char && !key.ctrl && !key.meta) {
         setInput((s) => s + stripAnsi(char));
+        setCursorPos((p) => p + stripAnsi(char).length);
         setMenuIndex(0);
       }
       return;
@@ -1146,12 +1217,35 @@ export function App({
         if (historyIndex === -1) setHistoryDraft(input); // stash what was being typed
         const next = historyIndex + 1;
         setHistoryIndex(next);
-        setInput(history[history.length - 1 - next]);
+        const text = history[history.length - 1 - next];
+        setInput(text);
+        setCursorPos(text.length); // recalled text: cursor to the end, like a shell
       } else {
         if (historyIndex === -1) return; // not currently browsing — nothing to go back to
         const next = historyIndex - 1;
         setHistoryIndex(next);
-        setInput(next === -1 ? historyDraft : history[history.length - 1 - next]);
+        const text = next === -1 ? historyDraft : history[history.length - 1 - next];
+        setInput(text);
+        setCursorPos(text.length);
+      }
+      return;
+    }
+
+    // Left/Right move the cursor within `input`; Ctrl+Left/Right (or
+    // Alt/Option+Left/Right — terminals differ on which one they send for
+    // "jump a word") skip to the next word boundary instead of one char.
+    // Reported directly: 화살표 키로 단어 사이 이동을 하려 했는데 동작하지 않음
+    // — there was previously no interior cursor at all (append/backspace-
+    // at-the-end only), so these keys had nothing to move.
+    if (key.leftArrow || key.rightArrow) {
+      if (key.ctrl || key.meta) {
+        setCursorPos((p) =>
+          key.leftArrow ? wordLeft(input, p) : wordRight(input, p)
+        );
+      } else {
+        setCursorPos((p) =>
+          key.leftArrow ? Math.max(0, p - 1) : Math.min(input.length, p + 1)
+        );
       }
       return;
     }
@@ -1182,6 +1276,7 @@ export function App({
       setHistoryIndex(-1);
       setHistoryDraft("");
       setInput("");
+      setCursorPos(0);
       // pastedBlocks is deliberately NOT cleared here — the log line just
       // pushed above keeps the placeholder label, and expanding it later
       // (see expandedPasteLineIds) needs this map to still have that
@@ -1195,17 +1290,28 @@ export function App({
     }
     if (key.backspace || key.delete) {
       // A pasted block is one atomic unit to delete, not one character at
-      // a time — see pasteChip.ts's doc comment.
-      const trailingPlaceholder = findTrailingPlaceholder(input, pastedBlocks);
+      // a time — see pasteChip.ts's doc comment. That shortcut only applies
+      // right at the end of the placeholder text, i.e. when the cursor sits
+      // immediately after it (backspace) — with an interior cursor now
+      // possible, every other position falls through to a plain single-
+      // character delete around cursorPos.
+      const trailingPlaceholder =
+        key.backspace && cursorPos === input.length ? findTrailingPlaceholder(input, pastedBlocks) : undefined;
       if (trailingPlaceholder) {
         setInput((s) => s.slice(0, s.length - trailingPlaceholder.length));
+        setCursorPos((p) => Math.max(0, p - trailingPlaceholder.length));
         setPastedBlocks((m) => {
           const next = new Map(m);
           next.delete(trailingPlaceholder);
           return next;
         });
+      } else if (key.backspace) {
+        if (cursorPos === 0) return; // nothing before the cursor
+        setInput((s) => s.slice(0, cursorPos - 1) + s.slice(cursorPos));
+        setCursorPos((p) => p - 1);
       } else {
-        setInput((s) => s.slice(0, -1));
+        if (cursorPos >= input.length) return; // nothing after the cursor
+        setInput((s) => s.slice(0, cursorPos) + s.slice(cursorPos + 1));
       }
       return;
     }
@@ -1213,6 +1319,7 @@ export function App({
       setMenuOpen(true);
       setMenuIndex(0);
       setInput("/");
+      setCursorPos(1);
       return;
     }
     // A pasted string can carry raw ANSI escape codes (color codes copied
@@ -1236,9 +1343,11 @@ export function App({
       const isPath = looksLikePastedFilePath(sanitized) && existsSync(sanitized.trim());
       const label = formatPasteLabel(sanitized, pasteCounterRef.current++, isPath);
       setPastedBlocks((m) => new Map(m).set(label, sanitized));
-      setInput((s) => s + label);
+      setInput((s) => s.slice(0, cursorPos) + label + s.slice(cursorPos));
+      setCursorPos((p) => p + label.length);
     } else {
-      setInput((s) => s + sanitized);
+      setInput((s) => s.slice(0, cursorPos) + sanitized + s.slice(cursorPos));
+      setCursorPos((p) => p + sanitized.length);
     }
   });
 
@@ -1333,15 +1442,14 @@ export function App({
   // fixed chrome (top+bottom border + status bar = 3, plus at least 3 rows
   // kept for the log) — never allowed to push the total layout past `rows`.
   const maxInputVisibleLines = Math.max(1, Math.min(8, rows - 6));
+  // Full wrap (before any visible-lines truncation below) — kept around so
+  // the cursor-positioning effect can map cursorPos to a (row, col) using
+  // the exact same wrap this renders, then adjust for however many of its
+  // leading rows got scrolled off (droppedInputLines).
+  const wrappedInputFull = singleLineStatus !== null ? [singleLineStatus] : wrapToWidth(input, maxInputWidth);
+  const droppedInputLines = Math.max(0, wrappedInputFull.length - maxInputVisibleLines);
   const inputLines =
-    singleLineStatus !== null
-      ? [singleLineStatus]
-      : (() => {
-          const wrapped = wrapToWidth(input, maxInputWidth);
-          return wrapped.length <= maxInputVisibleLines
-            ? wrapped
-            : wrapped.slice(wrapped.length - maxInputVisibleLines);
-        })();
+    droppedInputLines === 0 ? wrappedInputFull : wrappedInputFull.slice(droppedInputLines);
 
   // logHeight is a CONSTANT, independent of menu state — this is the outer
   // log-area Box's actual `height`, and it must never change, because
@@ -1381,9 +1489,9 @@ export function App({
   // Absolute cursor positioning, reliable because index.tsx switches to the
   // terminal's alternate screen buffer before rendering (giving row 1 a
   // fixed, known meaning) and the app's total height is now provably
-  // constant every frame regardless of menu state. Editing is append/
-  // backspace-only (no interior cursor movement), so the cursor always
-  // sits at the end of the LAST visual line of the input box.
+  // constant every frame regardless of menu state. cursorPos can now sit
+  // anywhere in `input` (left/right arrow, word-jump) — see cursorRowCol's
+  // doc comment for how a character offset maps to the row/col below.
   useEffect(() => {
     const inputTopBorderRow = logHeight + 1;
     // The log↔input boundary moves whenever inputLines.length changes
@@ -1423,9 +1531,27 @@ export function App({
     }
     prevInputTopBorderRowRef.current = inputTopBorderRow;
 
-    const lastLineIndex = inputLines.length - 1;
-    const lastLine = inputLines[lastLineIndex] ?? "";
-    const inputRow = inputTopBorderRow + 1 /* first content row */ + lastLineIndex;
+    // Interior cursor support (left/right arrow, word-jump): map cursorPos
+    // to the exact (row, col) cursorRowCol computes for the SAME wrap
+    // rendered below, then shift it by however many leading rows scrolled
+    // off the top of the visible box (droppedInputLines) — this used to
+    // always sit at the end of the last line (append/backspace-only
+    // editing had no other position to go to). `singleLineStatus` (a fixed
+    // Y/N prompt, not editable `input`) keeps the old end-of-line behavior
+    // since cursorPos doesn't describe it.
+    let lineIndex: number;
+    let colChars: number;
+    if (singleLineStatus !== null) {
+      lineIndex = 0;
+      colChars = inputLines[0]?.length ?? 0;
+    } else {
+      const { row: fullRow, col } = cursorRowCol(input, maxInputWidth, cursorPos);
+      const visibleRow = fullRow - droppedInputLines;
+      lineIndex = Math.max(0, Math.min(inputLines.length - 1, visibleRow));
+      colChars = visibleRow < 0 ? 0 : col;
+    }
+    const line = inputLines[lineIndex] ?? "";
+    const inputRow = inputTopBorderRow + 1 /* first content row */ + lineIndex;
     // Only the first content row is prefixed with a leading space (see the
     // input Box's JSX below); every wrapped continuation line starts flush
     // after the border+padding instead. The busy-spinner used to live here
@@ -1437,10 +1563,11 @@ export function App({
     // No left border column anymore (borderLeft={false} above) — the box's
     // interior now starts right at paddingX, one column earlier than when
     // a vertical border character used to sit in column 1.
+    const widthToCursor = stringWidth(line.slice(0, colChars));
     const promptColumn =
-      lastLineIndex === 0
-        ? 1 /* paddingX */ + 1 /* leading space */ + stringWidth(lastLine) + 1
-        : 1 /* paddingX */ + stringWidth(lastLine) + 1;
+      lineIndex === 0
+        ? 1 /* paddingX */ + 1 /* leading space */ + widthToCursor + 1
+        : 1 /* paddingX */ + widthToCursor + 1;
     const hideCursor = shouldHideCursor({ quitting, busy, input });
     lastCursorWriteRef.current = `\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`;
     process.stdout.write(lastCursorWriteRef.current);

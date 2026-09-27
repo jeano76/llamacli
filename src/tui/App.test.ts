@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk, wordLeft, wordRight, cursorRowCol } from "./App.js";
 import { formatDiff } from "../tools/diff.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
@@ -280,4 +280,38 @@ test("foldedDiffSummary names the file and the +/- counts, and invites a click t
   assert.match(label, /\+\d+/);
   assert.match(label, /-\d+/);
   assert.match(label, /펼치기/);
+});
+
+test("wordLeft skips trailing whitespace then the word behind it, like a shell's Ctrl+Left", () => {
+  const text = "quick brown fox";
+  assert.equal(wordLeft(text, text.length), "quick brown ".length);
+  assert.equal(wordLeft(text, "quick brown ".length), "quick ".length);
+  assert.equal(wordLeft(text, "quick ".length), 0);
+  assert.equal(wordLeft(text, 0), 0);
+});
+
+test("wordRight skips the current word then any whitespace after it, mirroring wordLeft", () => {
+  const text = "quick brown fox";
+  assert.equal(wordRight(text, 0), "quick".length);
+  assert.equal(wordRight(text, "quick".length), "quick brown".length);
+  assert.equal(wordRight(text, "quick brown".length), "quick brown fox".length);
+  assert.equal(wordRight(text, text.length), text.length);
+});
+
+test("cursorRowCol places the cursor on the same row/col wrapToWidth would render it on", () => {
+  // "abcde" at width 2 wraps to ["ab", "cd", "e"] (see wrapToWidth). Offset 2
+  // sits exactly on the wrap boundary — treated as the END of row 0 (right
+  // after "ab"), not the start of row 1, matching where a cursor naturally
+  // sits right before a line actually overflows.
+  assert.deepEqual(cursorRowCol("abcde", 2, 0), { row: 0, col: 0 });
+  assert.deepEqual(cursorRowCol("abcde", 2, 2), { row: 0, col: 2 });
+  assert.deepEqual(cursorRowCol("abcde", 2, 3), { row: 1, col: 1 });
+  assert.deepEqual(cursorRowCol("abcde", 2, 5), { row: 2, col: 1 });
+});
+
+test("cursorRowCol accounts for an explicit newline as a consumed separator, not a rendered character", () => {
+  // "ab\ncd" wraps (width >= 2) to ["ab", "cd"] — the "\n" itself occupies
+  // no column, so the offset right after it (3) is col 0 of row 1.
+  assert.deepEqual(cursorRowCol("ab\ncd", 10, 3), { row: 1, col: 0 });
+  assert.deepEqual(cursorRowCol("ab\ncd", 10, 2), { row: 0, col: 2 });
 });
