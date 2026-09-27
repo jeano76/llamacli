@@ -465,6 +465,16 @@ def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
     entrypoints = list((venv_root / "bin").glob("laya*")) if (venv_root / "bin").exists() else []
     env = dict(os.environ)
     env["LAYA_BOOT"] = "1"
+    # laya-serve reads its bind port from LAYA_PORT (default 8000 — see
+    # laya/serve.py's _resolve_port()), but every health probe in this file
+    # checks LAYA_ENDPOINT (default 8099). Without this, the two never agree:
+    # the spawned server binds 8000 while wait_url below polls 8099, so
+    # bootstrap_laya always times out waiting on the wrong port even when the
+    # server it just started is perfectly healthy — then kills it as "failed
+    # to boot" on the deadline. Confirmed live: a laya-serve already healthy
+    # on :8000 while every fastcheck call still blocked ~25-30s per turn
+    # polling :8099 before giving up (root cause of "llamacli가 멈춘 것 같다").
+    env["LAYA_PORT"] = os.environ.get("LAYA_ENDPOINT", "8099")
     # Prefer an explicit remote URL; otherwise boot the project-local venv.
     if entrypoints and not url:
         # Confirmed live: `python -m laya serve` fails outright —
