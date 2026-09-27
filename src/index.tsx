@@ -465,22 +465,27 @@ async function main() {
     if (!runtimeEnabled) return { skip: false };   // off => instant no-op (no checks)
     try {
       const { stdout } = await runLayaScript(["fastcheck", "--text", userText]);
-      // _verdict_prose() emits its verdict token on the FIRST line —
-      // SHORTCIRCUIT | PROCEED | DEGRADED | TRUTHFUL (case-insensitive), then
-      // a "[laya ...]" body line when short-circuiting. The same helper also
-      // appends " (score={s:.3f}, conf={c:.3f})" to the prose, so parse those
-      // from anywhere on the first physical line too. A verdict is reported as
-      // a non-folded status line; gateId makes loop.ts fold a cumulative summary.
-      const lines = stdout.split(/\r?\n/);
-      const firstLine = (lines[0] ?? "").trim();
-      const mVerdict = /SHORTCIRCUIT|PROCEED|DEGRADED|TRUTHFUL/i.exec(firstLine);
+      // cmd_fastcheck prints its own progress lines (install/boot-wait) on
+      // stdout BEFORE the final verdict, so the verdict can land on any
+      // line, not necessarily the first — _verdict_prose() (scripts/
+      // laya_integration.py) marks it unambiguously with a "GATE_VERDICT: "
+      // prefix carrying a single-word token (SHORTCIRCUIT|PROCEED|DEGRADED)
+      // plus conf=, found by scanning every line rather than assuming
+      // line 0. Previously this looked only at stdout's first line AND
+      // checked for the hyphenated literal "short-circuit" while the prose
+      // it was matching against started with "[laya]" and used "SHORTCIRCUIT"
+      // (no hyphen) — neither check could ever match the other, so the
+      // live per-turn gate could never actually short-circuit regardless of
+      // what verdict it computed.
+      const verdictLine = stdout.split(/\r?\n/).find((l) => /^GATE_VERDICT:/i.test(l.trim()));
+      const mVerdict = verdictLine && /SHORTCIRCUIT|PROCEED|DEGRADED|TRUTHFUL/i.exec(verdictLine);
       const verdict = mVerdict ? mVerdict[0].toLowerCase() : undefined;
-      const mScore = /(?:^|\s)score=([\d.]+)/i.exec(stdout);
-      const mConf = /(?:^|\s)conf=([\d.]+)/i.exec(stdout);
+      const mScore = verdictLine && /(?:^|\s)score=([\d.]+)/i.exec(verdictLine);
+      const mConf = verdictLine && /(?:^|\s)conf=([\d.]+)/i.exec(verdictLine);
       const score = mScore ? Number(mScore[1]) : undefined;
       const conf = mConf ? Number(mConf[1]) : undefined;
 
-      if (/^short-circuit$/i.test(firstLine)) {
+      if (verdict === "shortcircuit") {
         // Assign the stable id exactly once so every subsequent run appends to
         // the same foldable perf line.
         if (layaGateId === 0) layaGateId = 1;

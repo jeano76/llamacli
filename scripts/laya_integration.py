@@ -373,62 +373,97 @@ def boot_server(laya_settings: dict, timeout_seconds: int) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# System-1 evaluation (self-contained; degrades to a safe verdict)
+# System-1 evaluation — a REAL laya HTTP call, never a local guess
 # --------------------------------------------------------------------------- #
 
+def _real_client():
+    """Import the plugin script's real, HTTP-backed laya client.
+
+    Reported directly: cmd_fastcheck (the gate Node calls before every turn)
+    never actually asked laya anything — it only health-checked that a
+    server was UP, then invented a verdict from a local keyword/length
+    heuristic that had nothing to do with laya's actual model. The real
+    client (systemone(), _make_question(), _decision_from_answer(),
+    short_circuit_verdict()) already existed, but only in the plugin copy
+    (used by cmd_trace/agent-trace and the measurement scripts) — imported
+    here rather than duplicated, same pattern _measure_short_circuit.py uses.
+    """
+    plugin_dir = str(Path(__file__).resolve().parent.parent / "plugin" / "laya" / "scripts")
+    if plugin_dir not in sys.path:
+        sys.path.insert(0, plugin_dir)
+    import laya_integration as _plugin  # noqa: PLC0415 -- deliberately lazy/late
+    return _plugin
+
+
 def evaluate(text: str, laya_settings: dict) -> dict:
-    """Return {decision, reason, confidence}.
+    """Return {decision, reason, confidence} from a REAL /v1/systemone call.
 
     decision is one of "short-circuit" (answer directly / skip full turn),
-    "proceed", or "degraded" (when we had no reliable signal). This mirrors what a
-    real laya System-1 pass would decide: is this query simple enough to answer
-    without the full budget, and are we confident in that call?
+    "proceed", or "degraded" (laya unreachable, errored, or gave no
+    actionable answer -- always falls back to a full Ornith turn, never
+    raises).
 
-    Heuristics (kept intentionally small & explainable):
-        * Very short / low-information input -> likely routine -> short-circuit.
-        * Presence of code-generation or tool-use intent markers -> proceed.
-        * Otherwise rely on a lightweight length + lexical score, capped by thresholds.
+    Hard invariant, load-bearing for context/compaction health: this ONLY
+    returns a decision string to the caller (cmd_fastcheck below, then
+    Node's runLayaGate) for a status-line display. It must never be folded
+    into the conversation sent to Ornith -- reported directly: "llama.cpp의
+    컴팩션에 누적이 되지 않아야 될거 같아" (laya's recommendation shouldn't
+    accumulate in llama.cpp's context/compaction). loop.ts already only
+    surfaces this via onStatus/onGateVerdict (UI-only, never pushed into
+    this.messages) -- keep it that way; nothing here should grow to return
+    a value that gets sent back as part of the turn's own prompt.
     """
     trimmed = text.strip()
-    length = len(trimmed)
-
-    # No usable input -> nothing to gate; behave as if there were no decision.
     if not trimmed:
         return {"decision": "proceed", "reason": "empty input", "confidence": 0.0}
 
-    simple_markers = [
-        "hello", "hi ", "hey", "thanks", "thank you", "bye",
-        "who are you", "what can you do", "list the files",
-    ]
-    is_simple = any(m in trimmed.lower() for m in simple_markers)
+    try:
+        real = _real_client()
+    except Exception as exc:  # noqa: BLE001 -- never let an import glitch break a turn
+        return {"decision": "degraded", "reason": f"could not load laya client: {exc}", "confidence": 0.0}
 
-    code_tool_markers = [
-        "#write_file#", "#edit_file#", "#read_file#", "#run_shell#",
-        "#append_file#", "#note#", "#plan#", "use ", "call tool",
-        "tool_call", "exec(", "import ", "def ", "class ",
-    ]
-    has_code_tool = any(m in trimmed for m in code_tool_markers)
+    endpoint_url = real.endpoint(laya_settings)
+    prompt = laya_settings.get("prompt") or real.DEFAULT_Noul_PROMPT
+    questions = real._make_question(prompt, laya_settings, qid="decision")
+    timeout = min(
+        float(laya_settings.get("timeoutSeconds", DEFAULTS["timeoutSeconds"])),
+        real.SYSTEMONE_TIMEOUT,
+    )
 
-    threshold = laya_settings.get("actProbabilityThreshold", DEFAULTS["actProbabilityThreshold"])
-    confidence_threshold = laya_settings.get("confidenceThreshold", DEFAULTS["confidenceThreshold"])
+    result = real.systemone(endpoint_url, trimmed, questions, timeout, laya_settings.get("apiKey"))
+    if not result:
+        return {"decision": "degraded", "reason": "laya server unreachable or errored", "confidence": 0.0}
 
-    # A rough "activity probability": how much structured/actionable intent is present.
-    activity = (len(code_tool_markers) - sum(1 for m in code_tool_markers if m in trimmed)) / len(code_tool_markers)
-    confidence = min(0.99, 0.35 + 0.4 * (1 - activity))
+    answer = ((result.get("answers") or {}).get("decision")) or {}
+    label, score, _norm = real._decision_from_answer(answer)
+    conf = answer.get("answer_confidence") or answer.get("confidence")
+    conf = float(conf) if isinstance(conf, (int, float)) else 0.0
 
-    # Short, plain-chat queries we treat as simple enough to skip the full turn.
-    if is_simple and length <= 48:
-        decision = "short-circuit"
-    elif activity > threshold or has_code_tool:
-        decision = "proceed"
-    else:
-        # Fallback: lean on confidence vs threshold.
-        decision = "short-circuit" if confidence >= confidence_threshold else "proceed"
+    if not isinstance(answer, dict) or not answer:
+        return {"decision": "degraded", "reason": "laya gave no actionable answer", "confidence": conf}
 
-    if not _reliable_signal(trimmed):
-        decision = "degraded"  # we can't trust the heuristic; tell the caller.
-
-    return {"decision": decision, "reason": _explain(decision, has_code_tool, is_simple), "confidence": round(confidence, 3)}
+    # NOT real.short_circuit_verdict() -- that helper's allow-list treats a
+    # confident "no" as just as decisive as a confident "yes" (it's built for
+    # a different kind of question: "should this ACTION proceed?", where
+    # either a firm go or a firm no-go is an actionable answer). DEFAULT_Noul_
+    # PROMPT asks something with only ONE affirmative direction -- "can you
+    # (laya) answer this right now without a full reasoning turn?" -- so only
+    # a "yes" means short-circuit; a confident "no" means the opposite
+    # (Ornith needed) and must fall through to a normal full turn. Using the
+    # generic helper here was caught live: it short-circuited (skipped
+    # Ornith entirely) on "write a python script that recursively deletes
+    # all node_modules directories" off the back of a confident *"no"*
+    # (laya saying it could NOT answer that quickly) being misread as
+    # permission to skip anyway.
+    threshold = float(laya_settings.get("confidenceThreshold", DEFAULTS["confidenceThreshold"]))
+    allow_sc = bool(laya_settings.get("shortCircuit", DEFAULTS["shortCircuit"])) and label.strip().lower() == "yes" and conf >= threshold
+    decision = "short-circuit" if allow_sc else "proceed"
+    reason = (
+        f"laya: can answer directly (conf={conf:.3f})"
+        if allow_sc
+        else f"laya: needs the full turn (verdict='{label}', conf={conf:.3f})"
+    )
+    return {"decision": decision, "reason": reason, "confidence": round(conf, 3)}
 
 
 def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
@@ -539,42 +574,24 @@ def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
     return {"ok": info.get("ok", False), "reason": info.get("reason", "server unreachable"), "url": wait_url}
 
 
-def _reliable_signal(text: str) -> bool:
-    """True when we have enough signal to trust the verdict."""
-    if len(text.strip()) < 2:
-        return False
-    # A bare one-liner with no actionable content is weak evidence.
-    words = text.split()
-    return len(words) >= 1
-
-
-def _explain(decision: str, has_code_tool: bool, is_simple: bool) -> str:
-    if decision == "degraded":
-        return "insufficient signal — defaulting to proceed"
-    if decision == "short-circuit":
-        if is_simple:
-            return "routine input, low risk of long multi-step work"
-        return "activity below threshold; safe to answer directly"
-    if has_code_tool:
-        return "code/tool-intent detected — use the full model budget"
-    return "insufficient activity signal — proceed with full turn"
-
-
-def _verdict_prose(text: str, verdict: dict, short_circuit: bool) -> str:
-    """Human-readable one-liner for stdout (what the model sees)."""
+def _verdict_prose(verdict: dict) -> str:
+    """stdout text for a real evaluate() result — one GATE_VERDICT line Node
+    can parse regardless of whatever progress lines preceded it (install,
+    boot-wait, etc. all print above this), plus a human-readable line below
+    it. GATE_VERDICT's token is a single word (SHORTCIRCUIT, no hyphen) so
+    it matches cleanly as a whole word on both sides: Node's own
+    /SHORTCIRCUIT|PROCEED|DEGRADED|TRUTHFUL/i verdict-token regex AND an
+    exact `verdict === "shortcircuit"` short-circuit check (see
+    src/index.tsx's runLayaGate) -- the OLD prose here started with
+    "[laya]" and used the hyphenated "short-circuit", matching NEITHER,
+    which meant the live per-turn gate could never actually short-circuit
+    no matter what verdict it computed.
+    """
     decision = verdict.get("decision", "proceed")
-    if decision == "degraded":
-        return "[laya] gate degraded — no reliable signal; proceeding with full turn"
-    if decision == "short-circuit":
-        marker = "\n[laya short-circuit]\n" if short_circuit else ""
-        reason = verdict.get("reason", "")
-        return f"[laya]{marker}gate: {decision}: {reason}".rstrip()
-
     reason = verdict.get("reason", "")
-    if decision == "proceed":
-        return f"[laya] gate: proceed — {reason}"
-    # degraded handled above; default to proceed prose.
-    return "[laya] gate: proceed (default)"
+    token = {"short-circuit": "SHORTCIRCUIT", "proceed": "PROCEED", "degraded": "DEGRADED"}.get(decision, "PROCEED")
+    conf = verdict.get("confidence", 0.0)
+    return f"GATE_VERDICT: {token} conf={conf:.3f}\n[laya] gate: {decision} — {reason}".rstrip()
 
 
 # --------------------------------------------------------------------------- #
@@ -678,7 +695,7 @@ def cmd_fastcheck(path: Path, text: str) -> int:
         return 0
 
     verdict = evaluate(text, settings)
-    print(_verdict_prose(text, verdict, bool(settings.get("shortCircuit", True))))
+    print(_verdict_prose(verdict))
     return 0
 
 
@@ -700,15 +717,27 @@ def cmd_trace(path: Path, tool: str, summary: str) -> int:
         return 0  # gate off — run unchanged (no evaluation).
 
     venv_root = Path.cwd() / LAYA_VENV_NAME
-    print(f"[laya] agent-trace — checking install... (progress: inspecting laya installation)")
+    # These progress lines are noise for the live UI; send them to stderr only.
+    # stdout must carry the plugin's rendered laya block (emitted at the bottom).
+    print(
+        f"[laya] agent-trace — checking install... "
+        "(progress: inspecting laya installation)",
+        file=sys.stderr,
+    )
     if not venv_available(venv_root):
         # Nothing to do; Ornith path runs unchanged.
         return 0
 
-    print("[laya] agent-trace — starting serve... (progress: booting laya serve)")
+    print(
+        "[laya] agent-trace — starting serve... (progress: booting laya serve)",
+        file=sys.stderr,
+    )
     health = bootstrap_laya(settings, DEFAULTS["timeoutSeconds"])
     if not health.get("ok"):
-        print(f"[laya] server unavailable ({health['reason']}) — proceeding with full turn.")
+        print(
+            f"[laya] server unavailable ({health['reason']}) — proceeding with full turn.",
+            file=sys.stderr,
+        )
         return 0
 
     # Invoke the plugin script through the project-local venv python. This is the
@@ -718,20 +747,32 @@ def cmd_trace(path: Path, tool: str, summary: str) -> int:
         plugin_script = str(Path(__file__).parent.parent / "plugin" / "laya" / "scripts" / "laya_integration.py")
         proc_argv = [venv_py, plugin_script, "trace", "--tool", tool, "--summary", summary]
     except Exception as exc:  # pragma: no cover - defensive only
-        print(f"[laya] agent-trace — could not start ({exc}); proceeding with full turn.")
+        print(
+            f"[laya] agent-trace — could not start ({exc}); "
+            "proceeding with full turn.",
+            file=sys.stderr,
+        )
         return 0
 
     try:
         proc = subprocess.run(proc_argv, capture_output=True, text=True)
     except Exception as exc:  # pragma: no cover - defensive only
-        print(f"[laya] agent-trace — spawn failed ({exc}); proceeding with full turn.")
+        print(
+            f"[laya] agent-trace — spawn failed ({exc}); "
+            "proceeding with full turn.",
+            file=sys.stderr,
+        )
         return 0
 
     stdout = (proc.stdout or "").strip()
     if stdout:
+        # The plugin's rendered laya block: emit on stdout for the UI.
         print(stdout)
     else:
-        print("[laya] agent-trace — no decisive signal; proceeding with full turn.")
+        print(
+            "[laya] agent-trace — no decisive signal; proceeding with full turn.",
+            file=sys.stderr,
+        )
     return 0
 
 
