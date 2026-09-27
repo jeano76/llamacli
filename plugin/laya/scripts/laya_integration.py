@@ -23,7 +23,10 @@ What this provides:
   * Detect -> confirm -> install/serve onboarding menu (§6-1 of the review).
 
 Laya HTTP protocol (verified against serve.py v1.0.23):
-  entry point : `python -m laya serve`   (uvicorn; LAYA_HOST/LAYA_PORT env)
+  entry point : the `laya-serve` console script (uvicorn; LAYA_HOST/LAYA_PORT
+                env) -- NOT `python -m laya serve`, which fails outright
+                ("No module named laya.__main__; 'laya' is a package and
+                cannot be directly executed"), confirmed live.
   POST        : /v1/systemone   body {"state":..., "questions": {qid:{"prompt":...}}, "model"?}
   Response    : Jev payload {model, answers:{qid:{choice|score|noul}}, usage, routing?}
   Health probe: GET  /health       -> {"status":"ok","loaded":[...],"device":...}
@@ -368,8 +371,9 @@ def start_laya(cfg: dict) -> tuple[subprocess.Popen, int]:
     if cfg.get("apiKey"):
         env["LAYA_API_KEY"] = cfg["apiKey"]
 
+    laya_serve_bin = python.parent / "laya-serve"
     proc = subprocess.Popen(  # noqa: S603 -- local, trusted path
-        [str(python), "-m", "laya", "serve"],
+        [str(laya_serve_bin)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         start_new_session=True,
     )
