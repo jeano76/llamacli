@@ -1459,35 +1459,15 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "compaction-detail-folded", lineId: line.id });
       continue;
     }
-    // Requested directly: "저 설치는 폴딩으로 해서 펼침을 하면 진행
-    // 프로그래스를 확인하게 해줘" — a multi-line status push (e.g. laya's
-    // install/boot progress log via pushStatus) used to always render in
-    // full, unfoldable. Same fold-when-multi-line, click-to-expand pattern
-    // as tool-result below — an ordinary short one-line status is left
-    // alone (folding a single line to a one-line summary is pure friction).
-    if (line.kind === "status") {
-      let cached = rowCache.get(line.id);
-      if (!cached || cached.text !== line.text || cached.width !== width) {
-        cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
-        rowCache.set(line.id, cached);
-      }
-      if (cached.rows.length <= 1) {
-        cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
-        continue;
-      }
-      if (!expandedReasoningIds.has(line.id)) {
-        allRows.push({
-          key: `${line.id}-fold`,
-          text: line.foldLabel ?? `▸ 진행 상황 (${cached.rows.length}줄) — 클릭해서 펼치기`,
-          kind: "status-folded",
-          lineId: line.id,
-        });
-        continue;
-      }
-      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
-      allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "status-folded", lineId: line.id });
-      continue;
-    }
+    // REVERTED — reported directly: "ansi 로그부터 모든 명령어가 접기
+    // 모드로 되었네 모든 것들을 접기 모드로 하지 말아줘". Auto-folding
+    // every multi-line status push turned out to catch far more than the
+    // one install-progress-log case this was written for, defaulting all
+    // sorts of ordinary multi-line status text to collapsed. Back to
+    // always showing status lines in full — the fold-on-click machinery
+    // (status-folded, expandedReasoningIds reuse) is left in place below
+    // in case a narrower, opt-in version of this is wanted later, but
+    // nothing currently triggers it.
     if (line.kind === "tool-result") {
       let cached = rowCache.get(line.id);
       if (!cached || cached.text !== line.text || cached.width !== width) {
