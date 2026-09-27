@@ -478,9 +478,22 @@ def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
         # Wait for health on whatever URL we expect.
         wait_url = url + "/health" if url else (f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}/health")
         deadline = time.time() + max(1, timeout_seconds)
+        started = time.time()
+        # Reported directly: "서버 구동 과정에 프로그래스 안내도 없고" —
+        # loading the actual model(s) behind /health can genuinely take
+        # 10-20+ seconds (confirmed live: GPU OOM fallback to CPU, then
+        # several "Fetching N files" downloads) and this loop printed
+        # nothing at all while it waited, indistinguishable from a hang.
+        # One line every ~3s, not every 0.3s poll — frequent enough to show
+        # it's alive, not so frequent it floods the log.
+        next_report_at = started + 3.0
         while time.time() < deadline:
             if _http_ok(wait_url):
                 return {"ok": True, "reason": "server healthy", "url": wait_url}
+            now = time.time()
+            if now >= next_report_at:
+                print(f"[laya] waiting for server to become healthy... ({int(now - started)}s elapsed)")
+                next_report_at = now + 3.0
             time.sleep(0.3)
     finally:
         if proc is not None:
@@ -619,6 +632,17 @@ def cmd_fastcheck(path: Path, text: str) -> int:
             # Installed but could not become healthy; degrade to safe proceed.
             print(f"[laya] server unavailable ({health['reason']}) — proceeding with full turn.")
             return 0
+
+    if not text.strip():
+        # Reported directly: the install-triggering call (bare `fastcheck`,
+        # no --text — see /fastcheck on's Node-side handler) ran all the way
+        # through to evaluate("") and printed a real-looking verdict line
+        # ("gate: proceed — empty input") that has nothing to do with any
+        # actual user message — confusing noise on top of an otherwise
+        # successful install+boot. There is no real gate decision to make
+        # here; say so plainly instead.
+        print("[laya] ready — will gate the next real turn.")
+        return 0
 
     verdict = evaluate(text, settings)
     print(_verdict_prose(text, verdict, bool(settings.get("shortCircuit", True))))
