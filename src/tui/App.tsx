@@ -3,12 +3,13 @@ import { Box, Text, useInput, useStdout } from "ink";
 import stringWidth from "string-width";
 import stripAnsi from "strip-ansi";
 import { StatusBar } from "./StatusBar.js";
-import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem } from "./SlashMenu.js";
+import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem, menuVisibleRows } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
 import { renderMarkdown } from "./markdown.js";
-import { HARNESS_ART, ART_WIDTH, LETTER_WIDTH, SETTLED, BALL_COLOR, RESET, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
-import { supportsAnsiTui } from "./ansiSupport.js";
+import { buildArt, colored, SETTLED_SGR, BALL_SGR, LETTER_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
+import { startupHintText, KEY_BINDINGS, formatKeyRow, KEY_COLUMN_WIDTH } from "./keybindings.js";
+import { getCapabilities, buildSequences, glyph, borderStyleFor } from "./terminal.js";
 import { existsSync } from "node:fs";
 import { isLikelyPaste, looksLikePastedFilePath, formatPasteLabel, findTrailingPlaceholder, substitutePlaceholders } from "./pasteChip.js";
 
@@ -228,6 +229,9 @@ export const SHIMMER_TICK_MS = 80;
 
 /** Wraps one log entry into terminal rows (unpadded). */
 function wrapLogLine(line: LogLine, width: number): string[] {
+  // Read once per entry: the two line-classification glyphs below and the
+  // folded-block markers further down all consult it.
+  const caps = getCapabilities();
   if (line.kind === "diff") {
     // Diff text carries its own ANSI color codes (formatDiff()): wrap
     // ANSI-safely so an escape sequence is never torn apart mid-code.
@@ -238,8 +242,13 @@ function wrapLogLine(line: LogLine, width: number): string[] {
     // wrapped, since wrapping a table row destroys its borders.
     return wrapPreservingTables(renderMarkdown(line.text, width), width);
   }
-  if (line.kind === "user") return wrapToWidth(`❯ ${line.text}`, width);
-  if (line.kind === "tool") return wrapToWidth(`⚡ ${line.text}`, width);
+  // The two leading glyphs are the reader's anchor for "this is yours" vs
+  // "this is a tool's" — the fastest visual scan in a long transcript. Both
+  // are non-ASCII, so they go through the same ASCII fallback as the rest of
+  // the UI: `❯`/`⚡` become `>`/`*` rather than a `?` in the one column the
+  // eye actually uses to classify a line.
+  if (line.kind === "user") return wrapToWidth(`${glyph("❯", ">", caps)} ${line.text}`, width);
+  if (line.kind === "tool") return wrapToWidth(`${glyph("⚡", "*", caps)} ${line.text}`, width);
   // Chain-of-thought, shown only when enableThinking is on (loop.ts's
   // onReasoningDelta). Kept visually distinct (dim, prefixed) from the
   // real answer so it reads as "thinking out loud", not the final reply —
@@ -576,12 +585,67 @@ export function runHintText(columns: number): string {
     "  Esc: 강제종료 · /quit: 정상종료 · Shift+우클릭: 복사/붙여넣기",
     "  Esc: 강제종료 · /quit: 정상종료",
   ];
+  // Falls back to the shortest form even when IT doesn't fit, and that is
+  // deliberate: this line renders in place of the input box's own text, and
+  // the input Box is width-constrained and clips. A clipped
+  // "Esc: 강제종료 · /qu" still tells the reader Esc force-quits, where
+  // returning "" would tell them nothing at all. (Contrast
+  // scrolledBannerText/startupHintText, which live in the log's FIXED-height
+  // area where overflowing really does push the layout — there the width
+  // guarantee is enforced instead.)
   return forms.find((f) => stringWidth(f) <= columns - 1) ?? forms[forms.length - 1];
 }
 
 /** Input-box text while progress is being saved before exit. */
 export function quittingStatusText(elapsedMs: number): string {
   return `진행 상황 저장 중… ${Math.floor(elapsedMs / 1000)}초 · Esc: 저장하지 않고 바로 종료`;
+}
+
+/**
+ * The banner shown at the top of the log while scrolled back.
+ *
+ * Two bugs this replaces, both from truncating the string with
+ * `.slice(0, columns)`:
+ *  - `slice` counts UTF-16 code units, not terminal columns, so on a
+ *    narrow terminal it could cut mid-word and leave a dangling separator.
+ *  - The old text was English in an otherwise Korean UI, and used `─`/`↑`/`↓`,
+ *    which are exactly the glyphs that don't render on a non-UTF-8 terminal.
+ *
+ * Forms are ordered longest-first so the widest terminal gets the fullest
+ * text and a narrow one gets a shorter true statement rather than a
+ * truncated lie ("scrolled up 12" with no hint about how to get back).
+ * `tailToWidth` is used for the final clamp so the width contract holds
+ * whatever the forms turn out to be.
+ */
+export function scrolledBannerText(
+  offset: number,
+  max: number,
+  columns: number,
+  unicode: boolean
+): string {
+  // Only the DECORATIVE glyphs are gated. The Korean prose is this app's
+  // language and stays: a terminal that can't render it can't render the
+  // status messages, the /help output, or the model's own replies either, so
+  // stripping it would make this one line useless rather than more portable.
+  // What DOES get swapped is the box-drawing/arrow set, because those carry
+  // no meaning on their own and a `?` in their place is both ugly and a
+  // width the layout never budgeted for.
+  const up = unicode ? "↑" : "^";
+  const down = unicode ? "↓" : "v";
+  const rule = unicode ? "─" : "-";
+  const dot = unicode ? "·" : "|";
+  const forms = [
+    `${rule}${rule} ${up} ${offset}줄 위로 스크롤됨 (전체 ${max}줄) ${dot} ${down}/PageDown 또는 Shift+T 로 최신 위치로 ${rule}${rule}`,
+    `${up} ${offset}/${max} 위로 스크롤 ${dot} Shift+T 로 복귀`,
+    `${up} ${offset}줄 위 ${dot} Shift+T 복귀`,
+    `${up} ${offset}줄 위`,
+  ];
+  // Hard width guarantee rather than a `?? forms[last]` fallback, for the
+  // same reason startupHintText has one: the fallback isn't guaranteed to
+  // fit, and overflowing this row pushes the log's fixed height budget.
+  const budget = Math.max(1, columns);
+  const chosen = forms.find((f) => stringWidth(f) <= budget);
+  return tailToWidth(chosen ?? forms[forms.length - 1], budget);
 }
 
 export function App({
@@ -630,15 +694,46 @@ export function App({
   // log (a real, persistent line) rather than a raw stdout write before the
   // alt-screen switch, which was invisible in practice.
   useEffect(() => {
+    const caps = getCapabilities();
+    const art = buildArt("HARNESS", caps);
+    const artWidth = art[0].length;
+    const CLI_TEXT = "CLI";
+    const dim = (s: string) => colored(s, "2", caps);
+
+    // Compact mode. The 5-row block wordmark is 41 columns wide and needs
+    // block-drawing glyphs plus color to read as intended; on a narrow
+    // terminal it wrapped (which desynchronized the whole fixed-height log
+    // budget below it) and on a colorless/ASCII one it was just five rows
+    // of `#`. A developer opening a CLI wants the version and the repo, not
+    // an animation — so below the width where the art can render properly,
+    // and whenever the terminal can't do color, this collapses to one line
+    // and skips the animation entirely (which also removes a ~1.5s of
+    // repaint churn on every single startup).
+    const compact = !caps.ansi || caps.colorDepth === 0 || artWidth + 4 > Math.max(10, columns);
+
+    if (compact) {
+      setLog((prev) => [
+        {
+          id: logIdCounter++,
+          text: `${dim("HARNESS CLI")} ${startupBanner.version}  ${dim(startupBanner.repoUrl)}`,
+          kind: "status" as const,
+        },
+        { id: logIdCounter++, text: dim(startupHintText(Math.max(10, columns))), kind: "status" as const },
+        ...prev,
+      ]);
+      return;
+    }
+
     const artLineId = logIdCounter++;
     // CLI, the version, and the bounce-ball flourish all share ONE line,
     // right-aligned together — requested directly: "Harness 아래 CLI 와
     // 버전정보 그리고 탁구공모양을 한줄에 우측 정렬로 해서 작성해줘".
     const cliLineId = logIdCounter++;
     setLog((prev) => [
-      { id: artLineId, text: HARNESS_ART.join("\n"), kind: "status" as const },
+      { id: artLineId, text: art.join("\n"), kind: "status" as const },
       { id: cliLineId, text: "", kind: "status" as const },
-      { id: logIdCounter++, text: rightAlign(`\x1b[2m${startupBanner.repoUrl}\x1b[0m`, ART_WIDTH), kind: "status" as const },
+      { id: logIdCounter++, text: rightAlign(dim(startupBanner.repoUrl), artWidth), kind: "status" as const },
+      { id: logIdCounter++, text: dim(startupHintText(Math.max(10, columns))), kind: "status" as const },
       ...prev,
     ]);
     const setLineText = (id: number, text: string) => setLog((prev) => prev.map((line) => (line.id === id ? { ...line, text } : line)));
@@ -655,34 +750,33 @@ export function App({
     // (per "cli는 소문자로 좀 작게 해주고"), and uppercase (per "Harness
     // CLI 처럼 대소문자 반영해줘": the acronym stays uppercase, matching
     // how the app's own name is written everywhere else).
-    const CLI_TEXT = "CLI";
-    const shineLines = [...HARNESS_ART, CLI_TEXT];
+    const shineLines = [...art, CLI_TEXT];
     // Once the shine settles, the last letter of HARNESS and all of "CLI"
     // get recolored to match the bounce-ball's own color — requested
     // directly: "CLI 글자와 마지막 S 도형을 애니메이션 마지막엔 탁구공과
     // 같은 색으로 해줘". Built fresh from the plain (uncolored) source
     // text rather than patched into the shine's own frame, so there's no
     // risk of a leftover color from the sweep mixing in.
-    const lastLetterStartsAt = ART_WIDTH - LETTER_WIDTH;
-    const finalArtText = HARNESS_ART.map(
-      (row) => `${SETTLED}${row.slice(0, lastLetterStartsAt)}${BALL_COLOR}${row.slice(lastLetterStartsAt)}${RESET}`
-    ).join("\n");
-    const finalCliText = `${BALL_COLOR}${CLI_TEXT}${RESET}`;
+    const lastLetterStartsAt = artWidth - LETTER_WIDTH;
+    const finalArtText = art
+      .map((row) => colored(row.slice(0, lastLetterStartsAt), SETTLED_SGR, caps) + colored(row.slice(lastLetterStartsAt), BALL_SGR, caps))
+      .join("\n");
+    const finalCliText = colored(CLI_TEXT, BALL_SGR, caps);
     let shineTick = 0;
     let bounceId: ReturnType<typeof setInterval> | null = null;
     const shineTicks = shineMultilineFrameCount(shineLines);
     const shineId = setInterval(() => {
       shineTick++;
       const frame = shineMultilineFrame(shineLines, shineTick).split("\n");
-      setLineText(artLineId, frame.slice(0, HARNESS_ART.length).join("\n"));
-      setLineText(cliLineId, rightAlign(frame[HARNESS_ART.length], ART_WIDTH));
+      setLineText(artLineId, frame.slice(0, art.length).join("\n"));
+      setLineText(cliLineId, rightAlign(frame[art.length], artWidth));
       if (shineTick >= shineTicks) {
         clearInterval(shineId);
         setLineText(artLineId, finalArtText);
         let bounceTick = 0;
         bounceId = setInterval(() => {
           bounceTick++;
-          setLineText(cliLineId, rightAlign(`${finalCliText}  ${startupBanner.version}  ${bounceFrame(bounceTick)}`, ART_WIDTH));
+          setLineText(cliLineId, rightAlign(`${finalCliText}  ${startupBanner.version}  ${bounceFrame(bounceTick, caps)}`, artWidth));
           if (bounceTick >= bounceFrameCount()) clearInterval(bounceId!);
         }, 60);
       }
@@ -833,6 +927,10 @@ export function App({
   // handler, which would mean redoing the markdown/wrap rendering work
   // twice per keystroke just to clamp a scroll position.
   const maxScrollRef = useRef(0);
+  // The clamped scroll offset, carried across renders for the same reason as
+  // maxScrollRef above — the Shift+T "jump to live" handler reads it before
+  // this render has recomputed it.
+  const scrollOffsetRef = useRef(0);
   // Same reasoning as maxScrollRef — needed inside the key handler (for
   // sizing a Page Up/Down jump) before logHeight is computed later in this
   // render, so it's carried over from the previous one instead.
@@ -1205,6 +1303,102 @@ export function App({
       return;
     }
 
+    // Shift+T: jump back to the live tail. Reading scrollback and having a
+    // turn finish underneath you is the trap this closes — before, the only
+    // way back was to hold PageDown and count.
+    if (key.shift && char.toLowerCase() === "t") {
+      if (scrollOffsetRef.current > 0) {
+        setScrollOffset(0);
+        pushLine("[최신 출력으로 이동]", "status");
+      }
+      return;
+    }
+
+    // Ctrl+O: expand/collapse every foldable block at once.
+    //
+    // This is the keyboard equivalent of click-to-fold, which used to be the
+    // ONLY way to expand a reasoning block or a diff. That made the feature
+    // unreachable on exactly the terminals that needed the compatibility
+    // fallbacks in terminal.ts (mouse off, or SGR mouse unsupported so it
+    // could never be enabled) — the fallback quietly removed the only way to
+    // read a folded block. Toggling all of them at once is also the thing
+    // you actually want when auditing what a turn did: "show me everything,
+    // then hide it all again".
+    if (key.ctrl && char.toLowerCase() === "o") {
+      const foldable = clickMapRef.current.entries.filter((e) => e.foldable);
+      if (foldable.length === 0) {
+        pushLine("[접을 수 있는 블록이 없습니다]", "status");
+        return;
+      }
+      // One shared "everything is currently expanded?" verdict, so pressing
+      // it repeatedly alternates instead of flipping each block's own state
+      // and landing on a mixture.
+      const anyCollapsed = foldable.some(
+        (e) =>
+          (e.isDiff ? collapsedDiffIds : e.isGate ? firstSeen : e.isPaste ? expandedPasteLineIds : expandedReasoningIds).has(e.lineId)
+      );
+      const expandAll = anyCollapsed;
+      const toggle = (s: Set<number>) => {
+        const next = new Set(s);
+        for (const { lineId } of foldable) {
+          if (next.has(lineId)) next.delete(lineId);
+          else next.add(lineId);
+        }
+        return next;
+      };
+      setCollapsedDiffIds(toggle);
+      setFirstSeen(toggle);
+      setExpandedPasteLineIds(toggle);
+      setExpandedReasoningIds(toggle);
+      pushLine(expandAll ? "[블록 전체 펼침]" : "[블록 전체 접기]", "status");
+      return;
+    }
+
+    // Readline-standard line editing. A developer arriving from any shell
+    // already has these in their fingers, and without them the only options
+    // were arrowing one character at a time or selecting text with the
+    // mouse — which is unavailable on every terminal where mouse reporting
+    // is off (see terminal.ts) and unreliable under a multiplexer.
+    if (key.ctrl) {
+      const c = char.toLowerCase();
+      if (c === "a") {
+        setCursorPos(0);
+        return;
+      }
+      if (c === "e") {
+        setCursorPos(input.length);
+        return;
+      }
+      if (c === "k") {
+        // Kill to end of line. Also drops a trailing paste placeholder
+        // atomically, the same rule the backspace branch uses.
+        const trailing = findTrailingPlaceholder(input.slice(cursorPos), pastedBlocks);
+        if (trailing) {
+          const cut = input.slice(cursorPos, cursorPos + trailing.length);
+          setPastedBlocks((m) => {
+            const next = new Map(m);
+            next.delete(cut);
+            return next;
+          });
+          setInput(input.slice(0, cursorPos));
+        } else {
+          setInput(input.slice(0, cursorPos));
+        }
+        return;
+      }
+      if (c === "u") {
+        setInput(input.slice(cursorPos));
+        setCursorPos(0);
+        return;
+      }
+      if (c === "w") {
+        const target = wordLeft(input, cursorPos);
+        setInput(input.slice(0, target) + input.slice(cursorPos));
+        setCursorPos(target);
+        return;
+      }
+    }
+
     // Plain Up/Down: prompt history, matching a normal shell. (Previously
     // these did line-by-line log scrollback — moved to PageUp/PageDown-only
     // above, since history is the far more commonly reached-for behavior
@@ -1487,7 +1681,15 @@ export function App({
   // never-changing box. The outer box's contribution to the layout is
   // therefore always exactly `logHeight`, so nothing below it ever needs
   // to move, and nothing is permanently reserved when the menu is closed.
-  const menuBoxHeight = SLASH_MENU_ITEMS.length + 2; // round border top+bottom
+  // The menu popup's item-row count, then its total box height. Sized from the
+  // AVAILABLE space and the current match count rather than being pinned to
+  // the full command list — see menuVisibleRows' doc comment for the two
+  // visible defects that fixed (a 1-match filter still drawing 13 rows, and a
+  // 24-row terminal losing its transcript behind the popup). Still a pure
+  // function of (available rows, match count), so it never changes as the
+  // selection moves.
+  const menuItemRows = menuVisibleRows(Math.max(4, rows - 3 - inputLines.length), filterMenuItems(input).length);
+  const menuBoxHeight = menuItemRows + 2; // round border top+bottom
   // Chrome below the log area: input box top border(1) + content(inputLines.length)
   // + bottom border(1) + status bar(1). Unlike menuBoxHeight above, this is
   // NOT held fixed — an input box that grows to show a multi-line prompt
@@ -1526,9 +1728,13 @@ export function App({
     // Reported directly: on a terminal that doesn't actually interpret ANSI
     // escapes, every one of these raw writes shows up as literal stray
     // characters in the prompt instead of moving the cursor/clearing a row
-    // — see ansiSupport.ts's doc comment. Skip the whole block: Ink's own
-    // (safer, if slightly less precise) redraw still applies either way.
-    if (!supportsAnsiTui()) {
+    // — see terminal.ts's doc comment. The gate is `altScreen`, not `ansi`,
+    // because that is the actual precondition: CUP (`ESC[row;colH`) counts
+    // rows from the top of the *active* buffer, so absolute positioning is
+    // only meaningful once the alternate screen is actually in use. Gating
+    // on `ansi` alone let the cursor get addressed into the normal
+    // scrollback buffer on any terminal that has CSI but no alt screen.
+    if (!getCapabilities().altScreen) {
       prevInputTopBorderRowRef.current = inputTopBorderRow;
       return;
     }
@@ -1600,7 +1806,7 @@ export function App({
   // possibly remain visible.
   useEffect(() => {
     const id = setInterval(() => {
-      if (!supportsAnsiTui() || !lastCursorWriteRef.current) return;
+      if (!getCapabilities().altScreen || !lastCursorWriteRef.current) return;
       process.stdout.write(lastCursorWriteRef.current);
     }, 400);
     return () => clearInterval(id);
@@ -1852,6 +2058,10 @@ export function App({
   const maxScroll = Math.max(0, allRows.length - scrollableContentRows);
   maxScrollRef.current = maxScroll;
   const clampedScroll = menuOpen ? 0 : Math.min(scrollOffset, maxScroll);
+  // Same rationale as maxScrollRef: the Shift+T handler needs to know whether
+  // we're actually scrolled back before it bothers saying so, and it runs
+  // before this render has computed the clamped value.
+  scrollOffsetRef.current = clampedScroll;
   const showScrollIndicator = !menuOpen && clampedScroll > 0;
   const contentRows = menuOpen ? scrollableContentRows : logHeight - (showScrollIndicator ? 1 : 0) - hintRows;
   const sliceEnd = allRows.length - clampedScroll;
@@ -1920,19 +2130,14 @@ export function App({
        *  log content vs. the menu vs. the scroll indicator changes. */}
       <Box flexDirection="column" height={logHeight} overflow="hidden" justifyContent="flex-end">
         {showScrollIndicator && (
-          <Text dimColor>
-            {`── ↑ scrolled up ${clampedScroll} line${clampedScroll === 1 ? "" : "s"} · ↓/PageDown to return to live ──`.slice(
-              0,
-              Math.max(10, columns)
-            )}
-          </Text>
+          <Text dimColor>{scrolledBannerText(clampedScroll, maxScroll, columns, getCapabilities().unicode)}</Text>
         )}
         {allRows
           .slice(sliceStart, sliceEnd)
           .map((row) =>
             renderRow(row, row.lineId === thinkingLineId || row.lineId === streamingAssistantId ? shimmerTick : undefined)
           )}
-        {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} />}
+        {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} visibleRows={menuItemRows} />}
       </Box>
 
       {/* The prompt input lives INSIDE this bordered box, not below it —
@@ -1944,7 +2149,12 @@ export function App({
        *  leading space; wrapped continuation rows are flush left (matches
        *  the cursor-column math in the positioning effect above). */}
       <Box
-        borderStyle="round"
+        // Ink draws borders from cli-boxes, and `round` is built entirely from
+        // box-drawing characters (─ │ ┌ ┐). Ink picks no fallback, so on a
+        // non-UTF-8 terminal every box in the app — including the input box
+        // being typed into — renders its frame as `?`. `classic` is the same
+        // layout in `+ - |`. See terminal.ts's borderStyleFor.
+        borderStyle={borderStyleFor(getCapabilities())}
         borderColor={inputBorderColor}
         // Requested directly: match Claude Code's input box — only the
         // top/bottom lines (spanning the full width, no corner-to-corner
@@ -1981,6 +2191,8 @@ export function App({
         compactionStatus={compactionStatus}
         columns={columns}
         busy={busy}
+        unicode={getCapabilities().unicode}
+        scroll={{ offset: clampedScroll, max: maxScroll }}
       />
     </Box>
   );

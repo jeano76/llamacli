@@ -66,6 +66,23 @@ export const LOCAL_HASH_FILE = ".self-update-sha256";
 export const DEFAULT_MANIFEST_URL = "https://raw.githubusercontent.com/jeano76/llamacli/main/bin/manifest.json";
 export const DEFAULT_ARCHIVE_URL = "https://raw.githubusercontent.com/jeano76/llamacli/main/bin/llamacli-dist.tar.gz";
 
+/**
+ * Opt-outs. Both matter for anyone who is *developing* this tool rather
+ * than just using it.
+ *
+ * `LLAMACLI_NO_UPDATE=1` was a real gap, hit while building this: the
+ * updater downloads the published archive straight over `dist/`, so
+ * `npm run build` followed by one launch was silently undone — you end up
+ * testing the published binary and believing you tested your change. There
+ * was no way to turn it off, and no equivalent of npm's `--ignore-scripts`.
+ *
+ * The URLs are overridable for the same reason (point them at a local
+ * manifest to test the update path itself without publishing).
+ */
+export function selfUpdateDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.LLAMACLI_NO_UPDATE === "1";
+}
+
 export interface SelfUpdateResult {
   updated: boolean;
   reason: string;
@@ -94,11 +111,20 @@ export async function checkAndApplyUpdate(
     // the caller can announce it clearly BEFORE the download/verify/install
     // work starts, not only after everything already succeeded.
     onUpdateFound?: (manifest: UpdateManifest) => void;
+    /** Injected so the opt-out and URL overrides are testable without
+     *  mutating the real process environment. */
+    env?: NodeJS.ProcessEnv;
   } = {}
 ): Promise<SelfUpdateResult> {
+  // Checked first so the opt-out is absolute: no manifest fetch, no archive
+  // download, and above all no write to dist/. See selfUpdateDisabled's
+  // comment for why this matters when working on the tool itself.
+  if (selfUpdateDisabled(opts.env)) {
+    return { updated: false, reason: "self-update disabled via LLAMACLI_NO_UPDATE=1" };
+  }
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const manifestUrl = opts.manifestUrl ?? DEFAULT_MANIFEST_URL;
-  const archiveUrl = opts.archiveUrl ?? DEFAULT_ARCHIVE_URL;
+  const manifestUrl = opts.manifestUrl ?? opts.env?.LLAMACLI_UPDATE_MANIFEST_URL ?? DEFAULT_MANIFEST_URL;
+  const archiveUrl = opts.archiveUrl ?? opts.env?.LLAMACLI_UPDATE_ARCHIVE_URL ?? DEFAULT_ARCHIVE_URL;
 
   let manifest: UpdateManifest;
   try {

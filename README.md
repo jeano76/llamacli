@@ -7,6 +7,101 @@ fully compatible with the OpenAI Chat Completions API. See
 > 로컬 llama.cpp를 직접 호출하며 OpenAI Chat Completions API와 호환되는 AI 코딩 에이전트
 > CLI입니다. 설계 배경과 전체 요구사항은 [`PROMPT.md`](./PROMPT.md)를 참고하세요.
 
+## What this program is
+
+llamacli is a single-binary terminal coding agent. It reads a prompt, streams a
+reply from a local LLM, and executes the tools that reply asks for — reading
+and writing files, running shell commands, diffing, and driving a browser over
+CDP — looping until the model stops asking for tools. It is deliberately built
+around a **local** llama.cpp server rather than a hosted API, so the entire
+loop (model weights, conversation history, every file the agent reads) stays on
+one machine.
+
+Three things follow from that, and they explain most of the design:
+
+1. **It is a long-running process, not a request/response tool.** A turn can
+   take minutes of CPU-bound generation. That is why context is compacted
+   automatically rather than being allowed to overflow, why work is
+   checkpointed to disk between tool calls, and why a crash has to be
+   recoverable on the next launch.
+2. **Memory is the scarce resource, not disk.** The model file is tens of
+   gigabytes and the machine is not a datacenter. Every subsystem that can
+   hold memory has an explicit budget, and the failure mode to design against
+   is a host that gets slow and then kills the wrong process.
+3. **The UI is a fixed-size grid painted with escape sequences.** The whole
+   TUI assumes it knows exactly how many terminal columns and rows it has,
+   because it positions the real hardware cursor by absolute row/column. Any
+   change that makes a line's real width differ from the width the layout
+   budgeted for is a visual bug, not a cosmetic one.
+
+### Request flow
+
+```
+keystroke
+  └─ App.tsx (Ink)  input box, slash menu, status bar
+       └─ AgentLoop.send()
+            ├─ check context usage  ─── over threshold ──▶ compact()
+            │                                                   │
+            │                                     summarize + write checkpoint
+            │                                     to .llamacli/state/, resume
+            ▼                                                   │
+        POST /v1/chat/completions  ──▶ llama-server ──▶ tool_calls?
+            │                                                   │
+            │                                     yes ─────────┘
+            │                                     execute via tools/index.ts
+            │                                     (read/write/edit/shell/diff/browser)
+            │                                     append results to the transcript
+            ▼                                     loop back with the results
+        streamed text ──▶ markdown render ──▶ log pane
+```
+
+Every hop in that loop has a failure mode that has already bitten this
+codebase, and each is documented at its call site and covered by a test. The
+`## Implementation status` section below is the running list.
+
+### The subsystems
+
+| Area | Entry point | Responsibility |
+|---|---|---|
+| Terminal UI | `src/tui/App.tsx` | Input, log rendering, scroll, folds, cursor placement |
+| Terminal capabilities | `src/tui/terminal.ts` | What this process may emit, per terminal |
+| Keybindings | `src/tui/keybindings.ts` | The single source of truth for `/help` and `/keys` |
+| Agent loop | `src/agent/loop.ts` | Turn driving, tool dispatch, context accounting |
+| Compaction | `src/compaction/` | Checkpoint write/resume, history summarization |
+| Self-healing | `src/hermes/` | Failure log, circuit breaker, improvement proposals |
+| Backend | `src/backend/` | llama-server process management, OpenAI-compatible client |
+| Tools | `src/tools/` | `read_file` / `write_file` / `edit_file` / `run_shell` / `browser_*` |
+| Skills & rules | `src/skills/` | Always-on rules, lazily-loaded skills |
+| Update | `src/selfUpdate.ts` | Manifest check, hash-verified install, restart |
+| Crash handling | `src/crashHandler.ts` | Synchronous crash log + terminal restore |
+
+`src/tui/terminal.ts`, `src/tui/keybindings.ts` and `src/selfUpdate.ts` are
+the most recent additions and the ones with the sharpest edges — see the
+developer guide below before changing them.
+
+> ## 이 프로그램이 무엇인가
+>
+> llamacli는 단일 바이너리 터미널 코딩 에이전트입니다. 프롬프트를 받아 로컬 LLM
+> 응답을 스트리밍하고, 그 응답이 요구하는 도구(파일 읽기/쓰기, 셸 실행, diff,
+> CDP 브라우저 제어)를 실행하며, 모델이 도구를 더 요구하지 않을 때까지
+> 반복합니다. 호스팅 API가 아니라 **로컬 llama.cpp** 를 전제로 만들기 때문에
+> 모델 가중치·대화 기록·에이전트가 읽은 모든 파일이 한 머신 안에 남습니다.
+>
+> 여기서 대부분의 설계가 설명됩니다.
+>
+> 1. **요청-응답 도구가 아니라 오래 사는 프로세스입니다.** 한 턴이 수 분의
+>    CPU 바운드 생성을 걸칠 수 있습니다. 그래서 컨텍스트를 자동 압축하고,
+>    도구 호출 사이마다 체크포인트를 디스크에 남기며, 다음 실행에서 복구될 수
+>    있어야 합니다.
+> 2. **부족한 자원은 디스크가 아니라 메모리입니다.** 모델 파일이 수십 GB이고
+>    머신은 데이터센터가 아닙니다. 메모리를 잡을 수 있는 서브시스템마다 예산이
+>    명시되어 있고, 설계 대상 실패 모드는 "느려진 머신이 잘못된 프로세스를
+>    죽이는 것" 입니다.
+> 3. **UI는 탈출문자열로 칠하는 고정 크기 격자입니다.** TUI 전체가 터미널의 열과
+>    행 수를 정확히 안다고 가정합니다. 실제 커서를 절대 좌표로 이동시키기
+>    때문입니다. 줄의 실제 폭이 레이아웃이 예산한 폭과 달라지는 변경은
+>    장식이 아니라 버그입니다.
+
 ## Structure
 
 ```

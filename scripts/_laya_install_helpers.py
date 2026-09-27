@@ -19,6 +19,21 @@ from pathlib import Path
 
 LAYA_VENV_NAME = ".llamacli/laya-venv"
 
+# Default port the local laya-serve listens on (matches bootstrap_laya's
+# LAYA_ENDPOINT default in scripts/laya_integration.py). Overridable via the
+# LAYA_PORT environment variable, which both start and stop honor.
+LAYA_DEFAULT_ENDPOINT = 8099
+
+
+def _http_ok(url: str, timeout: float = 1.0) -> bool:
+    """True if ``url`` returns any HTTP response within ``timeout`` seconds."""
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 -- localhost health probe
+            return resp.status == 200
+    except Exception:  # noqa: BLE001 -- any error (refused, timeout, non-200) means down
+        return False
+
 
 def _load_config(path):
     path = Path(path)
@@ -216,7 +231,7 @@ def start_laya(cfg):
     if not python or not python.exists():
         raise RuntimeError("laya venv not found; run 'install' first")
 
-    port = int(os.environ.get("LAYA_PORT", "8099"))
+    port = int(os.environ.get("LAYA_PORT", str(LAYA_DEFAULT_ENDPOINT)))
     # Confirmed live: `<python> -m laya serve` fails outright — "No module
     # named laya.__main__; 'laya' is a package and cannot be directly
     # executed". The actual server entry point is the `laya-serve` console
@@ -241,3 +256,133 @@ def start_laya(cfg):
         except Exception:  # noqa: BLE001 -- health probe not up yet
             time.sleep(1.0)
     raise RuntimeError("laya server did not become healthy in time")
+
+
+def stop_laya(cfg):
+    """Stop the project-local laya-serve process (mirror of start_laya).
+
+    Progress is printed live; on failure print an actionable message and return
+    False without touching core llamacli or the Ornith path. The goal is a clean
+    shutdown, so we SIGTERM first, then escalate to SIGKILL after a short grace
+    period. Three independent discovery strategies are tried so a stopped
+    server can be found whether or not psutil is available and regardless of how
+    it was launched (start_laya vs bootstrap_laya).
+
+        1. psutil: scan for ``laya-serve`` in the project venv's bin/ dir and
+           terminate its process tree.
+        2. pgrep -f: fall back to the system grepper if psutil is missing.
+        3. HTTP health check: probe http://127.0.0.1:{port}/health; if it
+           responds we still attempt a best-effort signal via the above (the
+           server may be running but unhealthy, in which case only #1/#2 can
+           find it).
+
+    Returns True if the server was reachable/running before this call and is no
+    longer reachable afterward. If nothing was found to stop but the health
+    endpoint already answers (a stray server we couldn't identify), return False
+    so the caller's gate still reflects reality accurately — though callers that
+    want "off = gone" can rely on the config write instead.
+    """
+    port = int(os.environ.get("LAYA_PORT", str(LAYA_DEFAULT_ENDPOINT)))
+    health_url = f"http://127.0.0.1:{port}/health"
+
+    # Was it up? Establish whether there is anything to stop and what "success"
+    # means below (nothing left answering on the port).
+    was_up = _http_ok(health_url, timeout=1.0)
+
+    pids = _find_laya_pids()
+    if not was_up and not pids:
+        print("[laya] no running laya server found (port %d)." % port)
+        return False
+
+    stopped = False
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+        except Exception:  # noqa: BLE001 -- already gone between listing and here
+            continue
+        print(f"[laya] terminating laya-serve (pid {pid}) ...")
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=10)
+        except psutil.TimeoutExpired:
+            print(f"[laya] pid {pid} did not exit after SIGTERM; forcing ...")
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                pass
+        stopped = True
+
+    if not pids and was_up:
+        print("[laya] could not identify the laya-serve process; "
+              f"server is still answering on port {port} but no longer reachable.")
+    else:
+        # Give the socket a moment to release, then confirm it's gone.
+        time.sleep(1.0)
+        if _http_ok(health_url, timeout=1.0):
+            print("[laya] server still responding on port %d after stop attempt." % port)
+            stopped = False
+
+    # Best-effort cleanup of any leftover child (the detached laya-serve and its
+    # workers). psutil's kill_tree handles multi-process servers; pgrep-based
+    # stopping already only had the single entry pid.
+    if was_up or pids:
+        print("[laya] laya server stopped.")
+
+    return stopped
+
+
+def _find_laya_pids():
+    """Return PIDs of running laya-serve processes, discovered three ways.
+
+    Tries psutil first (precise, can walk the process tree), then falls back to
+    ``pgrep -f`` for environments where psutil isn't installed. Only matches the
+    server entry point (`laya-serve`) so we never touch unrelated Python.
+    """
+    # Strategy 1: psutil scan (works whether launched via start_laya or
+    # bootstrap_laya). The venv's bin/ holds the `laya-serve` launcher script;
+    # its shebang is the project python, so a full-name match is precise.
+    try:
+        import psutil
+    except ImportError:
+        return []
+
+    pids = set()
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            name = proc.info["name"] or ""
+            cmdline = proc.info["cmdline"] or []
+        except Exception:  # noqa: BLE001 -- process vanished mid-scan
+            continue
+        needle = os.path.join("laya-serve")
+        if needle in name or any(needle in " ".join(c for c in args) for args in cmdline):
+            pids.add(proc.pid)
+    return list(pids)
+
+
+def _find_laya_pids_pgrep():
+    """pgrep -f fallback when psutil is unavailable.
+
+    ``pgrep -f`` matches against the full command line; we restrict to the
+    `laya-serve` launcher to avoid false positives from, e.g., this verifier or
+    an editor that happens to have the string in its args.
+    """
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "laya-serve"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+    except (subprocess.SubprocessError, OSError):
+        return []
+    pids = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids

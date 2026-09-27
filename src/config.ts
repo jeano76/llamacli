@@ -88,9 +88,28 @@ export interface LlamacliConfig {
    *  see docs/skill-integration-review.md. `layaGate` in loop.ts is wired
    *  from this section via index.tsx. */
   laya?: {
-    /** Master switch (default false). When false, no gate callback is built. */
+    /**
+     * Master switch. Defaults to FALSE and should stay that way unless you
+     * have read `/fastcheck status`.
+     *
+     * The gate is consulted on every turn and, measured on this box
+     * (2026-09-28, see src/agent/gate.ts), costs ~0.11s per turn while the
+     * judge is the SAME 35B MoE as the main model and cannot reliably tell a
+     * trivial request from a destructive one. So it cannot pay for itself on
+     * latency. What it does give you: a "system1" turn (no chain-of-thought,
+     * 200-token cap) when the judge guesses right, and a hard rail that keeps
+     * destructive requests on a full turn regardless of the verdict.
+     */
     enabled?: boolean;
-    /** Whether the merge gate may short-circuit System 2 for simple tasks. */
+    /**
+     * Whether the judge may downgrade a turn to system1 mode.
+     *
+     * Note what this no longer does: it does NOT skip the model. That was the
+     * original design, and it is gone because it could not work — a skip has
+     * to be answered by something, and laya's /v1/systemone is a calibration
+     * endpoint that returns probabilities, never text. The shipped
+     * implementation therefore answered 80% of requests with zero characters.
+     */
     shortCircuit?: boolean;
     /** Hard cap, in seconds, on a laya round-trip (§7). Used to bound the
      *  subprocess timeout so a hung server never blocks a turn. */
@@ -135,6 +154,41 @@ export interface LoadConfigResult {
    *  a human-readable note (what was auto-detected, or what needs manual
    *  setup) meant for a one-time startup status message. */
   setupMessage?: string;
+}
+
+/** Path to this project's config.yaml, so callers can read/write it directly
+ *  without re-deriving the join(). Used by `/fastcheck on|off`, which now
+ *  persists its choice here (rather than relying on a Python script) — so the
+ *  toggle survives a restart the way a human editing the file would expect. */
+export function configPath(projectRoot: string): string {
+  return join(projectRoot, ".llamacli", "config.yaml");
+}
+
+/** Read and persist `laya.enabled` in config.yaml without disturbing any other
+ *  field (parse → mutate only the laya block → stringify). Returns true on a
+ *  successful write. A missing/partial file is tolerated: we parse what's there,
+ *  merge over DEFAULT_CONFIG so we never wipe known keys, then write back — so
+ *  toggling laya never clobbers backend/model/llama/etc. (see loadConfig for the
+ *  same "fill the gap, don't replace wholesale" reasoning). */
+export async function updateLayaEnabled(
+  projectRoot: string,
+  enabled: boolean
+): Promise<boolean> {
+  try {
+    const raw = await readFile(configPath(projectRoot), "utf8");
+    const parsed = parse(raw) as Partial<LlamacliConfig>;
+    const config: LlamacliConfig = {
+      ...DEFAULT_CONFIG,
+      ...parsed,
+      compaction: { ...DEFAULT_CONFIG.compaction, ...parsed.compaction },
+    };
+    // Preserve any existing laya block's other knobs; only flip `enabled`.
+    config.laya = { ...(config.laya ?? {}), enabled };
+    await writeFile(configPath(projectRoot), stringify(config), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function loadConfig(
