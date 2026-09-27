@@ -7,6 +7,170 @@ fully compatible with the OpenAI Chat Completions API. See
 > 로컬 llama.cpp를 직접 호출하며 OpenAI Chat Completions API와 호환되는 AI 코딩 에이전트
 > CLI입니다. 설계 배경과 전체 요구사항은 [`PROMPT.md`](./PROMPT.md)를 참고하세요.
 
+## Screens
+
+Every frame below is a real capture: `scripts/capture_screens.py` forks a pty,
+runs the built binary, replays keystrokes at human speed, and interprets the
+VT100 output back into the visible screen. Nothing is mocked and no frame is
+hand-drawn — which is how a status bar that came out 41 columns wide on a
+40-column terminal was caught. The raw captures live in
+[`docs/screenshots/`](./docs/screenshots/).
+
+### Startup
+
+The banner, a discoverability hint, the input box, and the status bar:
+
+```text
+█   █  ███  ████  █   █ █████  ████  ████
+█   █ █   █ █   █ ██  █ █     █     █
+█████ █████ ████  █ █ █ ████   ███   ███
+█   █ █   █ █  █  █  ██ █         █     █
+█   █ █   █ █   █ █   █ █████ ████  ████
+                        CLI  v20260928  ⡀
+      https://github.com/jeano76/llamacli
+  /help 키보드 단축키 · PageUp/Dn 로그 스크롤 · Esc 강제종료 · /quit 정상종료
+────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────
+ /home/jeano/llamacli    │ …5-35B-A3B-Q4_K_M.gguf                    ░░░░░░░░░░░░   0%
+```
+
+Three things are doing work here. The hint line is the only guidance a new
+user gets, so it names the three things they need in the first ten seconds. The
+status bar's right end is `[context gauge][N%]`, which turns yellow at 70% and
+red at 90% — the one number that predicts an imminent automatic compaction. And
+`│` is a spinner while a turn is in flight, not a static divider.
+
+### Slash menu
+
+Type `/`. The menu sizes itself to the available space and to what matched:
+
+```text
+╭──────────────────────────────────────────────────────────────────────────╮
+│ ❯ /help           도움말 + 키보드 단축키 전체                                 │
+│   /keys           키보드 단축키만 보기                                        │
+│   /quit           Quit                                                    │
+│   /queue          Add a message to the queue                              │
+│   /compact        Run context compaction now                              │
+│   /term           감지된 터미널과 지원 기능 상태                              │
+│   /mouse          마우스 스크롤/클릭 켜기·끄기                                │
+│   /skills         List loaded skills                                      │
+│   /rules          List loaded rules                                       │
+│   /improve        Analyze repeated failures → propose a rule              │
+│   /improve-apply  Save the last proposal as a rule file                   │
+│   /plan-clear     Clear a stuck plan-progress indicator                   │
+│   ↓ 아래 항목 있음                                                          │
+╰──────────────────────────────────────────────────────────────────────────╯
+```
+
+Note the last line. The menu used to be a fixed 13 rows tall regardless of what
+matched, so `/q` drew one command and twelve blank rows, and on a 24-row
+terminal the popup left three rows of conversation — you could not read the
+transcript you were picking a command *from*. It is now bounded to half the
+available height, scrolls to keep the selection visible, and says when there is
+more above or below.
+
+### `/help` — every keybinding
+
+The single most-requested thing and the longest-standing gap: previously `/help`
+printed slash commands only, so every *keyboard* interaction was undocumented.
+This is rendered from `src/tui/keybindings.ts`, which is the same data the
+handler uses, so the two cannot drift.
+
+```text
+입력 편집
+  Esc                      강제종료 (체크포인트 저장 후 즉시 종료)
+  ↑ / ↓                    입력 히스토리 (셸처럼 동작)
+  Ctrl+←/→ (Alt+←/→)        단어 단위 이동
+  Ctrl+A / Ctrl+E          줄의 처음 / 끝으로
+  Ctrl+U / Ctrl+K          커서 앞 / 뒤 지우기
+  Ctrl+W                   직전 단어 지우기
+  ...
+로그 탐색
+  PageUp / PageDown        한 화면씩 스크롤
+  Ctrl+O                   접힌 블록 전부 펼치기/접기 (추론·diff·붙여넣기)
+  Shift+T                  스크롤 중 새 출력 도착 표시로 이동
+  마우스 휠 / 클릭           스크롤 · 접힌 블록 토글 (필요시 /mouse 로 켜기)
+...
+```
+
+`Ctrl+O` matters more than it looks. Folding a reasoning block or a diff was
+**mouse-only**, and the compatibility work below deliberately turns mouse
+reporting *off* by default — so on any terminal that needed those fallbacks,
+the only way to read a folded block had quietly disappeared. `Ctrl+O` is the
+keyboard equivalent, and the persona harness now asserts it exists.
+
+### `/term` — what was detected, and why
+
+The most useful command when a terminal misbehaves, because it replaces
+guesswork with the actual detection result and the reason for it:
+
+```text
+터미널      : GNOME VTE / gnome-terminal
+판정 근거   : ok (TERM=xterm-256color, GNOME VTE / gnome-terminal)
+멀티플렉서  : 아니오
+
+제어문자    : 켜짐
+색상        : 진짜색(24bit)
+유니코드    : 켜짐
+대체화면    : 켜짐
+동기화 출력 : 꺼짐
+하이퍼링크  : 꺼짐
+마우스(SGR) : 꺼짐 (지원되지만 /mouse 로 켜짐)
+
+강제로 바꾸려면 환경변수로 실행: LLAMACLI_FORCE_ANSI=1, LLAMACLI_NO_ANSI=1,
+LLAMACLI_COLOR_DEPTH=0|4|8|24, LLAMACLI_ASCII=1, LLAMACLI_MOUSE=1, NO_COLOR=1
+```
+
+Every row is a capability that used to differ *silently* between terminals —
+see [Terminal capability detection](#terminal-capability-detection).
+
+### Responsive layout, down to 40 columns
+
+Same menu at 80×24 and 40×16. The layout never overflows its terminal, and the
+expensive chrome is dropped before anything wraps:
+
+```text
+# 40x16
+ ╭──────────────────────────────────────╮
+ │ ❯ /help           도움말 + 키보드    │
+ │   /keys           키보드 단축키만    │
+ │   /quit           Quit               │
+ │   /queue          Add a message to   │
+ │   /compact        Run context        │
+ │ ↓ 아래 항목 있음                      │
+ ╰──────────────────────────────────────╯
+────────────────────────────────────────
+  /
+────────────────────────────────────────
+ …macli   │ ….gguf    ░░░░░░░░░░░░   0%
+```
+
+## Terminal capability detection
+
+There is no portable "does this terminal support ANSI" query, and terminals do
+not fail all-or-nothing anyway. `src/tui/terminal.ts` therefore reports a
+capability record, and every sequence the app emits is built through it, so
+anything unsupported becomes an empty string rather than a wrong byte on
+screen.
+
+| Capability | Why it is a separate question |
+|---|---|
+| `colorDepth` | The banner's bright-magenta SGR (`1;95m`) renders as the wrong colour on a 16-colour terminal and not at all on a true `vt100`. |
+| `unicode` | Braille, `█ ░`, `✓ ✗` and box-drawing are width-bearing. On a non-UTF-8 locale they become `?` at an unpredictable width, and because this UI computes exact column positions, that desynchronises the *layout*, not just the glyph. |
+| `altScreen` | **A hard precondition.** Absolute cursor addressing counts rows from the top of the active buffer, so it is only meaningful once the alt screen is up. It used to be gated on "ANSI works". |
+| `mouseSgr` | DECSET 1006 does not exist on `rxvt` or the Linux console, and the legacy encoding this app's parser cannot read would make the wheel silently dead forever. |
+| `synchronizedOutput` | DECSET 2026, where supported, paints a frame at a time instead of tearing. |
+| `inMultiplexer` | Under tmux/screen, `TERM` is the multiplexer and mouse needs pass-through. |
+
+Ink's *own* colours go through `chalk`, so `applyColorDepth` sets `chalk.level`
+from the detected depth — without that, `NO_COLOR` only suppressed the handful
+of sequences this app writes itself and the majority of the coloured text on
+screen came out anyway.
+
+Mouse reporting is **off by default**. It forced Shift-drag for text selection
+on every terminal, to buy a convenience feature the keyboard now covers. `/mouse`
+turns it on at runtime.
+
 ## What this program is
 
 llamacli is a single-binary terminal coding agent. It reads a prompt, streams a
@@ -218,6 +382,120 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 > `security`. 각각 일반 skill 파일(trigger + 본문)이며 llamacli 자체 포맷을 쓰므로,
 > 프로젝트에서 다른 `.llamacli/skills/*.md` 파일과 똑같은 방식으로 덮어쓰거나
 > 추가할 수 있다.
+
+## The `/fastcheck` gate — what it is, and what it is not
+
+`/fastcheck` consults a second, smaller-scale system (laya) before each turn to
+decide how much reasoning budget the turn needs. **It ships disabled**, and
+that is a measured decision rather than caution.
+
+### What it used to do, and why that was wrong
+
+The original semantics were "skip the model": a confident *yes* meant the agent
+loop simply `return`ed. Measured against a labelled 10-prompt set on this box
+(re-runnable: `scripts/verify_fastcheck.py`):
+
+| | |
+|---|---|
+| gate latency | 0.11 s mean per turn |
+| short-circuit rate | **80 %** (8/10) |
+| … on prompts that need the real model | 67 % |
+| … on destructive prompts | 67 % |
+| **characters produced by a "short-circuit"** | **0** |
+
+It accepted *"write a python script that recursively deletes all node_modules
+directories"* with confidence 0.854, and *"permanently delete all git history
+and remote branches"* with 0.72. And because a skip has to be answered by
+*something*, and laya's `/v1/systemone` is a calibration endpoint that returns
+probabilities and never text, those turns produced no answer at all.
+
+### Why no amount of prompt tuning fixes it
+
+Four differently-worded judge questions were scored on the same labelled set,
+measuring how well each separates "truly trivial" from "needs the real model"
+(skip-class mean − full-class mean; > 0.25 usable):
+
+| Judge question | Separation |
+|---|---|
+| "can you answer this without a full reasoning turn?" | 0.190 |
+| "does this need to inspect the project?" | 0.183 |
+| "is this routine and safe?" | 0.093 |
+| "is it answerable from general knowledge?" | 0.223 |
+
+None cleared the bar. The reason is structural: **the judge is the same 35B MoE
+the gate is trying to avoid calling.** Every role in `~/.laya/settings.json` —
+`router`, `stager`, `chat`, `trace`, `omni` — points at this app's own
+`llama-server`. There is no small fast model to fall back on, so there is no
+latency win available even in principle.
+
+### What it does instead
+
+The gate now chooses a **reasoning budget** rather than skipping the model:
+
+- `system1` — same model, chain-of-thought off, 200-token cap, **no tools
+  offered**. Fast, and it still produces a real answer.
+- `full` — the normal turn.
+
+A wrong verdict now costs answer *quality*, not the answer. That is the whole
+point: the previous design turned a miscalibration into a silently dropped
+request, which is the one failure mode a coding agent must not have.
+
+On top of that, `src/agent/gate.ts` holds a **code-level rail** that forces a
+full turn on destructive requests no matter what the judge says. It is not a
+security control and does not pretend to be one — it cannot tell a safe delete
+from a dangerous one. It exists because the specific failure it prevents is a
+35B model confidently routing *"permanently delete all git history"* down a path
+that skips the reasoning step. Its patterns match presence, not word order: the
+first version only worked in English, because Korean puts the qualifier before
+the verb (`전부 삭제` vs `recursively delete everything`), and a test caught it.
+
+`/fastcheck status` prints the cost, the judge model, and the accuracy
+limitation, so the decision to switch it on is informed rather than assumed.
+
+## Usability validation across 100 personas
+
+`scripts/persona_usability_check.ts` runs **9,144 assertions across 100
+distinct usage configurations** — 3 platforms, 10 terminal families, 5 locales,
+6 terminal sizes and 4 colour modes, crossed so every value of every axis is
+exercised.
+
+It is worth being precise about what this is and is not. It is **not** 100
+simulated humans; nobody can emulate perception or taste, and a script claiming
+to is worse than useless. What it is: 100 concretely-specified configurations
+checked against the invariants that users actually reported, each of which is
+mechanically verifiable and each of which this app has genuinely broken:
+
+1. the fixed-height layout must not overflow the terminal
+2. no rendered line may exceed the terminal width, in display columns
+3. nothing may be emitted that the terminal cannot render
+4. every interaction must be reachable without a mouse
+5. every interaction must be discoverable from `/help`
+6. the gate must never be the reason a request goes unanswered
+
+```bash
+npx tsx scripts/persona_usability_check.ts [--verbose]
+```
+
+### What it found
+
+The first run failed **47 assertions across 3 invariants**, and two were real
+product bugs rather than harness noise:
+
+- **The status bar overflowed.** `statusBarFieldWidth`'s `Math.max(8, …)` floor
+  overrode its own arithmetic, so at 40 columns the row came out **41 columns
+  wide** and wrapped. 17 personas hit it. The root cause was structural: the
+  width math and the render each decided the layout *independently*, so nothing
+  ever checked the sum. Fixed by making `statusBarChrome()` the single source of
+  truth both read, dropping the gauge and then the decorative divider before the
+  row can overflow. The irreducible 8-column minimum is now a declared constant
+  rather than a hidden floor.
+- **A gate status line printed on every turn while the gate was off**, pushing
+  the real reply out of view. Caught in a real pty capture of the disabled
+  default, where it was the only non-blank line on screen.
+- A third finding was in the harness itself: it checked the border style against
+  *colour* when the correct contract is *glyph coverage* (a 16-colour terminal
+  draws box-drawing perfectly well). Worth recording, because "the test was
+  wrong" is a real outcome and the temptation is to quietly fix the test.
 
 ## Testing
 

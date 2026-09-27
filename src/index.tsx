@@ -787,7 +787,7 @@ async function main() {
                 `대체화면    : ${onOff(caps.altScreen)}`,
                 `동기화 출력 : ${onOff(caps.synchronizedOutput)}`,
                 `하이퍼링크  : ${onOff(caps.hyperlink)}`,
-                `마우스(SGR) : ${caps.mouse ? "켜짐" : caps.mouseSgr ? "꺼짐 (支持되지만 /mouse 로 켜짐)" : "꺼짐 (이 터미널 미지원)"}`,
+                `마우스(SGR) : ${caps.mouse ? "켜짐" : caps.mouseSgr ? "꺼짐 (지원되지만 /mouse 로 켜짐)" : "꺼짐 (이 터미널 미지원)"}`,
                 "",
                 "강제로 바꾸려면 환경변수로 실행: LLAMACLI_FORCE_ANSI=1, LLAMACLI_NO_ANSI=1,",
                 "LLAMACLI_COLOR_DEPTH=0|4|8|24, LLAMACLI_ASCII=1, LLAMACLI_MOUSE=1, NO_COLOR=1",

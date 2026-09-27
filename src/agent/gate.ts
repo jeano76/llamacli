@@ -158,6 +158,8 @@ export function decideGate(input: {
     };
   }
   if (!input.judgeEnabled) {
+    // Reason is still populated (callers and tests may want it) but callers
+    // MUST NOT print it when the gate didn't run — see AgentLoop's use.
     return { mode: "full", reason: "gate: 꺼짐 — 전체 턴", conf: input.conf, forced: false, matched };
   }
   if (input.judgeSaysCheap) {

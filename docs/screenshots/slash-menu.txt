@@ -1,0 +1,30 @@
+    █  ███  ████  █   █ █████  ████  ████
+█   █ █   █ █   █ ██  █ █     █     █
+█████ █████ ████  █ █ █ ████   ███   ███
+█   █ █   █ █  █  █  ██ █         █     █
+█   █ █   █ █   █ █   █ █████ ████  ████
+                        CLI  v20260928  ⡀
+      https://github.com/jeano76/llamacli
+  /help 키보드 단축키 · PageUp/Dn 로그 스크롤 · Esc 강제종료 · /quit 정상종료
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ❯ /help           도움말 + 키보드 단축키 전체                                                    │
+│   /keys           키보드 단축키만 보기                                                           │
+│   /quit           Quit                                                                           │
+│   /queue          Add a message to the queue                                                     │
+│   /compact        Run context compaction now                                                     │
+│   /term           감지된 터미널과 지원 기능 상태                                                 │
+│   /mouse          마우스 스크롤/클릭 켜기·끄기                                                   │
+│   /skills         List loaded skills                                                             │
+│   /rules          List loaded rules                                                              │
+│   /improve        Analyze repeated failures → propose a rule                                     │
+│   /improve-apply  Save the last proposal as a rule file                                          │
+│   /plan-clear     Clear a stuck plan-progress indicator                                          │
+│   ↓ 아래 항목 있음                                                                               │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  /
+────────────────────────────────────────────────────────────────────────────────────────────���─────
+ /home/jeano/llamacli    │ …5-35B-A3B-Q4_K_M.gguf                                 ░░░░░░░░░░░░   0%
+
+
+█

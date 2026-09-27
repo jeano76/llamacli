@@ -10,6 +10,8 @@ import {
   formatScrollIndicator,
   hasRoomForScrollSlot,
   renderGauge,
+  statusBarChrome,
+  MIN_VIABLE_COLUMNS,
   SCROLL_INDICATOR_WIDTH,
 } from "./StatusBar.js";
 import { tailToWidth } from "./textWidth.js";
@@ -160,8 +162,61 @@ test("formatPlanProgress falls back to blank instead of overflowing the reserved
   assert.equal(formatPlanProgress({ done: 1000, total: 2000 }), "");
 });
 
-test("statusBarFieldWidth has a sane floor even on a very narrow terminal", () => {
-  assert.ok(statusBarFieldWidth(20) >= 8);
+test("statusBarFieldWidth never returns zero, and never overflows the row", () => {
+  // The floor used to be 8. It existed to avoid showing a useless stub, but
+  // it silently overrode the arithmetic: at 40 columns the bar budgeted 7 per
+  // field and the floor forced 8, making the row 41 columns wide — i.e. it
+  // wrapped, which is the one thing this whole file exists to prevent. Found
+  // by scripts/persona_usability_check.ts across 17 of 100 personas.
+  //
+  // The contract is now: always at least 1, and the total always fits.
+  for (const columns of [MIN_VIABLE_COLUMNS, 10, 20, 30, 40, 50, 80, 120, 200]) {
+    const fw = statusBarFieldWidth(columns);
+    assert.ok(fw >= 1, `columns=${columns} fieldWidth=${fw}`);
+    const c = statusBarChrome(columns);
+    let total = 2 + 4 + fw * 2;
+    if (c.divider) total += 2;
+    if (c.gauge) total += 12;
+    if (c.percent) total += 5;
+    if (c.plan) total += 8;
+    if (c.compaction) total += 11;
+    if (c.scroll) total += 1 + SCROLL_INDICATOR_WIDTH;
+    assert.ok(
+      total <= Math.max(columns, MIN_VIABLE_COLUMNS),
+      `columns=${columns} total=${total} (chrome ${JSON.stringify(c)})`
+    );
+  }
+});
+
+test("the expensive chrome is dropped before the row can overflow", () => {
+  // 17 columns of gauge + percentage cannot coexist with two readable fields
+  // on a 40-column terminal, so the gauge goes first; the decorative divider
+  // goes before that.
+  assert.equal(statusBarChrome(40).gauge, true);
+  assert.equal(statusBarChrome(33).gauge, false);
+  assert.equal(statusBarChrome(33).percent, false);
+  assert.equal(statusBarChrome(20).divider, true);
+  assert.equal(statusBarChrome(19).divider, false);
+  // …and cwd/model get the reclaimed space instead of the row overflowing.
+  assert.ok(statusBarFieldWidth(30) > statusBarFieldWidth(40) - 1);
+});
+
+test("statusBarFieldWidth and the chrome record cannot disagree", () => {
+  // The original bug was the two sides computing the layout independently.
+  // A regression guard: whatever statusBarChrome says is dropped, the width
+  // math must actually account for, at every width.
+  for (const columns of [10, 19, 20, 33, 34, 59, 60, 71, 72, 79, 80, 200]) {
+    const c = statusBarChrome(columns);
+    const fw = statusBarFieldWidth(columns);
+    let total = 2 + 4 + fw * 2;
+    if (c.divider) total += 2;
+    if (c.gauge) total += 12;
+    if (c.percent) total += 5;
+    if (c.plan) total += 8;
+    if (c.compaction) total += 11;
+    if (c.scroll) total += 1 + SCROLL_INDICATOR_WIDTH;
+    assert.ok(total <= Math.max(columns, MIN_VIABLE_COLUMNS), `columns=${columns} total=${total}`);
+  }
 });
 
 test("a long cwd/model combination truncates to fit within the budgeted field width", () => {
@@ -177,4 +232,26 @@ test("a long cwd/model combination truncates to fit within the budgeted field wi
   assert.ok(stringWidth(truncatedModel) <= fieldWidth);
   // the most useful part (the tail) survives truncation
   assert.ok(truncatedModel.endsWith("Ornith-1.5-35B-Q4_K_M.gguf") || truncatedModel === longModel);
+});
+
+test("below the bar's own minimum it clips, and that is stated rather than accidental", () => {
+  // 2 paddingX + 4 gaps + 1+1 fields is irreducible, so a 5-column terminal
+  // cannot show the bar at all. That is a property of the terminal, not a bug
+  // in the layout — but it has to be a DECLARED floor, otherwise a test that
+  // quietly skipped these widths would have let the real 40-column overflow
+  // through (which is exactly what happened).
+  assert.equal(MIN_VIABLE_COLUMNS, 8);
+  for (const columns of [1, 2, 3, 5, 7]) {
+    assert.ok(statusBarFieldWidth(columns) >= 1, `columns=${columns}`);
+  }
+  // …and the first width that actually fits must fit exactly.
+  const c = statusBarChrome(MIN_VIABLE_COLUMNS);
+  let total = MIN_VIABLE_COLUMNS;
+  if (c.divider) total += 2;
+  if (c.gauge) total += 12;
+  if (c.percent) total += 5;
+  if (c.plan) total += 8;
+  if (c.compaction) total += 11;
+  if (c.scroll) total += 1 + SCROLL_INDICATOR_WIDTH;
+  assert.ok(total <= MIN_VIABLE_COLUMNS, `the declared minimum must be viable: ${total}`);
 });

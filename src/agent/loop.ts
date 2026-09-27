@@ -608,10 +608,12 @@ export class AgentLoop {
         text: userText,
         judgeEnabled: Boolean(gateResult),
       });
-      // Always surface the verdict. A turn that got a cheaper budget than the
-      // user expected, and wasn't told, is exactly the silent surprise this
-      // line exists to prevent.
-      this.opts.onStatus?.(decision.reason);
+      // Surface the verdict, but ONLY when the gate actually ran. When it is
+      // switched off, "gate: 꺼짐 — 전체 턴" on every single turn is pure
+      // noise — caught in a real pty capture of the disabled default, where
+      // it was the one non-blank line on screen and pushed the actual reply
+      // out of view. Silence is the correct output for a feature that is off.
+      if (gateResult) this.opts.onStatus?.(decision.reason);
       if (decision.forced) {
         this.opts.onGateVerdict?.({ ...gateResult, verdict: "forced-full" });
       }

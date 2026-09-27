@@ -160,21 +160,94 @@ function gaugeColor(ratio: number): string {
   return "green";
 }
 
-/** Budgets the width available for cwd/model (after padding + the gauge +
- *  " 100%") evenly between the two, so each can be truncated to its tail
- *  and the row can never wrap onto a second line no matter how long a real
- *  path/model id gets. */
+/**
+ * Which parts of the bar fit at this terminal width.
+ *
+ * This is the single source of truth for the bar's chrome: BOTH the width
+ * arithmetic (`statusBarFieldWidth`) and the render (`StatusBar`) read it.
+ * They used to each work it out independently, which is how the row ended up
+ * 41 columns wide on a 40-column terminal - the width math's `Math.max(8, ...)`
+ * floor pushed the total past the edge, and nothing caught it because only
+ * the math knew what the parts were. Found by
+ * scripts/persona_usability_check.ts across 17 of 100 personas.
+ *
+ * Every part is dropped or kept WHOLE rather than truncated, so the bar can
+ * never be left half-drawn.
+ */
+export interface StatusBarChrome {
+  /** The "N/M" plan-progress slot. */
+  plan: boolean;
+  /** The checkmark/cross + "HH:MM:SS" compaction slot. */
+  compaction: boolean;
+  /** The caret + "N/M" scroll-position slot. */
+  scroll: boolean;
+  /** The 12-cell context gauge. */
+  gauge: boolean;
+  /** The " NN%" figure beside the gauge. */
+  percent: boolean;
+  /** The vertical-bar / spinner between cwd and model. Purely decorative, so
+   *  it is the first thing to go when space runs out. */
+  divider: boolean;
+}
+
+/** Below this the 12-cell gauge and its percentage go. Together they are the
+ *  most expensive non-essential thing on the row (17 columns), and a
+ *  40-column terminal cannot hold them plus two readable fields. */
+export const MIN_COLUMNS_FOR_GAUGE = 34;
+/** Below this the decorative divider goes. */
+export const MIN_COLUMNS_FOR_DIVIDER = 20;
+
+/**
+ * The narrowest terminal this bar can be drawn in at all: 2 columns of
+ * paddingX, 4 of inter-field gaps, and 1 column for each of cwd and model.
+ * Below this the floor in `statusBarFieldWidth` is what makes the total
+ * exceed the terminal, and the `overflow="hidden"` Box clips it.
+ *
+ * Stated rather than hidden, because "the row is one column too wide" is a
+ * bug and "the terminal is 5 columns wide" is not — and a test that quietly
+ * excluded those widths would have let the real 40-column overflow through.
+ * Measured minimum real-world terminal is ~20 columns.
+ */
+export const MIN_VIABLE_COLUMNS = 8;
+
+export function statusBarChrome(columns: number): StatusBarChrome {
+  return {
+    plan: hasRoomForPlanSlot(columns),
+    compaction: hasRoomForCompactionSlot(columns),
+    scroll: hasRoomForScrollSlot(columns),
+    gauge: columns >= MIN_COLUMNS_FOR_GAUGE,
+    percent: columns >= MIN_COLUMNS_FOR_GAUGE,
+    divider: columns >= MIN_COLUMNS_FOR_DIVIDER,
+  };
+}
+
+/**
+ * Budgets the width available for cwd/model (everything else the bar draws)
+ * evenly between the two, so each can be truncated to its tail and the row
+ * can never wrap onto a second line no matter how long a real path/model id
+ * gets.
+ *
+ * The floor is 1, not 8. The 8-column floor was a "don't show a useless stub"
+ * guard, but it silently overrode this arithmetic on narrow terminals and
+ * overflowed the row - the exact failure every other comment in this file
+ * exists to prevent. Where there genuinely isn't room for a meaningful field,
+ * a 1-column tail the Box clips is the lesser evil; callers that need to
+ * branch on that can check `columns` directly.
+ */
 export function statusBarFieldWidth(columns: number): number {
-  const planSlotWidth = hasRoomForPlanSlot(columns) ? 1 /* space before it */ + PLAN_PROGRESS_WIDTH : 0;
-  const compactionSlotWidth = hasRoomForCompactionSlot(columns) ? 1 /* space before it */ + COMPACTION_STATUS_WIDTH : 0;
-  // The scroll slot is budgeted unconditionally (its content appears only
-  // while scrolled) for the same reason the plan slot is: a bar whose total
-  // width changes the moment you press PageUp is the exact "this row wraps"
-  // failure the rest of this fixed-width layout exists to prevent.
-  const scrollSlotWidth = hasRoomForScrollSlot(columns) ? 1 /* space before it */ + SCROLL_INDICATOR_WIDTH : 0;
-  // 2 paddingX + 2 "│ " + gauge + " 100%" + slots + inter-field gaps (4)
-  const fixedWidth = 2 /* paddingX */ + 2 /* "│ " */ + GAUGE_WIDTH + 5 /* " 100%" */ + planSlotWidth + compactionSlotWidth + scrollSlotWidth + 4 /* inter-field gaps */;
-  return Math.max(8, Math.floor((columns - fixedWidth) / 2));
+  const c = statusBarChrome(columns);
+  // 2 paddingX + 4 inter-field gaps + 1 column minimum per field.
+  let fixedWidth = MIN_VIABLE_COLUMNS;
+  if (c.divider) fixedWidth += 2;
+  if (c.gauge) fixedWidth += GAUGE_WIDTH;
+  if (c.percent) fixedWidth += 5; /* " 100%", padded from the real value */
+  if (c.plan) fixedWidth += 1 + PLAN_PROGRESS_WIDTH;
+  if (c.compaction) fixedWidth += 1 + COMPACTION_STATUS_WIDTH;
+  // Budgeted whenever the slot is present, whether or not it has content - a
+  // bar whose total width changes the instant you press PageUp is the "this
+  // row wraps" failure this layout exists to prevent.
+  if (c.scroll) fixedWidth += 1 + SCROLL_INDICATOR_WIDTH;
+  return Math.max(1, Math.floor((columns - fixedWidth) / 2));
 }
 
 /** Formats the "N/M" text for the fixed-width slot, or "" for no active
@@ -189,6 +262,11 @@ export function formatPlanProgress(planProgress: { done: number; total: number }
 }
 
 export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns, busy, unicode, scroll }: StatusBarProps) {
+  // Read the SAME chrome record statusBarFieldWidth budgeted against. Drawing
+  // from a second, independent set of width tests is precisely the bug that
+  // put this row 41 columns wide on a 40-column terminal: the math dropped
+  // the gauge, the render drew it, and the row wrapped.
+  const chrome = statusBarChrome(columns);
   const fieldWidth = statusBarFieldWidth(columns);
   const planText = formatPlanProgress(planProgress);
   const compactionText = formatCompactionStatus(compactionStatus, unicode);
@@ -209,12 +287,12 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
         <Text dimColor>{tailToWidth(cwd, fieldWidth)}</Text>
       </Text>
       <Text>
-        {busy ? <Spinner active /> : <Text dimColor>{divider}</Text>}
-        <Text> </Text>
+        {chrome.divider && (busy ? <Spinner active /> : <Text dimColor>{divider}</Text>)}
+        {chrome.divider && <Text> </Text>}
         <Text color="cyan">{tailToWidth(model, fieldWidth)}</Text>
       </Text>
       <Box>
-        {hasRoomForPlanSlot(columns) && (
+        {chrome.plan && (
           <>
             <Text color={planText ? "cyan" : undefined} dimColor={!planText}>
               {planText ? planText.padStart(PLAN_PROGRESS_WIDTH) : "".padStart(PLAN_PROGRESS_WIDTH)}
@@ -222,7 +300,7 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
             <Text> </Text>
           </>
         )}
-        {hasRoomForCompactionSlot(columns) && (
+        {chrome.compaction && (
           <>
             <Text color={compactionText ? compactionColor : undefined} dimColor={!compactionText}>
               {compactionText.padStart(COMPACTION_STATUS_WIDTH)}
@@ -230,7 +308,7 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
             <Text> </Text>
           </>
         )}
-        {hasRoomForScrollSlot(columns) && (
+        {chrome.scroll && (
           <>
             <Text color={scrollText ? "yellow" : undefined} dimColor={!scrollText}>
               {scrollText.padStart(SCROLL_INDICATOR_WIDTH)}
@@ -238,8 +316,8 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
             <Text> </Text>
           </>
         )}
-        <Text color={gaugeColor(contextUsedRatio)}>{renderGauge(contextUsedRatio, unicode)}</Text>
-        <Text dimColor>{percentText}</Text>
+        {chrome.gauge && <Text color={gaugeColor(contextUsedRatio)}>{renderGauge(contextUsedRatio, unicode)}</Text>}
+        {chrome.percent && <Text dimColor>{percentText}</Text>}
       </Box>
     </Box>
   );

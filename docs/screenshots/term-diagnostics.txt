@@ -1,0 +1,25 @@
+        ████ █████ ████  █ █ █ ████   ███   ███
+█   █ █   █ █  █  █  ██ █         █     █
+█   █ █   █ █   █ █   █ █████ ████  ████
+                        CLI  v20260928  ⡀
+      https://github.com/jeano76/llamacli
+  /help 키보드 단축키 · PageUp/Dn 로그 스크롤 · Esc 강제종료 · /quit 정상종료
+터미널      : GNOME VTE / gnome-terminal
+판정 근거   : ok (TERM=xterm-256color, GNOME VTE / gnome-terminal)
+TERM        : xterm-256color
+멀티플렉서  : 아니오
+
+제어문자    : 켜짐
+색상        : 진짜색(24bit)
+유니코드    : 켜짐
+대체화면    : 켜짐
+동기화 출력 : 꺼짐
+하이퍼링크  : 꺼짐
+마우스(SGR) : 꺼짐 (支持되지만 /mouse 로 켜짐)
+
+강제로 바꾸려면 환경변수로 실행: LLAMACLI_FORCE_ANSI=1, LLAMACLI_NO_ANSI=1,
+LLAMACLI_COLOR_DEPTH=0|4|8|24, LLAMACLI_ASCII=1, LLAMACLI_MOUSE=1, NO_COLOR=1
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ /home/jeano/llamacli    │ …5-35B-A3B-Q4_K_M.gguf                                 ░░░░░░░░░░░░   0%
