@@ -1289,14 +1289,29 @@ export function App({
       return;
     }
     if (key.backspace || key.delete) {
-      // A pasted block is one atomic unit to delete, not one character at
-      // a time — see pasteChip.ts's doc comment. That shortcut only applies
-      // right at the end of the placeholder text, i.e. when the cursor sits
-      // immediately after it (backspace) — with an interior cursor now
-      // possible, every other position falls through to a plain single-
-      // character delete around cursorPos.
+      // Reported directly: backspace stopped doing anything once left/right
+      // arrow landed. Root cause — on a real terminal the physical Backspace
+      // key sends \x7f (DEL), which Ink's own parser (parse-keypress.js)
+      // names "delete", NOT "backspace" (key.backspace only ever fires for
+      // literal \b / Ctrl+H, which basically nothing sends). Splitting
+      // backspace/delete into "remove before cursor" vs "remove after
+      // cursor" therefore routed the everyday Backspace key into the
+      // "after cursor" branch, which is a no-op whenever the cursor sits at
+      // the end of the input (the overwhelmingly common case while typing).
+      // There is no reliable signal in Ink's key object to tell a real
+      // forward-Delete key apart from this — both key.backspace and
+      // key.delete already meant the exact same "remove the last character"
+      // before interior cursor support existed, so keep treating them
+      // identically now (delete BEFORE the cursor) rather than inventing a
+      // forward-delete split Ink can't actually distinguish.
+      //
+      // A pasted block is one atomic unit to delete, not one character at a
+      // time — see pasteChip.ts's doc comment. That shortcut only applies
+      // right at the end of the placeholder text (cursor sits immediately
+      // after it); anywhere else falls through to a plain single-character
+      // delete before cursorPos.
       const trailingPlaceholder =
-        key.backspace && cursorPos === input.length ? findTrailingPlaceholder(input, pastedBlocks) : undefined;
+        cursorPos === input.length ? findTrailingPlaceholder(input, pastedBlocks) : undefined;
       if (trailingPlaceholder) {
         setInput((s) => s.slice(0, s.length - trailingPlaceholder.length));
         setCursorPos((p) => Math.max(0, p - trailingPlaceholder.length));
@@ -1305,13 +1320,10 @@ export function App({
           next.delete(trailingPlaceholder);
           return next;
         });
-      } else if (key.backspace) {
+      } else {
         if (cursorPos === 0) return; // nothing before the cursor
         setInput((s) => s.slice(0, cursorPos - 1) + s.slice(cursorPos));
         setCursorPos((p) => p - 1);
-      } else {
-        if (cursorPos >= input.length) return; // nothing after the cursor
-        setInput((s) => s.slice(0, cursorPos) + s.slice(cursorPos + 1));
       }
       return;
     }
