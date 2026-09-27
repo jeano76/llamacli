@@ -270,7 +270,15 @@ def resource_gate_ok(cfg: dict) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 
 def endpoint(cfg: dict) -> str:
-    base = cfg.get("baseUrl") or "http://127.0.0.1:8000"
+    # Must agree with scripts/laya_integration.py's endpoint() default
+    # (LAYA_ENDPOINT, default 8099) — these are two independent scripts that
+    # each boot their own laya-serve if none is healthy on the port they
+    # check. Before this fix they disagreed (8000 here vs 8099 there), so
+    # BOTH ended up running their own separate server permanently, each
+    # holding ~5GB RAM for the same model. Confirmed live: 하나는 8000,
+    # 하나는 8099. Sharing this default lets whichever script runs first win;
+    # the other then just finds it healthy and reuses it.
+    base = cfg.get("baseUrl") or f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}"
     if not base.startswith(("http://", "https://")):
         base = "http://" + base
     return base.rstrip("/")
@@ -363,7 +371,7 @@ def start_laya(cfg: dict) -> tuple[subprocess.Popen, int]:
     python = venv_python_path()
     if not python or not python.exists():
         raise RuntimeError("laya venv not found; run `onboard` first")
-    port = int(cfg.get("port", 8000))
+    port = int(cfg.get("port") or os.environ.get("LAYA_ENDPOINT", "8099"))
 
     env = dict(os.environ)
     env["LAYA_PORT"] = str(port)
