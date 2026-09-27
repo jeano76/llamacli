@@ -259,3 +259,78 @@ test("checkAndApplyUpdate never calls onUpdateFound when the manifest fetch itse
     assert.equal(result.updated, false);
     assert.equal(fired, false);
   }));
+
+// ── the opt-out ─────────────────────────────────────────────────────────────
+// Added after the updater silently replaced a local `npm run build` during
+// terminal-compatibility testing: it downloads the published archive straight
+// over dist/, so you end up testing the published binary and believing you
+// tested your change, with no way to stop it.
+
+test("LLAMACLI_NO_UPDATE=1 disables the check entirely — no fetch, no write", async () => {
+  await withTempDir(async (dir) => {
+    // A fetchImpl that throws if called at all: the opt-out has to be
+    // absolute, not merely "skip the install step".
+    const boom = (async () => {
+      throw new Error("network must not be touched when self-update is disabled");
+    }) as unknown as typeof fetch;
+    const result = await checkAndApplyUpdate(dir, {
+      fetchImpl: boom,
+      env: { LLAMACLI_NO_UPDATE: "1" },
+    });
+    assert.equal(result.updated, false);
+    assert.match(result.reason, /LLAMACLI_NO_UPDATE/);
+  });
+});
+
+test("the update URLs are overridable from the environment", async () => {
+  await withTempDir(async (dir) => {
+    // A real tar.gz of a dist tree, so the install path actually runs and
+    // the archive fetch is reached. The manifest's sha256 has to be the real
+    // one or the install correctly bails on a hash mismatch before fetching.
+    const stage = join(dir, "staged");
+    await mkdir(join(stage, "tui"), { recursive: true });
+    await writeFile(join(stage, "index.js"), "console.log('new')\n");
+    await writeFile(join(stage, "tui", "App.js"), "export const x = 1;\n");
+    const tgz = join(dir, "arch.tar.gz");
+    await execFileAsync("tar", ["-czf", tgz, "-C", stage, "."]);
+    const bytes = await readFile(tgz);
+    const sha = createHash("sha256").update(bytes).digest("hex");
+
+    // A local build hash is required before the archive is even fetched
+    // (that comparison is the whole "is there an update" decision), so the
+    // dist dir needs one that differs from the manifest's.
+    await writeFile(join(dir, LOCAL_HASH_FILE), "0000");
+
+    const archiveUrl = "https://example.invalid/arch.tar.gz";
+    const manifestUrl = "https://example.invalid/manifest.json";
+    const seen: string[] = [];
+    const fetchImpl = (async (u: any) => {
+      seen.push(String(u));
+      if (String(u) === manifestUrl) {
+        return new Response(JSON.stringify({ version: "v9", sha256: sha }), { status: 200 });
+      }
+      return new Response(bytes, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const result = await checkAndApplyUpdate(dir, {
+      fetchImpl,
+      env: { LLAMACLI_UPDATE_MANIFEST_URL: manifestUrl, LLAMACLI_UPDATE_ARCHIVE_URL: archiveUrl },
+    });
+    assert.ok(seen.includes(manifestUrl), "should have fetched the overridden manifest URL");
+    assert.ok(seen.includes(archiveUrl), "should have fetched the overridden archive URL");
+    assert.equal(result.updated, true, `install did not complete: ${result.reason}`);
+  });
+});
+
+test("with no opt-out set, the default URLs are still used", async () => {
+  await withTempDir(async (dir) => {
+    const seen: string[] = [];
+    const fetchImpl = (async (u: any) => {
+      seen.push(String(u));
+      return new Response("nope", { status: 404 });
+    }) as unknown as typeof fetch;
+    await checkAndApplyUpdate(dir, { fetchImpl, env: {} });
+    assert.equal(seen.length, 1);
+    assert.match(seen[0], /manifest\.json$/);
+  });
+});

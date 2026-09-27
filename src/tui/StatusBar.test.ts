@@ -7,19 +7,40 @@ import {
   hasRoomForPlanSlot,
   formatCompactionStatus,
   hasRoomForCompactionSlot,
+  formatScrollIndicator,
+  hasRoomForScrollSlot,
+  renderGauge,
+  SCROLL_INDICATOR_WIDTH,
 } from "./StatusBar.js";
 import { tailToWidth } from "./textWidth.js";
 
-test("statusBarFieldWidth never lets cwd+model+gauge(+plan-progress+compaction-status, when shown) exceed the terminal width", () => {
-  for (const columns of [40, 60, 80, 100, 120, 200]) {
+test("statusBarFieldWidth never lets cwd+model+gauge(+plan-progress+compaction-status+scroll, when shown) exceed the terminal width", () => {
+  for (const columns of [40, 60, 72, 80, 100, 120, 200]) {
     const fieldWidth = statusBarFieldWidth(columns);
     const planSlot = hasRoomForPlanSlot(columns) ? 7 + 1 : 0; // slot + its leading space
     const compactionSlot = hasRoomForCompactionSlot(columns) ? 10 + 1 : 0; // slot + its leading space
+    const scrollSlot = hasRoomForScrollSlot(columns) ? SCROLL_INDICATOR_WIDTH + 1 : 0; // slot + its leading space
     // Simulate the worst case: both fields maxed out at fieldWidth.
     const totalUsed =
-      2 /* paddingX */ + 2 /* "│ " */ + fieldWidth + fieldWidth + planSlot + compactionSlot + 12 /* gauge */ + 5 /* " 100%" */ + 4 /* gaps */;
+      2 /* paddingX */ + 2 /* "│ " */ + fieldWidth + fieldWidth + planSlot + compactionSlot + scrollSlot + 12 /* gauge */ + 5 /* " 100%" */ + 4 /* gaps */;
     assert.ok(totalUsed <= columns + 4, `columns=${columns}, fieldWidth=${fieldWidth}, totalUsed=${totalUsed}`);
   }
+});
+
+// The scroll slot is budgeted unconditionally (content appears only while
+// scrolled). That's the point: a bar that changes width the instant you
+// press PageUp is the "this row wraps" failure the rest of the layout
+// exists to prevent.
+test("the scroll slot is width-budgeted even when nothing is scrolled", () => {
+  const withSlot = statusBarFieldWidth(200);
+  const wouldBeWithout = (() => {
+    // Recompute what the old budget (no scroll slot) would have produced.
+    const planSlot = hasRoomForPlanSlot(200) ? 8 : 0;
+    const compactionSlot = hasRoomForCompactionSlot(200) ? 11 : 0;
+    const fixed = 2 + 2 + 12 + 5 + planSlot + compactionSlot + 4;
+    return Math.max(8, Math.floor((200 - fixed) / 2));
+  })();
+  assert.ok(withSlot < wouldBeWithout, `expected the scroll slot to consume budget: ${withSlot} vs ${wouldBeWithout}`);
 });
 
 // Caught directly by the test above before this existed: reserving the
@@ -55,6 +76,70 @@ test("formatCompactionStatus shows a checkmark and the real time-of-day on succe
 
 test("formatCompactionStatus shows a cross and the real time-of-day on failure", () => {
   assert.equal(formatCompactionStatus({ state: "failed", timestamp: "2026-09-18T09:05:00.000Z" }), "✗ 09:05:00");
+});
+
+test("formatCompactionStatus falls back to a one-column ASCII mark, keeping the same total width", () => {
+  // The width is the constraint, not the glyph: a two-column fallback would
+  // push the gauge past the terminal width and wrap the row.
+  const uni = formatCompactionStatus({ state: "complete", timestamp: "2026-09-18T18:01:31.059Z" }, true);
+  const ascii = formatCompactionStatus({ state: "complete", timestamp: "2026-09-18T18:01:31.059Z" }, false);
+  assert.equal(ascii, "+ 18:01:31");
+  assert.equal(stringWidth(ascii), stringWidth(uni));
+  assert.equal(
+    stringWidth(formatCompactionStatus({ state: "failed", timestamp: "2026-09-18T09:05:00.000Z" }, false)),
+    stringWidth(formatCompactionStatus({ state: "failed", timestamp: "2026-09-18T09:05:00.000Z" }, true))
+  );
+});
+
+// ── context gauge glyph fallback ────────────────────────────────────────────
+
+test("renderGauge produces the same width with and without block glyphs", () => {
+  // `█`/`░` are U+2588/U+2591. On a terminal without block coverage they
+  // become `?` at an unpredictable width, which desynchronizes this fixed
+  // one-row bar — so the ASCII form must be exactly as wide.
+  for (const ratio of [0, 0.13, 0.5, 0.87, 1, 1.4]) {
+    assert.equal(stringWidth(renderGauge(ratio, true)), stringWidth(renderGauge(ratio, false)));
+    assert.equal(stringWidth(renderGauge(ratio, false)), 12);
+  }
+});
+
+test("renderGauge clamps out-of-range ratios instead of overflowing", () => {
+  assert.equal(renderGauge(-1, false), renderGauge(0, false));
+  assert.equal(renderGauge(5, false), renderGauge(1, false));
+});
+
+// ── scroll indicator ────────────────────────────────────────────────────────
+
+test("the scroll slot is hidden on terminals too narrow to show it", () => {
+  assert.equal(hasRoomForScrollSlot(40), false);
+  assert.equal(hasRoomForScrollSlot(71), false);
+  assert.equal(hasRoomForScrollSlot(72), true);
+});
+
+test("formatScrollIndicator is blank when pinned to the bottom", () => {
+  // Blank-when-idle is deliberate: the slot is already width-budgeted, so
+  // nothing reflows when the user starts or stops scrolling.
+  assert.equal(formatScrollIndicator({ offset: 0, max: 40 }, "▲", true), "");
+  assert.equal(formatScrollIndicator(null, "▲", true), "");
+});
+
+test("formatScrollIndicator shows rows-back / rows-available, padded to the reserved width", () => {
+  const text = formatScrollIndicator({ offset: 12, max: 48 }, "▲", true);
+  assert.equal(text.trim(), "▲ 12/48");
+  assert.equal(stringWidth(text), SCROLL_INDICATOR_WIDTH);
+});
+
+test("formatScrollIndicator uses an ASCII caret when Unicode is unavailable", () => {
+  const text = formatScrollIndicator({ offset: 3, max: 9 }, "^", false);
+  assert.equal(text.trim(), "^ 3/9");
+  assert.equal(stringWidth(text), SCROLL_INDICATOR_WIDTH);
+});
+
+test("formatScrollIndicator goes blank rather than overflow its reserved slot", () => {
+  // A 5-digit offset would otherwise wrap the whole status bar.
+  const text = formatScrollIndicator({ offset: 123456, max: 987654 }, "^", false);
+  assert.equal(text, "");
+  assert.ok(stringWidth(formatScrollIndicator({ offset: 99, max: 100 }, "^", false)) <= SCROLL_INDICATOR_WIDTH);
 });
 
 // Requested directly: show plan/todo progress persistently in the status

@@ -31,6 +31,21 @@ export interface StatusBarProps {
    *  character while composing, so the same animation reads as normal
    *  motion here instead of visual noise. */
   busy: boolean;
+  /** Whether the terminal can render the block/shade glyphs the gauge is
+   *  drawn with. From terminal.ts's `unicode`; false switches to an ASCII
+   *  gauge of the same width rather than letting `█` become `?`. */
+  unicode: boolean;
+  /** How far back the log is scrolled (rows) and the furthest it can go.
+   *  `offset === 0` means pinned to the bottom (following new output).
+   *
+   *  Added because scrolling back with PageUp looked identical to being at
+   *  the bottom: nothing indicated you were reading history, and nothing
+   *  indicated that output kept arriving underneath you. Both are real
+   *  traps in a long agent session — you scroll up to re-read a command, and
+   *  a turn finishes while you're there, and there is no way to tell that
+   *  without scrolling all the way back down. `null` keeps this bar's layout
+   *  byte-identical to before on terminals too narrow to show it. */
+  scroll: { offset: number; max: number } | null;
 }
 
 const GAUGE_WIDTH = 12;
@@ -70,21 +85,73 @@ export function hasRoomForCompactionSlot(columns: number): boolean {
   return columns >= MIN_COLUMNS_FOR_COMPACTION_SLOT;
 }
 
+// "^ 12/48" — one char of marker, one space, then rows-back / rows-available.
+export const SCROLL_INDICATOR_WIDTH = 8;
+const MIN_COLUMNS_FOR_SCROLL_SLOT = 72;
+
+export function hasRoomForScrollSlot(columns: number): boolean {
+  return columns >= MIN_COLUMNS_FOR_SCROLL_SLOT;
+}
+
+/**
+ * The scroll indicator text, always exactly `SCROLL_INDICATOR_WIDTH` wide
+ * while scrolled, and "" when pinned to the bottom.
+ *
+ * Blank-when-idle rather than "0/0": the slot itself is reserved in the
+ * width budget unconditionally (see statusBarFieldWidth), so the bar's
+ * layout is byte-identical whether you're scrolled or not and nothing
+ * reflows the moment you press PageUp. Only the *content* appears.
+ *
+ * The width is bounded the same way the plan slot is — a session that
+ * scrolled 10,000 rows back would otherwise produce a 4-digit number that
+ * overflows the reserved slot and wraps the whole row.
+ */
+export function formatScrollIndicator(
+  scroll: { offset: number; max: number } | null,
+  up: string,
+  wide: boolean
+): string {
+  if (!scroll || scroll.offset <= 0) return "";
+  const text = wide
+    ? `${scroll.offset}/${scroll.max}`
+    : `${Math.min(scroll.offset, 99)}/${scroll.max}`;
+  if (text.length + 2 > SCROLL_INDICATOR_WIDTH) return "";
+  return (`${up} ${text}`).padStart(SCROLL_INDICATOR_WIDTH);
+}
+
 /** Formats the compaction indicator text, always exactly
  *  `COMPACTION_STATUS_WIDTH` characters (or "" for no compaction yet) so
- *  it never shifts anything next to it regardless of which state it's in. */
-export function formatCompactionStatus(status: { state: "running" | "complete" | "failed"; timestamp: string } | null): string {
+ *  it never shifts anything next to it regardless of which state it's in.
+ *
+ *  `unicode` picks the mark only — the ASCII alternatives are also exactly
+ *  one column, which is the constraint that matters here: a two-column
+ *  fallback would silently push the gauge over the terminal width and wrap
+ *  the row, which is the bug this fixed-width formatting exists to prevent. */
+export function formatCompactionStatus(
+  status: { state: "running" | "complete" | "failed"; timestamp: string } | null,
+  unicode = true
+): string {
   if (!status) return "";
   if (status.state === "running") return "compacting";
   const hhmmss = status.timestamp.slice(11, 19); // ISO 8601 "...THH:MM:SS.sssZ"
-  const glyph = status.state === "complete" ? "✓" : "✗";
-  return `${glyph} ${hhmmss}`;
+  const mark = status.state === "complete" ? (unicode ? "✓" : "+") : unicode ? "✗" : "x";
+  return `${mark} ${hhmmss}`;
 }
 
-/** Renders a small bar-animation battery gauge for context usage (PROMPT.md §6). */
-function renderGauge(ratio: number): string {
+/** Renders a small bar-animation battery gauge for context usage (PROMPT.md §6).
+ *
+ *  `█`/`░` are U+2588/U+2591 block elements. On a terminal without block
+ *  coverage — or under a non-UTF-8 locale — they come out as `?` or at a
+ *  width the terminal disagrees with, and because this row is on the
+ *  app's fixed one-row-height budget, a width mismatch shifts everything
+ *  beside it. The ASCII pair below is the same visual at the same width.
+ *  See terminal.ts's `detectUnicode` for how the locale is decided. */
+export function renderGauge(ratio: number, unicode: boolean): string {
   const filled = Math.round(Math.max(0, Math.min(1, ratio)) * GAUGE_WIDTH);
-  return "█".repeat(filled) + "░".repeat(GAUGE_WIDTH - filled);
+  if (unicode) return "█".repeat(filled) + "░".repeat(GAUGE_WIDTH - filled);
+  // "#" for filled, "." for empty — distinct at a glance in a terminal
+  // where the block shades would have collapsed into the same glyph.
+  return "#".repeat(filled) + ".".repeat(GAUGE_WIDTH - filled);
 }
 
 function gaugeColor(ratio: number): string {
@@ -100,8 +167,13 @@ function gaugeColor(ratio: number): string {
 export function statusBarFieldWidth(columns: number): number {
   const planSlotWidth = hasRoomForPlanSlot(columns) ? 1 /* space before it */ + PLAN_PROGRESS_WIDTH : 0;
   const compactionSlotWidth = hasRoomForCompactionSlot(columns) ? 1 /* space before it */ + COMPACTION_STATUS_WIDTH : 0;
+  // The scroll slot is budgeted unconditionally (its content appears only
+  // while scrolled) for the same reason the plan slot is: a bar whose total
+  // width changes the moment you press PageUp is the exact "this row wraps"
+  // failure the rest of this fixed-width layout exists to prevent.
+  const scrollSlotWidth = hasRoomForScrollSlot(columns) ? 1 /* space before it */ + SCROLL_INDICATOR_WIDTH : 0;
   // 2 paddingX + 2 "│ " + gauge + " 100%" + slots + inter-field gaps (4)
-  const fixedWidth = 2 /* paddingX */ + 2 /* "│ " */ + GAUGE_WIDTH + 5 /* " 100%" */ + planSlotWidth + compactionSlotWidth + 4 /* inter-field gaps */;
+  const fixedWidth = 2 /* paddingX */ + 2 /* "│ " */ + GAUGE_WIDTH + 5 /* " 100%" */ + planSlotWidth + compactionSlotWidth + scrollSlotWidth + 4 /* inter-field gaps */;
   return Math.max(8, Math.floor((columns - fixedWidth) / 2));
 }
 
@@ -116,11 +188,20 @@ export function formatPlanProgress(planProgress: { done: number; total: number }
   return text.length <= PLAN_PROGRESS_WIDTH ? text : "";
 }
 
-export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns, busy }: StatusBarProps) {
+export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns, busy, unicode, scroll }: StatusBarProps) {
   const fieldWidth = statusBarFieldWidth(columns);
   const planText = formatPlanProgress(planProgress);
-  const compactionText = formatCompactionStatus(compactionStatus);
+  const compactionText = formatCompactionStatus(compactionStatus, unicode);
   const compactionColor = compactionStatus?.state === "failed" ? "red" : compactionStatus?.state === "running" ? "yellow" : "green";
+  // `│` and `▲` are both non-ASCII; fall back with the rest of the bar so a
+  // non-UTF-8 locale doesn't get a stray `?` in the middle of the row.
+  const divider = unicode ? "│" : "|";
+  const scrollText = formatScrollIndicator(scroll, unicode ? "▲" : "^", unicode);
+  // " 100%" is a 5-column budget, but the real number is 1-3 digits plus a
+  // percent sign, and past 999% (possible: the ratio isn't clamped at 1) it
+  // would grow. Pad the actual text to the budget rather than assuming, so
+  // the gauge can't be pushed right and wrap the row.
+  const percentText = ` ${Math.round(contextUsedRatio * 100)}%`.padStart(5);
 
   return (
     <Box justifyContent="space-between" paddingX={1} height={1} overflow="hidden">
@@ -128,7 +209,7 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
         <Text dimColor>{tailToWidth(cwd, fieldWidth)}</Text>
       </Text>
       <Text>
-        {busy ? <Spinner active /> : <Text dimColor>│</Text>}
+        {busy ? <Spinner active /> : <Text dimColor>{divider}</Text>}
         <Text> </Text>
         <Text color="cyan">{tailToWidth(model, fieldWidth)}</Text>
       </Text>
@@ -149,8 +230,16 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
             <Text> </Text>
           </>
         )}
-        <Text color={gaugeColor(contextUsedRatio)}>{renderGauge(contextUsedRatio)}</Text>
-        <Text dimColor> {Math.round(contextUsedRatio * 100)}%</Text>
+        {hasRoomForScrollSlot(columns) && (
+          <>
+            <Text color={scrollText ? "yellow" : undefined} dimColor={!scrollText}>
+              {scrollText.padStart(SCROLL_INDICATOR_WIDTH)}
+            </Text>
+            <Text> </Text>
+          </>
+        )}
+        <Text color={gaugeColor(contextUsedRatio)}>{renderGauge(contextUsedRatio, unicode)}</Text>
+        <Text dimColor>{percentText}</Text>
       </Box>
     </Box>
   );

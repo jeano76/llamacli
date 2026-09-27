@@ -47,6 +47,7 @@ from pathlib import Path
 from _laya_install_helpers import (  # noqa: E402
     install_laya,
     start_laya,
+    stop_laya,
     venv_available,
     venv_python_path,
     LAYA_VENV_NAME,
@@ -54,12 +55,132 @@ from _laya_install_helpers import (  # noqa: E402
 
 HEALTH_TIMEOUT = 1.0  # seconds; how long to wait when probing the /health endpoint
 
+# Transient user unit the laya server is (re)started as, when systemd-run works.
+# See _spawn_laya_serve for why the server must NOT simply be a fork of this
+# script.
+LAYA_UNIT = "laya-serve.service"
+
+
+def _spawn_laya_serve(binary, env):
+    """Start the laya server, preferring its own systemd cgroup.
+
+    Reported directly, 2026-09-27: running llamacli made the whole terminal
+    force-close with no error, twice in three minutes, and left the local
+    llama.cpp server stopped. Not a llamacli bug — systemd-oomd killed the
+    terminal:
+
+        Killed .../app-org.gnome.Terminal.slice/vte-spawn-9ae27e2f.scope
+          due to memory pressure for user@1000.service being 72.13% > 50.00% for > 20s
+
+    systemd-oomd picks the LARGEST sub-cgroup under the one that exceeded its
+    limit. This script is spawned by the Node TUI, so the server it forks
+    inherits the terminal's cgroup — and laya-serve carries torch and sits at
+    ~3.9GB RSS. Together with the Node process that made the terminal scope the
+    fattest thing in the session, so the terminal is what got SIGKILLed, taking
+    the running llamacli session with it. `start_new_session=True` does not help
+    here: that only detaches the process group / controlling terminal, NOT the
+    cgroup, so the server stayed in vte-spawn-*.scope (confirmed via
+    /proc/<pid>/cgroup).
+
+    Running it as a transient user unit puts it in its own scope under app.slice
+    instead, so the terminal is never the thing holding the memory.
+
+    Returns (proc, spawned_via_systemd). Falls back to a plain Popen whenever
+    systemd-run is unavailable or refuses, which keeps behaviour identical to
+    before on machines without a user bus — the cgroup problem is a
+    mis-accounting hazard, never a reason for the feature to stop working.
+
+    When an already-running unit is reused, the returned pair is (None, True)
+    and the caller's failure path will stop it. That is intended: we only
+    reach that branch when the reused server then failed the health check, so
+    it is a broken server and leaving it running would help nobody.
+    """
+    cmd = [
+        "systemd-run",
+        "--user",
+        "--unit=" + LAYA_UNIT,
+        # Laya servers are restarted across many llamacli turns; --collect
+        # garbage-collects the dead unit instead of leaving failed units
+        # lying around until `systemctl --user reset-failed`.
+        "--collect",
+        # Same cwd the plain Popen used to inherit, so relative paths in the
+        # project's laya config keep resolving.
+        "--working-directory=" + os.getcwd(),
+        # Keep it away from the caller's stdin entirely: a server that reads
+        # the TUI's keystrokes is its own bug source, and systemd-run refuses
+        # to wire a terminal to a transient unit anyway.
+        "--property=StandardInput=null",
+        # The one job this unit has to be good at is getting out of the way
+        # when memory runs short, rather than being the reason a terminal dies.
+        # NB: there is deliberately no ManagedOOMPreference here — systemd only
+        # accepts none|avoid|omit, never a "prefer to be killed" value, and
+        # omit/avoid on this unit would do the exact opposite of what's wanted.
+        "--property=OOMScoreAdjust=900",
+        "--property=MemoryHigh=4G",
+        "--property=MemoryMax=6G",
+        "--property=MemorySwapMax=1G",
+        str(binary),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+        )
+        # systemd-run returns as soon as the unit is queued, so this is not a
+        # boot health check (wait_url below is). Only a non-zero exit means the
+        # unit was never created at all — no user bus, unit name taken, etc.
+        out, errout = proc.communicate(timeout=30)
+        if proc.returncode == 0:
+            return None, True
+        stderr = (errout or "").strip()
+        # "Unit laya-serve.service was already loaded or has a fragment file"
+        # is not a failure — it means a previous session's server is still
+        # running, which is exactly what we want. Treating it as an error made
+        # every launch fall back to a plain fork, which put a multi-GB server
+        # back inside the terminal's cgroup: the precise situation
+        # systemd-run exists to avoid (see this function's doc comment), and
+        # the whole reason the OOM investigation ended with laya as a victim.
+        if "already loaded" in stderr or "already exists" in stderr:
+            active = subprocess.run(
+                ["systemctl", "--user", "is-active", "--quiet", LAYA_UNIT],
+                check=False,
+            ).returncode == 0
+            if active:
+                # Already up and running. Reuse it; don't start a second one,
+                # and don't stop it on the failure path either (the caller only
+                # stops what it started).
+                print("[laya] reusing the already-running laya-serve unit", file=sys.stderr)
+                return None, True
+        print(f"[laya] systemd-run failed (rc={proc.returncode}): {stderr}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - any failure must fall back, not break the gate
+        print(f"[laya] systemd-run unavailable ({exc}); falling back to a plain fork", file=sys.stderr)
+
+    return (
+        subprocess.Popen(
+            [str(binary)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,  # survives this script's own exit, not tied to its process group
+        ),
+        False,
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Config IO — read/write only the flat `laya:` subsection of .llamacli/config.yaml
 # --------------------------------------------------------------------------- #
 
 DEFAULTS = {
+    # OFF by default, changed 2026-09-28. The gate ran on EVERY turn and its
+    # measured benefit does not pay for that: 0.11s per turn against a judge
+    # that is the same 35B model as the main one and cannot distinguish a
+    # trivial request from a destructive one. See agent/gate.ts for the full
+    # measurement, and /fastcheck status for the user-facing summary. Opt in
+    # with `/fastcheck on` when you want the cheaper turn and the safety rail.
     "enabled": False,
     "shortCircuit": True,
     "timeoutSeconds": 30,
@@ -387,12 +508,68 @@ def _real_client():
     short_circuit_verdict()) already existed, but only in the plugin copy
     (used by cmd_trace/agent-trace and the measurement scripts) — imported
     here rather than duplicated, same pattern _measure_short_circuit.py uses.
+
+    THE BUG THAT MADE THE GATE INERT (2026-09-28): the plugin directory was
+    resolved as `__file__/../../plugin/laya/scripts`, which is correct when
+    this file runs from the repo's `scripts/` directory but WRONG in the
+    shipped build, where the same file lives at `dist/scripts/`. There,
+    `dist/plugin/...` does not exist, so the sys.path insertion silently
+    pointed at nothing — and because the script's OWN directory is already on
+    sys.path, the subsequent `import laya_integration` resolved to THIS FILE
+    rather than the plugin. The import therefore "succeeded" and returned a
+    module that is missing every function the gate calls, so each attribute
+    access raised AttributeError, which evaluate() caught and reported as
+    `degraded`. Net effect: the installed binary's gate answered
+    "degraded" on every turn, forever, while the source checkout appeared to
+    work — the worst possible failure shape, invisible from tests run against
+    `src/`.
+
+    Fixed by searching every plausible location AND refusing to return
+    anything that isn't actually the plugin module (verified by a marker
+    attribute only the plugin defines), so a future layout change fails
+    loudly instead of quietly degrading.
     """
-    plugin_dir = str(Path(__file__).resolve().parent.parent / "plugin" / "laya" / "scripts")
-    if plugin_dir not in sys.path:
-        sys.path.insert(0, plugin_dir)
-    import laya_integration as _plugin  # noqa: PLC0415 -- deliberately lazy/late
-    return _plugin
+    candidates = []
+    env_dir = os.environ.get("LAYA_PLUGIN_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    here = Path(__file__).resolve()
+    # repo checkout: <root>/scripts/laya_integration.py
+    candidates.append(here.parent.parent / "plugin" / "laya" / "scripts")
+    # npm global install that links the package root: <root>/dist/scripts/...
+    candidates.append(here.parent.parent.parent / "plugin" / "laya" / "scripts")
+    candidates.append(Path.cwd() / "plugin" / "laya" / "scripts")
+    candidates.append(Path.cwd().parent / "plugin" / "laya" / "scripts")
+
+    last_error = None
+    for cand in candidates:
+        if not (cand / "laya_integration.py").is_file():
+            continue
+        d = str(cand)
+        if d in sys.path:
+            sys.path.remove(d)
+        sys.path.insert(0, d)
+        # Drop a previously-imported module of the same name so a stale one
+        # (notably THIS file, imported as a sibling) can't be reused.
+        sys.modules.pop("laya_integration", None)
+        try:
+            import laya_integration as _plugin  # noqa: PLC0415 -- deliberately lazy/late
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+        # Only the plugin defines this. Without the check, the sibling-import
+        # failure mode above is indistinguishable from success.
+        if hasattr(_plugin, "_make_question") and hasattr(_plugin, "systemone"):
+            return _plugin
+        last_error = RuntimeError(
+            f"{cand}/laya_integration.py is missing the plugin API "
+            f"(_make_question/systemone) — found a different module of the same name"
+        )
+    raise RuntimeError(
+        "could not load the laya plugin client. Looked in: "
+        + ", ".join(str(c) for c in candidates)
+        + (f". Last error: {last_error}" if last_error else ". None contained laya_integration.py")
+    )
 
 
 def evaluate(text: str, laya_settings: dict) -> dict:
@@ -497,6 +674,7 @@ def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
 
     proc = None
     booted = False
+    spawned_via_systemd = False
     entrypoints = list((venv_root / "bin").glob("laya*")) if (venv_root / "bin").exists() else []
     env = dict(os.environ)
     env["LAYA_BOOT"] = "1"
@@ -520,13 +698,7 @@ def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
         # (bin/laya-serve -> laya.serve.main), already found by the
         # `entrypoints` glob above.
         laya_serve_bin = venv_root / "bin" / "laya-serve"
-        proc = subprocess.Popen(
-            [str(laya_serve_bin)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,  # survives this script's own exit, not tied to its process group
-        )
+        proc, spawned_via_systemd = _spawn_laya_serve(laya_serve_bin, env)
     # Wait for health on whatever URL we expect.
     wait_url = url + "/health" if url else (f"http://127.0.0.1:{os.environ.get('LAYA_ENDPOINT', '8099')}/health")
     deadline = time.time() + max(1, timeout_seconds)
@@ -565,10 +737,24 @@ def bootstrap_laya(cfg: dict, timeout_seconds: int = 25) -> dict:
     # spawned a process for it, it's stuck/broken (or still loading past our
     # patience) rather than left orphaned indefinitely.
     if proc is not None:
-        try:
-            proc.terminate()
-        except Exception:  # noqa: BLE001 - best-effort cleanup only
-            pass
+        # Under systemd the spawned process is NOT a child of this script —
+        # `proc` is just the short-lived `systemd-run` client — so
+        # proc.terminate() would kill the client (already dead) and leave the
+        # actual server running. Stop the unit instead.
+        if spawned_via_systemd:
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", LAYA_UNIT],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=20, check=False,
+                )
+            except Exception:  # noqa: BLE001 - best-effort cleanup only
+                pass
+        else:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001 - best-effort cleanup only
+                pass
 
     info = locate_server()  # final authoritative read for the reported reason
     return {"ok": info.get("ok", False), "reason": info.get("reason", "server unreachable"), "url": wait_url}
@@ -622,6 +808,8 @@ def cmd_disable(path: Path) -> int:
     settings = laya_section(path)
     settings["enabled"] = False
     write_config(path, settings)
+    print("laya gate disabled. Stopping the local server ...")
+    stop_laya(settings)
     print("laya gate disabled. The System-1 shortcut will be skipped on the next turn.")
     return 0
 
@@ -630,12 +818,40 @@ def cmd_status(path: Path) -> int:
     settings = laya_section(path)
     info = locate_server()
     enabled = bool(settings.get("enabled", False))
-    state = "enabled" if enabled else "disabled"
+    state = "enabled" if enabled else "disabled (opt in with /fastcheck on)"
     print(f"laya gate: {state}")
     print(f"  questionType : {settings.get('questionType')}")
     print(f"  thresholds   : act={settings.get('actProbabilityThreshold')} "
           f"confidence={settings.get('confidenceThreshold')}")
     print(f"  integration  : {info['reason']}")
+    # The honest part, and the reason this output grew: someone deciding
+    # whether to switch on a feature that runs on EVERY turn needs to know what
+    # it costs and what it buys. Measured on this box over a labelled 10-prompt
+    # set (2026-09-28):
+    #
+    #   gate latency ..... 0.11s mean per turn
+    #   judge accuracy ... none of four question wordings separated "trivial"
+    #                      from "needs the real model" (best separation 0.223,
+    #                      usable threshold 0.25)
+    #   judge model ...... THE SAME 35B MoE as the main model — every laya role
+    #                      in ~/.laya/settings.json points at this app's own
+    #                      llama-server, so there is no small fast model to
+    #                      fall back on and no latency win available at all
+    #
+    # So the gate cannot justify itself on speed. What it does provide is a
+    # cheaper turn when the guess is right, plus a hard rail that keeps
+    # destructive requests on a full turn whatever the verdict says. That is
+    # why it ships OFF by default rather than quietly taxing every turn.
+    print(
+        "\n  measured cost   : 0.11s per turn (laya /v1/systemone)\n"
+        "  judge model     : the same 35B MoE as the main model — not a small\n"
+        "                    fast model, so there is no latency win available\n"
+        "  judge accuracy  : cannot reliably tell a trivial request from a\n"
+        "                    destructive one (measured; see src/agent/gate.ts)\n"
+        "  what you get    : system1 mode (no chain-of-thought, 200-token cap)\n"
+        "                    when the guess is right, plus a hard rail that\n"
+        "                    forces a full turn on destructive requests"
+    )
     return 0
 
 

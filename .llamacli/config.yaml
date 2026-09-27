@@ -7,7 +7,7 @@ compaction:
   autoResume: true
   autoTriggerRatio: 0.7
 laya:
-  enabled: true
+  enabled: false
   shortCircuit: true
   timeoutSeconds: 30
   questionType: noul

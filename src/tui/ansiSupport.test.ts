@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { supportsAnsiTui } from "./ansiSupport.js";
+import { detectTerminal } from "./terminal.js";
 
 const TTY = { stdoutIsTTY: true, stdinIsTTY: true, platform: "linux" as NodeJS.Platform };
 
@@ -35,8 +36,22 @@ test("supportsAnsiTui: LLAMACLI_NO_ANSI=1 forces it off even on an otherwise-sup
   assert.equal(supportsAnsiTui({ LLAMACLI_NO_ANSI: "1" }, TTY), false);
 });
 
-test("supportsAnsiTui: NO_COLOR forces it off (any value, per the NO_COLOR convention)", () => {
-  assert.equal(supportsAnsiTui({ NO_COLOR: "" }, TTY), false);
+test("supportsAnsiTui: NO_COLOR suppresses color but NOT cursor/alt-screen control", () => {
+  // Corrected semantics. NO_COLOR (https://no-color.org) is a request about
+  // COLOR, and it used to switch off every control sequence this app emits —
+  // so setting it silently disabled the alt screen and the absolute cursor
+  // positioning that the input line depends on, for a color preference. That
+  // was over-broad, and it is itself part of the per-terminal breakage this
+  // shim now delegates away. `supportsAnsiTui` answers "may we emit control
+  // sequences"; color is `capabilities.colorDepth`, tested in terminal.test.ts.
+  assert.equal(supportsAnsiTui({ NO_COLOR: "" }, TTY), true);
+  assert.equal(detectTerminal({ NO_COLOR: "" }, TTY).colorDepth, 0);
+});
+
+test("supportsAnsiTui: NO_COLOR=0 is still honored (any value counts, per the convention)", () => {
+  // The convention is presence-based, not truthiness-based — `NO_COLOR=0` and
+  // `NO_COLOR=` both mean "no color".
+  assert.equal(detectTerminal({ TERM: "xterm-256color", NO_COLOR: "0" }, TTY).colorDepth, 0);
 });
 
 test("supportsAnsiTui: LLAMACLI_FORCE_ANSI=1 forces it on even without a TTY or a known-good win32 terminal", () => {

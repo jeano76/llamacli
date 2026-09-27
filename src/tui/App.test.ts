@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk, wordLeft, wordRight, cursorRowCol } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk, wordLeft, wordRight, cursorRowCol, scrolledBannerText } from "./App.js";
 import { formatDiff } from "../tools/diff.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
@@ -314,4 +314,71 @@ test("cursorRowCol accounts for an explicit newline as a consumed separator, not
   // no column, so the offset right after it (3) is col 0 of row 1.
   assert.deepEqual(cursorRowCol("ab\ncd", 10, 3), { row: 1, col: 0 });
   assert.deepEqual(cursorRowCol("ab\ncd", 10, 2), { row: 0, col: 2 });
+});
+
+// ── "you are scrolled back" banner ──────────────────────────────────────────
+// Replaces a version that built its text and then cut it with
+// `.slice(0, columns)`. slice() counts UTF-16 code units, not terminal
+// columns, so a narrow terminal could end up with a dangling separator and a
+// misleading fragment — and the text was English in a Korean UI while using
+// `─ ↑ ↓`, the exact glyphs that don't render on a non-UTF-8 terminal.
+
+test("scrolledBannerText always fits the terminal width", () => {
+  for (const columns of [10, 20, 30, 40, 60, 80, 120, 200]) {
+    for (const offset of [1, 12, 999, 123456]) {
+      const text = scrolledBannerText(offset, 5000, columns, true);
+      assert.ok(
+        stringWidth(text) <= columns,
+        `columns=${columns} offset=${offset} width=${stringWidth(text)} "${text}"`
+      );
+    }
+  }
+});
+
+test("scrolledBannerText falls back to ASCII on a non-UTF-8 terminal", () => {
+  // The DECORATIVE glyphs must not leak: a `?` in their place is both ugly
+  // and a width the layout never budgeted for. The Korean prose is the app's
+  // own language and deliberately stays — see scrolledBannerText's comment.
+  const text = scrolledBannerText(12, 480, 200, false);
+  assert.ok(!/[─↑↓…·█░⠁❯│✓✗]/.test(text), `decorative non-ASCII leaked: "${text}"`);
+  assert.ok(text.includes("12"), `expected the position, got "${text}"`);
+  // …and the same banner in Unicode mode is the decorated version of the
+  // same information, so the two can't drift in content.
+  const uni = scrolledBannerText(12, 480, 200, true);
+  for (const token of ["12", "480", "Shift+T"]) {
+    assert.ok(uni.includes(token), `unicode banner lost "${token}": "${uni}"`);
+  }
+});
+
+test("scrolledBannerText states the position and how to get back to live", () => {
+  const wide = scrolledBannerText(7, 90, 200, true);
+  assert.ok(wide.includes("7"), "should say how far up we are");
+  assert.ok(wide.includes("90"), "should say how much there is in total");
+  assert.ok(wide.includes("Shift+T"), "should say how to return to the live tail");
+});
+
+test("scrolledBannerText says something useful even when very little fits", () => {
+  const narrow = scrolledBannerText(3, 9, 12, true);
+  assert.ok(stringWidth(narrow) <= 12);
+  assert.ok(narrow.includes("3"), `expected the offset to survive, got "${narrow}"`);
+});
+
+test("runHintText intentionally returns the shortest form even when it does not fit", () => {
+  // Deliberate, and NOT the same contract as the log-area hints: this line
+  // renders in place of the input box's own text, and the input Box is
+  // width-constrained and clips, so a truncated "Esc: 강제종료 · /qu" still
+  // communicates something while "" would communicate nothing. The log-area
+  // hints (scrolledBannerText, startupHintText) are held to a hard width
+  // guarantee instead, because they live in the log's fixed-height area where
+  // overflowing really does displace rows.
+  for (const columns of [1, 5, 10, 19]) {
+    const text = runHintText(columns);
+    assert.equal(text, "  Esc: 강제종료 · /quit: 정상종료");
+    assert.ok(stringWidth(text) > columns, "expected this form to be wider than the terminal (that is the point)");
+  }
+  // Above the shortest form's width it does fit, and that's the case where
+  // the width guarantee actually holds.
+  for (const columns of [34, 40, 80, 200]) {
+    assert.ok(stringWidth(runHintText(columns)) <= columns - 1, `columns=${columns}`);
+  }
 });

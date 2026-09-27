@@ -6,6 +6,7 @@
  *  art's own width. Pure ANSI + pure functions so the animation is
  *  unit-testable without a terminal. */
 import stringWidth from "string-width";
+import { paint, type TerminalCapabilities } from "./terminal.js";
 
 /** `vYYYYMMDD` from a file's mtime — used with dist/index.js's own mtime as
  *  a build date, since there's no separate build-info step to read from. */
@@ -13,6 +14,44 @@ export function buildVersionString(mtimeMs: number): string {
   const d = new Date(mtimeMs);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `v${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+}
+
+// SGR parameter strings, not full sequences, so `paint` can downgrade them
+// for the terminal's actual color depth. The previous hardcoded `1;95m` /
+// `2;90m` (bright magenta / bright black) reached 16-color terminals as the
+// wrong color and true `vt100` not at all — nothing checked depth, and
+// these are the exact codes that broke.
+//
+// Bright-color fallbacks for a 16-color terminal live in paintMap below,
+// because the downgrade isn't a truncation: SGR 90-97 is a *separate* range
+// from 30-37, so a 16-color terminal needs 95 -> 35 (bright magenta is
+// approximated by plain magenta there).
+const SETTLED_SGR = "1;36";
+const PEAK_SGR = "1;95";
+const DIM_SGR = "2;90";
+export const BALL_SGR = "1;33";
+export { SETTLED_SGR };
+
+/** Bright (90-97) -> the matching standard color (30-37), for terminals with
+ *  only 16 colors. Applied by `sgrFor` below. */
+const BRIGHT_TO_STANDARD: Record<string, string> = {
+  "90": "30", "91": "31", "92": "32", "93": "33",
+  "94": "34", "95": "35", "96": "36", "97": "37",
+};
+
+/** Rewrites an SGR parameter string for the terminal's color depth. */
+export function sgrFor(sgr: string, caps: TerminalCapabilities): string {
+  if (caps.colorDepth !== 4) return sgr;
+  return sgr
+    .split(";")
+    .map((p) => BRIGHT_TO_STANDARD[p] ?? p)
+    .join(";");
+}
+
+/** Colors `text` with `sgr`, degrading to nothing on a colorless terminal
+ *  and remapping bright colors on a 16-color one. */
+export function colored(text: string, sgr: string, caps: TerminalCapabilities): string {
+  return paint(text, sgrFor(sgr, caps), caps);
 }
 
 export const RESET = "\x1b[0m";
@@ -48,14 +87,24 @@ export function bannerWordCount(text: string): number {
 // ball's height — 0 (top of its arc) through 3 (ground). Two bounces, each
 // smaller than the last (gravity), settling on the ground.
 const BOUNCE_HEIGHTS = [0, 1, 2, 3, 2, 1, 0, 1, 2, 3, 2, 1, 2, 3];
+// Braille dots, with ASCII stand-ins of the same *shape* (a rising little
+// ball) for terminals that can't render them. The Spinner component was
+// already converted to plain ASCII for exactly this reason (see its doc
+// comment: glyph coverage and computed width vary by font, and a width
+// mismatch shifts everything next to it) — but the banner kept its Braille,
+// and the banner is the widest fixed-width element on screen, so a font
+// without Braille coverage misaligned the whole startup block.
 const BOUNCE_DOTS = ["⠁", "⠂", "⠄", "⡀"];
+const BOUNCE_DOTS_ASCII = [".", "o", "O", "@"];
 export const BALL_COLOR = "\x1b[1;33m"; // bold yellow — reads as a distinct little flourish, not more banner text
 
 /** One frame of the bouncing-ball flourish, played once after the word
  *  reveal finishes. Clamps to the final (resting) frame past the end. */
-export function bounceFrame(tick: number): string {
+export function bounceFrame(tick: number, caps?: TerminalCapabilities): string {
   const height = BOUNCE_HEIGHTS[Math.min(tick, BOUNCE_HEIGHTS.length - 1)];
-  return `${BALL_COLOR}${BOUNCE_DOTS[height]}${RESET}`;
+  const dot = caps && !caps.unicode ? BOUNCE_DOTS_ASCII[height] : BOUNCE_DOTS[height];
+  if (caps) return colored(dot, BALL_SGR, caps);
+  return `${BALL_COLOR}${dot}${RESET}`;
 }
 
 export function bounceFrameCount(): number {
@@ -159,16 +208,41 @@ const ART_ROWS = 5;
  *  shine's peak color to it (see shineMultilineFrame's peakAllowed). */
 export const LETTER_WIDTH = 5;
 
+/**
+ * Same wordmark in `#`, for a terminal that can't render `█` (U+2588).
+ * Every cell is deliberately still exactly 5 columns wide: `ART_WIDTH` and
+ * `rightAlign` are computed from the glyph table, so an ASCII table of a
+ * different width would silently shift the right-aligned version/caption
+ * line instead of just looking plainer. That's the whole class of bug the
+ * Spinner comment describes, and the reason a naive "strip the non-ASCII
+ * characters" fallback is wrong — stripping `█` leaves an empty banner
+ * AND a zero ART_WIDTH, which then breaks every caller that indexes into it.
+ */
+const GLYPHS_ASCII: Record<string, string[]> = {
+  H: ["#   #", "#   #", "#####", "#   #", "#   #"],
+  A: [" ### ", "#   #", "#####", "#   #", "#   #"],
+  R: ["#### ", "#   #", "#### ", "#  # ", "#   #"],
+  N: ["#   #", "##  #", "# # #", "#  ##", "#   #"],
+  E: ["#####", "#    ", "#### ", "#    ", "#####"],
+  S: [" ####", "#    ", " ### ", "    #", "#### "],
+  C: [" ####", "#    ", "#    ", "#    ", " ####"],
+  L: ["#    ", "#    ", "#    ", "#    ", "#####"],
+  I: ["#####", "  #  ", "  #  ", "  #  ", "#####"],
+};
+
 /** Builds the 5-row block-letter art for `text` (letters side by side, one
  *  space apart; a literal space becomes a narrower word gap), uppercased.
  *  Pure so it — and the shine animation over it — is unit-testable without
- *  a terminal. */
-export function buildArt(text: string): string[] {
+ *  a terminal. `caps` selects the block or ASCII glyph table; omitting it
+ *  keeps the original (Unicode) output so existing callers and tests are
+ *  unaffected. */
+export function buildArt(text: string, caps?: TerminalCapabilities): string[] {
+  const table = caps && !caps.unicode ? GLYPHS_ASCII : GLYPHS;
   const rows = new Array(ART_ROWS).fill("");
   for (const ch of text.toUpperCase()) {
-    const glyph = ch === " " ? WORD_GAP_GLYPH : GLYPHS[ch] ?? BLANK_GLYPH;
+    const g = ch === " " ? WORD_GAP_GLYPH : table[ch] ?? BLANK_GLYPH;
     for (let r = 0; r < ART_ROWS; r++) {
-      rows[r] += (rows[r] ? " " : "") + glyph[r];
+      rows[r] += (rows[r] ? " " : "") + g[r];
     }
   }
   return rows;

@@ -2,7 +2,7 @@
 import React from "react";
 import { render } from "ink";
 import { App } from "./tui/App.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, updateLayaEnabled } from "./config.js";
 import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt, injectSkillIndexIntoSystemPrompt } from "./skills/loader.js";
 import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { LlamaServerManager } from "./backend/llamaServer.js";
@@ -21,7 +21,8 @@ import { dirname, resolve as pathResolve } from "node:path";
 import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
-import { supportsAnsiTui } from "./tui/ansiSupport.js";
+import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth } from "./tui/terminal.js";
+import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
@@ -76,21 +77,22 @@ whatever language is otherwise correct for them.`;
  * cursor exactly on the input line) reliable, since row 1 is now a fixed,
  * known reference point rather than an unknown offset into scrollback.
  * The original screen is restored on exit so nothing is left behind.
+ *
+ * Every sequence here comes from `buildSequences`, which emits "" for
+ * anything the detected terminal can't take. That replaces the previous
+ * single `if (!supportsAnsiTui()) return;` guard, because "ANSI works" never
+ * implied "alt screen works" — and App.tsx's absolute cursor addressing is
+ * only *meaningful* once this has succeeded, since rows are counted from the
+ * top of the active buffer. Each capability is now asked about separately;
+ * see terminal.ts.
  */
 function enterAltScreen(): void {
-  // Reported directly: on a terminal that doesn't actually interpret ANSI
-  // escapes (legacy Windows cmd.exe, a WSL window whose console didn't
-  // negotiate VT mode, output piped through something that mangles control
-  // sequences), these bytes show up as literal stray characters instead of
-  // switching screens — see ansiSupport.ts's doc comment. Skip entirely
-  // rather than risk it; the app still works, just without the alt-screen
-  // origin-stability/scrollback niceties described below.
-  if (!supportsAnsiTui()) return;
-  // Also turn on mouse reporting (button events, SGR encoding) so the
-  // wheel scrolls the log — the alt screen has no native scrollback, and
-  // PageUp/PageDown alone was reported as not enough. Side effect: the
-  // terminal's own click-drag text selection needs Shift held while this
-  // is on (standard for mouse-aware terminal apps).
+  const seq = buildSequences(getCapabilities());
+  // Mouse reporting is off by default now (see terminal.ts's `mouse` field):
+  // enabling it means text selection requires holding Shift on nearly every
+  // terminal — a silent cost paid for a convenience feature. It stays
+  // reachable via `/mouse` (or LLAMACLI_MOUSE=1), and the wheel/click
+  // handling is now also on the keyboard, so nothing is actually lost.
   //
   // Reported directly: "입력 프롬프트가 화면 제일 하단 좌측에 있는 경우도
   // 있고 하단이 갑자기 깜빡이는 경우도 있고" — App.tsx's own per-render
@@ -100,17 +102,16 @@ function enterAltScreen(): void {
   // real terminal cursor sits wherever Ink's own sequential top-to-bottom
   // writes happened to leave it — trailing the last line it printed, i.e.
   // bottom-left — fully visible and blinking there by the terminal's own
-  // default, until our effect catches up and moves/hides it. Hiding it
-  // immediately here (before Ink ever renders a single frame) closes that
-  // window entirely: the cursor stays hidden by default the whole time,
-  // and only ever becomes visible again where App.tsx's effect explicitly
-  // puts it, on the input line — never at some transient wrong spot.
-  process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l");
+  // default, until our effect catches up and moves/hides it. `altScreenOn`
+  // therefore ends with the cursor-hide, closing that window entirely: the
+  // cursor stays hidden by default and only becomes visible again where
+  // App.tsx's effect explicitly puts it, on the input line.
+  process.stdout.write(seq.altScreenOn + seq.mouseOn);
 }
 
 function exitAltScreen(): void {
-  if (!supportsAnsiTui()) return;
-  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+  const seq = buildSequences(getCapabilities());
+  process.stdout.write(seq.mouseOff + seq.altScreenOff);
 }
 
 /** Before taking over the screen: if llamacli is already running in this
@@ -460,9 +461,15 @@ async function main() {
     });
 
   const runLayaGate = async (userText: string): Promise<{
-    skip: boolean; verdict?: string; score?: number; conf?: number; gateId?: number;
-  }> => {
-    if (!runtimeEnabled) return { skip: false };   // off => instant no-op (no checks)
+    judgeSaysCheap: boolean; verdict?: string; score?: number; conf?: number; gateId?: number;
+  } | undefined> => {
+    // Off => the gate doesn't run at all, and `undefined` (rather than a
+    // synthetic "not cheap") is what makes decideGate report "gate: 꺼짐"
+    // instead of pretending laya was asked and declined. Throwing here would
+    // be wrong: loop.ts catches a throw and prints "laya gate skipped
+    // (using full model): …" on every single turn, which is exactly the noise
+    // a deliberately-disabled feature must not produce.
+    if (!runtimeEnabled) return undefined;
     try {
       const { stdout } = await runLayaScript(["fastcheck", "--text", userText]);
       // cmd_fastcheck prints its own progress lines (install/boot-wait) on
@@ -485,19 +492,23 @@ async function main() {
       const score = mScore ? Number(mScore[1]) : undefined;
       const conf = mConf ? Number(mConf[1]) : undefined;
 
-      if (verdict === "shortcircuit") {
+      // `judgeSaysCheap` is the JUDGE's opinion, not a decision. Whether it
+      // actually downgrades the turn is decided in agent/gate.ts, where the
+      // high-risk rail can override it — see that module for the measurement
+      // that made "skip the model" untenable.
+      const judgeSaysCheap = verdict === "shortcircuit";
+      if (judgeSaysCheap) {
         // Assign the stable id exactly once so every subsequent run appends to
         // the same foldable perf line.
         if (layaGateId === 0) layaGateId = 1;
-        return { skip: true, verdict, score, conf, gateId: layaGateId };   // let loop.ts skip Ornith
+        return { judgeSaysCheap, verdict, score, conf, gateId: layaGateId };
       }
-      // A proceed/degraded/truthful verdict carries no id (nothing to fold —
-      // the slow turn still ran). Surface prose only when present.
-      return { skip: false, verdict, score, conf };
+      return { judgeSaysCheap, verdict, score, conf };
     } catch {
-      // Any failure (nonzero exit, timeout, spawn error) => silent fall back:
-      // Ornith still runs the turn unchanged. Never throw past here.
-      return { skip: false };
+      // Any failure (nonzero exit, timeout, spawn error) => the gate simply
+      // doesn't get a say, and the full turn runs unchanged. Never throw past
+      // here — a turn must never fail because a gate did.
+      return { judgeSaysCheap: false };
     }
   };
 
@@ -612,6 +623,15 @@ async function main() {
     ]).finally(exitNow);
   };
 
+  // Hand the detected color depth to chalk BEFORE the first render, because
+  // chalk is what Ink colors through. Without this, NO_COLOR and a 16-color
+  // terminal only affected the handful of raw SGR sequences this app writes
+  // itself — all of Ink's own color (<Text color="cyan">, dimColor, the box
+  // borders, the context gauge) would still come out at whatever chalk
+  // decided from the environment, which is exactly the per-terminal
+  // mismatch this detection exists to remove. See terminal.ts.
+  applyColorDepth(getCapabilities());
+
   const { unmount } = render(
     // exitOnCtrlC: false — Ink's default behavior kills the whole process
     // the instant Ctrl-C is pressed, which conflicts with terminals/users
@@ -721,14 +741,87 @@ async function main() {
             break;
           }
           case "help": {
-            const lines = SLASH_MENU_ITEMS.map((i) => `${i.label.padEnd(10)} ${i.description}`);
+            // The keybinding table is the point of this, not an appendix:
+            // every interaction that isn't a slash command is a key, and
+            // before this the only way to learn one was to read the source.
+            // Rendered from KEY_BINDINGS so it can't drift from what the key
+            // handler actually does — see keybindings.ts.
+            const lines: string[] = [];
+            for (const group of KEY_BINDINGS) {
+              lines.push(group.title, ...group.bindings.map((b) => "  " + formatKeyRow(b)), "");
+            }
+            lines.push(
+              "명령 (/ 로 시작)",
+              ...SLASH_MENU_ITEMS.map((i) => `  ${i.label.padEnd(16)} ${i.description}`),
+              "",
+              "컨텍스트 사용량이 임계치에 닿으면 자동 압축이 실행되고 이후 작업이 자동으로 이어집니다."
+            );
+            ui?.pushStatus(lines.join("\n"));
+            break;
+          }
+          case "keys": {
+            const lines: string[] = [];
+            for (const group of KEY_BINDINGS) {
+              lines.push(group.title, ...group.bindings.map((b) => "  " + formatKeyRow(b)), "");
+            }
+            ui?.pushStatus(lines.join("\n").trimEnd());
+            break;
+          }
+          case "term": {
+            // Report what was actually detected rather than making the user
+            // guess from symptoms. Every field here corresponds to a
+            // behavior that used to differ silently between terminals —
+            // see terminal.ts.
+            const caps = getCapabilities();
+            const onOff = (b: boolean) => (b ? "켜짐" : "꺼짐");
             ui?.pushStatus(
               [
-                "Available slash commands:",
-                ...lines,
+                `터미널      : ${caps.terminal}`,
+                `판정 근거   : ${caps.reason}`,
+                `TERM        : ${process.env.TERM ?? "(미설정)"}`,
+                `멀티플렉서  : ${caps.inMultiplexer ? "예 (tmux/screen)" : "아니오"}`,
                 "",
-                "When context usage hits the threshold, compaction runs automatically and work resumes on its own afterward.",
+                `제어문자    : ${onOff(caps.ansi)}`,
+                `색상        : ${{ 0: "없음", 4: "16색", 8: "256색", 24: "진짜색(24bit)" }[caps.colorDepth]}`,
+                `유니코드    : ${onOff(caps.unicode)}`,
+                `대체화면    : ${onOff(caps.altScreen)}`,
+                `동기화 출력 : ${onOff(caps.synchronizedOutput)}`,
+                `하이퍼링크  : ${onOff(caps.hyperlink)}`,
+                `마우스(SGR) : ${caps.mouse ? "켜짐" : caps.mouseSgr ? "꺼짐 (支持되지만 /mouse 로 켜짐)" : "꺼짐 (이 터미널 미지원)"}`,
+                "",
+                "강제로 바꾸려면 환경변수로 실행: LLAMACLI_FORCE_ANSI=1, LLAMACLI_NO_ANSI=1,",
+                "LLAMACLI_COLOR_DEPTH=0|4|8|24, LLAMACLI_ASCII=1, LLAMACLI_MOUSE=1, NO_COLOR=1",
               ].join("\n")
+            );
+            break;
+          }
+          case "mouse": {
+            // Toggling at runtime instead of re-exec: the capability record
+            // is pure data, so this just re-derives one boolean. The
+            // sequences are emitted here (not only at startup) because the
+            // terminal has to be put into mouse-reporting mode at the moment
+            // the user asks for it.
+            const caps = getCapabilities();
+            if (!caps.mouseSgr) {
+              ui?.pushStatus(
+                `[mouse] 이 터미널은 SGR 마우스 보고(1006)를 지원하지 않아 켤 수 없습니다. ` +
+                  `터미널 단축키로 스크롤하거나 PageUp/PageDown 을 사용하세요. (/term 으로 확인)`
+              );
+              break;
+            }
+            const next = withMouse(caps, !caps.mouse);
+            setTerminalCapabilities(next);
+            // Put the terminal into (or take it out of) mouse-reporting mode
+            // right now, since the user asked for it mid-session rather than
+            // at startup. mouseOff is emitted whenever SGR is available so a
+            // terminal whose mode we enabled and then disabled still gets
+            // cleaned up.
+            const seq = buildSequences(next);
+            process.stdout.write(next.mouse ? seq.mouseOn : seq.mouseOff);
+            ui?.pushStatus(
+              next.mouse
+                ? "[mouse] 켜짐 — 휠 스크롤 · 클릭으로 접힌 블록 토글. 텍스트 선택은 Shift 를 누른 상태로 드래그하세요."
+                : "[mouse] 꺼짐 — Shift 없이 드래그해 텍스트를 선택할 수 있습니다."
             );
             break;
           }
@@ -820,6 +913,15 @@ async function main() {
             ui?.setBusy(true);
             try {
               if (sub === "on" || sub === "enable") {
+                // Persist the choice to config.yaml FIRST so it survives a
+                // restart — this is the whole point of editing YAML rather than
+                // keeping a session-only flag. Warn but still proceed with the
+                // round-trip below if the write fails.
+                const persisted = await updateLayaEnabled(projectRoot, true);
+                if (!persisted) {
+                  ui?.pushStatus("[laya] could not write laya.enabled:true to config.yaml — add it manually to keep this enabled.");
+                }
+                runtimeEnabled = true;   // immediate: next turn already gated (this session)
                 // Enabling also boots/installs the laya server (if missing) so the
                 // feature works immediately. Enable first (so cmd_fastcheck's
                 // enabled-gate passes and it proceeds to install/boot), then run the
@@ -842,7 +944,8 @@ async function main() {
                 });
                 runtimeEnabled = true;   // immediate: next turn already gated
               } else if (sub === "off" || sub === "disable") {
-                await runLayaScript(["disable"]);
+                // Persist the off choice too — symmetry with `on`.
+                await updateLayaEnabled(projectRoot, false);
                 runtimeEnabled = false;  // immediate no-op, incl. no health check
               } else if (sub === "status" || sub === "state") {
                 await runLayaScript(["status"]);
