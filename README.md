@@ -452,9 +452,57 @@ the verb (`전부 삭제` vs `recursively delete everything`), and a test caught
 `/fastcheck status` prints the cost, the judge model, and the accuracy
 limitation, so the decision to switch it on is informed rather than assumed.
 
+## Validation — what is actually checked, and what is not
+
+Three harnesses, one per axis, plus the unit suite. Run all of them:
+
+```bash
+npm test                                              # 618 unit tests
+npx tsx scripts/persona_usability_check.ts           # terminal identity
+npx tsx scripts/project_persona_check.ts             # project shape
+npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
+```
+
+| Axis | Harness | Checks | Status |
+|---|---|---:|---|
+| Unit / regression | `npm test` | **618** | pass |
+| Terminal identity (100 personas) | `persona_usability_check.ts` | **9,177** | 0 violations |
+| Project shape (100 real directories) | `project_persona_check.ts` | **7,020** | 0 violations |
+| Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
+| Hardware matrix (one-off sweep) | *(not committed — see below)* | 168,668 | 0 violations |
+
+The four sections below each cover one axis. Every bug they found is in the
+unit suite now, and each was verified by **reverting the fix and requiring the
+new tests to fail** — a regression test that passes with its own fix reverted is
+asserting nothing, and one of these did exactly that before it was caught.
+
+### What this does not cover
+
+Stated plainly, because a validation section that only lists passes is not
+useful:
+
+- **No real Windows, macOS, or musl machine.** `platform: "win32"` and
+  `darwin` exercise the *branch*, not the OS. Windows path separators, `\r\n`
+  line endings, conhost behaviour, Apple unified memory and a musl libc are
+  untested. The bugs most likely to hide there are exactly the ones the
+  document set this work came from warned about.
+- **No real GPU pressure.** Synthetic VRAM figures prove the arithmetic; they
+  do not prove an 8 GB card survives a 35B MoE load.
+- **No real mouse or compositor.** Selection and edge-scroll arithmetic is
+  verified; frame pacing, and whether *your* Wayland compositor refuses OSC 52,
+  are not. The harness asserts the app behaves correctly whenever refusal
+  happens, which is the half the app owns.
+- **13 of 47 acceptance TCs remain unverified**, mostly those needing a live
+  backend, a live `laya-serve`, or a real build. Per-TC results:
+  [`docs/multienv-acceptance-report.md`](docs/multienv-acceptance-report.md).
+
+The honest summary: the **decision and rendering logic** is now well covered,
+and the **OS and hardware layers are not covered at all**. Anyone reading
+"16,796 checks, all passing" as "this works everywhere" is reading it wrong.
+
 ## Usability validation across 100 personas
 
-`scripts/persona_usability_check.ts` runs **9,144 assertions across 100
+`scripts/persona_usability_check.ts` runs **9,177 assertions across 100
 distinct usage configurations** — 3 platforms, 10 terminal families, 5 locales,
 6 terminal sizes and 4 colour modes, crossed so every value of every axis is
 exercised.
@@ -500,8 +548,8 @@ product bugs rather than harness noise:
 ## Hardware / environment matrix validation
 
 `scripts/persona_usability_check.ts` (above) varies the **terminal**. This section
-is about the other axis: the **machine**. `src/setup/tuning.test.ts` and the
-sweeps behind it check the setup decisions against a matrix of
+is about the other axis: the **machine**. The sweep behind this was run once as
+a throwaway harness over
 
 ```
 CPU (1·2·4·8·12·16·32·64) × RAM (2–256 GiB)
@@ -509,7 +557,17 @@ CPU (1·2·4·8·12·16·32·64) × RAM (2–256 GiB)
   × platform (linux·darwin·win32) × model size (0·1·4·20·70 GiB)
 ```
 
-= **6,720 environment combinations, 168,668 invariant checks**.
+= **6,720 environment combinations, 168,668 invariant checks, 1,442 violations
+before the fix, 0 after.**
+
+Being precise about what survives in the repo: the one-off harness was **not
+committed** — the 168,668 figure is what that throwaway run reported, and you
+cannot re-run it from a clean checkout. What *is* committed is
+`src/setup/tuning.test.ts` (11 tests), which pins every invariant the sweep
+found broken, plus the cross-product spot-checks. The sweep's value was finding
+the three bugs below; the tests are what stop them coming back. Quoting a check
+count that no longer has anything to reproduce it would be the same mistake this
+README criticises elsewhere.
 
 The invariants are the ones whose violation the user discovers hours later:
 threads never exceed the core count, context stays in a range llama.cpp's KV
@@ -709,8 +767,11 @@ real thing.
 > `tools/browser.ts`(타겟 선택/에러 경로는 fake HTTP 서버로 — 실제 CDP 왕복은
 > 실제 headless Chrome으로 수동 검증, 아래 참고), `hermes/selfHeal.ts`,
 > `hermes/selfImprove.ts`(fake `ModelBackend` 사용), `compaction/compactor.ts`,
-> `compaction/checkpoint.ts`, `skills/loader.ts`, `setup/tuning.ts`
-> (코어 수 · VRAM · OS에 따른 플래그 결정 불변식 — 위 매트릭스 검증 참조).
+> `compaction/checkpoint.ts`, `skills/loader.ts`,
+> `setup/tuning.ts`(코어 수 · VRAM · OS에 따른 플래그 결정 불변식),
+> `tui/terminal.ts` + `tui/SlashMenu.tsx`(터미널 능력 감지 · 팝업 높이),
+> `setup/bootstrap.ts` + `config.ts`(쓰기 불가 프로젝트에서의 점진적 저하).
+> 현재 **618개 테스트 전부 통과**.
 > 에이전트 루프와 TUI는
 > 통합 테스트 성격(도구 호출 루프, 스트리밍, 슬래시 명령)이라 실제 llama-server를
 > 대상으로 pty로 실제 키 입력을 흘려보내며 검증했다(git 히스토리 참고) — Ink 터미널
