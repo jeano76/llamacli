@@ -279,7 +279,42 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // Declared before the adoption block: the early return reports the model it
   // found, even though step 3 (which fills it in) never runs on that path.
   let model: ModelChoice | undefined;
-  if (!opts.offline) {
+  // Declared here (not at the download step) so the "keep the model already in
+  // use" branch above can assign it.
+  let modelPath = "";
+  // The model this install is ALREADY using, if that file still exists.
+  //
+  // Checked before the Hub, and deliberately without consulting it. The Hub
+  // republishes filenames: this box's working model is
+  // `Ornith-1.5-35B-A3B-Q4_K_M.gguf` (21,864,081,056 bytes) while the same
+  // quant is published today as `Ornith-1.5-35B-Q4_K_M.gguf`
+  // (21,713,463,040) — different name, different size, same intended model.
+  // Resolving from the catalogue first therefore produced a filename that
+  // matches nothing on disk, and a 20 GB download of weights the machine had
+  // been serving all along. Observed twice, ~3h each at this link's speed.
+  //
+  // The config's own record of the working model is the authority: if that file
+  // is still present it is by definition correct, and re-deriving it from a
+  // remote catalogue can only make it worse.
+  const configuredPaths = [
+    typeof existing?.llama?.modelPath === "string" ? existing.llama.modelPath : undefined,
+    typeof existing?.model === "string" ? existing.model : undefined,
+  ];
+  let alreadyInUse: string | undefined;
+  for (const p of configuredPaths) {
+    if (p && (await fileSize(p)) > 0) { alreadyInUse = p; break; }
+  }
+  if (alreadyInUse) {
+    const size = await fileSize(alreadyInUse);
+    modelPath = alreadyInUse;
+    model = {
+      candidate: { repo: "(기존 설정)", filename: alreadyInUse.split("/").pop()!, sizeBytes: size, url: "" },
+      reason: `이미 사용 중인 모델을 유지합니다: ${alreadyInUse}`,
+      alternatives: [],
+    };
+    steps.push({ name: "모델 결정", ok: true, detail: `기존 모델 유지 (다운로드 불필요): ${alreadyInUse}` });
+    log(`이미 사용 중인 모델을 유지합니다 — 내려받지 않습니다: ${alreadyInUse}`);
+  } else if (!opts.offline) {
     const gpu = hardware.gpus[0];
     await step("모델 결정", async () => {
       const { c35, c9 } = await resolveModel({ env, fetchImpl: opts.fetchImpl, log });
@@ -302,7 +337,6 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // clipboard fallback lives in /tmp, which is often tmpfs). By the time a
   // progress bar is on screen the space is already gone, so this has to be a
   // precondition.
-  let modelPath = "";
   let equivalent: string | null = null;
   if (model) {
     const needed = (model.candidate.sizeBytes || 0) + RESERVE_BYTES;
