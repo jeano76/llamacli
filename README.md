@@ -616,6 +616,75 @@ the directory was *not* actually read-only the test passed without exercising
 anything. Reverting the fixes and watching the tests fail is the only reason
 that got caught.
 
+## TUI / terminal simulation
+
+The two harnesses above vary the terminal's *identity* and the project's
+*shape*. `scripts/tui_simulation_check.ts` covers the third axis: **what the
+terminal can actually do, and what happens when the user interacts with it.**
+
+```bash
+npx tsx scripts/tui_simulation_check.ts [--verbose]
+```
+
+- **12 terminal configurations**, each with a **ground-truth capability
+  table** — not a guess, but what that terminal genuinely does: xterm at 256
+  and truecolor, `vt100`, `dumb`, a CI pipe with no tty at all, `NO_COLOR`,
+  a `C`-locale non-UTF-8 terminal, Windows Terminal, bare conhost, macOS
+  Terminal, and tmux.
+- **5 sizes, 20×10 through 200×50** — the layout must hold at the 40×16 the
+  docs name and at a 20×10 that is genuinely too small for a 15-item popup.
+- **A real pty** (`script -qec`) for the cases only a terminal can answer:
+  background restore on exit, cursor restoration, and line width as bytes
+  actually reach the wire.
+- **Clipboard routes** — a terminal that accepts OSC 52, one that refuses it
+  (Wayland, several multiplexers), and a payload too large to send.
+- **Korean and emoji width** at every size, plus paste-chip detection driven
+  by a keystroke timeline.
+
+**599 checks.**
+
+### What it found
+
+- **Monochrome terminals were being sent colour.** `detectColorDepth` fell
+  through to a 16-colour default for unknown TERMs, and `vt100` was in that
+  unknown set — so `48;2;0;0;0m` and `95m` went to a terminal that renders
+  them as stray characters. The code's own comment warns about "guessing up";
+  this was a guess up in the direction nothing noticed, because every common
+  TERM does have colour. Now matched by exact name, with the safe fallback
+  preserved for terminals this code has never heard of.
+
+- **`altScreen` was derived from `ansi`, and they are different capabilities.**
+  `vt100` predates the alternate screen, and — more importantly — **tmux and
+  GNU screen disable `alternate-screen` by default**, because switching buffers
+  is precisely what destroys scrollback. Their inner `TERM` is still
+  `screen-256color`, so both the ANSI and the colour checks pass and *nothing
+  else would have caught it*. The app was telling tmux sessions to enter an
+  alternate buffer nobody asked for. It now answers "no" when unsure, because
+  rendering inline is recoverable and switching a session's buffer is not.
+
+- **The slash menu could render taller than the thing it overlays.** At 20×10
+  the log area is 5 rows, the `MIN_ROWS` floor produced 4 items, and the box
+  needed 6 — clipping its own bottom border. Clamped to the container now.
+
+### What the simulation got wrong, and why that matters
+
+The first run reported 17 failures. **Nine were my expectations being wrong**,
+and several would have caused damage if "fixed":
+
+- Asserting that `selectionText` strips ANSI would have "fixed" code that is
+  already correct — both real call sites (`App.tsx:1354`, `index.tsx:1136`)
+  wrap it in `stripAnsiForCopy`.
+- Asserting a reset sequence on a non-ANSI terminal would have written escapes
+  into a dumb pipe.
+- Asserting SGR `0m` on exit would have "fixed" the app to wipe the user's
+  *foreground* colour too; the real restore is SGR `49`.
+- Asserting the paste detector on a whole typed string tested an input the app
+  never receives — typing produces one `useInput` chunk per keystroke.
+
+Each was checked against the real call site, contract, and unit before being
+reclassified. Recording this because a simulation harness that reports its own
+bugs as product bugs is worse than no harness.
+
 ## Testing
 
 Every module with real logic (not just glue/IO) has a `*.test.ts` next to it,

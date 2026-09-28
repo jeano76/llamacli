@@ -146,8 +146,37 @@ function identifyTerminal(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): st
   return term || "unknown";
 }
 
-function detectColorDepth(env: NodeJS.ProcessEnv, ansi: boolean, terminal: string): ColorDepth {
-  if (!ansi) return 0;
+/**
+ * Whether the alternate screen buffer can be trusted.
+ *
+ * Separate from ANSI on purpose: understanding CSI says nothing about having
+ * a second screen buffer. Two families fail that, and both are still in daily
+ * use:
+ *
+ *   - `vt100` and its relatives predate the feature. They understand escape
+ *     sequences and no colours, and `?1049h` is meaningless to them.
+ *   - tmux and GNU screen disable `alternate-screen` BY DEFAULT, because
+ *     switching buffers is exactly what destroys an application's scrollback
+ *     and users complained. The inner `TERM` is still usually
+ *     `screen-256color`/`tmux-256color`, so the ANSI and colour checks both
+ *     pass and nothing else would catch it.
+ *
+ * The `xterm-*-screen`/`rxvt-unicode` family supports it, as do the modern
+ * emulators, so those default to true. An explicit override wins in both
+ * directions, because someone who knows their multiplexer is configured
+ * should be able to say so.
+ */
+function detectAltScreen(env: NodeJS.ProcessEnv, term: string): boolean {
+  if (env.LLAMACLI_ALT_SCREEN === "0") return false;
+  if (env.LLAMACLI_ALT_SCREEN === "1") return true;
+  const t = (term ?? "").toLowerCase();
+  if (/^vt(100|102|220|320|420)$/.test(t)) return false;
+  if (/^(dumb|cons25|emacs)$/.test(t)) return false;
+  if (/^(screen|tmux)(-[0-9]+color)?$/.test(t)) return false;
+  return true;
+}
+
+function detectColorDepth(env: NodeJS.ProcessEnv, ansi: boolean, terminal: string): ColorDepth {  if (!ansi) return 0;
   if (isSet(env.NO_COLOR)) return 0;
 
   const override = env.LLAMACLI_COLOR_DEPTH;
@@ -179,6 +208,22 @@ function detectColorDepth(env: NodeJS.ProcessEnv, ansi: boolean, terminal: strin
   // conhost with VT enabled: 16 colors plus the bright 90-97 range it has
   // supported since Windows 10, which is what the 4 bucket means here.
   if (terminal === "Windows conhost") return 4;
+
+  // Known monochrome TERMs. `vt100` is a real, still-selectable TERM value
+  // (PuTTY's "VT100" mode, `TERM=vt100` in a bare emacs/shell), and it is
+  // genuinely monochrome -- it implements no SGR colour attributes at all.
+  // Falling through to the 16-colour default below therefore made the app
+  // emit `95m`, `48;2;0;0;0m` and friends into a terminal that renders them
+  // as stray characters, which is the exact failure the "guess up" comment
+  // warns about -- except the guess was wrong in the conservative direction
+  // and nothing caught it, because every other TERM in common use does have
+  // colour.
+  //
+  // Caught by the terminal simulation sweep (12 terminal configurations with
+  // a ground-truth capability table). Matched by exact name only: an unknown
+  // TERM must still fall back to 4, since refusing colour everywhere would
+  // strip it from every terminal this has not heard of.
+  if (["vt100", "vt220", "vt320", "vt420", "wy50", "wy60", "wsvt25", "sun", "dumb"].includes(term)) return 0;
 
   // Unknown TERM: assume the 16 ANSI colors, which every terminal that
   // understands CSI at all also understands. Guessing *up* here is what
@@ -288,6 +333,25 @@ export function detectTerminal(
   const mouseSgr = ansi && detectMouseSgr(env, term);
   const modern = MODERN_TERMINALS.some((t) => terminal.includes(t)) || /^(alacritty|kitty|wezterm|foot|ghostty|rio)$/i.test(term);
 
+  // The alternate screen is a SEPARATE capability from ANSI, and conflating
+  // them made the app claim a buffer it does not have on two real terminals.
+  //
+  // `vt100` predates the alternate screen entirely, and tmux/screen do not
+  // pass it through by default (`alternate-screen` is off unless the user
+  // enables it, precisely because it breaks scrollback). So `altScreen: ansi`
+  // was true for both, and the app emitted `?1049h` into a terminal that
+  // would either ignore it or, under tmux, tear away the scrollback the user
+  // relies on.
+  //
+  // Caught by the terminal simulation sweep (12 configurations with a
+  // ground-truth capability table).
+  //
+  // Note the consequence is safe in the direction that matters: when in doubt
+  // this now says NO, so the app renders inline instead of switching buffers.
+  // Showing output in the main buffer is the recoverable outcome; switching a
+  // tmux session into an alternate buffer the user did not ask for is not.
+  const altScreen = ansi && detectAltScreen(env, term);
+
   // Mouse default. ON by default, and this is a REVERSAL of an earlier
   // decision in this file — the change is documented here because the reason
   // it was flipped is the reason it was flipped back.
@@ -327,7 +391,7 @@ export function detectTerminal(
     ansi,
     colorDepth,
     unicode,
-    altScreen: ansi,
+    altScreen,
     synchronizedOutput: ansi && modern && env.LLAMACLI_NO_SMOOTH !== "1",
     hyperlink: ansi && modern,
     mouse: mouse && mouseSgr,

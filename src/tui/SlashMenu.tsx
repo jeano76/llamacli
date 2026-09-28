@@ -72,12 +72,29 @@ export interface SlashMenuProps {
  * down reflows nothing.
  */
 export function menuVisibleRows(availableRows: number, matchCount: number): number {
-  const MIN_ROWS = 4;
+  // A popup row needs its own border, so a box of N items occupies N + 2 rows.
+  // The floor and the share are both computed on the ITEM budget and then
+  // clamped against what the container can physically hold.
+  //
+  // The clamp is the fix. `Math.max(MIN_ROWS, ...)` made the floor unconditional
+  // in the wrong direction: on a 20x10 terminal the log area is 5 rows, the
+  // floor produced 4 items, and the box (4 + 2 borders) needed 6 -- so the
+  // popup was drawn larger than the space it overlays and the transcript
+  // behind it was pushed to nothing. Caught by the terminal simulation sweep,
+  // which checks the box against the log height at 20x10 through 200x50.
+  //
+  // 3 items is the smallest box that still reads as a list rather than a
+  // fragment (2 would leave a single visible item between two borders).
+  const MIN_ROWS = 3;
   // A popup may claim at most this share of the log area; the conversation
   // has to stay readable while it is open.
   const MAX_SHARE = 0.5;
-  const budget = Math.max(MIN_ROWS, Math.floor(availableRows * MAX_SHARE));
-  return Math.min(Math.max(1, matchCount), budget);
+  const BORDER_ROWS = 2;
+  const wanted = Math.max(MIN_ROWS, Math.floor(availableRows * MAX_SHARE));
+  // Never taller than the container, borders included. A popup that overflows
+  // its own overlay is not a popup.
+  const ceiling = Math.max(1, availableRows - BORDER_ROWS);
+  return Math.min(Math.max(1, matchCount), wanted, ceiling);
 }
 
 /**
