@@ -112,6 +112,13 @@ export interface BootstrapOptions {
    *  reported the resulting silence as a verdict. Nothing in the config looked
    *  wrong; the running process simply predated the fix, so re-running /reset
    *  could not fix it without actually killing it. */
+  /**
+   * Re-derive settings but never transfer a model. Used by `/reset`, which runs
+   * inside a live session: a multi-hour download there wedges the agent loop
+   * and the user sees a prompt that has stopped responding. The file is fetched
+   * on the next launch instead, where the progress can be shown properly.
+   */
+  noDownload?: boolean;
   resetLaya?: boolean;
   /** Injected so tests need not kill a real process. */
   stopServer?: () => Promise<boolean>;
@@ -192,8 +199,85 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     log(`기존 llama-server 사용: ${llama.binPath}`);
   }
 
+  // ── 2.5 Adopt an already-running server, BEFORE touching the network ──────
+  // This check used to live in step 5, AFTER the model had been resolved and
+  // DOWNLOADED. On a machine that already has a healthy llama-server serving a
+  // model, that meant the bootstrap searched HuggingFace and began a 20 GB
+  // fetch before ever noticing there was nothing to do.
+  //
+  // Not a theoretical waste — confirmed live. A 20 GB model deleted to reclaim
+  // disk space was silently re-downloaded, in full, on the next launch: the file
+  // the running server was actually serving had a different name AND a
+  // different byte count from the one the Hub publishes today, so the
+  // "equivalent model already on disk" check could not match it — while the
+  // server serving that very file was up the whole time.
+  //
+  // So "is there already a server I can simply use?" is asked FIRST, and a yes
+  // ends the bootstrap before any model resolution, download or disk probe.
+  let existing = opts.force
+    ? keepUserOwnedKeys(await readConfig(opts.projectRoot))
+    : await readConfig(opts.projectRoot);
+
+  // `force` skips adoption on purpose: /reset exists to re-derive the model and
+  // the flags from the current hardware, so it must NOT be short-circuited by
+  // whatever happens to be running.
+  if (!opts.force) {
+  //
+  // This was found by running the real bootstrap on a machine that already had
+  // a llama-server up: planPorts saw 8080 busy and moved us to 8081, which
+  // means llamacli spawns a SECOND llama-server. On this box that is fatal —
+  // the running server already holds 7.2 GB of an 8 GB card, so a second one
+  // OOMs on load. And it is pointless: the thing on 8080 is already answering
+  // /v1/models with the model we just picked.
+  //
+  // So detection runs first, and only a genuinely free port leads to a spawn.
+  // This is also the same probe config.ts already uses for a project with no
+  // config, so "adopt the running server" and "detect a running server" are one
+  // mechanism rather than two that can disagree.
+  const detect = opts.detectServer ?? ((h: string, p: number[]) => detectRunningServer(h, p));
+  const running = await detect("127.0.0.1", [LLAMA_PORT, ...COMMON_PORTS.slice(1)]);
+  if (running) {
+    const adoptedPort = Number(new URL(running.baseUrl).port);
+    steps.push({
+      name: "기존 서버 연결",
+      ok: true,
+      detail: `이미 실행 중인 서버를 사용합니다: ${running.baseUrl} (${running.model})`,
+    });
+    log(`이미 실행 중인 llama-server 에 연결합니다: ${running.baseUrl}`);
+    steps.push({ name: "포트 결정", ok: true, detail: `llama ${adoptedPort} (기존 서버), laya ${opts.layaPort ?? LAYA_PORT}` });
+    const adopted: Record<string, unknown> = {
+      ...(existing ?? {}),
+      backend: "openai-compatible",
+      baseUrl: running.baseUrl,
+      model: running.model,
+      laya: {
+        ...(existing?.laya ?? {}),
+        port: opts.layaPort ?? LAYA_PORT,
+        baseUrl: `http://127.0.0.1:${opts.layaPort ?? LAYA_PORT}`,
+      },
+    };
+    if (opts.projectRoot) {
+      await writeConfig(opts.projectRoot, adopted);
+      steps.push({ name: "설정 저장", ok: true, detail: ".llamacli/config.yaml (기존 서버 연결)" });
+    }
+    return {
+      ok: true,
+      steps,
+      hardware,
+      llama: llama ?? undefined,
+      tuning: undefined,
+      ports: { llamaPort: adoptedPort, layaPort: opts.layaPort ?? LAYA_PORT },
+      config: adopted,
+      errors,
+    };
+  }
+
+  }
+
   // ── 3. Model ──────────────────────────────────────────────────────────────
   const modelsDir = opts.modelsDir ?? env.LLAMACLI_MODELS_DIR ?? DEFAULT_MODELS_DIR;
+  // Declared before the adoption block: the early return reports the model it
+  // found, even though step 3 (which fills it in) never runs on that path.
   let model: ModelChoice | undefined;
   if (!opts.offline) {
     const gpu = hardware.gpus[0];
@@ -254,6 +338,25 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
           detail: `동일한 모델이 다른 이름으로 이미 있습니다: ${equivalent}`,
         });
         log(`이미 있는 동일 모델을 사용합니다: ${equivalent}`);
+      } else if (opts.noDownload) {
+        // /reset runs INSIDE a live TUI session. A 20 GB fetch here blocks the
+        // agent loop for hours while the user watches a spinner on a prompt
+        // that will never answer — reported directly as "the prompt stops
+        // working after /reset".
+        //
+        // So /reset re-derives the SETTINGS and reports what would need
+        // downloading, but never transfers. The file is fetched on the next
+        // real launch, where the progress belongs on the normal scrollback
+        // instead of inside a running session.
+        steps.push({
+          name: "모델 다운로드",
+          ok: true,
+          detail: `세션 중에는 다운로드하지 않습니다: ${dest}`,
+        });
+        log(`모델은 다음 실행 시 내려받습니다: ${dest}`);
+        // Still recorded, so the config is complete and correct; the next
+        // launch's size check will simply find no file and download it.
+        modelPath = dest;
       } else if (opts.offline) {
         steps.push({ name: "모델 다운로드", ok: false, detail: "오프라인이라 건너뜁니다." });
       } else {
@@ -276,61 +379,6 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // to PRESERVE user intent (apiKey, verify commands, the laya toggle); with
   // `force` that is deliberately narrowed to the keys the user owns, because
   // the whole point is to discard machine-derived values and recompute them.
-  const existing = opts.force ? keepUserOwnedKeys(await readConfig(opts.projectRoot)) : await readConfig(opts.projectRoot);
-
-  // ── 5. Ports ──────────────────────────────────────────────────────────────
-  // An ALREADY-RUNNING healthy server must be adopted, not routed around.
-  //
-  // This was found by running the real bootstrap on a machine that already had
-  // a llama-server up: planPorts saw 8080 busy and moved us to 8081, which
-  // means llamacli spawns a SECOND llama-server. On this box that is fatal —
-  // the running server already holds 7.2 GB of an 8 GB card, so a second one
-  // OOMs on load. And it is pointless: the thing on 8080 is already answering
-  // /v1/models with the model we just picked.
-  //
-  // So detection runs first, and only a genuinely free port leads to a spawn.
-  // This is also the same probe config.ts already uses for a project with no
-  // config, so "adopt the running server" and "detect a running server" are one
-  // mechanism rather than two that can disagree.
-  const detect = opts.detectServer ?? ((h: string, p: number[]) => detectRunningServer(h, p));
-  const running = await detect("127.0.0.1", [LLAMA_PORT, ...COMMON_PORTS.slice(1)]);
-  if (running) {
-    const adoptedPort = Number(new URL(running.baseUrl).port);
-    steps.push({
-      name: "기존 서버 연결",
-      ok: true,
-      detail: `이미 실행 중인 서버를 사용합니다: ${running.baseUrl} (${running.model})`,
-    });
-    log(`이미 실행 중인 llama-server 에 연결합니다: ${running.baseUrl}`);
-    steps.push({ name: "포트 결정", ok: true, detail: `llama ${adoptedPort} (기존 서버), laya ${opts.layaPort ?? LAYA_PORT}` });
-    const adopted: Record<string, unknown> = {
-      ...(existing ?? {}),
-      backend: "openai-compatible",
-      baseUrl: running.baseUrl,
-      model: running.model,
-      laya: {
-        ...(existing?.laya ?? {}),
-        port: opts.layaPort ?? LAYA_PORT,
-        baseUrl: `http://127.0.0.1:${opts.layaPort ?? LAYA_PORT}`,
-      },
-    };
-    if (opts.projectRoot) {
-      await writeConfig(opts.projectRoot, adopted);
-      steps.push({ name: "설정 저장", ok: true, detail: ".llamacli/config.yaml (기존 서버 연결)" });
-    }
-    return {
-      ok: true,
-      steps,
-      hardware,
-      llama: llama ?? undefined,
-      model,
-      tuning: undefined,
-      ports: { llamaPort: adoptedPort, layaPort: opts.layaPort ?? LAYA_PORT },
-      config: adopted,
-      errors,
-    };
-  }
-
   const plan = await planPorts({
     probe: opts.probe ?? tcpPortProbe,
     llamaPort: typeof existing?.llama?.port === "number" ? existing.llama.port : undefined,

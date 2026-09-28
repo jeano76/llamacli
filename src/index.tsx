@@ -1015,6 +1015,8 @@ async function main() {
               const report = await ensureLocalStack({
                 projectRoot,
                 force: true,
+                // Never fetch inside a live session — see noDownload.
+                noDownload: true,
                 // Measure the backend rather than reading the hardware table, so
                 // the llama settings reflect what this machine actually does —
                 // including a throttled card, a fallback build, or a busy box.
