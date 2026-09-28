@@ -1,0 +1,26 @@
+# llamacli 설정 예시.
+#
+# 실제 .llamacli/config.yaml 은 gitignore 대상입니다 — 부트스트랩이 매 실행마다
+# 이 컴퓨터의 GPU/VRAM/RAM 기준으로 다시 쓰기 때문에, 머신별 설정입니다.
+# 아래는 사용자가 직접 만지는 값들만 적은 예시입니다.
+#
+# backend: openai-compatible
+# baseUrl: http://127.0.0.1:8080
+# model: /path/to/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+
+compaction:
+  autoTriggerRatio: 0.7
+  autoResume: true
+  # 요약 생성 예산. 이 값이 컴팩션 지연과 거의 일치합니다
+  # (이 기기에서 decode 38 tok/s 기준 1024 ≈ 27초, 4096 ≈ 107초).
+  # summaryMaxTokens: 1024
+
+laya:
+  enabled: false
+  # laya-serve 가 바인딩하는 포트이자 health 체크가 조회하는 포트.
+  # 두 값이 어긋나면 게이트가 매 턴 30초씩 타임아웃합니다.
+  port: 8099
+
+browser:
+  debugPort: 9222
+  host: 127.0.0.1

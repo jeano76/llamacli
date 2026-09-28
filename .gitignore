@@ -1,6 +1,12 @@
 node_modules/
 dist/
 .llamacli/state/
+# Per-machine runtime config. The bootstrap (src/setup/) rewrites this on every
+# launch with values derived from the local GPU/VRAM/RAM — gpuLayers, threads,
+# contextSize, laya.port — so it is a property of the BOX, not of the project,
+# and committing it makes every user's machine share one machine's tuning.
+# `.llamacli/rules/` stays tracked: those are meant to be shared.
+.llamacli/config.yaml
 *.log
 .claude/
 __pycache__/
