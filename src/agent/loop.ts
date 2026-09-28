@@ -354,7 +354,7 @@ export interface AgentLoopOptions {
    * `verdict` is the judge's own "this is cheap" boolean, `conf` its
    * confidence, `score` its raw probability. `reason`/`gateId` are for the UI.
    */
-  layaGate?: (userText: string) => Promise<{ judgeSaysCheap: boolean; reason?: string; verdict?: string; score?: number; conf?: number; gateId?: number; failed?: boolean } | undefined>;
+  layaGate?: (userText: string) => Promise<{ judgeSaysCheap: boolean; reason?: string; verdict?: string; score?: number; conf?: number; gateId?: number; failed?: boolean; failureReason?: string } | undefined>;
   // Fired once per short-circuit verdict (skip:true) with the same payload
   // layaGate returned. Lets the UI append a stable-id cumulative perf line
   // even though the foldable summary is rendered elsewhere — see App.tsx's
@@ -612,6 +612,9 @@ export class AgentLoop {
         // separately so "the judge said no" and "the judge never answered"
         // don't look the same on screen — see runLayaGate's `failed` doc.
         gateFailed: Boolean(gateResult?.failed),
+        // The caller knows WHY the gate was unreachable; pass it through so the
+        // user is told which of "install it" / "restart it" applies.
+        failureReason: gateResult?.failureReason,
       });
       // Surface the verdict, but ONLY when the gate actually ran. When it is
       // switched off, "gate: 꺼짐 — 전체 턴" on every single turn is pure

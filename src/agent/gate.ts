@@ -154,6 +154,12 @@ export function decideGate(input: {
    *  "gate: 전체 턴 필요로 판단 (conf=0.000)". Nothing on screen distinguished a
    *  dead gate from a working one. */
   gateFailed?: boolean;
+  /** Why the gate was unreachable, when it was. Supplied by the caller because
+   *  only it knows the difference that matters to the user — "never installed"
+   *  and "your server died" need different instructions, and a single generic
+   *  "판정 실패" teaches them nothing. Defaults to the generic wording when
+   *  absent, so the function is still usable on its own. */
+  failureReason?: string;
 }): GateDecision {
   const matched = highRiskMatches(input.text);
 
@@ -172,7 +178,7 @@ export function decideGate(input: {
     // "full" simply because there is no judge to disagree.
     return {
       mode: "full",
-      reason: "gate: 판정 실패 (laya 서버에 연결하지 못함) — 전체 턴으로 진행",
+      reason: `gate: ${input.failureReason ?? "판정 실패 (laya 서버에 연결하지 못함)"} — 전체 턴으로 진행`,
       conf: input.conf,
       forced: false,
       matched,

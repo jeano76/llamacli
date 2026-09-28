@@ -168,6 +168,23 @@ function askYesNo(ui: any, question: string): Promise<boolean> {
   });
 }
 
+/** Whether the laya server answers /health on the port WE are polling.
+ *
+ *  Probed from Node rather than inferred from a failed gate call, because the
+ *  two give different answers about what to tell the user: a failed call is
+ *  ambiguous (was it never installed? did it die? was the port wrong?), a health
+ *  probe is not. The port is passed in rather than re-derived here so it is
+ *  literally the same value handed to the child process via layaPortEnv — the
+ *  two disagreeing is the entire bug this is built around. */
+async function layaHealthOk(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T): T {
   const original = stdout.write.bind(stdout);
   let reasserting = false;
@@ -490,6 +507,15 @@ async function main() {
   // summary keyed by this id via App.pushGateLog) keeps appending to ONE
   // growing line across every fastcheck run instead of spawning one per run.
   let layaGateId = 0;
+  /** One-shot guard for the self-heal below. A gate whose server is down tries
+   *  to start it ONCE per session and then stops trying.
+   *
+   *  Retrying every turn is worse than not retrying at all: a cold install is a
+   *  multi-minute pip, so a per-turn retry would either wedge the agent loop
+   *  for minutes at a time or fire repeatedly and thrash. Once is enough to fix
+   *  "I just enabled it" and to fix "the server died"; a genuinely broken
+   *  install is reported with instructions instead. */
+  let layaBootAttempted = false;
   /** Default cap, seconds, for a laya round-trip when config.yaml doesn't set
    *  `laya.timeoutSeconds`. A hung server must never block a turn. */
   const DEFAULT_LAYA_TIMEOUT_SECONDS = 30;
@@ -605,8 +631,13 @@ async function main() {
      *  "full turn needed" and printed `gate: 전체 턴 필요로 판단 (conf=0.000)`
      *  — a verdict that was never made, presented identically to a real one.
      *  The user could not tell a dead gate from a working one. `failed` is what
-     *  lets the two be told apart. */
+     *  lets the two be told apart.
+     *
+     *  `failureReason` carries WHY, because "never installed" and "the server
+     *  died" need different instructions and the generic string teaches the user
+     *  nothing they can act on. Only the caller can tell them apart. */
     failed?: boolean;
+    failureReason?: string;
   } | undefined> => {
     // Off => the gate doesn't run at all, and `undefined` (rather than a
     // synthetic "not cheap") is what makes decideGate report "gate: 꺼짐"
@@ -615,6 +646,39 @@ async function main() {
     // (using full model): …" on every single turn, which is exactly the noise
     // a deliberately-disabled feature must not produce.
     if (!runtimeEnabled) return undefined;
+
+    // ── Self-heal: is the gate's own server even up? ───────────────────────
+    // Asked before the round-trip, because the round-trip's own failure cannot
+    // say WHY it failed. A user staring at "판정 실패" learns nothing; the
+    // difference between "never installed" and "was running and died" is the
+    // difference between "run /fastcheck on" and "your server is dead".
+    const healthy = await layaHealthOk(layaPort);
+    if (!healthy && !layaBootAttempted) {
+      layaBootAttempted = true;
+      try {
+        // The bare `fastcheck` command installs and boots, streaming its own
+        // progress. Given the INSTALL timeout, not the 30 s per-turn one: a
+        // cold install cannot finish inside 30 s, so using it here would make
+        // the self-heal impossible by construction.
+        const boot = await runLayaScript(["fastcheck"], LAYA_INSTALL_TIMEOUT_MS, (line) => {
+          if (line.trim()) (globalThis as any).__llamacli_ui?.pushStatus(line);
+        });
+        if (boot.stdout) (globalThis as any).__llamacli_ui?.pushStatus(boot.stdout.trim());
+        return undefined; // not this turn's job to decide; next turn will ask
+      } catch {
+        // Fall through to the normal path, which reports the failure properly.
+      }
+    }
+    if (!healthy) {
+      return {
+        judgeSaysCheap: false,
+        failed: true,
+        failureReason: layaBootAttempted
+          ? "laya 서버가 응답하지 않습니다 — /fastcheck on 으로 다시 시도하거나, 끄려면 /fastcheck off"
+          : "laya 서버가 아직 준비되지 않았습니다 — /fastcheck on 으로 설치·시작하세요",
+      };
+    }
+
     try {
       const { stdout } = await runLayaScript(["fastcheck", "--text", userText]);
       // cmd_fastcheck prints its own progress lines (install/boot-wait) on
