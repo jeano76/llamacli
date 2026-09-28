@@ -560,6 +560,62 @@ For the per-TC results, what was actually executed, and the 25 test cases that
 remain **unverified** for lack of the hardware, see
 [`docs/multienv-acceptance-report.md`](docs/multienv-acceptance-report.md).
 
+## Project validation — 100 developers, 100 projects
+
+The harness above varies the **terminal**. `scripts/project_persona_check.ts`
+varies the axis next to it: the **project the developer opened**.
+
+```bash
+npx tsx scripts/project_persona_check.ts [--verbose]
+```
+
+Being precise about what this is: not 100 simulated humans, and not 100
+simulated machines. A "developer" here is a concrete, reproducible project state
+— a directory layout, a path shape, a config state, a locale, a disk
+condition. Nothing about it is fictional. The value is the coverage matrix, not
+a story about a person.
+
+What makes it different from the synthetic sweep above is that **every persona
+gets a real directory on disk and the real `ensureLocalStack` runs against it.**
+Only the network and the hardware probe are stubbed — the two things a test
+must not depend on. So this covers what pure-function tests structurally
+cannot: a project directory called `my project 28`, or `프로젝트-5`, or
+`proj-7-🚀`, or one whose `.llamacli/config.yaml` is three bytes of garbage, or
+a read-only checkout, or a model file sitting inside the repo.
+
+- **10 project kinds** — empty, git repo, dirty git repo, monorepo, already
+  bootstrapped, corrupt config, truncated config, read-only, model-in-project,
+  deeply nested
+- **8 path shapes** — ascii, spaces, Korean, emoji, many dots, very long,
+  a name that *looks* like `C:\Users\dev\project`, and a symlink (where the
+  path you type and the path on disk differ)
+- **5 locales**, **5 disk conditions**
+
+**7,020 checks across 100 real project directories.**
+
+### What it found
+
+Two real bugs, in the same shape, one layer apart:
+
+- **`ensureLocalStack` threw on an unwritable project.** `writeConfig` was the
+  one call in the whole function not wrapped in the error-catching `step()`
+  helper, so `mkdir .llamacli` failing with `EACCES` rejected the entire
+  bootstrap — directly contradicting this module's own contract that a
+  bootstrap "degrades instead of failing". A read-only mount, a checkout owned
+  by someone else, or a container running as a non-owner all reach it.
+
+- **`loadConfig` had the identical defect, and it was worse.** The same
+  unguarded `mkdir` + `writeFile`, inside the `catch` block that handles a
+  *missing* config. Since that path runs on **every launch**, a read-only
+  project could not start `llamacli` at all. It now starts with in-memory
+  defaults and says so honestly, instead of showing a stack trace.
+
+Both are now regression-tested — and the tests were themselves wrong at first:
+the read-only probe created `.llamacli` as a side effect, so on a system where
+the directory was *not* actually read-only the test passed without exercising
+anything. Reverting the fixes and watching the tests fail is the only reason
+that got caught.
+
 ## Testing
 
 Every module with real logic (not just glue/IO) has a `*.test.ts` next to it,

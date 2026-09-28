@@ -269,10 +269,30 @@ export async function loadConfig(
       ? { ...DEFAULT_CONFIG, backend: "openai-compatible", baseUrl: detected.baseUrl, model: detected.model }
       : DEFAULT_CONFIG;
 
-    await mkdir(join(projectRoot, ".llamacli"), { recursive: true });
-    await writeFile(path, stringify(config), "utf8");
+    // Persisting the generated config is best-effort, exactly as the read
+    // above is. It used to be an unguarded `mkdir` + `writeFile` inside the
+    // catch block, so a project directory that cannot be written to — a
+    // read-only mount, a checkout owned by another user, a container running
+    // as a non-owner — made EVERY launch reject with EACCES. That is a much
+    // worse failure than the one it was handling: the file being missing is
+    // handled fine, and the generated config is only a convenience.
+    //
+    // Found by a project-axis sweep (100 project states). The session must
+    // still start; the user is told the setting was not saved rather than
+    // being shown a stack trace.
+    let saved = true;
+    try {
+      await mkdir(join(projectRoot, ".llamacli"), { recursive: true });
+      await writeFile(path, stringify(config), "utf8");
+    } catch {
+      saved = false;
+    }
 
-    const setupMessage = detected
+    const setupMessage = !saved
+      ? `[setup] No .llamacli/config.yaml found, and this project directory is not writable, so the generated config could not be saved. ` +
+        `llamacli is using in-memory defaults for this session only — they will be re-derived on every launch. ` +
+        `Run llamacli in a directory you own, or make this one writable, to persist them.`
+      : detected
       ? `[setup] No .llamacli/config.yaml found — detected a running server at ${detected.baseUrl} and created one pointing at it.`
       : `[setup] No .llamacli/config.yaml found and no local server detected on common ports (${COMMON_PORTS.join(", ")}). ` +
         `Created a placeholder — edit .llamacli/config.yaml to point at your backend.`;

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { keepUserOwnedKeys, buildConfig } from "./bootstrap.js";
 import { ensureLocalStack } from "./bootstrap.js";
 import { parse } from "yaml";
-import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, mkdir, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeReset } from "./resetDiff.js";
@@ -131,4 +131,61 @@ test("the config diff names the fields that actually changed", () => {
 test("an unchanged reset reports no differences at all, so 'nothing changed' is legible", () => {
   const same = { model: "/m.gguf", llama: { gpuLayers: 999, threads: 6, contextSize: 16384, port: 8080 }, laya: { port: 8099 }, baseUrl: "http://127.0.0.1:8080", backend: "local-llama" };
   assert.deepEqual(describeReset(same, same), []);
+});
+
+// `writeConfig` was the one call in ensureLocalStack that was not wrapped in
+// the error-catching `step()` helper, so it could throw straight out of the
+// function — contradicting this module's own contract that a bootstrap
+// "degrades instead of failing". A read-only project directory made
+// `mkdir .llamacli` fail with EACCES and the entire bootstrap reject, taking
+// down a working install. Found by a project-axis sweep over 100 project
+// states. Same defect, one layer up, was in config.ts's loadConfig.
+test("ensureLocalStack reports an unwritable project instead of throwing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-ro-"));
+  const project = join(dir, "project");
+  await mkdir(project);
+  await chmod(project, 0o555);
+  // Probe with a THROWAWAY name, not `.llamacli`. The first version of this
+  // test probed with the real name, so on any system where the mkdir SUCCEEDED
+  // it left a real `.llamacli` behind and the bootstrap then wrote to it
+  // successfully -- the test passed without ever exercising an unwritable
+  // directory. It now verifies the precondition without disturbing the thing
+  // under test.
+  const writable = await mkdir(join(project, ".probe-canary")).then(
+    () => true,
+    () => false
+  );
+  if (writable) {
+    await rm(join(project, ".probe-canary"), { recursive: true, force: true });
+  }
+  // Where the mode bit cannot be enforced (root ignores it, or an fs that does
+  // not honour it) there is no unwritable directory to test against, so the
+  // case is skipped rather than asserted vacuously.
+  if (writable) {
+    await chmod(project, 0o755);
+    await rm(dir, { recursive: true, force: true });
+    return;
+  }
+  try {
+    const report = await ensureLocalStack({
+      projectRoot: project,
+      offline: true,
+      allowBuild: false,
+      hardware: hw,
+      probe: async () => "free",
+      detectServer: async () => null,
+    });
+    // A report must still come back, and it must be usable.
+    assert.ok(report.config, "expected the derived config to be returned even when it cannot be saved");
+    assert.ok(Array.isArray(report.steps) && report.steps.length > 0);
+    // The failure must be reported, not swallowed: losing the write means the
+    // next launch redoes all of this work.
+    const saveStep = report.steps.find((s) => s.name === "설정 저장");
+    assert.ok(saveStep, "expected a config-write step");
+    assert.equal(saveStep.ok, false, "expected the config write to be reported as failed");
+    assert.ok(report.errors.some((e) => /설정 저장/.test(e)), `errors did not mention the failure: ${JSON.stringify(report.errors)}`);
+  } finally {
+    await chmod(project, 0o755);
+    await rm(dir, { recursive: true, force: true });
+  }
 });

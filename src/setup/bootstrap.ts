@@ -466,8 +466,25 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
 
   const config = buildConfig({ existing, llama, modelPath, plan, tuning, portsEnv: layaPortEnv(plan.layaPort), resetLaya: opts.resetLaya });
   if (opts.projectRoot) {
-    await writeConfig(opts.projectRoot, config);
-    steps.push({ name: "설정 저장", ok: true, detail: ".llamacli/config.yaml" });
+    // Wrapped like every other step, because until now this was the ONE call
+    // that could throw straight out of the function — which contradicted the
+    // module's own contract ("a bootstrap that throws takes down a working
+    // install; a bootstrap that returns a report lets the caller start anyway").
+    //
+    // Found by a project-axis sweep (100 project states): a read-only project
+    // directory made `mkdir .llamacli` fail with EACCES and the whole bootstrap
+    // rejected. That is a real and reachable state — a project on a read-only
+    // mount, a checkout owned by another user, a container running as a
+    // non-owner — and the user saw a crash instead of a report.
+    //
+    // Losing the write is genuinely bad (the run is not persisted), so it is
+    // recorded as a FAILED step and pushes an error, rather than being
+    // swallowed. The caller still gets a usable report and can start the
+    // session with the settings it derived.
+    await step("설정 저장", async () => {
+      await writeConfig(opts.projectRoot!, config);
+      return ".llamacli/config.yaml";
+    });
   }
   // NOTE: the config is written AFTER the download above. That ordering was
   // called out as a limitation and is deliberately left in place now that the
