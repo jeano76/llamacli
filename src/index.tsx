@@ -22,6 +22,11 @@ import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth } from "./tui/terminal.js";
+import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
+import { getCursorPlacement } from "./tui/cursorPlacement.js";
+import { ensureLocalStack } from "./setup/bootstrap.js";
+import { layaPortEnv, LAYA_PORT } from "./setup/ports.js";
+import { describeReset } from "./setup/resetDiff.js";
 import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
 
@@ -106,12 +111,95 @@ function enterAltScreen(): void {
   // therefore ends with the cursor-hide, closing that window entirely: the
   // cursor stays hidden by default and only becomes visible again where
   // App.tsx's effect explicitly puts it, on the input line.
-  process.stdout.write(seq.altScreenOn + seq.mouseOn);
+  // backgroundOn comes FIRST, before any box is drawn, so the very first frame
+  // is already painted on black rather than flashing the terminal's own
+  // background for one repaint.
+  process.stdout.write(seq.backgroundOn + seq.altScreenOn + seq.mouseOn);
 }
 
 function exitAltScreen(): void {
   const seq = buildSequences(getCapabilities());
-  process.stdout.write(seq.mouseOff + seq.altScreenOff);
+  // backgroundOff is NOT optional. Without it the black background outlives the
+  // process and recolours the user's shell for the rest of the session — the
+  // app is gone but its SGR state is not.
+  process.stdout.write(seq.mouseOff + seq.altScreenOff + seq.backgroundOff);
+}
+
+/**
+ * Returns a stdout-like object that re-asserts the prompt's cursor position
+ * after every frame written through it.
+ *
+ * Ink needs a real stream (it reads `.columns`/`.rows` for layout and calls
+ * `.on`/`.off` for resize), so this returns a proxy over the original rather
+ * than a bare `{write}` stub — dropping those properties is what makes naive
+ * wrappers produce a 0x0 layout or a resize crash.
+ *
+ * `write` appends the placement only when there is one registered, so the cost
+ * while the app is idle is a single null check. The placement is read at write
+ * time (not captured) so it always reflects the most recent prompt render.
+ */
+/** A blocking y/N question, reusing the same in-log + input-box pattern the
+ *  startup resume question uses.
+ *
+ *  Returns false on anything that isn't an explicit yes, so a stray keystroke,
+ *  a closed stdin or a timeout all take the safe branch — a destructive
+ *  command must never proceed on ambiguity. */
+function askYesNo(ui: any, question: string): Promise<boolean> {
+  ui?.pushStatus(`${question}\nY(예) / N(아니오) 를 입력해주세요.`, "status");
+  return new Promise<boolean>((resolve) => {
+    const onData = (chunk: Buffer) => {
+      const text = chunk.toString("utf8").trim().toLowerCase();
+      // Escape sequences (a mouse report, an arrow key) can arrive in the same
+      // chunk; only a chunk that is EXACTLY y/n counts as an answer, so a
+      // report can never be read as consent.
+      if (text === "y" || text === "\r" || text === "\n") {
+        process.stdin.off("data", onData);
+        process.stdin.setRawMode?.(false);
+        process.stdin.pause();
+        resolve(true);
+      } else if (text === "n" || text === "\x03") {
+        process.stdin.off("data", onData);
+        process.stdin.setRawMode?.(false);
+        process.stdin.pause();
+        resolve(false);
+      }
+    };
+    process.stdin.on("data", onData);
+  });
+}
+
+function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T): T {
+  const original = stdout.write.bind(stdout);
+  let reasserting = false;
+  const patched = ((chunk: any, ...rest: any[]): boolean => {
+    const result = original(chunk, ...rest);
+    const placement = getCursorPlacement();
+    if (placement && !reasserting) {
+      // Guard against recursion: a write that itself triggers another write
+      // (possible if stdout is a pipe being drained synchronously) would
+      // otherwise re-enter here forever.
+      reasserting = true;
+      try {
+        // The black background is re-asserted here, before the cursor
+        // placement, for the same reason the cursor is. Ink emits a full SGR
+        // reset (`\x1b[0m`) in the middle of frames, and SGR 0 resets the
+        // default background along with everything else — so the black set at
+        // startup is undone partway through the very first frame, and any cell
+        // after that reset comes back on the terminal's own background.
+        // Re-asserting at the end of every frame means the next frame starts
+        // from black again.
+        //
+        // The background is read from buildSequences rather than hard-coded so
+        // the color-depth fallback (16-colour SGR 40) stays in one place.
+        original(buildSequences(getCapabilities()).backgroundOn + placement);
+      } finally { reasserting = false; }
+    }
+    return result;
+  }) as typeof stdout.write;
+  // Object.create keeps the real stream as the prototype so `.columns`,
+  // `.rows`, `.on`, `.off`, `.isTTY` and friends all still resolve, and only
+  // `write` is shadowed.
+  return Object.create(stdout, { write: { value: patched, configurable: true } });
 }
 
 /** Before taking over the screen: if llamacli is already running in this
@@ -278,6 +366,30 @@ async function main() {
   await maybeSelfUpdateAndRestart();
   await ensureSingleInstance();
   const projectRoot = process.cwd();
+  // ── First-run bootstrap ───────────────────────────────────────────────────
+  // Runs BEFORE the alt screen, so its progress lines land on the normal
+  // scrollback where they can scroll past, and before loadConfig so the config
+  // it writes is the one that gets loaded.
+  //
+  // Every step is idempotent and derived from measured hardware, so this is a
+  // few stat() calls on an already-set-up machine and a real install on a fresh
+  // one — with no prompt anywhere. It is also allowed to fail: the report is
+  // surfaced and the app continues, because a bootstrap that throws would take
+  // down a working install. `LLAMACLI_NO_BOOTSTRAP=1` skips it entirely.
+  let bootstrapReport: Awaited<ReturnType<typeof ensureLocalStack>> | undefined;
+  if (process.env.LLAMACLI_NO_BOOTSTRAP !== "1") {
+    try {
+      bootstrapReport = await ensureLocalStack({
+        projectRoot,
+        log: (line) => process.stdout.write(`[setup] ${line}\n`),
+      });
+    } catch (err) {
+      process.stdout.write(
+        `[setup] 자동 설정을 완료하지 못했습니다 (${err instanceof Error ? err.message : String(err)}). ` +
+          `기존 설정으로 계속합니다.\n`
+      );
+    }
+  }
   enterAltScreen();
   let cleanedUp = false;
   const cleanup = () => {
@@ -383,6 +495,13 @@ async function main() {
   const DEFAULT_LAYA_TIMEOUT_SECONDS = 30;
   const LAYA_TIMEOUT_MS = (config.laya?.timeoutSeconds ?? DEFAULT_LAYA_TIMEOUT_SECONDS) * 1000;
   const layaScriptPath = resolveLayaScriptPath();
+  // The single laya port, from config when set, else the bootstrap's plan, else
+  // the canonical default. Read ONCE here so every laya spawn and the health
+  // check refer to the same number.
+  const layaPort =
+    (typeof config.laya?.port === "number" && config.laya.port) ||
+    bootstrapReport?.ports?.layaPort ||
+    LAYA_PORT;
 
   // Reported directly, live: "[laya error] laya script timed out after
   // 30000ms" — the very first real `/fastcheck on` install (pip installing
@@ -422,6 +541,19 @@ async function main() {
       let timer: NodeJS.Timeout | undefined;
       const child: ChildProcess = spawn("python3", ["-u", layaScriptPath, ...args], {
         timeout: timeoutMs,
+        // The laya port is set from OUR config on every spawn, so the port
+        // llamacli names and the port laya binds cannot drift apart.
+        //
+        // This is the fix for a bug that made the app look hung: `laya-serve`
+        // reads its BIND port from LAYA_PORT (upstream default 8000) while every
+        // health probe in laya_integration.py read LAYA_ENDPOINT (default 8099).
+        // The server bound 8000, the probe polled 8099, so bootstrap_laya timed
+        // out on a perfectly healthy server and then killed it as "failed to
+        // boot" — a laya-serve that was healthy on :8000 while every fastcheck
+        // call still blocked ~25-30s per turn. Both variables are set to the one
+        // planned port so the bind and the probe cannot disagree (see
+        // layaPortEnv).
+        env: { ...process.env, ...layaPortEnv(layaPort) },
       });
       // `child.kill(timeout:true)` is Node < 18.0 semantics; use a manual timer
       // that kills the process and resolves as an error so callers treat it like
@@ -462,6 +594,19 @@ async function main() {
 
   const runLayaGate = async (userText: string): Promise<{
     judgeSaysCheap: boolean; verdict?: string; score?: number; conf?: number; gateId?: number;
+    /** The gate could not be consulted at all (no server, timeout, spawn
+     *  error, non-zero exit). Distinct from "the judge said go slow".
+     *
+     *  Reported directly: the gate looked like it was running, and it was —
+     *  but it was failing every single turn. The laya server was listening on
+     *  :8000 while every health probe polled :8099, so each call burned the full
+     *  30 s timeout, hit the catch below, and returned a bare
+     *  `{judgeSaysCheap:false}`. `decideGate` read that as a confident
+     *  "full turn needed" and printed `gate: 전체 턴 필요로 판단 (conf=0.000)`
+     *  — a verdict that was never made, presented identically to a real one.
+     *  The user could not tell a dead gate from a working one. `failed` is what
+     *  lets the two be told apart. */
+    failed?: boolean;
   } | undefined> => {
     // Off => the gate doesn't run at all, and `undefined` (rather than a
     // synthetic "not cheap") is what makes decideGate report "gate: 꺼짐"
@@ -505,10 +650,15 @@ async function main() {
       }
       return { judgeSaysCheap, verdict, score, conf };
     } catch {
-      // Any failure (nonzero exit, timeout, spawn error) => the gate simply
-      // doesn't get a say, and the full turn runs unchanged. Never throw past
-      // here — a turn must never fail because a gate did.
-      return { judgeSaysCheap: false };
+      // Any failure (nonzero exit, timeout, spawn error) => the gate doesn't get
+      // a say and the full turn runs unchanged. Never throw past here — a turn
+      // must never fail because a gate did.
+      //
+      // `failed: true` is what stops this from being reported as a verdict. It
+      // used to be indistinguishable from a real "not cheap" answer, so a gate
+      // that was down on every single turn looked exactly like a gate that was
+      // working and simply always choosing the full path.
+      return { judgeSaysCheap: false, failed: true };
     }
   };
 
@@ -820,9 +970,111 @@ async function main() {
             process.stdout.write(next.mouse ? seq.mouseOn : seq.mouseOff);
             ui?.pushStatus(
               next.mouse
-                ? "[mouse] 켜짐 — 휠 스크롤 · 클릭으로 접힌 블록 토글. 텍스트 선택은 Shift 를 누른 상태로 드래그하세요."
-                : "[mouse] 꺼짐 — Shift 없이 드래그해 텍스트를 선택할 수 있습니다."
+                ? "[mouse] 켜짐 — 휠 스크롤 · 클릭으로 접힌 블록 토글 · 드래그로 선택 후 놓으면 복사(가장자리에서 자동 스크롤). " +
+                  "네이티브 선택이 필요하면 Shift 를 누른 상태로 드래그하세요."
+                : "[mouse] 꺼짐 — Shift 없이 드래그해 텍스트를 선택할 수 있습니다. 단, 이 화면은 alt screen 이라 " +
+                  "터미널 스크롤백이 없어 화면 위로 드래그해도 과거 출력까지 이어지지 않습니다."
             );
+            break;
+          }
+          // /copy — the keyboard route to the same clipboard the drag-selection
+          // writes to, and the one that works with the mouse off entirely.
+          // Two forms:
+          //   /copy            the whole visible log
+          //   /copy N          the last N log rows
+          // Deliberately reads the rows from the same buffer the drag uses, so
+          // the two can never disagree about what "the log" is.
+          // /reset — re-derive the model, the llama flags and the ports from
+          // the CURRENT hardware, after asking.
+          //
+          // Asked rather than just done, because it discards machine-derived
+          // settings: if the user hand-tuned `llama.contextSize` (to match a
+          // larger -c on their server, say) that is thrown away and replaced
+          // with what the hardware probe decided. The user's OWN keys — apiKey,
+          // verify commands, the laya toggle — are deliberately kept; see
+          // keepUserOwnedKeys for why losing one of those would be data loss
+          // rather than a reset.
+          case "reset": {
+            const answer = await askYesNo(
+              ui,
+              "현재 시스템(GPU·VRAM·메모리)에 맞는 모델과 llama 설정을 다시 계산합니다.\n" +
+                "지금까지의 모델/컨텍스트/스레드 설정은 덮어써집니다 (진행 후 재시작 필요).\n" +
+                "계속하시겠습니까?",
+            );
+            if (!answer) {
+              ui?.pushStatus("[reset] 취소했습니다.");
+              break;
+            }
+            ui?.setBusy(true);
+            try {
+              // Phase markers, so a reset that takes a while (it measures the
+              // backend, and may re-download a model) never looks frozen. Each
+              // says what is about to happen AND what it is about to affect.
+              ui?.pushStatus("[reset 1/4] 지금 시스템의 GPU·VRAM·메모리를 확인하고 있습니다…", "status");
+              ui?.pushStatus("[reset 2/4] 백엔드 속도를 측정해 컨텍스트 크기를 정합니다… (수 초)", "status");
+              const report = await ensureLocalStack({
+                projectRoot,
+                force: true,
+                // Measure the backend rather than reading the hardware table, so
+                // the llama settings reflect what this machine actually does —
+                // including a throttled card, a fallback build, or a busy box.
+                calibrate: true,
+                // A stale laya is invisible AND poisonous: one left on :8000
+                // while the config said :8099 made every gate call time out
+                // while the UI reported the silence as a verdict. /reset kills
+                // it and clears the venv, which re-running the config alone
+                // could never do.
+                resetLaya: true,
+                log: (line) => ui?.pushStatus(`[reset] ${line}`),
+              });
+              const changed = describeReset(report.config, config as unknown as Record<string, unknown>);
+              const layaNote = report.calibration?.degraded
+                ? "속도 측정 불가 — 하드웨어 정보 기반으로 설정했습니다.\n"
+                : "";
+              // Say what is now in force, not only what changed: the useful
+              // fact after a reset is which model and how big a context the
+              // machine settled on.
+              const nowInForce =
+                `[reset 3/4] 적용된 설정\n` +
+                `  · 모델: ${String((report.config as any)?.model ?? config.model)}\n` +
+                `  · 컨텍스트: ${(report.tuning?.contextSize ?? 0).toLocaleString()} 토큰 ` +
+                `(GPU ${report.tuning?.gpuLayers === 0 ? "미사용 (CPU)" : "오프로드"}, 스레드 ${report.tuning?.threads})\n` +
+                (report.calibration && !report.calibration.degraded
+                  ? `  · 측정: prefill ${report.calibration.throughput.promptTokensPerSecond.toFixed(0)} tok/s, ` +
+                    `decode ${report.calibration.throughput.decodeTokensPerSecond.toFixed(1)} tok/s\n`
+                  : "");
+              ui?.pushStatus(
+                changed.length > 0
+                  ? `[reset 4/4] 완료. 바뀐 항목 ${changed.length}개:\n${changed.map((c) => `  · ${c}`).join("\n")}\n` +
+                    nowInForce + layaNote +
+                    "새 설정을 적용하려면 llamacli 를 재시작하세요."
+                  : "[reset 4/4] 현재 시스템에 이미 최적이었습니다. 바뀐 항목이 없습니다.\n" +
+                    nowInForce + layaNote +
+                    "재시작할 필요도 없습니다."
+              );
+            } catch (err) {
+              ui?.pushStatus(`[reset 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
+            } finally {
+              ui?.setBusy(false);
+            }
+            break;
+          }
+          case "copy": {
+            const rows: string[] = (globalThis as any).__llamacli_ui?.getVisibleLogText?.() ?? [];
+            if (rows.length === 0) {
+              ui?.pushStatus("[복사] 로그에 복사할 내용이 없습니다.");
+              break;
+            }
+            const n = Number.parseInt(argument.trim(), 10);
+            const picked = Number.isFinite(n) && n > 0 ? rows.slice(-n) : rows;
+            const text = stripAnsiForCopy(picked.join("\n"));
+            void copySelection(text)
+              .then((result) => {
+                ui?.pushStatus(
+                  `[복사] ${text.length}자를 ${result.via === "osc52" ? "클립보드에 넣고" : "클립보드가 거부해서 파일로"} 저장했습니다 → ${result.path}`
+                );
+              })
+              .catch((err: any) => ui?.pushStatus(`[복사 실패] ${summarizeErrorForDisplay(err.message)}`));
             break;
           }
           case "compact":
@@ -964,7 +1216,28 @@ async function main() {
         }
       }}
     />,
-    { exitOnCtrlC: false }
+    // `stdout` is wrapped so the real cursor is put back where the prompt is
+    // after EVERY frame Ink writes.
+    //
+    // Reported directly: "프롬프트 창에 문자를 적고 있으면 마지막 커서가 하단
+    // 최좌측으로 나타나는 경우가 있어" — while typing, the cursor sometimes
+    // appears in the bottom-left corner.
+    //
+    // The cause is an ordering property of Ink 4: the reconciler calls a
+    // `throttle(onRender, 32, {leading: true, trailing: true})`
+    // (node_modules/ink/build/ink.js), so a frame can be written up to 32 ms
+    // AFTER App's effect has already positioned the cursor. That repaint leaves
+    // the real cursor wherever the frame's output ended — the bottom-left of the
+    // alt screen — and nothing re-places it, because no state change followed.
+    // Ink's public `onRender` render-option is never called in 4.4.1 (only
+    // `debug` mode uses the user's callback), so there is no supported post-paint
+    // hook and the fix has to sit on the write itself.
+    //
+    // Wrapping `write` rather than shortening the old 400 ms self-heal timer is
+    // what makes this correct rather than merely less visible: it closes the
+    // window instead of bounding how long the cursor is wrong, and it costs a
+    // null check while nothing is being drawn. See cursorPlacement.ts.
+    { exitOnCtrlC: false, stdout: wrapStdoutWithCursorReassertion(process.stdout) }
   );
 
   if (setupMessage) (globalThis as any).__llamacli_ui?.pushStatus(setupMessage);

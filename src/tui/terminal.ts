@@ -288,16 +288,40 @@ export function detectTerminal(
   const mouseSgr = ansi && detectMouseSgr(env, term);
   const modern = MODERN_TERMINALS.some((t) => terminal.includes(t)) || /^(alacritty|kitty|wezterm|foot|ghostty|rio)$/i.test(term);
 
-  // Mouse default. OFF by default, deliberately: enabling mouse reporting
-  // means the user can no longer select text with the mouse (every
-  // mouse-aware TUI has this trade-off, and it must be held with Shift on
-  // most terminals) for a feature this app can now also reach from the
-  // keyboard. The previous always-on default made that trade silently. Turn
-  // it on with `/mouse`, or start with LLAMACLI_MOUSE=1.
+  // Mouse default. ON by default, and this is a REVERSAL of an earlier
+  // decision in this file — the change is documented here because the reason
+  // it was flipped is the reason it was flipped back.
+  //
+  // It was turned off with the reasoning "enabling mouse reporting means the
+  // user can no longer select text with the mouse, and the wheel/click
+  // features are reachable from the keyboard anyway". Both halves turned out
+  // to be wrong, and both were found by driving the real binary in a pty
+  // (scripts/capture_screens.py), not by reasoning:
+  //
+  //   1. "Reachable from the keyboard" was only half true. PageUp/PageDown and
+  //      Ctrl+O exist, but the WHEEL and click-to-toggle-fold do not have a
+  //      keyboard equivalent at all, and with the mouse off they were not just
+  //      harder to reach — they were completely dead, with nothing on screen to
+  //      say so. Reported directly: click-to-expand/collapse "used to work but
+  //      doesn't now", and the log could not be scrolled with the wheel.
+  //
+  //   2. The selection trade-off was self-defeating on an ALTERNATE SCREEN.
+  //      With the mouse off the terminal does get to select text, but the alt
+  //      screen has no scrollback (see selection.ts), so a drag that runs off
+  //      the top edge has nothing to scroll to — the exact behaviour every
+  //      other terminal has was impossible. So "let the terminal select" never
+  //      actually delivered the thing it was protecting.
+  //
+  // The app now implements selection itself (selection.ts): press, drag off
+  // the edge, the log auto-scrolls and the selection keeps growing, release
+  // copies to the clipboard with a file fallback. Shift+drag still reaches the
+  // terminal for native selection — runHintText tells the user so — and
+  // `/mouse` (or LLAMACLI_MOUSE=0) turns this back off for anyone who prefers
+  // to keep every mouse gesture for the terminal.
   let mouse: boolean;
   if (env.LLAMACLI_MOUSE === "1") mouse = mouseSgr;
   else if (env.LLAMACLI_MOUSE === "0") mouse = false;
-  else mouse = opts.mouseDefault ?? false;
+  else mouse = opts.mouseDefault ?? true;
 
   return {
     ansi,
@@ -355,6 +379,13 @@ const csi = (body: string): string => `\x1b[${body}`;
 export interface Sequences {
   altScreenOn: string;
   altScreenOff: string;
+  /** Set the default background to black. Owned by the app rather than left to
+   *  the terminal's own theme — see `backgroundOn` below. */
+  backgroundOn: string;
+  /** Undo `backgroundOn` (SGR 49 = default background). MUST be emitted on
+   *  exit: a background left set outlives the app and recolours the user's
+   *  shell for the rest of the session. */
+  backgroundOff: string;
   mouseOn: string;
   mouseOff: string;
   hideCursor: string;
@@ -373,6 +404,39 @@ export function buildSequences(caps: TerminalCapabilities): Sequences {
   return {
     altScreenOn: caps.altScreen ? `${csi("?1049h")}${csi("?25l")}` : "",
     altScreenOff: caps.altScreen ? `${csi("?25h")}${csi("?1049l")}` : "",
+    // Requested directly: "llamacli 의 배경을 검은색으로 해줘 그게 가독성이
+    // 더 있는거 같아" — a black background reads better than a light one.
+    //
+    // Two things make this more than a one-line SGR, and both were the failure
+    // modes of doing it naively:
+    //
+    // 1. It is emitted on the alt screen, which is where the app lives, so it
+    //    cannot leak into the user's shell — BUT the matching reset (SGR 49)
+    //    still has to be emitted on exit. A background left set outlives the
+    //    process and recolours the terminal for the rest of the session,
+    //    including every command typed afterwards. `backgroundOff` exists for
+    //    exactly that and index.tsx writes it in exitAltScreen.
+    //
+    // 2. 48;2;r;g;b is TRUECOLOR. On a terminal at colorDepth 4 (16 colours)
+    //    or 8 (256) this either does nothing or is mangled, so it is gated on
+    //    `colorDepth === 24`. A 16-colour terminal keeps its own background
+    //    rather than getting a half-applied one. `backgroundBlack` (SGR 40) is
+    //    the fallback for those, since black is in every colour palette.
+    //
+    //    NOTE the trailing `m`: this module's `csi()` helper does NOT append
+    //    the final byte (every other call site passes it, e.g. `csi("?1049h")`).
+    //    Omitting it here emitted a truncated `\x1b[49` immediately followed by
+    //    the alt-screen sequence, which a terminal silently fails to parse —
+    //    caught by capturing the raw bytes off a live pty, not by reading the
+    //    code. The pairing of the two sequences (set black, then promote it to
+    //    the DEFAULT) is what makes it survive Ink repainting.
+    backgroundOn:
+      caps.colorDepth === 24
+        ? `${csi("48;2;0;0;0m")}${csi("49m")}` // set black, then make it the DEFAULT
+        : caps.colorDepth >= 4
+          ? `${csi("40m")}${csi("49m")}`
+          : "",
+    backgroundOff: caps.colorDepth >= 4 ? csi("49m") : "",
     mouseOn: caps.mouse ? `${csi("?1000h")}${csi("?1006h")}` : "",
     mouseOff: caps.mouseSgr ? `${csi("?1006l")}${csi("?1000l")}` : "",
     hideCursor: caps.ansi ? csi("?25l") : "",

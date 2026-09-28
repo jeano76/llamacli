@@ -7,6 +7,10 @@ export interface CompactionThresholds {
   /** Fraction of the model's context window (0-1) that triggers auto-compaction. */
   autoTriggerRatio: number;
   contextWindowTokens: number;
+  /** Generation budget for the summary. This is the compaction's latency
+   *  almost exactly (prefill is served from the prompt cache). Optional so
+   *  existing callers need no change; see DEFAULT_SUMMARY_MAX_TOKENS. */
+  summaryMaxTokens?: number;
 }
 
 /** What a compaction actually did to the conversation — requested directly
@@ -246,6 +250,17 @@ function sanitizeForSummary(messages: ChatMessage[]): ChatMessage[] {
 // retry (see runCompaction's tailBudgetFraction param below) instead of
 // giving up the instant one compaction attempt fails to shrink anything.
 export const DEFAULT_TAIL_BUDGET_FRACTION = 0.4;
+
+/** Default generation budget for the summary, in tokens.
+ *
+ *  Measured on the real backend: decode runs at 38 tok/s, so this number IS the
+ *  compaction latency (the prefill is served from the prompt cache and is
+ *  negligible). 1,024 is ~27 s; the previous window-derived cap of 4,096 was
+ *  ~107 s for the same work.
+ *
+ *  Override with `compaction.summaryMaxTokens` in config.yaml. Raise it if a
+ *  summary is dropping detail you need; lower it for a faster, terser summary. */
+export const DEFAULT_SUMMARY_MAX_TOKENS = 1024;
 // Loop.ts's own main-turn request always reserves this fraction of the
 // window for max_tokens (the reply about to be generated) — see loop.ts's
 // `max_tokens: Math.max(512, Math.floor(...* 0.25))`. The kept tail and
@@ -360,7 +375,38 @@ export async function runCompaction(
   const originalSystemText = typeof originalSystem?.content === "string" ? originalSystem.content : "";
   const summaryInput = sanitizeForSummary(toSummarize);
 
-  const defaultSummaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(contextWindowTokens * 0.25)));
+  // Reported directly: "컴팩션의 시간이 오래걸리는데" — compaction is slow.
+  //
+  // Measured against the real backend (2026-09-28, RTX 2070 8 GB, 35B-A3B Q4
+  // with 30 MoE layers on the CPU) rather than guessed:
+  //
+  //     prefill   334 tok/s   decode  38 tok/s
+  //     main turn     7,244 prompt tokens   75.9 s
+  //     compaction       22 prompt tokens   40.8 s   <- prefill is ~free
+  //
+  // The 22 is the important number. The summary request's [system] + toSummarize
+  // is a VERBATIM PREFIX of the turn that just ran, so llama-server's prompt
+  // cache serves essentially all of it (that is why the original system message
+  // is preserved verbatim rather than replaced with a "please summarize" one —
+  // see the cache-prefix note below). Prefill is therefore ~0.3 s and is NOT
+  // the problem.
+  //
+  // Generation is the entire cost: the cap below was up to 4,096 tokens, and at
+  // 38 tok/s that is ~107 seconds of the ~110 second compaction. The cap was
+  // sized from the CONTEXT WINDOW (25% of 24,576) with no regard for how much
+  // history is actually being condensed, so a compaction of a 14k-token history
+  // was allowed to spend minutes writing a summary.
+  //
+  // The default is now DEFAULT_SUMMARY_MAX_TOKENS (1,024 ≈ 27 s here). That is
+  // a deliberate quality trade: a 1,024-token summary of a 14k-token history is
+  // still a ~14x compression, which is what the summary is FOR, but it will
+  // keep less detail than a 4,096-token one. It is a config field
+  // (`compaction.summaryMaxTokens`) precisely because that trade is a judgement
+  // call, not a fact — raise it if summaries are losing detail you need.
+  const defaultSummaryMaxTokens = Math.max(
+    256,
+    Math.min(DEFAULT_SUMMARY_MAX_TOKENS, Math.floor(contextWindowTokens * 0.25))
+  );
   const windowBasedCap = summaryMaxTokensCap
     ? Math.max(128, Math.min(defaultSummaryMaxTokens, summaryMaxTokensCap))
     : defaultSummaryMaxTokens;

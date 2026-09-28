@@ -337,8 +337,62 @@ test("runCompaction sets max_tokens on the summary request, scaled to the real c
       const sent = lastRequest();
       assert.ok(sent);
       assert.ok(typeof sent!.max_tokens === "number" && sent!.max_tokens! > 0, `expected a positive max_tokens, got ${sent!.max_tokens}`);
-      // Scaled to the window (16384 * 0.25 = 4096), not a flat constant.
-      assert.equal(sent!.max_tokens, 4096);
+      // Bounded by the WINDOW, not a flat constant — but the default is now
+      // DEFAULT_SUMMARY_MAX_TOKENS (1024), not the window's 25%.
+      //
+      // Reported directly: "컴팩션의 시간이 오래걸리는데". Measured: the summary
+      // request's prefill is served from the prompt cache (~0.3 s), and decode
+      // runs at 38 tok/s, so the old window-derived 4096 was ~107 s of pure
+      // generation for a summary whose job is to COMPRESS the history. 1024 is
+      // ~27 s. The budget is still window-bounded (a small window still shrinks
+      // it) and still overridable per-config, because the right trade is a
+      // judgement call rather than a fact.
+      assert.equal(sent!.max_tokens, 1024);
+      assert.equal(
+        sent!.max_tokens!,
+        Math.min(1024, Math.floor(16384 * 0.25)),
+        "1024 default, still capped by the window"
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("the summary budget defaults to 1024 and the retry cap can only tighten it", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-test-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: LONG_FILLER_TEXT },
+        { role: "assistant", content: "hi" },
+      ];
+      const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      // Default: 1024, whatever the window is.
+      await runCompaction(dir, messages, backend, "m", partial, 16_384);
+      assert.equal(lastRequest()!.max_tokens, 1024);
+
+      // The cap parameter can only TIGHTEN. Raising the budget is done one layer
+      // up, in loop.ts's postCompactionBudget, from
+      // `compaction.summaryMaxTokens` in config.yaml — this parameter is the
+      // overflow-retry's "try smaller" lever and must never be able to make the
+      // summary bigger than the default.
+      await runCompaction(dir, messages, backend, "m", partial, 16_384, 0.4, 300);
+      assert.equal(lastRequest()!.max_tokens, 300, "an explicit cap tightens the budget");
+
+      await runCompaction(dir, messages, backend, "m", partial, 16_384, 0.4, 99_999);
+      assert.equal(
+        lastRequest()!.max_tokens,
+        1024,
+        "a cap above the default does not raise it — only config.yaml can"
+      );
+
+      // ...and the window still caps everything, so no setting can produce a
+      // request that overflows the context.
+      await runCompaction(dir, messages, backend, "m", partial, 1024, 0.4, 99_999);
+      assert.ok(lastRequest()!.max_tokens! <= 1024 * 0.25, "the window still wins");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -366,7 +420,7 @@ test("runCompaction's summary max_tokens has a floor for a small context window,
       assert.equal(lastRequest()!.max_tokens, 256); // floor, not 512*0.25=128
 
       await runCompaction(dir, messages, backend, "m", partial, 200_000); // huge window
-      assert.equal(lastRequest()!.max_tokens, 4096); // ceiling, not 50000
+      assert.equal(lastRequest()!.max_tokens, 1024); // default cap, not 50000
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -16,6 +16,17 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   { key: "compact", label: "/compact", description: "Run context compaction now" },
   { key: "term", label: "/term", description: "감지된 터미널과 지원 기능 상태" },
   { key: "mouse", label: "/mouse", description: "마우스 스크롤/클릭 켜기·끄기" },
+  // /copy is the keyboard route to the same clipboard a mouse drag writes to.
+  // It has to be a registered item, not just a case in index.tsx: the menu
+  // filters typed input against this list, so an unregistered command shows
+  // "0 matching commands" and Enter never dispatches it — which is exactly
+  // what happened the first time this was added.
+  { key: "copy", label: "/copy", description: "화면 로그 복사 (드래그 선택과 같은 클립보드)" },
+  // /reset re-derives the model + llama flags + ports from the CURRENT hardware.
+  // It is destructive to machine-derived settings, so it asks first — and the
+  // ask is in the command, not in a separate confirmation screen, so the menu
+  // item itself is the whole affordance.
+  { key: "reset", label: "/reset", description: "현재 GPU·VRAM·RAM에 맞는 모델/설정으로 다시 초기화" },
   { key: "skills", label: "/skills", description: "List loaded skills" },
   { key: "rules", label: "/rules", description: "List loaded rules" },
   { key: "improve", label: "/improve", description: "Analyze repeated failures → propose a rule" },

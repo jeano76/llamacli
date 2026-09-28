@@ -38,6 +38,16 @@ export interface LlamacliConfig {
      *  instead of stopping and waiting for the user to type another
      *  message. See loop.ts's AgentLoopOptions.autoResume. */
     autoResume: boolean;
+    /**
+     * Generation budget for the summary, in tokens.
+     *
+     * This number IS the compaction's latency. Measured against the real
+     * backend (38 tok/s decode, with the prefill served from the prompt cache),
+     * 1024 is ~27 s and the old window-derived 4096 was ~107 s for the same
+     * work. Defaults to 1024; raise it if summaries are losing detail you
+     * need, lower it for a faster/terser summary.
+     */
+    summaryMaxTokens?: number;
   };
   /** Remote debugging (Chrome DevTools Protocol) for the browser tools —
    *  connects to an already-running Chrome/Chromium started with
@@ -88,6 +98,20 @@ export interface LlamacliConfig {
    *  see docs/skill-integration-review.md. `layaGate` in loop.ts is wired
    *  from this section via index.tsx. */
   laya?: {
+    /** The port the local laya-serve binds AND that every health check polls.
+     *  One number for both, deliberately: the two used to be derived
+     *  independently (upstream `laya-serve` reads its bind port from
+     *  `LAYA_PORT`, default 8000, while every health probe here read
+     *  `LAYA_ENDPOINT`, default 8099), and the mismatch made
+     *  `bootstrap_laya` time out waiting on a port nothing was listening to and
+     *  then KILL the healthy server it had just started — a laya-serve healthy
+     *  on :8000 while every fastcheck call still blocked ~25-30s per turn.
+     *  index.tsx also passes this into the child process environment, so the
+     *  Python side cannot quietly fall back to its own default. */
+    port?: number;
+    /** Base URL of a REMOTE laya. Takes precedence over `port`; when set,
+     *  nothing is booted locally. */
+    baseUrl?: string;
     /**
      * Master switch. Defaults to FALSE and should stay that way unless you
      * have read `/fastcheck status`.

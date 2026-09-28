@@ -9,6 +9,7 @@ import {
   buildResumePrompt,
   CompactionThresholds,
   DEFAULT_TAIL_BUDGET_FRACTION,
+  DEFAULT_SUMMARY_MAX_TOKENS,
   splitSystemMessage,
   stripResumePrefix,
   type CompactionDetail,
@@ -353,7 +354,7 @@ export interface AgentLoopOptions {
    * `verdict` is the judge's own "this is cheap" boolean, `conf` its
    * confidence, `score` its raw probability. `reason`/`gateId` are for the UI.
    */
-  layaGate?: (userText: string) => Promise<{ judgeSaysCheap: boolean; reason?: string; verdict?: string; score?: number; conf?: number; gateId?: number } | undefined>;
+  layaGate?: (userText: string) => Promise<{ judgeSaysCheap: boolean; reason?: string; verdict?: string; score?: number; conf?: number; gateId?: number; failed?: boolean } | undefined>;
   // Fired once per short-circuit verdict (skip:true) with the same payload
   // layaGate returned. Lets the UI append a stable-id cumulative perf line
   // even though the foldable summary is rendered elsewhere — see App.tsx's
@@ -606,7 +607,11 @@ export class AgentLoop {
         judgeSaysCheap: gateResult?.judgeSaysCheap ?? false,
         conf: gateResult?.conf ?? 0,
         text: userText,
-        judgeEnabled: Boolean(gateResult),
+        judgeEnabled: Boolean(gateResult) && !gateResult?.failed,
+        // A gate that could not be reached is not a verdict. Reported
+        // separately so "the judge said no" and "the judge never answered"
+        // don't look the same on screen — see runLayaGate's `failed` doc.
+        gateFailed: Boolean(gateResult?.failed),
       });
       // Surface the verdict, but ONLY when the gate actually ran. When it is
       // switched off, "gate: 꺼짐 — 전체 턴" on every single turn is pure
@@ -1672,7 +1677,19 @@ export class AgentLoop {
     }
     const usableRoom = Math.max(256, room);
     // Same default cap as runCompaction's; only tightened when room is short.
-    const defaultSummaryMaxTokens = Math.max(256, Math.min(4096, Math.floor(window * 0.25)));
+    //
+    // The `Math.min(4096, …)` used to be the whole budget. It is now
+    // DEFAULT_SUMMARY_MAX_TOKENS (1024), because this number is the compaction's
+    // latency almost exactly: the summary request's prefill is served from the
+    // prompt cache (~0.3 s measured), and decode runs at 38 tok/s on this
+    // backend, so 4096 was ~107 s of generation for a summary that is supposed
+    // to COMPRESS the history, not restate it. `compaction.summaryMaxTokens` in
+    // config.yaml overrides it, because the right trade is a judgement call.
+    const configured = this.opts.thresholds.summaryMaxTokens;
+    const defaultSummaryMaxTokens = Math.max(
+      256,
+      Math.min(configured ?? DEFAULT_SUMMARY_MAX_TOKENS, Math.floor(window * 0.25))
+    );
     const summaryMaxTokens = Math.min(defaultSummaryMaxTokens, Math.floor(usableRoom / 2));
     // selectKeptTail() measures its budget as a fraction of 75% of the window.
     const tailTokens = usableRoom - summaryMaxTokens;
@@ -1730,6 +1747,11 @@ export class AgentLoop {
     for (let attempt = 0; ; attempt++) {
       try {
         const budget = await this.postCompactionBudget(tailBudgetFraction);
+        // Compaction used to be a black box that froze the UI for up to two
+        // minutes with nothing on screen. Reporting what it cost makes the wait
+        // explicable, and — more usefully — makes a regression in that number
+        // visible instead of being absorbed as "compaction is just slow".
+        const startedAt = Date.now();
         const { messages, checkpoint, detail } = await runCompaction(
           this.opts.projectRoot,
           this.messages,
@@ -1742,6 +1764,10 @@ export class AgentLoop {
         );
         this.messages = messages;
         this.progress.onCompaction();
+        this.opts.onStatus?.(
+          `[compaction] ${((Date.now() - startedAt) / 1000).toFixed(1)}s ` +
+          `(요약 ${detail.summary.length}자, 요약 예산 ${budget.summaryMaxTokens} 토큰)`
+        );
         // Working notes go back in with the summary, so what the model had
         // established survives the compaction verbatim.
         const notes = await readNotes(this.opts.projectRoot);

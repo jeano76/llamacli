@@ -138,20 +138,25 @@ test("parseMouseWheel consumes clicks without scrolling, and ignores ordinary in
   assert.equal(parseMouseWheel("[<not a report"), null);
 });
 
-test("the running-state key hint uses the long form when it fits, and a short one otherwise, and always distinguishes Esc (force quit) from /quit (normal quit)", () => {
-  assert.match(runHintText(100), /Shift\+드래그: 선택 · Shift\+우클릭: 복사\/붙여넣기/);
-  assert.equal(runHintText(50), "  Esc: 강제종료 · /quit: 정상종료");
-  assert.equal(runHintText(30), "  Esc: 강제종료 · /quit: 정상종료");
-  for (const cols of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 40, 60, 80, 120]) {
+test("the running-state key hint teaches the app's own drag-to-select, and never overflows the input box", () => {
+  // With the mouse default back ON (see terminal.ts for why it was flipped
+  // back), a plain drag is now the app's own selection — the user has to be
+  // told that dragging copies, and that the log auto-scrolls at the edges,
+  // because the alt screen has no native scrollback to discover that from.
+  assert.match(runHintText(100), /드래그: 선택·복사/);
+  assert.match(runHintText(100), /가장자리: 자동 스크롤/);
+  // Narrow terminals fall back to progressively shorter forms rather than
+  // clipping mid-word; the last form is deliberately the most compact one.
+  assert.equal(runHintText(40), "  Esc: 강제종료 · 드래그: 선택·복사");
+  assert.equal(runHintText(20), "  Esc: 강제종료 · /quit: 정상종료");
+  for (const cols of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 40, 60, 80, 100, 120]) {
     const text = runHintText(cols);
     assert.match(text, /Esc: 강제종료/);
-    assert.match(text, /\/quit: 정상종료/);
-    // The shortest form is itself fairly wide now that it must name both
-    // Esc and /quit distinctly (see runHintText's doc comment) — only the
-    // widest form's own line matters for not overflowing a normal terminal;
-    // an unrealistically narrow one (<34 cols) is a display cutoff, not a
-    // display-code bug, the same carve-out the old shortest form had.
-    if (cols >= 34) assert.ok(stringWidth(text) <= cols - 1);
+    // This line renders in place of the input box's own text, and the input
+    // Box is width-constrained and clips — so the guarantee is that the widest
+    // form is never itself clipped on a terminal wide enough to be real. An
+    // absurdly narrow terminal (<34 cols) is a display cutoff, not a bug.
+    if (cols >= 34) assert.ok(stringWidth(text) <= cols - 1, `overflowed at ${cols} cols`);
   }
 });
 

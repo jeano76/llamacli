@@ -145,6 +145,15 @@ export function decideGate(input: {
   text: string;
   /** Disabled by config; then the rail still applies but the judge is ignored. */
   judgeEnabled: boolean;
+  /** The gate could not be consulted at all (server down, timeout, spawn error).
+   *  Checked BEFORE `judgeEnabled`, because a failed call sets neither the
+   *  judge's answer nor its "off" state — and reporting it as either is a lie.
+   *  Confirmed live: a laya-serve listening on :8000 while every probe polled
+   *  :8099 made every turn burn the full 30 s timeout and return
+   *  `{judgeSaysCheap:false}`, which this function rendered as a confident
+   *  "gate: 전체 턴 필요로 판단 (conf=0.000)". Nothing on screen distinguished a
+   *  dead gate from a working one. */
+  gateFailed?: boolean;
 }): GateDecision {
   const matched = highRiskMatches(input.text);
 
@@ -154,6 +163,18 @@ export function decideGate(input: {
       reason: `gate: 위험 작업으로 판단되어 전체 턴 유지 (${matched.join(", ")})`,
       conf: input.conf,
       forced: true,
+      matched,
+    };
+  }
+  if (input.gateFailed) {
+    // Deliberately NOT `forced`: the risk rail did not fire, and marking it as
+    // forced would report a high-risk hold that never happened. The mode is
+    // "full" simply because there is no judge to disagree.
+    return {
+      mode: "full",
+      reason: "gate: 판정 실패 (laya 서버에 연결하지 못함) — 전체 턴으로 진행",
+      conf: input.conf,
+      forced: false,
       matched,
     };
   }

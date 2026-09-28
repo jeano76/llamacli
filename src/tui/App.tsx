@@ -10,8 +10,14 @@ import { renderMarkdown } from "./markdown.js";
 import { buildArt, colored, SETTLED_SGR, BALL_SGR, LETTER_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 import { startupHintText, KEY_BINDINGS, formatKeyRow, KEY_COLUMN_WIDTH } from "./keybindings.js";
 import { getCapabilities, buildSequences, glyph, borderStyleFor } from "./terminal.js";
+import { setCursorPlacement, clearCursorPlacement } from "./cursorPlacement.js";
 import { existsSync } from "node:fs";
 import { isLikelyPaste, looksLikePastedFilePath, formatPasteLabel, findTrailingPlaceholder, substitutePlaceholders } from "./pasteChip.js";
+import {
+  edgeDirection, rowRange, selectionText, copySelection, isSelectionEmpty, stripAnsiForCopy,
+  EDGE_SCROLL_STEP, EDGE_SCROLL_INTERVAL_MS,
+  type Selection, type LogPoint, type EdgeDirection,
+} from "./selection.js";
 
 export interface AppProps {
   cwd: string;
@@ -257,6 +263,47 @@ function wrapLogLine(line: LogLine, width: number): string[] {
   return wrapToWidth(line.text, width);
 }
 
+/** Renders one log row, highlighting `highlight` (a character range within
+ *  `row.text`) if the user is currently dragging a selection over it.
+ *
+ *  The highlight is applied by cloning the element the per-kind branches
+ *  already produced rather than by threading a `highlight` parameter through
+ *  every one of those branches — there are a dozen, they each pick a colour
+ *  and attributes, and duplicating that decision in a second code path is
+ *  exactly how a selection ends up rendered in a colour that does not match
+ *  the row it is selecting.
+ *
+ *  Nested `<Text backgroundColor>` inherits the outer colour, so the selected
+ *  span is styled by overriding only the background; the characters themselves
+ *  keep whatever colour/italic/bold the row already had. Rows whose children
+ *  are not a plain string (the streaming shimmer bands) are left untouched:
+ *  their characters are sliced out of the source text mid-reveal, so a
+ *  character range into `row.text` does not correspond to anything on screen. */
+function renderRowWithHighlight(
+  row: RenderedRow,
+  shimmerTick?: number,
+  highlight?: { start: number; end: number } | null
+) {
+  const el = renderRow(row, shimmerTick);
+  if (!highlight || highlight.end <= highlight.start) return el;
+  const text = el.props?.children;
+  if (typeof text !== "string") return el; // shimmer bands: see doc comment
+  const before = text.slice(0, highlight.start);
+  const middle = text.slice(highlight.start, highlight.end);
+  const after = text.slice(highlight.end);
+  if (!middle) return el;
+  return React.cloneElement(el, {}, [
+    before,
+    // Reverse video rather than a colour: it stays legible over every row
+    // colour this app uses (cyan reasoning, magenta tool, yellow compaction)
+    // without needing a per-kind contrast table.
+    <Text key="__sel" backgroundColor="blue" color="white">
+      {middle}
+    </Text>,
+    after,
+  ]);
+}
+
 function renderRow(row: RenderedRow, shimmerTick?: number) {
   if (row.kind === "reasoning-folded") {
     // Same cyan the reasoning text itself settles at once fully revealed
@@ -492,6 +539,52 @@ export function parseMouseClicks(input: string): { row: number; col: number }[] 
   return clicks;
 }
 
+/** SGR mouse motion reports with a button HELD DOWN, as 1-based (row, col).
+ *
+ *  This is the third kind of report the app has to tell apart, and the bit
+ *  that separates it is not obvious: in SGR encoding, bit 5 (value 32) means
+ *  "motion", and the low two bits carry the button that is down. So 32/33/34
+ *  are "dragging with left/middle/right" and 35 is "moved, no button" (a bare
+ *  hover), which must NOT be treated as a drag — otherwise simply moving the
+ *  mouse across the log would start a selection and auto-scroll the view.
+ *  Releases arrive with the low bits clear and a lowercase 'm' final byte. */
+export function parseMouseDrag(input: string): { row: number; col: number }[] {
+  const out: { row: number; col: number }[] = [];
+  for (const [, code, colStr, rowStr, kind] of input.matchAll(/\[<(\d+);(\d+);(\d+)([Mm])/g)) {
+    if (kind !== "M") continue;
+    const button = Number(code);
+    if ((button & 64) !== 0) continue;         // wheel, not a drag
+    if ((button & 32) === 0) continue;         // not a motion report
+    if ((button & 3) === 3) continue;          // motion with NO button held
+    out.push({ row: Number(rowStr), col: Number(colStr) });
+  }
+  return out;
+}
+
+/** SGR mouse releases (lowercase 'm'), as 1-based (row, col). A release is
+ *  what ends a drag, so it is also what triggers the copy. */
+export function parseMouseRelease(input: string): { row: number; col: number }[] {
+  const out: { row: number; col: number }[] = [];
+  for (const [, , colStr, rowStr, kind] of input.matchAll(/\[<(\d+);(\d+);(\d+)([Mm])/g)) {
+    if (kind !== "m") continue;
+    out.push({ row: Number(rowStr), col: Number(colStr) });
+  }
+  return out;
+}
+
+/** A press that must NOT start a selection, because the user is pointing at
+ *  something clickable rather than selecting text. Only the log is
+ *  selectable; presses on the input box, the slash menu and the dialogs are
+ *  left alone so this can never swallow an interaction with them. */
+export function isLogBodyRow(
+  row: number,
+  firstRow: number,
+  count: number
+): boolean {
+  const idx = row - firstRow;
+  return idx >= 0 && idx < count;
+}
+
 /** Log entries kept for scrollback. Rendering only ever builds React
  *  elements for the visible window (see visibleRows below), so this bounds
  *  memory, not render cost. */
@@ -571,9 +664,10 @@ export function cursorRowCol(text: string, maxWidth: number, pos: number): { row
  *  attempt at putting it inside the box once did. Picks the long form when
  *  it fits the given width. */
 export function runHintText(columns: number): string {
-  // With mouse reporting on (wheel scrollback), plain clicks go to the app;
-  // holding Shift hands them back to the terminal, so Shift+drag selects and
-  // Shift+right-click opens the terminal's own Copy/Paste menu.
+  // With mouse reporting on (the default again — see terminal.ts for why it
+  // was flipped back), a plain drag selects and copies within the app, and
+  // holding Shift hands the gesture back to the terminal for native
+  // selection; Shift+right-click opens the terminal's own Copy/Paste menu.
   // Esc and /quit are NOT the same thing — Esc cancels the running turn and
   // exits right away (a checkpoint is written first so it resumes next
   // time), while /quit waits for the turn to finish and runs the normal
@@ -581,8 +675,8 @@ export function runHintText(columns: number): string {
   // 정상종료) rather than just "Esc: 종료" for both, which didn't say which
   // was which.
   const forms = [
-    "  실행 중 · Esc: 강제종료 · /quit: 정상종료 · Shift+드래그: 선택 · Shift+우클릭: 복사/붙여넣기",
-    "  Esc: 강제종료 · /quit: 정상종료 · Shift+우클릭: 복사/붙여넣기",
+    "  실행 중 · Esc: 강제종료 · 드래그: 선택·복사 · 가장자리: 자동 스크롤 · Shift+우클릭: 붙여넣기",
+    "  Esc: 강제종료 · 드래그: 선택·복사",
     "  Esc: 강제종료 · /quit: 정상종료",
   ];
   // Falls back to the shortest form even when IT doesn't fit, and that is
@@ -909,9 +1003,36 @@ export function App({
   // only runs later, async, in response to a real terminal event — can map
   // the absolute terminal row it landed on back to a log line without
   // recomputing the whole layout itself.
-  const clickMapRef = useRef<{ firstRow: number; entries: { lineId: number; foldable: boolean; isDiff: boolean; isPaste: boolean; isGate: boolean }[] }>({
+  const clickMapRef = useRef<{
+    firstRow: number;
+    entries: { lineId: number; foldable: boolean; isDiff: boolean; isPaste: boolean; isGate: boolean }[];
+    /** Index into `allRows` of the first VISIBLE row. The anchor for a
+     *  selection is stored in allRows space, so a press has to add this to
+     *  convert a terminal row into a log row — and the same conversion is
+     *  what makes a selection survive the window scrolling underneath it. */
+    sliceStart: number;
+    /** Absolute terminal row of the LAST selectable log row — the bottom edge
+     *  the auto-scroll watches. */
+    lastRow: number;
+    /** Absolute terminal row of the log BOX's first row, which is the
+     *  scroll-indicator's row when one is showing. Edge auto-scroll is
+     *  measured against this, not against `firstRow`.
+     *
+     *  Reported by the actual behaviour: auto-scroll advanced exactly one row
+     *  and stopped. The first tick makes the scroll indicator appear, which
+     *  pushes the selectable body down by one row — so the pointer that was
+     *  resting on the top edge of the BODY was now on the indicator, i.e.
+     *  outside it, and edgeDirection returned null, tearing the timer down
+     *  after a single tick. Measuring the edge against the box's own top row
+     *  makes the indicator's appearance irrelevant, which is the only stable
+     *  reference a drag can be measured against. */
+    boxFirstRow: number;
+  }>({
     firstRow: 1,
     entries: [],
+    sliceStart: 0,
+    lastRow: 0,
+    boxFirstRow: 1,
   });
   // Holds a SGR mouse report that arrived split across two raw stdin
   // chunks — reported directly ("마우스 클릭 또는 휠을 내리면 프롬포트창에
@@ -935,6 +1056,46 @@ export function App({
   // sizing a Page Up/Down jump) before logHeight is computed later in this
   // render, so it's carried over from the previous one instead.
   const logHeightRef = useRef(3);
+  // ── Mouse selection ───────────────────────────────────────────────────────
+  // Reported directly: "마우스로 드레그 하면 화면 영역 밖에까지 복사할 수 있게
+  // 스크롤 업 또는 다운이 되어야 해". The alt screen has no terminal
+  // scrollback (see selection.ts for the full reasoning), so selecting past the
+  // edge has to be done by the app scrolling its OWN log. See
+  // selection.ts — this is the state half of that feature.
+  //
+  // The anchor is stored in LOG-ROW space, not terminal-row space, and that is
+  // the whole trick: the visible window moves under a held pointer, so an
+  // anchor in terminal coordinates would slide away as the log scrolls and the
+  // selection would shrink instead of growing. The head is therefore *derived*
+  // during render (from the pointer's terminal row plus the current window
+  // origin), so scrolling while dragging extends the selection for free.
+  const [drag, setDrag] = useState<{
+    anchor: LogPoint;
+    pointerRow: number;
+    pointerCol: number;
+    /** A press that has not moved yet. Distinguishing this from a real drag
+     *  matters: a plain click on a fold line must toggle that fold, and doing
+     *  that on press made every drag also fold a block. */
+    moved: boolean;
+    /** Which edge of the log the pointer is currently pressed against, or
+     *  null in the body. Drives the auto-scroll effect above. */
+    edge: EdgeDirection;
+  } | null>(null);
+  /** The selection that stays on screen after the drag ends (until the next
+   *  press clears it). Held as state so a re-render for any other reason
+   *  keeps the highlight visible — without it, a status line arriving mid-
+   *  selection would make the highlight blink out. */
+  const [stickySelection, setStickySelection] = useState<Selection | null>(null);
+  /** Every row's plain text, for turning a selection into copyable text on
+   *  release. Lives in a ref because the copy happens in the input handler,
+   *  outside render, where `allRows` no longer exists. */
+  const allRowsRef = useRef<{ text: string }[]>([]);
+  /** Mirror of the live drag, readable synchronously inside a single
+   *  stdin chunk. `useState` alone is not enough: one chunk can legally carry
+   *  a press, several motion reports and the release together, and by the time
+   *  the state update for the press had been applied the release handler would
+   *  still have read `drag === null` and thrown the gesture away. */
+  const dragRef = useRef<{ moved: boolean; sel: Selection; edge: EdgeDirection } | null>(null);
   const rowCacheRef = useRef(new Map<number, { text: string; width: number; rows: string[] }>());
   // The terminal row of the input box's top border, from the PREVIOUS
   // render — see the cursor-positioning effect below for why this exists.
@@ -1060,6 +1221,31 @@ export function App({
     });
   }
 
+  // ── Edge auto-scroll while a drag is held against the top/bottom ─────────
+  // This is the mechanism that makes "drag off the top and keep selecting"
+  // possible at all. Without it the pointer would pin to the same terminal
+  // row forever and the selection could never grow past the first screen.
+  //
+  // The edge lives INSIDE `drag` (as `edge`) rather than in a ref on purpose:
+  // the effect has to re-arm when the pointer crosses from the top edge to the
+  // body and back, and a ref changes without re-rendering, so the effect
+  // would keep ticking the direction it captured on the first drag.
+  //
+  // It deliberately does NOT depend on scrollOffset: the scroll is what this
+  // effect causes, so depending on it would tear down and re-create the
+  // interval on every single tick (and the timer would never fire twice).
+  const dragEdge = drag?.edge ?? null;
+  useEffect(() => {
+    if (dragEdge === null) return;
+    const id = setInterval(() => {
+      setScrollOffset((s) => {
+        const next = s + (dragEdge === "up" ? EDGE_SCROLL_STEP : -EDGE_SCROLL_STEP);
+        return Math.max(0, Math.min(maxScrollRef.current, next));
+      });
+    }, EDGE_SCROLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [dragEdge]);
+
   // Folds every currently-expanded diff to its one-line summary. Diffs
   // default to expanded (the point is to actually see the change), but
   // shouldn't sit taking up the whole log forever — requested directly to
@@ -1136,10 +1322,106 @@ export function App({
       if (wheel !== null && wheel !== 0 && !menuOpen && quittingSince === null) {
         setScrollOffset((s) => Math.max(0, Math.min(maxScrollRef.current, s + wheel)));
       }
+      // --- Selection: press / drag / release -------------------------------- //
+      // Reported directly: "마우스로 드레그 하면 화면 영역 밖에까지 복사할 수
+      // 있게 스크롤 업 또는 다운이 되어야 해". See selection.ts for why the app
+      // has to own this rather than letting the terminal do it.
+      //
+      // Order matters here and is not interchangeable. A press over the log
+      // starts a selection; motion extends it; the RELEASE decides what the
+      // gesture was — a drag (copy) or a click (toggle a fold). Deciding on
+      // the press instead, which is what the click handler did, meant every
+      // drag also folded a block the moment it began.
+      if (quittingSince === null) {
+        const { firstRow, entries, sliceStart, lastRow, boxFirstRow } = clickMapRef.current;
+
+        // Release first: it ends the previous drag, and a release must not
+        // also be read as the start of a new one.
+        for (const { row, col } of parseMouseRelease(char)) {
+          const current = dragRef.current;
+          dragRef.current = null;
+          setDrag(null);
+          if (!current) continue;
+          if (!current.moved) {
+            // A click, not a drag: fall through to the fold toggle below.
+            setStickySelection(null);
+            continue;
+          }
+          setStickySelection(current.sel);
+          // Stripped here rather than at the sink so BOTH consumers get clean
+          // text — log rows carry the app's own SGR codes, and a copy carrying
+          // them pastes literal "[1;36m" into whatever it lands in.
+          const text = stripAnsiForCopy(selectionText(current.sel, allRowsRef.current));
+          if (!text.trim()) {
+            setStickySelection(null);
+            continue;
+          }
+          void copySelection(text)
+            .then((result) => {
+              // The file is ALWAYS written, because OSC 52 is refused silently
+              // by most Wayland terminals and the user is told where the text
+              // is either way — so the message never claims a copy succeeded
+              // when all it can honestly say is "here it is, in a file".
+              const via = result.via === "osc52" ? "클립보드에 넣고" : "클립보드가 거부해서 파일로";
+              pushLine(`[복사] ${text.length}자를 ${via} 저장했습니다 → ${result.path}`, "status");
+            })
+            .catch((err: any) => pushLine(`[복사 실패] ${err?.message ?? err}`, "status"));
+        }
+
+        // Press: start a selection when the pointer is over the log body.
+        // Outside the log (input box, dialogs) this is ignored so it can never
+        // intercept those interactions.
+        if (!menuOpen && dragRef.current === null) {
+          for (const { row, col } of parseMouseClicks(char)) {
+            if (!isLogBodyRow(row, firstRow, entries.length)) continue;
+            const sel: Selection = { anchor: { row: sliceStart + (row - firstRow), col: col - 1 }, head: { row: sliceStart + (row - firstRow), col: col - 1 } };
+            dragRef.current = { moved: false, sel, edge: null };
+            setDrag({ anchor: sel.anchor, pointerRow: row, pointerCol: col, moved: false, edge: null });
+            setStickySelection(null);
+            break;
+          }
+        }
+
+        // Motion with a button held: extend the selection, and record which
+        // edge (if any) the pointer is on so the auto-scroll effect can run.
+        const drags = parseMouseDrag(char);
+        if (drags.length > 0) {
+          const current = dragRef.current;
+          const last = drags[drags.length - 1];
+          // Measured against the log BOX's top row, not the selectable body's.
+          // See clickMapRef.boxFirstRow: the scroll indicator occupies the box's
+          // first row and appears as soon as the first auto-scroll tick lands,
+          // so measuring the body meant the drag's own scrolling turned the
+          // edge "outside the log" and stopped the timer after one row.
+          const edge = edgeDirection(last.row, boxFirstRow, lastRow, { menuOpen });
+          if (current) {
+            const head = { row: sliceStart + (last.row - firstRow), col: Math.max(0, last.col - 1) };
+            const sel: Selection = { anchor: current.sel.anchor, head };
+            // A motion with the button held is a drag even if the pointer
+            // landed back on the same row/col — the user moved the mouse, and
+            // the release is what actually decides. `moved` only has to be true
+            // here so the release is not mistaken for a click.
+            dragRef.current = { moved: true, sel, edge };
+            setDrag({ anchor: current.sel.anchor, pointerRow: last.row, pointerCol: last.col, moved: true, edge });
+          } else {
+            // Motion with no press tracked (e.g. the press was swallowed as a
+            // paste/multi-byte read, or the app started mid-gesture). Nothing
+            // to extend; explicitly clearing the edge stops any stale
+            // auto-scroll that might still be running.
+            dragRef.current = { moved: true, sel: { anchor: { row: sliceStart, col: 0 }, head: { row: sliceStart, col: 0 } }, edge: null };
+            setDrag(null);
+          }
+        }
+      }
+
       // A plain click: toggle a folded/expanded reasoning block if it
       // landed on one of its rows. Ignored while the menu is open or
       // saving (the map wasn't built for those layouts).
-      if (!menuOpen && quittingSince === null) {
+      //
+      // Only reached for a press that did NOT become a drag: the release
+      // branch above already consumed that case by clearing dragRef, and
+      // `dragRef.current` is non-null only while a gesture is in flight.
+      if (!menuOpen && quittingSince === null && dragRef.current === null) {
         const { firstRow, entries } = clickMapRef.current;
         for (const { row } of parseMouseClicks(char)) {
           const idx = row - firstRow;
@@ -1164,6 +1446,11 @@ export function App({
             else next.add(entry.lineId);
             return next;
           });
+          // A press that reaches here also started a selection above; drop it
+          // so a click doesn't leave a stray one-row highlight behind.
+          dragRef.current = null;
+          setDrag(null);
+          setStickySelection(null);
         }
       }
       return;
@@ -1592,6 +1879,12 @@ export function App({
     setContextUsedRatio,
     setPlanProgress: (done: number, total: number) => setPlanProgress(total > 0 ? { done, total } : null),
     setCompactionStatus: (state: "running" | "complete" | "failed", timestamp: string) => setCompactionStatus({ state, timestamp }),
+    // The rendered log's plain text, one entry per VISIBLE row. This is the
+    // same array the drag-selection copies from (allRowsRef, written during
+    // render), so `/copy` and a mouse drag can never disagree about what the
+    // log contains. Read through a ref rather than a fresh render so the
+    // caller always gets the rows as they were last drawn.
+    getVisibleLogText: () => allRowsRef.current.map((r) => r.text),
   };
 
   // Reported directly: llamacli flickers, especially noticeable on Windows
@@ -1736,6 +2029,12 @@ export function App({
     // scrollback buffer on any terminal that has CSI but no alt screen.
     if (!getCapabilities().altScreen) {
       prevInputTopBorderRowRef.current = inputTopBorderRow;
+      // Also drop the placement: with no alt screen the sequence is never
+      // computed, and a stale one left registered would have the stdout
+      // wrapper keep writing absolute cursor addressing into a terminal that
+      // cannot honour it — the literal-escape-garbage failure mode terminal.ts
+      // documents.
+      clearCursorPlacement();
       return;
     }
 
@@ -1788,27 +2087,35 @@ export function App({
         : 1 /* paddingX */ + widthToCursor + 1;
     const hideCursor = shouldHideCursor({ quitting, busy, input });
     lastCursorWriteRef.current = `\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`;
+    // Registered as well as written. The registration is what makes the
+    // placement survive an Ink repaint — see cursorPlacement.ts for why a
+    // write from this effect is not enough on its own.
+    setCursorPlacement(lastCursorWriteRef.current);
     process.stdout.write(lastCursorWriteRef.current);
   });
 
   // Reported directly: the blinking cursor sometimes ends up sitting
-  // outside the prompt box, for no identifiable trigger — the effect above
-  // already re-runs after every single render (no dependency array), which
-  // should always keep it correct, but if some render doesn't actually
-  // fire it (or Ink's own paint moves the real cursor afterward, e.g.
-  // while drawing a log update, without a React state change following it
-  // to re-trigger the effect), there's currently nothing to correct it
-  // until the next state change happens to come along. A cheap self-
-  // healing safety net: periodically re-issue the SAME escape sequence the
-  // effect above most recently computed (never recomputed here — this
-  // must never be a second, independently-computed source of truth that
-  // could disagree with it), capping how long any such drift could
-  // possibly remain visible.
+  // outside the prompt box, for no identifiable trigger.
+  //
+  // This used to be a 400 ms self-heal interval that re-issued the last
+  // placement unconditionally. It is now GONE, and that is the fix rather than
+  // a reduction: the drift it was papering over is an Ink repaint landing after
+  // the effect (see cursorPlacement.ts), so a timer could only ever bound how
+  // long the cursor was visibly wrong — up to 400 ms of it, on every repaint.
+  // The stdout wrapper in index.tsx now re-asserts the placement after every
+  // frame Ink writes, which closes the window instead of shortening it, and
+  // costs nothing when nothing is being drawn.
+  //
+  // The narrow case this still covers is kept: a write that does NOT go through
+  // Ink's wrapper (an external process sharing the tty, a terminal-side redraw)
+  // leaves no state change to re-trigger the effect above. That is rare enough
+  // that a slow backstop is the right shape for it, and it is now much slower
+  // precisely because it is only a backstop.
   useEffect(() => {
     const id = setInterval(() => {
       if (!getCapabilities().altScreen || !lastCursorWriteRef.current) return;
       process.stdout.write(lastCursorWriteRef.current);
-    }, 400);
+    }, 2000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2077,8 +2384,12 @@ export function App({
     const visibleCount = sliceEnd - sliceStart;
     const childrenHeight = (showScrollIndicator ? 1 : 0) + visibleCount + (menuOpen ? menuBoxHeight : 0) + hintRows;
     const gap = Math.max(0, logHeight - childrenHeight);
+    // Extracted into a const because both the click map and `lastRow` below
+    // need it, and the two drifting apart is exactly the bug that would make
+    // the auto-scroll fire one row off.
+    const firstRow = 1 + gap + (showScrollIndicator ? 1 : 0);
     clickMapRef.current = {
-      firstRow: 1 + gap + (showScrollIndicator ? 1 : 0),
+      firstRow,
       entries: allRows
         .slice(sliceStart, sliceEnd)
         .map((r) => ({
@@ -2104,8 +2415,36 @@ export function App({
           isPaste: r.kind === "user-paste-folded" || r.kind === "user-paste-expanded",
           isGate: r.kind === "gate" || r.kind === "gate-folded",
         })),
+      sliceStart,
+      // The bottom edge the auto-scroll watches: the last row the log box
+      // actually occupies. Computed from the same arithmetic as firstRow so
+      // the two can't disagree about where the log ends — if they did, a drag
+      // held one row below the content would keep scrolling forever.
+      lastRow: firstRow + (sliceEnd - sliceStart) - 1,
+      boxFirstRow: firstRow - (showScrollIndicator ? 1 : 0),
     };
+    // Every row's text, for copying a selection on release (the input handler
+    // runs outside render, where `allRows` is gone).
+    allRowsRef.current = allRows;
   }
+
+  // The selection to render. While dragging, the head is DERIVED from the
+  // pointer's terminal row against the current window origin — which is what
+  // makes the selection keep growing while the auto-scroll moves the window
+  // underneath a pointer that has not moved at all. When not dragging, the
+  // last selection stays visible so a stray re-render can't erase it.
+  const activeSelection: Selection | null =
+    drag !== null && !drag.moved
+      ? { anchor: drag.anchor, head: drag.anchor }
+      : drag !== null
+        ? {
+            anchor: drag.anchor,
+            head: {
+              row: clickMapRef.current.sliceStart + (drag.pointerRow - clickMapRef.current.firstRow),
+              col: Math.max(0, drag.pointerCol - 1),
+            },
+          }
+        : stickySelection;
 
   const inputBorderColor = quitting || quitConfirmPending || resumeConfirmPending
     ? "yellow"
@@ -2134,9 +2473,17 @@ export function App({
         )}
         {allRows
           .slice(sliceStart, sliceEnd)
-          .map((row) =>
-            renderRow(row, row.lineId === thinkingLineId || row.lineId === streamingAssistantId ? shimmerTick : undefined)
-          )}
+          .map((row, i) => {
+            const shimmer = row.lineId === thinkingLineId || row.lineId === streamingAssistantId ? shimmerTick : undefined;
+            // The selection is stored in allRows coordinates, so it has to be
+            // offset by the same sliceStart the row index carries — the visible
+            // index `i` alone is only correct at scrollOffset 0.
+            return renderRowWithHighlight(
+              row,
+              shimmer,
+              activeSelection ? rowRange(activeSelection, sliceStart + i, row.text.length) : null
+            );
+          })}
         {menuOpen && <SlashMenu items={filterMenuItems(input)} selectedIndex={menuIndex} visibleRows={menuItemRows} />}
       </Box>
 

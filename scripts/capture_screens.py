@@ -37,7 +37,22 @@ class Screen:
         self.x = self.y = 0
         self.saved = None
         self.alt = False
+        # (row, col) of the last cursor position the app SET, and whether it
+        # was ever hidden. Used to verify the prompt cursor actually lands in
+        # the input box rather than at the end of the frame (bottom-left).
+        self.cursor_moves: list[tuple[int, int]] = []
+        self.cursor_hidden = False
         self.main = [[" "] * cols for _ in range(rows)]
+
+    def cursor_report(self) -> str:
+        if not self.cursor_moves:
+            return "no explicit cursor positioning seen"
+        last = self.cursor_moves[-1]
+        return (
+            f"last cursor placed at row={last[0]} col={last[1]} "
+            f"(1-based, {len(self.cursor_moves)} placements); "
+            f"hidden={self.cursor_hidden}; final pen at row={self.y + 1} col={self.x + 1}"
+        )
 
     def _clamp(self):
         self.x = max(0, min(self.cols - 1, self.x))
@@ -109,7 +124,12 @@ class Screen:
         if final == "H" or final == "f":
             self.y = (nums[0] - 1) if len(nums) > 0 else 0
             self.x = (nums[1] - 1) if len(nums) > 1 else 0
+            self.cursor_moves.append((self.y + 1, self.x + 1))
             self._clamp()
+        elif final == "l" and a == 25:
+            self.cursor_hidden = True
+        elif final == "h" and a == 25:
+            self.cursor_hidden = False
         elif final == "J":
             mode = a or 0
             if mode == 2:

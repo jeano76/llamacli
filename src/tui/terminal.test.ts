@@ -129,10 +129,18 @@ test("LLAMACLI_ASCII=1 forces ASCII glyphs, and disables unicode even on win32+W
 
 // ── mouse ───────────────────────────────────────────────────────────────────
 
-test("mouse is OFF by default even on a fully capable terminal", () => {
-  // Always-on mouse reporting is what forced Shift-drag for text selection on
-  // every terminal, for a feature the app can now also drive from the keyboard.
-  assert.equal(detectTerminal({ TERM: "xterm-256color" }, TTY).mouse, false);
+test("mouse is ON by default on a capable terminal, and OFF is reachable explicitly", () => {
+  // This default was OFF, then flipped back to ON after driving the real binary
+  // in a pty (scripts/capture_screens.py) showed the OFF default had killed the
+  // wheel and click-to-fold outright — they have no keyboard equivalent, so
+  // nothing on screen told the user they were simply gone. The selection
+  // trade-off that motivated turning it off never actually paid off either:
+  // this app draws on the ALT SCREEN, which has no scrollback, so a native
+  // drag had nothing to scroll to. The app now does its own selection with edge
+  // auto-scroll (see selection.ts). `/mouse` and LLAMACLI_MOUSE=0 still turn it
+  // off for anyone who wants every mouse gesture handed to the terminal.
+  assert.equal(detectTerminal({ TERM: "xterm-256color" }, TTY).mouse, true);
+  assert.equal(detectTerminal({ TERM: "xterm-256color", LLAMACLI_MOUSE: "0" }, TTY).mouse, false);
 });
 
 test("LLAMACLI_MOUSE=1 turns it on where SGR is available", () => {
@@ -208,15 +216,59 @@ test("every sequence builder degrades to an empty string when unsupported", () =
   assert.equal(s.eraseLineAt(3), "");
 });
 
-test("mouseOn/mouseOff are only emitted together", () => {
-  const on = buildSequences(detectTerminal({ TERM: "xterm-256color", LLAMACLI_MOUSE: "1" }, TTY));
+test("mouseOn/mouseOff are only emitted together, and disabling really disables", () => {
+  const on = buildSequences(detectTerminal({ TERM: "xterm-256color" }, TTY));
   assert.ok(on.mouseOn.includes("\x1b[?1000h"));
   assert.ok(on.mouseOn.includes("\x1b[?1006h"));
-  const off = buildSequences(detectTerminal({ TERM: "xterm-256color" }, TTY));
+  // LLAMACLI_MOUSE=0 is the escape hatch for a user who wants every mouse
+  // gesture handed back to the terminal (native selection). It has to actually
+  // turn the mode off, not merely decline to turn it on.
+  const off = buildSequences(detectTerminal({ TERM: "xterm-256color", LLAMACLI_MOUSE: "0" }, TTY));
   assert.equal(off.mouseOn, "");
   // mouseOff must still be emitted when the terminal *can* do SGR, so a
   // terminal whose mode we turned on and then disabled still gets cleaned up.
   assert.ok(off.mouseOff.includes("\x1b[?1000l"));
+});
+
+test("the black background is a well-formed, terminated SGR on a truecolor terminal", () => {
+  // Requested directly: "llamacli 의 배경을 검은색으로 해줘".
+  //
+  // The termination is the whole assertion. This module's `csi()` helper does
+  // NOT append the final byte — every other call site passes it in (`csi("?1049h")`)
+  // — so `csi("49")` silently emitted a truncated `\x1b[49` that ran straight
+  // into the next escape sequence. Terminals do not error on that; they just
+  // fail to apply it, so the background stayed whatever the user's theme was
+  // and nothing anywhere reported a problem. Found by capturing the raw bytes
+  // off a live pty, not by reading this code.
+  const s = buildSequences(detectTerminal({ TERM: "xterm-256color", COLORTERM: "truecolor" }, TTY));
+  assert.ok(s.backgroundOn.includes("\x1b[48;2;0;0;0m"), "truecolor black");
+  assert.ok(s.backgroundOn.includes("\x1b[49m"), "promoted to the DEFAULT background");
+  // No truncated sequence: every CSI in the string must end in a real final byte.
+  for (const m of s.backgroundOn.matchAll(/\x1b\[[0-9;?]*([@-~])/g)) {
+    assert.ok(m[1], `truncated escape sequence in ${JSON.stringify(s.backgroundOn)}`);
+  }
+  assert.ok(!/\x1b\[[0-9;?]*(?=\x1b|$)/.test(s.backgroundOn), "no CSI missing its final byte");
+});
+
+test("a black background is only claimed on a terminal that can honour it", () => {
+  // 16-colour: black is in every palette, so the SGR 40 fallback applies.
+  const sixteen = buildSequences(detectTerminal({ TERM: "xterm", LLAMACLI_COLOR_DEPTH: "4" }, TTY));
+  assert.ok(sixteen.backgroundOn.includes("\x1b[40m"));
+  assert.ok(sixteen.backgroundOff.includes("\x1b[49m"), "and it can always be undone");
+  // No colour at all: claiming a background would emit escapes into a terminal
+  // that shows them literally.
+  const none = buildSequences(detectTerminal({ TERM: "xterm", NO_COLOR: "1" }, TTY));
+  assert.equal(none.backgroundOn, "");
+  assert.equal(none.backgroundOff, "");
+});
+
+test("the background is reset on exit, or it outlives the app and recolours the shell", () => {
+  // The alt screen protects the user's scrollback, but NOT their SGR state: a
+  // background left set keeps colouring every command they type afterwards.
+  // This is the assertion that would have caught a missing backgroundOff.
+  const s = buildSequences(detectTerminal({ TERM: "xterm-256color", COLORTERM: "truecolor" }, TTY));
+  assert.ok(s.backgroundOff.length > 0, "exit must emit a background reset");
+  assert.ok(s.backgroundOff.endsWith("m"));
 });
 
 test("alt screen entry hides the cursor and exit restores it", () => {
