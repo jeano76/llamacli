@@ -497,6 +497,69 @@ product bugs rather than harness noise:
   draws box-drawing perfectly well). Worth recording, because "the test was
   wrong" is a real outcome and the temptation is to quietly fix the test.
 
+## Hardware / environment matrix validation
+
+`scripts/persona_usability_check.ts` (above) varies the **terminal**. This section
+is about the other axis: the **machine**. `src/setup/tuning.test.ts` and the
+sweeps behind it check the setup decisions against a matrix of
+
+```
+CPU (1·2·4·8·12·16·32·64) × RAM (2–256 GiB)
+  × GPU (none / 4·8·12·24·80 GiB, plus a card reporting 0 MiB free)
+  × platform (linux·darwin·win32) × model size (0·1·4·20·70 GiB)
+```
+
+= **6,720 environment combinations, 168,668 invariant checks**.
+
+The invariants are the ones whose violation the user discovers hours later:
+threads never exceed the core count, context stays in a range llama.cpp's KV
+allocator handles, `-b`/`-ub` stay powers of two, no derived flag is ever `NaN`
+or negative, and no GPU means `-ngl 0` while a GPU always wins over the CPU.
+
+### What it found
+
+Three real bugs, all of which the previous 590 tests passed straight through —
+because each one is invisible on the machine they were written on.
+
+- **Threads exceeded the core count on 1–3 core machines** (`tuning.ts`). The GPU
+  branch used a `Math.max(2, …)` floor, so a 1-core box was launched with
+  `-t 2 -tb 2`. The dev box has 12 cores, where `max(2, 6)` lands on a legal
+  value *by accident* — 1,440 of the 6,720 combinations were wrong and none of
+  them could be seen from here. Now clamped with `Math.min(cpuCount, …)`; the
+  known-good 12-core result (`threads=6`, the value in the hand-tuned config
+  below) is unchanged, and a test pins it.
+
+- **Recursive and forced deletes were classified "cheap"** (`gate.ts`). The
+  `bulk delete` rail required a delete verb *and* a separate bulk word, so the
+  `-r`/`-f` flag did not count as the qualifier. `rm -rf /home/jeano` and
+  `rm -rf /*` were caught — the first by the path pattern, the second by a literal
+  `*` — while `rm -rf /`, `rm -rf ~` and `rm -fr node_modules` passed through and
+  could be downgraded to a system1 turn. Whether a destructive command was held
+  depended on which characters sat next to it.
+
+- **Korean verb conjugations were not matched** (`gate.ts`). The rail listed
+  `지우`, but Korean changes the stem vowel `우 → 워` before a vowel-ending
+  suffix, so the imperative anyone actually types — `지워줘` — does **not**
+  contain `지우` as a prefix. `모든 파일을 지워줘` ("delete all the files") was
+  judged cheap while the identical `전부 삭제해줘` was held. `제거` and `재귀`
+  were absent from the list entirely.
+
+All three are now covered by regression tests, and the benign side is guarded
+too: 39 ordinary requests (English and Korean) must stay unflagged, because a
+rail that fires on everything is the same as having no rail.
+
+### What this does *not* cover
+
+Being explicit, because a matrix like this is easy to over-claim. It exercises
+the **decision functions** against synthetic hardware. It does not run on real
+Windows, macOS, Wayland or musl, and it does not put a real 8 GB card under
+real VRAM pressure. A green matrix means the *arithmetic* is sound; it says
+nothing about the driver, the kernel, or the terminal.
+
+For the per-TC results, what was actually executed, and the 25 test cases that
+remain **unverified** for lack of the hardware, see
+[`docs/multienv-acceptance-report.md`](docs/multienv-acceptance-report.md).
+
 ## Testing
 
 Every module with real logic (not just glue/IO) has a `*.test.ts` next to it,
@@ -521,7 +584,9 @@ real thing.
 > `tools/browser.ts`(타겟 선택/에러 경로는 fake HTTP 서버로 — 실제 CDP 왕복은
 > 실제 headless Chrome으로 수동 검증, 아래 참고), `hermes/selfHeal.ts`,
 > `hermes/selfImprove.ts`(fake `ModelBackend` 사용), `compaction/compactor.ts`,
-> `compaction/checkpoint.ts`, `skills/loader.ts`. 에이전트 루프와 TUI는
+> `compaction/checkpoint.ts`, `skills/loader.ts`, `setup/tuning.ts`
+> (코어 수 · VRAM · OS에 따른 플래그 결정 불변식 — 위 매트릭스 검증 참조).
+> 에이전트 루프와 TUI는
 > 통합 테스트 성격(도구 호출 루프, 스트리밍, 슬래시 명령)이라 실제 llama-server를
 > 대상으로 pty로 실제 키 입력을 흘려보내며 검증했다(git 히스토리 참고) — Ink 터미널
 > 렌더링을 모킹하는 것보다 실제로 구동해보는 쪽이 더 실질적이라고 판단.

@@ -128,11 +128,22 @@ export function tuneForHardware(hw: Hardware, opts?: { modelBytes?: number }): L
   // offload path). The split is: leave physical half the cores for the OS and
   // the offloaded expert compute. On the 12-core box this yields 6, which is
   // exactly what the hand-tuned working config in this repo used (`-t 6`).
-  const threads = gpu ? Math.max(2, Math.floor(cpuCount / 2)) : Math.max(1, cpuCount - 1);
+  //
+  // The `Math.max(2, …)` floor on the GPU branch was the bug: on a 1-core box
+  // it produced `-t 2 -tb 2`, i.e. MORE threads than the machine has cores,
+  // which is precisely what the rule above says must never happen. TC-08 caught
+  // it by sweeping 1/2/3-core machines — the dev box is 12 cores, where
+  // `max(2, 6)` accidentally lands on a legal value and hides the bug entirely.
+  // The floor is now clamped to the core count rather than assuming >= 2.
+  const threads = gpu
+    ? Math.min(cpuCount, Math.max(2, Math.floor(cpuCount / 2)))
+    : Math.min(cpuCount, Math.max(1, cpuCount - 1));
   // Prompt processing is not GPU-bound in the same way (it's a big batched
   // matmul that does use the GPU, but is far more sensitive to thread count),
   // so it gets the full complement when there's a GPU to share with.
-  const threadsBatch = gpu ? Math.max(2, cpuCount - 1) : Math.max(1, cpuCount - 1);
+  const threadsBatch = gpu
+    ? Math.min(cpuCount, Math.max(2, cpuCount - 1))
+    : Math.min(cpuCount, Math.max(1, cpuCount - 1));
   rationale.push(
     gpu
       ? `스레드는 생성 ${threads} / 프롬프트 처리 ${threadsBatch} 로 나눴습니다 (코어 ${cpuCount}개, GPU가 계산하므로 CPU 스레드 과할당은 역효과).`

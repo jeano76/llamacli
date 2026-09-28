@@ -429,16 +429,32 @@ test("cancel() aborts an in-flight streaming chat() call, distinguishably from a
     async (baseUrl) => {
       const client = new OpenAICompatibleClient(baseUrl);
       const deltas: string[] = [];
+      let firstDeltaResolve: () => void = () => {};
+      const firstDelta = new Promise<void>((r) => {
+        firstDeltaResolve = r;
+      });
       const chatPromise = client.chat(
         { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
         (chunk) => {
-          if (chunk.choices[0]?.delta.content) deltas.push(chunk.choices[0].delta.content as string);
+          if (chunk.choices[0]?.delta.content) {
+            deltas.push(chunk.choices[0].delta.content as string);
+            firstDeltaResolve();
+          }
         }
       );
-      // Give it a moment to actually start streaming before cancelling —
-      // cancelling instantly (before any chunk arrives) is covered by the
-      // "cancel before anything streams" case below.
-      await new Promise((r) => setTimeout(r, 20));
+      // Wait for the stream to ACTUALLY start rather than assuming 20 ms is
+      // enough. It usually is, but under a loaded machine (the full 606-test
+      // suite runs this alongside ~600 others) the first chunk can arrive
+      // later, and the fixed sleep then failed on `deltas.length > 0` — a
+      // flake in the test, not a regression in cancel(). The condition the
+      // test is really asserting is "cancel arrives after streaming began",
+      // so waiting for that condition is both truer and deterministic.
+      // Bounded so a genuinely dead stream still fails the test rather than
+      // hanging it.
+      await Promise.race([
+        firstDelta,
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error("no delta arrived within 2s")), 2000)),
+      ]);
       const start = Date.now();
       client.cancel();
       await assert.rejects(() => chatPromise, /cancelled/);

@@ -100,8 +100,51 @@ const HIGH_RISK_PATTERNS: { name: string; all: RegExp[] }[] = [
     // to require a particular sequence.
     name: "bulk delete",
     all: [
-      /(\brm\s+-[a-z]*[rf]|remove|delete|삭제|지우|없애|정리)/i,
-      /(\brecursiv|\ball\b|\beverything\b|\bwhole\b|전체|전부|모든|모두|\*)/i,
+      // The Korean verbs are matched by STEM, not by whole word, and the stem
+      // of 지우다 is not a plain prefix: the vowel 우 becomes 워 before a
+      // vowel-ending suffix, so the ordinary imperative is `지워줘` — which
+      // `지우` does NOT match. `지[우워]` plus `지웠` covers the plain,
+      // comparative, and past forms (지우 / 지워 / 지웠 / 지워서 / 지워줘 / 지우는).
+      // `제거` and `삭제` are the other verbs the corpus used.
+      //
+      // Found by a sweep over a Korean request corpus (TC-28): "모든 파일을
+      // 지워줘" and "모든 것을 제거해줘" were both classified cheap while the
+      // grammatically equivalent "전부 삭제해줘" was held — the only difference
+      // being which conjugated form of the same verb was typed.
+      /(\brm\s+-[a-z]*[rf]|remove|delete|삭제|제거|지[우워]|지웠|없애|없앤|정리)/i,
+      // A RECURSIVE or FORCED delete is bulk on its own — the flag IS the
+      // qualifier, so requiring a second English/Korean word to say "all" let
+      // the most destructive invocations through.
+      //
+      // Found by TC-28: `rm -rf /` and `rm -fr node_modules` were classified
+      // cheap and could be downgraded to a system1 turn, while
+      // `rm -rf /*` (which the same pattern caught, via the literal `*`) was
+      // held. The inconsistency was purely an artifact of which words happened
+      // to sit next to the command.
+      //
+      // `-[a-z]*r` / `-[a-z]*f` match the conventional combinations in any
+      // order (`-rf`, `-fr`, `-r`, `-f`, and with other flags like `-vrf`).
+      //
+      // `재귀` is the Korean "recursive" and was missing, so "재귀적으로 삭제"
+      // matched neither half of the pattern.
+      /(\brm\s+-[a-z]*r|\brm\s+-[a-z]*f|\brecursiv|\brecursive|재귀|\ball\b|\beverything\b|\bwhole\b|전체|전부|모든|모두|\*)/i,
+    ],
+  },
+  {
+    // A delete aimed at the filesystem root, the home directory, or a parent
+    // path. Held as its own pattern because it is a delete of a NAMED path, so
+    // the pattern below is structurally blind to it: `rm -rf /` has no
+    // dot-slash, no trailing-slash segment and no file extension to match on,
+    // and a trailing bare `/` is exactly what `\/[\w.-]+\/` requires to be
+    // absent. `rm -rf ~` is missed for the same reason.
+    name: "delete of a filesystem root or home",
+    all: [
+      /(\brm\s+-[a-z]*[rf]+|\brmdir\b|remove|delete|삭제|지우|없애)/i,
+      // The target must be the root, the home directory, or a path anchored at
+      // one of them. `~` as a PREFIX is included (`rm -rf ~/Documents`), which
+      // is why this is a prefix test rather than an end-of-string one — a home
+      // wipe is just as irreversible as a root wipe.
+      /(\s\/\s*$|\s~\/?\s*$|\s\/(\s|\/)|(^|\s)\/(?:\s|$)|\s~\/)/,
     ],
   },
   {

@@ -42,6 +42,114 @@ test("the rail does not fire on ordinary requests", () => {
   }
 });
 
+test("a recursive or forced delete is bulk on its own — no 'all' word needed", () => {
+  // TC-28. The rail used to require BOTH a delete verb AND a separate
+  // bulk-qualifier word, so the flag-qualified invocations fell between the
+  // two halves of that pattern and were classified cheap:
+  //
+  //     "rm -rf /"                 -> missed  (no "all"/"everything"/"전체")
+  //     "rm -fr node_modules"      -> missed
+  //     "rm -rf /*"                -> CAUGHT, but only via the literal "*"
+  //     "rm -rf /home/jeano"       -> CAUGHT, but only via the path pattern
+  //
+  // That inconsistency was an artifact of which words sat next to the
+  // command, and it mattered: a "cheap" verdict on `rm -rf /` is exactly the
+  // miscalibration the rail exists to refuse. `-r`/`-f` IS the qualifier.
+  for (const text of [
+    "rm -rf /",
+    "rm -fr node_modules",
+    "rm -r build",
+    "rm -f important.txt",
+    "rm -rf ~",
+    "sudo rm -rf /var/lib",
+    "rm -rf --no-preserve-root /",
+  ]) {
+    assert.ok(highRiskMatches(text).length > 0, `should be high risk: "${text}"`);
+    const d = judgeCheap(text, 0.99);
+    assert.equal(d.mode, "full", `must not downgrade: "${text}"`);
+    assert.equal(d.forced, true, `rail must be what decided: "${text}"`);
+  }
+});
+
+test("the rail matches Korean verbs by stem, not by one conjugated form", () => {
+  // TC-28, found by sweeping a Korean request corpus. The rail listed `지우`,
+  // which is the PLAIN form of 지우다 — but Korean changes the stem vowel
+  // 우 → 워 before a vowel-ending suffix, so the imperative everyone actually
+  // types is `지워줘`, and `지우` does not match it as a prefix. `제거` and the
+  // Korean `재귀` ("recursive") were missing from the list entirely.
+  //
+  // The result was that grammatically identical requests were classified
+  // differently depending only on which form was typed:
+  //     "전부 삭제해줘"      -> held
+  //     "모든 파일을 지워줘"  -> CHEAP (would be downgraded)
+  //     "모든 것을 제거해줘"  -> CHEAP
+  //     "재귀적으로 삭제"     -> CHEAP
+  // Each of these still needs a bulk qualifier (all / recursive) — the rail
+  // requires BOTH signals. A bare "지워줘" is deliberately NOT flagged: one
+  // file is a normal request, and a rail that fires on everything is the same
+  // as no rail at all.
+  for (const text of [
+    "모든 파일을 지워줘",
+    "전부 지워",
+    "모든 걸 지워줘",
+    "모든 것을 지워서 정리해줘",
+    "모든 것을 제거해줘",
+    "전체를 제거해줘",
+    "재귀적으로 삭제",
+    "재귀 삭제",
+  ]) {
+    assert.ok(highRiskMatches(text).length > 0, `should be high risk: "${text}"`);
+    const d = judgeCheap(text, 0.99);
+    assert.equal(d.mode, "full", `must not downgrade: "${text}"`);
+    assert.equal(d.forced, true, `rail must be what decided: "${text}"`);
+  }
+});
+
+test("the rail still leaves ordinary Korean requests alone", () => {
+  // The guard on the other side: a stem-based Korean match must not turn
+  // everyday requests into permanent full turns, or the gate stops doing
+  // anything at all.
+  for (const text of [
+    "README.md 의 첫 번째 문장만 그대로 인용해줘.",
+    "이 폴더를 정리해줘",
+    "이 저장소에서 테스트를 실행하는 명령어는?",
+    "이 함수의 시간 복잡도는?",
+    "중복된 코드를 정리하고 함수 이름을 바꿔줘",
+    "이 파일 하나만 지워줘",
+  ]) {
+    assert.deepEqual(highRiskMatches(text), [], `should not be high risk: "${text}"`);
+  }
+});
+
+test("a delete aimed at the filesystem root or home is high risk", () => {
+  // Held as its own pattern: `rm -rf /` and `rm -rf ~` have no dot-slash, no
+  // trailing-slash segment and no file extension, which is exactly what the
+  // "named path/config" pattern requires to be present.
+  for (const text of ["rm -rf /", "rm -rf ~", "rm -rf ~/", "rmdir /", "delete /", "삭제 /"]) {
+    assert.ok(
+      highRiskMatches(text).includes("delete of a filesystem root or home"),
+      `root/home delete should match: "${text}"`
+    );
+  }
+});
+
+test("the rail still does not fire on ordinary requests after the fix", () => {
+  // The flag-based rule is broad, so the benign side needs its own guard:
+  // "remove"/"delete" as an editing verb must not start matching everything.
+  for (const text of [
+    "remove the unused import from line 3",
+    "delete the temporary log file",
+    "remove dead code",
+    "이 폴더를 정리해줘",
+    "can you format this code?",
+    "refactor this function",
+    "git status",
+    "show me the diff",
+  ]) {
+    assert.deepEqual(highRiskMatches(text), [], `should not be high risk: "${text}"`);
+  }
+});
+
 test("the rail overrides a confident judge verdict", () => {
   const d = judgeCheap("node_modules 디렉터리를 재귀적으로 전부 삭제하는 스크립트", 0.95);
   assert.equal(d.mode, "full");
