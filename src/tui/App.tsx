@@ -24,7 +24,7 @@ export interface AppProps {
   model: string;
   onSubmit: (text: string) => void;
   /** Fires for a slash command selected from the menu. `argument` is the text
-   *  after the command key (e.g. "/fastcheck foo" → argument "foo"), or "" for
+   *  after the command key (e.g. "/copy 20" → argument "20"), or "" for
    *  commands with no arguments; lets arg-taking commands read their input. */
   onSlashCommand: (key: string, argument?: string) => void;
   /** A message typed while the agent is busy — applied at the next
@@ -184,18 +184,6 @@ export function foldedDiffSummary(diffText: string): string {
   return `▸ diff: ${path} (+${added} -${removed}) — 클릭해서 펼치기`;
 }
 
-/** Folded summary line for the LAYA/fastcheck gate (see src/index.tsx's
- *  runLayaGate) — a single stable-id log line that accumulates, across every
- *  prompt in the session, the performance gain of each short-circuited gate.
- *  The text already carries the per-run verdict and score/conf; this only
- *  supplies the collapsed label + click affordance. Starts expanded on first
- *  output (App's firstSeen set), then folds like tool-result/reasoning and
- *  re-expands by click, so cumulative output stays one growing line rather
- *  than spamming a new row each run. */
-export function foldedGateSummary(text: string): string {
-  const chars = text.trim().length;
-  return `▸ laya 성능 요약 (${chars}자) — 클릭해서 펼치기`;
-}
 
 /** A single band's role in the "thinking" shimmer: `dim` hasn't been
  *  reached by the reveal wave yet, `peak` is the wave's leading edge (the
@@ -457,10 +445,10 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
  *  live. Every registered command's own `key` is a single token (no
  *  embedded spaces — even "plan clear" is `key: "plan-clear"`), but the
  *  query used to be the ENTIRE text after "/", argument included. The
- *  instant you typed a space and started an argument ("/fastcheck on"),
- *  the query became "fastcheck on" — which no item's key contains — so
+ *  instant you typed a space and started an argument ("/copy 20"),
+ *  the query became "copy 20" — which no item's key contains — so
  *  the menu dropped to "No matching commands" and Enter did nothing at
- *  all, even though "/fastcheck" alone matched perfectly a moment before.
+ *  all, even though "/copy" alone matched perfectly a moment before.
  *  Only the first whitespace-delimited token is a command name; anything
  *  after the first space is always argument text, never part of what
  *  should narrow the match. */
@@ -775,7 +763,7 @@ export function App({
   const pasteCounterRef = useRef(1);
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
-  // Gate lines (LAYA/fastcheck) expand the moment they first appear, then
+  // Long lines expand the moment they first appear, then
   // fold on subsequent prompts until clicked — so a single stable-id line
   // stays one growing summary rather than re-expanding every run. Mirrors
   // reasoning/tool-result's expanded-vs-folded tracking but keyed on "first
@@ -1179,24 +1167,6 @@ export function App({
     );
   }
 
-  // Appends (or extends, when `id` already exists) the LAYA/fastcheck gate's
-  // cumulative performance line — a single stable-id log row that grows with
-  // each short-circuited run. The text carries verdict + score/conf; the
-  // fold label is derived from it via foldedGateSummary. Passed to loop.ts as
-  // opts.onGateVerdict so gate results reach the TUI.
-  function pushGateLog(payload: { id?: number; text: string }) {
-    const foldLabel = foldedGateSummary(payload.text);
-    setLog((prev) => {
-      if (payload.id != null) {
-        const existing = prev.find((l) => l.id === payload.id && l.kind === "gate");
-        if (existing) {
-          return prev.map((l) => (l.id === payload.id ? { ...l, text: payload.text } : l)).slice(-MAX_LOG_ENTRIES);
-        }
-      }
-      const id = payload.id ?? logIdCounter++;
-      return [...prev, { id, text: payload.text, kind: "gate" as const, foldLabel }].slice(-MAX_LOG_ENTRIES);
-    });
-  }
 
   function pushTool(label: string) {
     const id = logIdCounter++;
@@ -1539,7 +1509,7 @@ export function App({
           );
         } else {
           // Pass everything after the command key as its argument, so
-          // commands that take text (e.g. "/fastcheck <question>") can read it.
+          // commands that take text (e.g. "/copy 20") can read it.
           onSlashCommand(item.key, input.slice(item.key.length + 1));
         }
       } else if (key.escape) {
@@ -1853,23 +1823,9 @@ export function App({
     finalizeReasoning,
     pushCompactionDetail,
     pushToolResult,
-    pushGateLog,
     collapseDiffs,
     setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
-    onGateVerdict: (gate: { verdict?: string; score?: number; conf?: number; gateId?: number }) => {
-      // A short-circuit verdict surfaced as a non-folded status line by the
-      // loop (the always-visible "laya gate: <verdict>"); here we also fold
-      // the growing cumulative perf log keyed by its stable gateId, so every
-      // subsequent fastcheck short-circuit in the session appends to the SAME
-      // single summary instead of spawning a new line each time.
-      const text = [
-        `laya gate: ${gate.verdict ?? "judged simple enough to skip full model"}`,
-        typeof gate.score === "number" ? `score=${gate.score.toFixed(3)}` : null,
-        typeof gate.conf === "number" ? `conf=${gate.conf.toFixed(3)}` : null,
-      ].filter(Boolean).join("  ");
-      pushGateLog({ id: gate.gateId, text });
-    },
     pushTool,
     finalizeToolCall,
     pushDiff: (t: string) => pushLine(t, "diff"),
@@ -2218,10 +2174,10 @@ export function App({
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "tool-result-folded", lineId: line.id });
       continue;
     }
-    // LAYA gate summary — a single stable-id log line that accumulates the
-    // performance gain of every fastcheck short-circuit. Folded by default
-    // (expanded on first output, folded on subsequent prompts, clickable to
-    // re-expand) so it stays one growing line rather than spamming the view.
+    // A "gate" row is a single stable-id log line that accumulates across the
+    // session. Folded by default (expanded on first output, folded on
+    // subsequent prompts, clickable to re-expand) so it stays one growing line
+    // rather than spamming the view.
     if (line.kind === "gate") {
       let cached = rowCache.get(line.id);
       if (!cached || cached.text !== line.text || cached.width !== width) {
@@ -2237,7 +2193,7 @@ export function App({
       if (!expanded) {
         allRows.push({
           key: `${line.id}-fold`,
-          text: line.foldLabel ?? "▸ laya 성능 요약 — 클릭해서 펼치기",
+          text: line.foldLabel ?? "",
           kind: "gate-folded",
           lineId: line.id,
         });

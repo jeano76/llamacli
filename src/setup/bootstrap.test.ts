@@ -1,8 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { planPorts, layaPortEnv, COMMON_PORTS, LLAMA_PORT, LAYA_PORT, type PortState } from "./ports.js";
+import { planPorts, COMMON_PORTS, LLAMA_PORT, type PortState } from "./ports.js";
 import { findLlamaServer, installBuildPackages } from "./llamaCpp.js";
-import { chooseModel, searchHubModels, listGgufFiles, type ModelCandidate } from "./modelCatalog.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
 
@@ -17,24 +16,21 @@ const probeFor = (busy: number[]): ((p: number) => Promise<PortState>) =>
 test("a clean machine gets the canonical ports and nothing is reported as moved", async () => {
   const plan = await planPorts({ probe: probeFor([]) });
   assert.equal(plan.llamaPort, LLAMA_PORT);
-  assert.equal(plan.layaPort, LAYA_PORT);
+  assert.equal(plan.llamaPort, LLAMA_PORT);
   assert.deepEqual(plan.moved, []);
-});
-
-test("laya never lands on llama's port, because two servers cannot bind one port", async () => {
-  // The failure this prevents is subtle: with a shared port the health check
-  // would probe llama-server (or vice versa) and report a healthy-looking
-  // process that is the wrong one entirely.
-  const plan = await planPorts({ probe: probeFor([]), llamaPort: 8099, layaPort: 8099 });
-  assert.notEqual(plan.llamaPort, plan.layaPort);
-  assert.ok(plan.moved.some((m) => m.what === "laya" && /충돌/.test(m.because)));
 });
 
 test("an occupied llama port is moved, and the move is reported rather than absorbed silently", async () => {
   const plan = await planPorts({ probe: probeFor([LLAMA_PORT]) });
   assert.notEqual(plan.llamaPort, LLAMA_PORT, "must not stay on a busy port");
   assert.ok(plan.moved.some((m) => m.what === "llama"), "the move is reported");
-  assert.notEqual(plan.layaPort, plan.llamaPort, "and the two stay distinct");
+  // There is only one port now, so the surviving contract is that a recorded
+  // move actually says where it went and why — not merely that it happened.
+  const move = plan.moved.find((m) => m.what === "llama")!;
+  assert.equal(move.from, LLAMA_PORT, "the move records where it came from");
+  assert.equal(move.to, plan.llamaPort, "and where it went");
+  assert.notEqual(move.to, move.from, "a move that does not move is not a move");
+  assert.ok(move.because.length > 0, "and it says why");
 });
 
 test("a port the firewall silently drops is treated as usable, not as a failure", async () => {
@@ -46,20 +42,9 @@ test("a port the firewall silently drops is treated as usable, not as a failure"
 });
 
 test("an already-recorded port is kept when it is free, so an install does not migrate every launch", async () => {
-  const plan = await planPorts({ probe: probeFor([]), llamaPort: 18080, layaPort: 18099 });
-  assert.equal(plan.llamaPort, 18080);
-  assert.equal(plan.layaPort, 18099);
-  assert.deepEqual(plan.moved, []);
-});
-
-test("layaPortEnv sets the bind port and the probe port to the SAME value", async () => {
-  // The bug in this repo's own history: laya-serve bound LAYA_PORT (8000) while
-  // every health probe read LAYA_ENDPOINT (8099), so bootstrap waited on a port
-  // nothing listened to, timed out, and killed a perfectly healthy server.
-  const env = layaPortEnv(9123);
-  assert.equal(env.LAYA_PORT, "9123");
-  assert.equal(env.LAYA_ENDPOINT, "9123");
-  assert.equal(env.LAYA_PORT, env.LAYA_ENDPOINT, "the two must never disagree");
+  const plan = await planPorts({ probe: probeFor([]), llamaPort: 18080 });
+  assert.equal(plan.llamaPort, 18080, "an established install keeps the port it recorded");
+  assert.deepEqual(plan.moved, [], "and nothing is reported as moved");
 });
 
 test("the probe list leads with our own port so a running llamacli is the obvious match", () => {
@@ -137,109 +122,6 @@ test("a failing passwordless sudo falls back to the interactive one", async () =
   assert.equal(res.ok, true);
   assert.equal(calls.length, 2);
   assert.ok(!calls[1].includes("-n"), "the retry is allowed to prompt");
-});
-
-// ── Model choice ────────────────────────────────────────────────────────────
-
-const cand = (filename: string, sizeBytes: number): ModelCandidate => ({
-  repo: "r", filename, sizeBytes, url: `https://h/${filename}`,
-});
-const C35 = [cand("Ornith-1.5-35B-A3B-Q4_K_M.gguf", 21_864_081_056)];
-const C9 = [cand("Ornith-1.5-9B-Q4_K_M.gguf", 5_497_000_000)];
-
-test("a big card with enough RAM gets the 35B", async () => {
-  const c = chooseModel({
-    vramTotalBytes: 24 * GiB, vramFreeBytes: 23 * GiB, ramTotalBytes: 64 * GiB,
-    candidates35b: C35, candidates9b: C9,
-  });
-  assert.match(c.candidate.filename, /35B/);
-  assert.match(c.reason, /전량 오프로드/);
-});
-
-test("the 8 GB card this repo is developed on still gets the 35B, with expert streaming", async () => {
-  // The documented, working configuration: 8 GB VRAM, 30 GB RAM, 35B-A3B at
-  // ~19 tok/s via --n-cpu-moe. If this ever starts choosing the 9B, the
-  // capability regression is silent — nothing errors, the model just gets worse.
-  const c = chooseModel({
-    vramTotalBytes: 8 * GiB, vramFreeBytes: 7 * GiB, ramTotalBytes: 30 * GiB,
-    candidates35b: C35, candidates9b: C9,
-  });
-  assert.match(c.candidate.filename, /35B/);
-  assert.match(c.reason, /n-cpu-moe/, "and says why it is still the right pick");
-});
-
-test("too little RAM for expert paging downgrades to the 9B instead of picking an unusable 35B", async () => {
-  const c = chooseModel({
-    vramTotalBytes: 24 * GiB, vramFreeBytes: 23 * GiB, ramTotalBytes: 16 * GiB,
-    candidates35b: C35, candidates9b: C9,
-  });
-  assert.match(c.candidate.filename, /9B/);
-  assert.match(c.reason, /RAM/);
-});
-
-test("a tiny card gets the 9B, which is the only one of the two that is fast there", async () => {
-  const c = chooseModel({
-    vramTotalBytes: 4 * GiB, vramFreeBytes: 3.5 * GiB, ramTotalBytes: 8 * GiB,
-    candidates35b: C35, candidates9b: C9,
-  });
-  assert.match(c.candidate.filename, /9B/);
-  assert.match(c.reason, /VRAM/);
-});
-
-test("no GPU at all still yields a model rather than throwing", async () => {
-  const c = chooseModel({
-    vramTotalBytes: 0, vramFreeBytes: 0, ramTotalBytes: 32 * GiB,
-    candidates35b: C35, candidates9b: C9,
-  });
-  assert.ok(c.candidate.filename);
-});
-
-test("if nothing is downloadable the error names the override, rather than failing later at the URL", async () => {
-  assert.throws(
-    () => chooseModel({
-      vramTotalBytes: 8 * GiB, vramFreeBytes: 7 * GiB, ramTotalBytes: 30 * GiB,
-      candidates35b: [], candidates9b: [],
-    }),
-    /MODEL_REPO_35B/,
-  );
-});
-
-test("the requested Q4_K_M quant is preferred over the other quants in the same repo", () => {
-  const c = chooseModel({
-    vramTotalBytes: 24 * GiB, vramFreeBytes: 23 * GiB, ramTotalBytes: 64 * GiB,
-    candidates35b: [
-      cand("Ornith-1.5-35B-A3B-Q2_K.gguf", 13_000_000_000),
-      cand("Ornith-1.5-35B-A3B-Q6_K.gguf", 29_000_000_000),
-      cand("Ornith-1.5-35B-A3B-Q4_K_M.gguf", 21_864_081_056),
-    ],
-    candidates9b: C9,
-  });
-  assert.match(c.candidate.filename, /Q4_K_M/);
-});
-
-test("a split-llama.cpp repo (one file per shard) is not mistaken for a single file", async () => {
-  // The Hub lists shards; treating them as candidates would download a
-  // 600 MB fragment and then fail to load it as a model.
-  const files = await listGgufFiles("some/repo", {
-    fetchImpl: (async () => ({
-      ok: true, status: 200,
-      json: async () => ({ siblings: [
-        { rfilename: "model-00001-of-00003.gguf", size: 600_000_000 },
-        { rfilename: "model-00002-of-00003.gguf", size: 600_000_000 },
-        { rfilename: "tokenizer.json" },
-      ] }),
-    })) as unknown as typeof fetch,
-  });
-  assert.equal(files.length, 2);
-  assert.ok(files.every((f) => f.url.includes("/resolve/main/")));
-});
-
-test("a Hub search returns repo ids, and a failed search does not throw", async () => {
-  const ids = await searchHubModels("Ornith-1.5", {
-    fetchImpl: (async () => ({ ok: true, status: 200, json: async () => [{ id: "a/gguf" }, { id: "b" }, {}] })) as unknown as typeof fetch,
-  });
-  assert.deepEqual(ids, ["a/gguf", "b"]);
-  await assert.rejects(() => searchHubModels("x", { fetchImpl: (async () => ({ ok: false, status: 500 })) as unknown as typeof fetch }));
 });
 
 // ── Hardware → tuning, the two halves together ──────────────────────────────
@@ -323,21 +205,3 @@ test("the VRAM budget holds back a reserve for the compositor and load-time allo
   assert.ok(budget > 5, "but not so conservative that nothing fits");
 });
 
-test("the model that fits and the llama flags that run it agree on one box", async () => {
-  // The end-to-end property that matters: the VRAM fit test and the tuning
-  // calculation must not disagree about the same machine.
-  const hw = {
-    cpuCount: 12, ramTotalBytes: 30 * GiB, ramAvailableBytes: 26 * GiB,
-    gpus, gpuBackend: "cuda", canBuildCuda: true, tools: {}, platform: "linux",
-  } as Hardware;
-  const g = pickPrimaryGpu(hw)!;
-  const choice = chooseModel({
-    vramTotalBytes: g.vramTotalBytes, vramFreeBytes: g.vramFreeBytes,
-    ramTotalBytes: hw.ramTotalBytes, candidates35b: C35, candidates9b: C9,
-  });
-  const t = tuneForHardware(hw, { modelBytes: choice.candidate.sizeBytes });
-  assert.equal(t.gpuLayers, 999);
-  if (choice.candidate.filename.includes("35B")) {
-    assert.ok(t.cpuMoeLayers > 0, "a 35B pick on this card MUST page experts to RAM");
-  }
-});

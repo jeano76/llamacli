@@ -2,7 +2,7 @@
 import React from "react";
 import { render } from "ink";
 import { App } from "./tui/App.js";
-import { loadConfig, updateLayaEnabled } from "./config.js";
+import { loadConfig } from "./config.js";
 import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt, injectSkillIndexIntoSystemPrompt } from "./skills/loader.js";
 import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { LlamaServerManager } from "./backend/llamaServer.js";
@@ -25,8 +25,6 @@ import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, ap
 import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
 import { getCursorPlacement } from "./tui/cursorPlacement.js";
 import { ensureLocalStack } from "./setup/bootstrap.js";
-import { layaPortEnv, LAYA_PORT } from "./setup/ports.js";
-import { describeReset } from "./setup/resetDiff.js";
 import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
 
@@ -168,22 +166,6 @@ function askYesNo(ui: any, question: string): Promise<boolean> {
   });
 }
 
-/** Whether the laya server answers /health on the port WE are polling.
- *
- *  Probed from Node rather than inferred from a failed gate call, because the
- *  two give different answers about what to tell the user: a failed call is
- *  ambiguous (was it never installed? did it die? was the port wrong?), a health
- *  probe is not. The port is passed in rather than re-derived here so it is
- *  literally the same value handed to the child process via layaPortEnv — the
- *  two disagreeing is the entire bug this is built around. */
-async function layaHealthOk(port: number): Promise<boolean> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
 
 function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T): T {
   const original = stdout.write.bind(stdout);
@@ -292,35 +274,6 @@ function ensureWindowsUtf8Console(): void {
   }
 }
 
-/** Reported directly: "llamacli에서 fastcheck on 또는 off 등의 명령어가
- *  동작하지 않아" — the laya integration script used to be resolved
- *  relative to `projectRoot` (the directory llamacli happens to be RUN
- *  from), so `/fastcheck` only ever worked in the couple of project
- *  directories that happened to already have their own copy of this
- *  script sitting at their root. Confirmed live: running from any other
- *  directory, `python3 <projectRoot>/scripts/laya_integration.py enable`
- *  fails with "can't open file" (ENOENT), silently, every time.
- *
- *  The script belongs to the llamacli INSTALLATION, not to whatever
- *  project it's currently pointed at — resolve it the same way
- *  maybeSelfUpdateAndRestart resolves its own install directory: next to
- *  the running entry point. Ships as dist/scripts/laya_integration.py
- *  (copied there by `npm run build`, so it travels with every self-update
- *  same as every other dist/ file); under `tsx` (dev mode) the entry
- *  point is src/index.tsx and the script sits one level up at the project
- *  root's own scripts/, unchanged from before. */
-function resolveLayaScriptPath(): string {
-  let entryPath: string;
-  try {
-    entryPath = fileURLToPath(import.meta.url);
-  } catch {
-    entryPath = "";
-  }
-  const entryDir = dirname(entryPath || pathResolve("src", "index.tsx"));
-  return entryPath.endsWith(".js")
-    ? pathResolve(entryDir, "scripts", "laya_integration.py") // dist/index.js -> dist/scripts/...
-    : pathResolve(entryDir, "..", "scripts", "laya_integration.py"); // src/index.tsx -> <root>/scripts/...
-}
 
 /** Requested directly: "CLI 구동시 신규 버전의 바이너리가 github에
  *  존재를 하면 해당 버전을 업데이트하고 cli는 재구동을 하는 기능을 넣어줘"
@@ -491,258 +444,8 @@ async function main() {
     // Non-llama.cpp backend, or /props unavailable — config value stands.
   }
 
-  // --- laya (fast System-1) before-turn gate wiring ----------------------- #
-  // The gate is a no-op callback unless config.laya.enabled. `/fastcheck on|off`
-  // flips this flag at runtime (no restart): once on, the first turn of every
-  // subsequent message runs a laya round-trip BEFORE Ornith; the model then sees
-  // the honest System-1 read and decides whether to trust it. Off => the callback
-  // returns immediately and no health/server check is attempted at all. The Python
-  // script owns server boot + config IO, so this only spawns it with a bounded
-  // timeout and degrades silently on any failure (a hung/failed server must never
-  // block or crash a turn — the normal Ornith run always proceeds).
-  const layaEnabled = Boolean(config.laya?.enabled ?? false);
-  let runtimeEnabled = layaEnabled;            // toggled by /fastcheck |off|on|
-  // Stable per-session id for the LAYA gate's cumulative perf line. Assigned
-  // once, on the first short-circuit, so loop.ts (which pushes a foldable
-  // summary keyed by this id via App.pushGateLog) keeps appending to ONE
-  // growing line across every fastcheck run instead of spawning one per run.
-  let layaGateId = 0;
-  /** One-shot guard for the self-heal below. A gate whose server is down tries
-   *  to start it ONCE per session and then stops trying.
-   *
-   *  Retrying every turn is worse than not retrying at all: a cold install is a
-   *  multi-minute pip, so a per-turn retry would either wedge the agent loop
-   *  for minutes at a time or fire repeatedly and thrash. Once is enough to fix
-   *  "I just enabled it" and to fix "the server died"; a genuinely broken
-   *  install is reported with instructions instead. */
-  let layaBootAttempted = false;
-  /** Default cap, seconds, for a laya round-trip when config.yaml doesn't set
-   *  `laya.timeoutSeconds`. A hung server must never block a turn. */
-  const DEFAULT_LAYA_TIMEOUT_SECONDS = 30;
-  const LAYA_TIMEOUT_MS = (config.laya?.timeoutSeconds ?? DEFAULT_LAYA_TIMEOUT_SECONDS) * 1000;
-  const layaScriptPath = resolveLayaScriptPath();
-  // The single laya port, from config when set, else the bootstrap's plan, else
-  // the canonical default. Read ONCE here so every laya spawn and the health
-  // check refer to the same number.
-  const layaPort =
-    (typeof config.laya?.port === "number" && config.laya.port) ||
-    bootstrapReport?.ports?.layaPort ||
-    LAYA_PORT;
 
-  // Reported directly, live: "[laya error] laya script timed out after
-  // 30000ms" — the very first real `/fastcheck on` install (pip installing
-  // laya[serve]'s torch+CUDA deps) got killed mid-install by the same 30s
-  // bound meant for an ordinary per-turn gate round-trip. That bound is
-  // right for the gate (a hung check must never wedge a turn) but far too
-  // short for a one-time install that can legitimately take minutes —
-  // install_laya() itself already allows up to 600s for the pip step.
-  const LAYA_INSTALL_TIMEOUT_MS = 10 * 60 * 1000; // matches install_laya()'s own pip timeout=600
 
-  /** Spawn the laya integration script with a hard timeout. All config writes,
-   *  server boot and health checks live in Python; Node only runs it and reads
-   *  stdout, killing the process if it outlives the timeout so a hung script
-   *  can never wedge the TUI or block a turn. Resolves with stdout on success
-   *  (exit 0) and rejects otherwise — callers catch everything. `timeoutMs`
-   *  overrides LAYA_TIMEOUT_MS for calls that legitimately need longer (the
-   *  install-triggering call below uses LAYA_INSTALL_TIMEOUT_MS).
-   *
-   *  Reported directly: "로그가 나오지 않는데?" — this used to only ever
-   *  hand the caller the FULL accumulated stdout once the process exited,
-   *  so a multi-minute install (pip installing torch+CUDA) showed nothing
-   *  at all until it was completely done. `onLine`, when given, is called
-   *  with each COMPLETE line as it actually arrives, so a caller that wants
-   *  to show live progress (the install-triggering call below) can push
-   *  each line the moment it's printed instead of waiting for the end.
-   *  `-u` (unbuffered) is required on top of this — Python fully buffers
-   *  stdout by default whenever it isn't a real TTY (i.e. always, here,
-   *  since Node pipes it), so without it every print() would still sit in
-   *  Python's OWN buffer regardless of how promptly Node reads it. */
-  const runLayaScript = (
-    args: string[],
-    timeoutMs: number = LAYA_TIMEOUT_MS,
-    onLine?: (line: string) => void
-  ): Promise<{ stdout: string }> =>
-    new Promise((resolve, reject) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | undefined;
-      const child: ChildProcess = spawn("python3", ["-u", layaScriptPath, ...args], {
-        timeout: timeoutMs,
-        // The laya port is set from OUR config on every spawn, so the port
-        // llamacli names and the port laya binds cannot drift apart.
-        //
-        // This is the fix for a bug that made the app look hung: `laya-serve`
-        // reads its BIND port from LAYA_PORT (upstream default 8000) while every
-        // health probe in laya_integration.py read LAYA_ENDPOINT (default 8099).
-        // The server bound 8000, the probe polled 8099, so bootstrap_laya timed
-        // out on a perfectly healthy server and then killed it as "failed to
-        // boot" — a laya-serve that was healthy on :8000 while every fastcheck
-        // call still blocked ~25-30s per turn. Both variables are set to the one
-        // planned port so the bind and the probe cannot disagree (see
-        // layaPortEnv).
-        env: { ...process.env, ...layaPortEnv(layaPort) },
-      });
-      // `child.kill(timeout:true)` is Node < 18.0 semantics; use a manual timer
-      // that kills the process and resolves as an error so callers treat it like
-      // any other failure (silent fall back — Ornith still runs).
-      timer = setTimeout(() => {
-        settled = true;
-        child.kill("SIGTERM");
-        reject(new Error(`laya script timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-
-      let out = "";
-      let lineBuf = "";
-      child.on("error", (err) => {
-        if (!settled) { clearTimeout(timer); settled = true; reject(err); }
-      });
-      child.stdout?.on("data", (d: Buffer) => {
-        const chunk = String(d);
-        out += chunk;
-        if (!onLine) return;
-        lineBuf += chunk;
-        const lines = lineBuf.split("\n");
-        lineBuf = lines.pop() ?? ""; // last element: not newline-terminated yet — keep buffering it
-        for (const line of lines) onLine(line);
-      });
-      child.on("exit", (code) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          // Flush a final line that never got a trailing newline (common:
-          // the process's very last print() before exiting).
-          if (onLine && lineBuf) onLine(lineBuf);
-          // Only treat exit code 0 as success; anything else is a silent fall
-          // back so the normal turn proceeds unchanged.
-          code === 0 ? resolve({ stdout: out }) : reject(new Error(`laya script exited with code ${code}`));
-        }
-      });
-    });
-
-  const runLayaGate = async (userText: string): Promise<{
-    judgeSaysCheap: boolean; verdict?: string; score?: number; conf?: number; gateId?: number;
-    /** The gate could not be consulted at all (no server, timeout, spawn
-     *  error, non-zero exit). Distinct from "the judge said go slow".
-     *
-     *  Reported directly: the gate looked like it was running, and it was —
-     *  but it was failing every single turn. The laya server was listening on
-     *  :8000 while every health probe polled :8099, so each call burned the full
-     *  30 s timeout, hit the catch below, and returned a bare
-     *  `{judgeSaysCheap:false}`. `decideGate` read that as a confident
-     *  "full turn needed" and printed `gate: 전체 턴 필요로 판단 (conf=0.000)`
-     *  — a verdict that was never made, presented identically to a real one.
-     *  The user could not tell a dead gate from a working one. `failed` is what
-     *  lets the two be told apart.
-     *
-     *  `failureReason` carries WHY, because "never installed" and "the server
-     *  died" need different instructions and the generic string teaches the user
-     *  nothing they can act on. Only the caller can tell them apart. */
-    failed?: boolean;
-    failureReason?: string;
-  } | undefined> => {
-    // Off => the gate doesn't run at all, and `undefined` (rather than a
-    // synthetic "not cheap") is what makes decideGate report "gate: 꺼짐"
-    // instead of pretending laya was asked and declined. Throwing here would
-    // be wrong: loop.ts catches a throw and prints "laya gate skipped
-    // (using full model): …" on every single turn, which is exactly the noise
-    // a deliberately-disabled feature must not produce.
-    if (!runtimeEnabled) return undefined;
-
-    // ── Self-heal: is the gate's own server even up? ───────────────────────
-    // Asked before the round-trip, because the round-trip's own failure cannot
-    // say WHY it failed. A user staring at "판정 실패" learns nothing; the
-    // difference between "never installed" and "was running and died" is the
-    // difference between "run /fastcheck on" and "your server is dead".
-    const healthy = await layaHealthOk(layaPort);
-    if (!healthy && !layaBootAttempted) {
-      layaBootAttempted = true;
-      try {
-        // The bare `fastcheck` command installs and boots, streaming its own
-        // progress. Given the INSTALL timeout, not the 30 s per-turn one: a
-        // cold install cannot finish inside 30 s, so using it here would make
-        // the self-heal impossible by construction.
-        const boot = await runLayaScript(["fastcheck"], LAYA_INSTALL_TIMEOUT_MS, (line) => {
-          if (line.trim()) (globalThis as any).__llamacli_ui?.pushStatus(line);
-        });
-        if (boot.stdout) (globalThis as any).__llamacli_ui?.pushStatus(boot.stdout.trim());
-        return undefined; // not this turn's job to decide; next turn will ask
-      } catch {
-        // Fall through to the normal path, which reports the failure properly.
-      }
-    }
-    if (!healthy) {
-      return {
-        judgeSaysCheap: false,
-        failed: true,
-        failureReason: layaBootAttempted
-          ? "laya 서버가 응답하지 않습니다 — /fastcheck on 으로 다시 시도하거나, 끄려면 /fastcheck off"
-          : "laya 서버가 아직 준비되지 않았습니다 — /fastcheck on 으로 설치·시작하세요",
-      };
-    }
-
-    try {
-      const { stdout } = await runLayaScript(["fastcheck", "--text", userText]);
-      // cmd_fastcheck prints its own progress lines (install/boot-wait) on
-      // stdout BEFORE the final verdict, so the verdict can land on any
-      // line, not necessarily the first — _verdict_prose() (scripts/
-      // laya_integration.py) marks it unambiguously with a "GATE_VERDICT: "
-      // prefix carrying a single-word token (SHORTCIRCUIT|PROCEED|DEGRADED)
-      // plus conf=, found by scanning every line rather than assuming
-      // line 0. Previously this looked only at stdout's first line AND
-      // checked for the hyphenated literal "short-circuit" while the prose
-      // it was matching against started with "[laya]" and used "SHORTCIRCUIT"
-      // (no hyphen) — neither check could ever match the other, so the
-      // live per-turn gate could never actually short-circuit regardless of
-      // what verdict it computed.
-      const verdictLine = stdout.split(/\r?\n/).find((l) => /^GATE_VERDICT:/i.test(l.trim()));
-      const mVerdict = verdictLine && /SHORTCIRCUIT|PROCEED|DEGRADED|TRUTHFUL/i.exec(verdictLine);
-      const verdict = mVerdict ? mVerdict[0].toLowerCase() : undefined;
-      const mScore = verdictLine && /(?:^|\s)score=([\d.]+)/i.exec(verdictLine);
-      const mConf = verdictLine && /(?:^|\s)conf=([\d.]+)/i.exec(verdictLine);
-      const score = mScore ? Number(mScore[1]) : undefined;
-      const conf = mConf ? Number(mConf[1]) : undefined;
-
-      // `judgeSaysCheap` is the JUDGE's opinion, not a decision. Whether it
-      // actually downgrades the turn is decided in agent/gate.ts, where the
-      // high-risk rail can override it — see that module for the measurement
-      // that made "skip the model" untenable.
-      const judgeSaysCheap = verdict === "shortcircuit";
-      if (judgeSaysCheap) {
-        // Assign the stable id exactly once so every subsequent run appends to
-        // the same foldable perf line.
-        if (layaGateId === 0) layaGateId = 1;
-        return { judgeSaysCheap, verdict, score, conf, gateId: layaGateId };
-      }
-      return { judgeSaysCheap, verdict, score, conf };
-    } catch {
-      // Any failure (nonzero exit, timeout, spawn error) => the gate doesn't get
-      // a say and the full turn runs unchanged. Never throw past here — a turn
-      // must never fail because a gate did.
-      //
-      // `failed: true` is what stops this from being reported as a verdict. It
-      // used to be indistinguishable from a real "not cheap" answer, so a gate
-      // that was down on every single turn looked exactly like a gate that was
-      // working and simply always choosing the full path.
-      return { judgeSaysCheap: false, failed: true };
-    }
-  };
-
-  // Agent-trace: evaluate a run_shell tool RESULT after it returns (laya's
-  // typed-decisions checkpoint). Fire-and-forget — never awaited, so it can
-  // never block or slow an Ornith turn. Silently ignored on any failure
-  // (disabled gate, missing server, timeout) and when output is empty. Uses
-  // the same bounded-spawn primitive as the gate; a success just needs to be
-  // surfaced to the user via onStatus.
-  const runLayaTrace = (command: string, output: string): void => {
-    if (!runtimeEnabled) return;              // off => instant no-op (no checks)
-    if (!output || !output.trim()) return;    // nothing to evaluate
-    try {
-      runLayaScript(["trace", "--tool", "run_shell", "--summary", output])
-        .then((r) => (globalThis as any).__llamacli_ui?.pushStatus(r.stdout.trim()))
-        .catch(() => {});                      // silent fall back, never throw
-    } catch {
-      // Any spawn failure => silent fall back. Never propagate here.
-    }
-  };
 
   const loop = new AgentLoop({
     projectRoot,
@@ -779,8 +482,6 @@ async function main() {
     onToolCallDone: () => (globalThis as any).__llamacli_ui?.finalizeToolCall(),
     onDiff: (_path, diff) => (globalThis as any).__llamacli_ui?.pushDiff(diff),
     onToolResult: (command, output) => {
-      // After a run_shell result lands, trace it in the background for observability.
-      runLayaTrace(command, output);
       (globalThis as any).__llamacli_ui?.pushToolResult(command, output);
     },
     onStatus: (s) => (globalThis as any).__llamacli_ui?.pushStatus(s),
@@ -790,11 +491,6 @@ async function main() {
     onCompactionStatus: (status, timestamp) => (globalThis as any).__llamacli_ui?.setCompactionStatus(status, timestamp),
     onCompactionDetail: (detail) => (globalThis as any).__llamacli_ui?.pushCompactionDetail(detail),
     onTurnStart: () => (globalThis as any).__llamacli_ui?.collapseDiffs(),
-    layaGate: runLayaGate,
-    // Gate results reach the TUI through App's dispatch (onGateVerdict →
-    // pushGateLog), which keeps the gate line a single stable-id cumulative
-    // summary across every fastcheck short-circuit.
-    onGateVerdict: (result) => (globalThis as any).__llamacli_ui?.onGateVerdict(result),
   });
 
   // Session-end self-improvement gate (PROMPT.md §3): if failures were
@@ -1041,90 +737,6 @@ async function main() {
             );
             break;
           }
-          // /copy — the keyboard route to the same clipboard the drag-selection
-          // writes to, and the one that works with the mouse off entirely.
-          // Two forms:
-          //   /copy            the whole visible log
-          //   /copy N          the last N log rows
-          // Deliberately reads the rows from the same buffer the drag uses, so
-          // the two can never disagree about what "the log" is.
-          // /reset — re-derive the model, the llama flags and the ports from
-          // the CURRENT hardware, after asking.
-          //
-          // Asked rather than just done, because it discards machine-derived
-          // settings: if the user hand-tuned `llama.contextSize` (to match a
-          // larger -c on their server, say) that is thrown away and replaced
-          // with what the hardware probe decided. The user's OWN keys — apiKey,
-          // verify commands, the laya toggle — are deliberately kept; see
-          // keepUserOwnedKeys for why losing one of those would be data loss
-          // rather than a reset.
-          case "reset": {
-            const answer = await askYesNo(
-              ui,
-              "현재 시스템(GPU·VRAM·메모리)에 맞는 모델과 llama 설정을 다시 계산합니다.\n" +
-                "지금까지의 모델/컨텍스트/스레드 설정은 덮어써집니다 (진행 후 재시작 필요).\n" +
-                "계속하시겠습니까?",
-            );
-            if (!answer) {
-              ui?.pushStatus("[reset] 취소했습니다.");
-              break;
-            }
-            ui?.setBusy(true);
-            try {
-              // Phase markers, so a reset that takes a while (it measures the
-              // backend, and may re-download a model) never looks frozen. Each
-              // says what is about to happen AND what it is about to affect.
-              ui?.pushStatus("[reset 1/4] 지금 시스템의 GPU·VRAM·메모리를 확인하고 있습니다…", "status");
-              ui?.pushStatus("[reset 2/4] 백엔드 속도를 측정해 컨텍스트 크기를 정합니다… (수 초)", "status");
-              const report = await ensureLocalStack({
-                projectRoot,
-                force: true,
-                // Never fetch inside a live session — see noDownload.
-                noDownload: true,
-                // Measure the backend rather than reading the hardware table, so
-                // the llama settings reflect what this machine actually does —
-                // including a throttled card, a fallback build, or a busy box.
-                calibrate: true,
-                // A stale laya is invisible AND poisonous: one left on :8000
-                // while the config said :8099 made every gate call time out
-                // while the UI reported the silence as a verdict. /reset kills
-                // it and clears the venv, which re-running the config alone
-                // could never do.
-                resetLaya: true,
-                log: (line) => ui?.pushStatus(`[reset] ${line}`),
-              });
-              const changed = describeReset(report.config, config as unknown as Record<string, unknown>);
-              const layaNote = report.calibration?.degraded
-                ? "속도 측정 불가 — 하드웨어 정보 기반으로 설정했습니다.\n"
-                : "";
-              // Say what is now in force, not only what changed: the useful
-              // fact after a reset is which model and how big a context the
-              // machine settled on.
-              const nowInForce =
-                `[reset 3/4] 적용된 설정\n` +
-                `  · 모델: ${String((report.config as any)?.model ?? config.model)}\n` +
-                `  · 컨텍스트: ${(report.tuning?.contextSize ?? 0).toLocaleString()} 토큰 ` +
-                `(GPU ${report.tuning?.gpuLayers === 0 ? "미사용 (CPU)" : "오프로드"}, 스레드 ${report.tuning?.threads})\n` +
-                (report.calibration && !report.calibration.degraded
-                  ? `  · 측정: prefill ${report.calibration.throughput.promptTokensPerSecond.toFixed(0)} tok/s, ` +
-                    `decode ${report.calibration.throughput.decodeTokensPerSecond.toFixed(1)} tok/s\n`
-                  : "");
-              ui?.pushStatus(
-                changed.length > 0
-                  ? `[reset 4/4] 완료. 바뀐 항목 ${changed.length}개:\n${changed.map((c) => `  · ${c}`).join("\n")}\n` +
-                    nowInForce + layaNote +
-                    "새 설정을 적용하려면 llamacli 를 재시작하세요."
-                  : "[reset 4/4] 현재 시스템에 이미 최적이었습니다. 바뀐 항목이 없습니다.\n" +
-                    nowInForce + layaNote +
-                    "재시작할 필요도 없습니다."
-              );
-            } catch (err) {
-              ui?.pushStatus(`[reset 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
-            } finally {
-              ui?.setBusy(false);
-            }
-            break;
-          }
           case "copy": {
             const rows: string[] = (globalThis as any).__llamacli_ui?.getVisibleLogText?.() ?? [];
             if (rows.length === 0) {
@@ -1204,81 +816,6 @@ async function main() {
               .then(() => ui?.pushStatus("Plan progress cleared."))
               .catch((err: any) => ui?.pushStatus(`[error] failed to clear plan: ${summarizeErrorForDisplay(err.message)}`));
             break;
-          // "queue" is handled locally inside App (needs the live queue state).
-          // laya: /fastcheck toggles the before-turn gate at runtime and runs
-          // one-time ad-hoc questions. First word selects the sub-command;
-          // anything else is treated as an ad-hoc question text (always works,
-          // regardless of on/off state). The enable/disable/status branches are
-          // delegated to the Python script so YAML is never hand-edited here.
-          case "fastcheck": {
-            // `argument` is the text typed after "/fastcheck" — a bare word
-            // ("on"/"off"/"status") or an ad-hoc question. Split just once; the
-            // rest is preserved verbatim for the ad-hoc-question path below.
-            const tokens = argument.trim().split(/\s+/);
-            const sub = (tokens[0] ?? "").toLowerCase();
-            if (sub === "") {
-              ui?.pushStatus(
-                [
-                  "/fastcheck — laya before-turn gate (see docs/fastcheck-toggle-directive.md)",
-                  "  /fastcheck on            run a laya round-trip before each turn",
-                  "  /fastcheck off           stop the gate immediately (no restart needed)",
-                  "  /fastcheck status        show enabled state + integration health",
-                  "  /fastcheck <question>    ask laya one time now, no matter on/off",
-                ].join("\n")
-              );
-              break;
-            }
-            ui?.setBusy(true);
-            try {
-              if (sub === "on" || sub === "enable") {
-                // Persist the choice to config.yaml FIRST so it survives a
-                // restart — this is the whole point of editing YAML rather than
-                // keeping a session-only flag. Warn but still proceed with the
-                // round-trip below if the write fails.
-                const persisted = await updateLayaEnabled(projectRoot, true);
-                if (!persisted) {
-                  ui?.pushStatus("[laya] could not write laya.enabled:true to config.yaml — add it manually to keep this enabled.");
-                }
-                runtimeEnabled = true;   // immediate: next turn already gated (this session)
-                // Enabling also boots/installs the laya server (if missing) so the
-                // feature works immediately. Enable first (so cmd_fastcheck's
-                // enabled-gate passes and it proceeds to install/boot), then run the
-                // fastcheck round-trip which surfaces install/boot progress + success
-                // via pushStatus; on success we flip the gate on so the very next
-                // turn is already System-1 gated.
-                const enableResult = await runLayaScript(["enable"]);
-                if (enableResult.stdout) {
-                  ui?.pushStatus(enableResult.stdout);
-                }
-                // This specific call can trigger a real install (pip installing
-                // laya[serve]) — the ordinary per-turn LAYA_TIMEOUT_MS (30s) is
-                // nowhere near enough for that, see LAYA_INSTALL_TIMEOUT_MS's doc
-                // comment. onLine pushes each progress line the moment it's
-                // printed (see runLayaScript's doc comment) — reported directly
-                // ("로그가 나오지 않는데?"): without this, nothing appeared for
-                // however many minutes the install actually took.
-                await runLayaScript(["fastcheck"], LAYA_INSTALL_TIMEOUT_MS, (line) => {
-                  if (line.trim()) ui?.pushStatus(line);
-                });
-                runtimeEnabled = true;   // immediate: next turn already gated
-              } else if (sub === "off" || sub === "disable") {
-                // Persist the off choice too — symmetry with `on`.
-                await updateLayaEnabled(projectRoot, false);
-                runtimeEnabled = false;  // immediate no-op, incl. no health check
-              } else if (sub === "status" || sub === "state") {
-                await runLayaScript(["status"]);
-              } else {
-                // ad-hoc question: always works regardless of on/off state;
-                // `argument` is the full verbatim text after "/fastcheck".
-                await runLayaScript(["fastcheck", "--text", argument.trim()]);
-              }
-            } catch (err: any) {
-              ui?.pushStatus(`[laya error] ${summarizeErrorForDisplay(err.message)}`);
-            } finally {
-              ui?.setBusy(false);
-            }
-            break;
-          }
         }
       }}
     />,

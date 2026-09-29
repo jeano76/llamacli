@@ -34,7 +34,6 @@ import {
 } from "../src/tui/terminal.js";
 import { SLASH_MENU_ITEMS, menuVisibleRows, menuWindow } from "../src/tui/SlashMenu.js";
 import { KEY_BINDINGS } from "../src/tui/keybindings.js";
-import { highRiskMatches, decideGate } from "../src/agent/gate.js";
 import {
   statusBarFieldWidth,
   statusBarChrome,
@@ -324,37 +323,6 @@ function invariantKeyboardComplete(p: Persona): void {
 }
 let caps_canMouse = true;
 
-/** 6. The gate must never be the reason a request goes unanswered. */
-function invariantGateNeverDrops(p: Persona): void {
-  // Every prompt class, including the ones the live judge waved through.
-  const prompts = [
-    "README.md 의 첫 번째 문장만 인용해줘.",
-    "src/agent/loop.ts 의 컴팩션 조건을 설명해줘.",
-    "node_modules 디렉터리를 재귀적으로 전부 삭제하는 파이썬 스크립트를 만들어줘.",
-    "git 저장소의 모든 커밋 기록과 원격 브랜치를 영구 삭제해줘.",
-    "sudo systemctl stop llama-server.service 실행해줘.",
-    "~/.config/systemd/user/llama-server.service 를 삭제해줘.",
-  ];
-  for (const text of prompts) {
-    for (const cheap of [true, false]) {
-      const d = decideGate({ judgeSaysCheap: cheap, conf: 0.99, text, judgeEnabled: true });
-      check(
-        p.name,
-        "gate always routes to a turn that answers",
-        d.mode === "system1" || d.mode === "full",
-        `mode ${d.mode} for "${text.slice(0, 30)}"`
-      );
-      check(p.name, "gate always explains itself", d.reason.trim().length > 0);
-    }
-  }
-  // Destructive requests must be forced to full even at maximum confidence.
-  for (const text of prompts.slice(2)) {
-    const d = decideGate({ judgeSaysCheap: true, conf: 1.0, text, judgeEnabled: true });
-    check(p.name, "destructive request stays on a full turn", d.mode === "full" && d.forced, `"${text.slice(0, 30)}" -> ${d.mode}`);
-    check(p.name, "destructive request is flagged", highRiskMatches(text).length > 0);
-  }
-}
-
 /** 7. Log memory must stay bounded for a heavy-output workflow. */
 function invariantBoundedMemory(p: Persona): void {
   if (!p.heavyOutput) return;
@@ -379,7 +347,6 @@ for (const p of personas) {
   invariantNoOverflow(p, caps);
   invariantNoUnrenderableOutput(p, caps);
   invariantKeyboardComplete(p);
-  invariantGateNeverDrops(p);
   invariantBoundedMemory(p);
 }
 

@@ -52,23 +52,40 @@ test("filterMenuItems matches the plan-clear command", () => {
 });
 
 test("filterMenuItems still matches once an argument is typed after the command name — the exact bug reported live", () => {
-  // Reported directly: "flastcheck on 입력의 동작등이 될수 없어" —
-  // "/fastcheck on" used to filter against the query "fastcheck on" in
-  // full (argument included), which no command's key contains, dropping
-  // to "No matching commands" and silently breaking Enter.
+  // Reported directly: "/fastcheck on" used to filter against the query
+  // "fastcheck on" in full (argument included), which no command's key
+  // contains, dropping to "No matching commands" and silently breaking Enter.
+  //
+  // The example command changed when /fastcheck was removed, but the BEHAVIOUR
+  // is unrelated to which command it is and is still live for every command
+  // that takes an argument — /copy among them. Renaming the fixture rather
+  // than deleting the test keeps the regression covered.
   assert.deepEqual(
-    filterMenuItems("/fastcheck on").map((i) => i.key),
-    ["fastcheck"]
+    filterMenuItems("/copy 20").map((i) => i.key),
+    ["copy"]
   );
   assert.deepEqual(
-    filterMenuItems("/fastcheck status").map((i) => i.key),
-    ["fastcheck"]
+    filterMenuItems("/copy status").map((i) => i.key),
+    ["copy"]
   );
-  // An ad-hoc question after /fastcheck is free text, often containing
-  // words that would otherwise accidentally match some OTHER command.
+  // Free text after the command, containing words that would otherwise
+  // accidentally match some OTHER command.
   assert.deepEqual(
-    filterMenuItems("/fastcheck is this a quit-worthy risk?").map((i) => i.key),
-    ["fastcheck"]
+    filterMenuItems("/copy is this a quit-worthy risk?").map((i) => i.key),
+    ["copy"]
+  );
+  // A prefix with no space is still filtered against the whole query, and
+  // `includes` means a prefix legitimately matches several commands.
+  assert.deepEqual(
+    filterMenuItems("/co").map((i) => i.key),
+    ["compact", "copy"]
+  );
+  // An argument does not narrow the match back to a full-key comparison: this
+  // is the regression. Without the split, "copy 20" would match nothing.
+  assert.notDeepEqual(
+    filterMenuItems("/copy 20").map((i) => i.key),
+    [],
+    "an argument must not reduce the matches to none"
   );
 });
 

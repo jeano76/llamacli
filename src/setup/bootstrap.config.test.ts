@@ -28,21 +28,21 @@ test("a hand-tuned config survives the bootstrap — the keys a user set by hand
     verify: { afterEdit: { "*.py": "pytest" } },
     browser: { debugPort: 9333 },
     llama: { modelPath: "/data/mine.gguf", port: 18080 },
-    laya: { enabled: true, confidenceThreshold: 0.8 },
   };
   const next = buildConfig({
     existing,
     llama: { binPath: "/usr/bin/llama-server", source: "path", backend: "unknown" },
     modelPath: "/data/mine.gguf",
-    plan: { llamaPort: 18080, layaPort: 18099 },
+    plan: { llamaPort: 18080 },
     tuning,
-    portsEnv: {},
   });
   assert.equal(next.apiKey, "sk-secret");
   assert.deepEqual(next.verify, existing.verify);
   assert.deepEqual(next.browser, existing.browser);
-  assert.equal((next.laya as any).enabled, true, "the laya toggle is a user decision, not ours");
-  assert.equal((next.laya as any).confidenceThreshold, 0.8);
+  // A `laya` block in an OLD config is deliberately NOT carried forward: the
+  // feature it configures was removed, so preserving the block would imply
+  // something can still act on it.
+  assert.equal((next as any).laya, undefined, "a removed feature's config block was resurrected");
 });
 
 test("the backend only flips to local-llama when there is BOTH a binary and a model", () => {
@@ -53,9 +53,8 @@ test("the backend only flips to local-llama when there is BOTH a binary and a mo
     existing: { backend: "openai-compatible", baseUrl: "http://127.0.0.1:8080" },
     llama: { binPath: "/usr/bin/llama-server", source: "path", backend: "unknown" },
     modelPath: "",
-    plan: { llamaPort: 8080, layaPort: 8099 },
+    plan: { llamaPort: 8080 },
     tuning,
-    portsEnv: {},
   });
   assert.equal(noModel.backend, "openai-compatible", "unchanged without a model");
 
@@ -63,26 +62,10 @@ test("the backend only flips to local-llama when there is BOTH a binary and a mo
     existing: {},
     llama: { binPath: "/usr/bin/llama-server", source: "path", backend: "unknown" },
     modelPath: "/m.gguf",
-    plan: { llamaPort: 8080, layaPort: 8099 },
+    plan: { llamaPort: 8080 },
     tuning,
-    portsEnv: {},
   });
   assert.equal(withModel.backend, "local-llama");
-});
-
-test("laya's baseUrl is derived from the same port, so the two cannot drift", () => {
-  // The failure in this repo's history: the config named one port while the
-  // server bound another, and every health check polled a port nothing was on.
-  const cfg = buildConfig({
-    existing: {},
-    llama: { binPath: "/b", source: "path", backend: "unknown" },
-    modelPath: "/m.gguf",
-    plan: { llamaPort: 8080, layaPort: 9123 },
-    tuning,
-    portsEnv: {},
-  });
-  assert.equal((cfg.laya as any).port, 9123);
-  assert.equal((cfg.laya as any).baseUrl, "http://127.0.0.1:9123");
 });
 
 test("the tuned llama flags reach the config, not just the log", () => {
@@ -90,9 +73,8 @@ test("the tuned llama flags reach the config, not just the log", () => {
     existing: {},
     llama: { binPath: "/b", source: "built", backend: "cuda" },
     modelPath: "/m.gguf",
-    plan: { llamaPort: 8080, layaPort: 8099 },
+    plan: { llamaPort: 8080 },
     tuning,
-    portsEnv: {},
   });
   assert.equal((cfg.llama as any).gpuLayers, 999);
   assert.equal((cfg.llama as any).threads, 6);
@@ -129,7 +111,7 @@ test("an existing config is read back and merged, not discarded", async () =>
     const after = parse(await readFile(join(dir, ".llamacli", "config.yaml"), "utf8"));
     assert.equal(after.apiKey, "sk-keepme", "the user's own key is still there after a bootstrap");
     assert.equal(after.browser.debugPort, 9999);
-    assert.equal(report.ports?.layaPort, 8099);
+    assert.equal(report.ports?.llamaPort, 8080);
   }));
 
 test("a bootstrap that cannot fully do its job still returns a report and a usable config", async () =>
@@ -138,10 +120,19 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
     // is that this RETURNS rather than throwing: a bootstrap that throws takes
     // down a working install, which is strictly worse than one that reports a
     // degraded setup and lets the app start.
+    //
+    // `detectServer: null` is load-bearing and was added during this change.
+    // Without it the test adopted whatever happened to be listening on 8080 on
+    // the machine running it — so on a dev box with a real llama-server up it
+    // silently took the "existing server" path, wrote an openai-compatible
+    // config with no `llama` block at all, and failed its own assertion. That
+    // is precisely "testing the machine, not the code", the failure mode every
+    // injectable seam in this codebase exists to prevent.
     const report = await ensureLocalStack({
       projectRoot: dir,
       offline: true,
       allowBuild: false,
+      detectServer: async () => null,
       hardware: {
         cpuCount: 4, ramTotalBytes: 16 * 1024 ** 3, ramAvailableBytes: 12 * 1024 ** 3,
         gpus: [], gpuBackend: "none", canBuildCuda: false, tools: {}, platform: "linux",
@@ -151,11 +142,17 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
     // No throw, and a well-formed report either way.
     assert.ok(Array.isArray(report.steps) && report.steps.length > 0);
     assert.ok(Array.isArray(report.errors));
-    // No model was resolved offline, so it must NOT have claimed local-llama —
-    // that is the state index.tsx treats as unconfigured and silently falls
-    // through to a dead default URL.
+    // It must have said plainly that no model was found, rather than silently
+    // proceeding — model acquisition was removed, so there is no fallback path.
+    assert.ok(
+      report.steps.some((s) => !s.ok && /모델/.test(s.name)),
+      "a missing model is reported as a failed step, not glossed over"
+    );
+    // No model, so it must NOT have claimed local-llama — that is the state
+    // index.tsx treats as unconfigured and silently falls through to a dead
+    // default URL.
     const after = parse(await readFile(join(dir, ".llamacli", "config.yaml"), "utf8"));
     assert.notEqual(after.backend, "local-llama", "never claims a local backend it cannot serve");
-    assert.ok(after.laya?.port, "ports were still decided and recorded");
+    assert.ok(after.llama?.port, "ports were still decided and recorded");
     assert.ok(report.ports?.llamaPort);
   }));

@@ -1,33 +1,32 @@
 /**
- * One place that decides which ports llamacli, llama-server and laya use, so
- * they cannot disagree.
+ * The one place that decides which port llamacli talks to, so the configured
+ * port and the port llama-server binds cannot disagree.
  *
- * ── The problem this removes ────────────────────────────────────────────────
- * The three ports used to be independent facts:
- *   - `COMMON_PORTS` in detect.ts probed 8080/8081/11434 and picked the first
- *     that answered;
- *   - `DEFAULT_8GB_PROFILE.port` in llamaServer.ts was 8081;
- *   - laya's port came from `LAYA_ENDPOINT`, defaulting to 8099, in TWO
- *     independent scripts (the repo-root one and plugin/laya's copy) which had
- *     already drifted apart once — 8000 vs 8099 — and both then booted their own
- *     laya-serve, each holding ~5 GB of RAM for the same model.
+ * ── What this used to do, and why it is smaller now ─────────────────────────
+ * There were once two ports: llama-server and a `laya` "System 1" helper that
+ * was consulted before each turn (see the removed `/fastcheck`). Both the
+ * helper and its port are gone, so exactly one port remains and the collision
+ * logic that existed to stop the two servers fighting over 8099 is gone with
+ * it. `layaPortEnv()` went the same way — its whole reason for existing was
+ * making the Python side's bind port and its health probe agree, and there is
+ * no Python side any more.
  *
- * A fresh install that happened to find a server on 8080 wrote a config
- * pointing at 8080 while its own spawn default said 8081, so which port the
- * next run used depended on what else was running. The requirement is simply
- * that the port llamacli talks to, the port llama-server binds, and the port
- * laya binds are the same number by construction — decided once, written once,
- * and re-asserted on every launch.
+ * ── The problem that remains ────────────────────────────────────────────────
+ * The port was once an independent fact per component: `detect.ts` probed
+ * 8080/8081/11434 and took the first responder, while a separate spawn default
+ * said 8081. Which port the next run used therefore depended on what else
+ * happened to be running. The requirement is simply that the port llamacli
+ * talks to and the port llama-server binds are the same number by
+ * construction — decided once, written once, and re-asserted on every launch.
  */
 
 export const LLAMA_PORT = 8080;
-export const LAYA_PORT = 8099;
 
 /** Ports llamacli will probe for an already-running OpenAI-compatible server
  *  when a project has no config yet. The candidates are ORDERED and the first
  *  responder wins, so our own port leads: if llamacli is already serving, that
  *  is unambiguously the right answer. */
-export const COMMON_PORTS = [LLAMA_PORT, LAYA_PORT, 11434];
+export const COMMON_PORTS = [LLAMA_PORT, 11434];
 
 export type PortState = "free" | "in-use" | "unknown";
 
@@ -35,9 +34,9 @@ export type PortState = "free" | "in-use" | "unknown";
  *
  *  A pure TCP connect, deliberately: it answers "is this port taken", which is
  *  the only question here, without depending on an HTTP server existing there
- *  (llama-serve and laya-serve both answer HTTP, but a *foreign* process squatting
- *  on 8080 is exactly the case this must detect). Injected so the whole module
- *  is testable without binding real ports. */
+ *  (a *foreign* process squatting on 8080 is exactly the case this must
+ *  detect). Injected so the whole module is testable without binding real
+ *  ports. */
 export type PortProbe = (port: number) => Promise<PortState>;
 
 export const tcpPortProbe: PortProbe = async (port) => {
@@ -56,15 +55,14 @@ export const tcpPortProbe: PortProbe = async (port) => {
 
 export interface PortPlan {
   llamaPort: number;
-  layaPort: number;
   /** Set when a port had to be moved, so the reason is reported rather than
    *  silently changing where the server lives between runs. */
-  moved: { what: "llama" | "laya"; from: number; to: number; because: string }[];
+  moved: { what: "llama"; from: number; to: number; because: string }[];
   notes: string[];
 }
 
 /**
- * Resolves the port pair.
+ * Resolves the port.
  *
  * `wanted` lets a caller pass a port that is already recorded in a config
  * (i.e. one this llamacli install set up before), so an established install
@@ -76,7 +74,6 @@ export interface PortPlan {
 export async function planPorts(opts: {
   probe: PortProbe;
   llamaPort?: number;
-  layaPort?: number;
 }): Promise<PortPlan> {
   const { probe } = opts;
   const moved: PortPlan["moved"] = [];
@@ -104,21 +101,7 @@ export async function planPorts(opts: {
     }
   }
 
-  let layaPort = opts.layaPort ?? LAYA_PORT;
-  // laya must never share llama's port: two servers cannot bind it, and the
-  // health check would then probe the wrong process. Checked explicitly rather
-  // than trusted, because the two defaults are independently configurable.
-  if (layaPort === llamaPort) {
-    const next = await firstFree(probe, layaPort + 1, layaPort + 20);
-    moved.push({ what: "laya", from: layaPort, to: next, because: `llama 포트(${llamaPort})와 동일해서 충돌` });
-    layaPort = next;
-  }
-  const layaState = await probe(layaPort);
-  if (layaState === "in-use") {
-    notes.push(`laya 포트 ${layaPort}가 이미 사용 중입니다 — 실행 중이라면 그대로 재사용합니다.`);
-  }
-
-  return { llamaPort, layaPort, moved, notes };
+  return { llamaPort, moved, notes };
 }
 
 async function firstFree(probe: PortProbe, from: number, to: number): Promise<number> {
@@ -126,17 +109,4 @@ async function firstFree(probe: PortProbe, from: number, to: number): Promise<nu
     if ((await probe(p)) === "free") return p;
   }
   return to;
-}
-
-/** The env the laya Python side must see for its bind port and its health
- *  probes to agree.
- *
- *  Reported in this repo's own history as the cause of "llamacli가 멈춘 것 같다":
- *  `laya-serve` reads its BIND port from `LAYA_PORT` (upstream default 8000) while
- *  every health probe in laya_integration.py read `LAYA_ENDPOINT` (default 8099).
- *  The spawned server bound 8000, the probe polled 8099, so bootstrap timed out
- *  on a perfectly healthy server and then killed it as "failed to boot". Setting
- *  BOTH to the one planned port is what makes them agree by construction. */
-export function layaPortEnv(port: number): Record<string, string> {
-  return { LAYA_PORT: String(port), LAYA_ENDPOINT: String(port) };
 }

@@ -6,7 +6,7 @@
  * Requested directly: "llamacli 의 초기 구동 시 llama.cpp 가 존재를 하지 않는다면
  * 관련 설치 패키지와 llama.cpp 를 설치하고 … 정합한 모델을 다운로드 받는 초기
  * 과정을 수행해야해 … llama.cpp의 포트와 llamacli 에서 사용하는 포트가 맞아야
- * 하고 … laya 서버의 포트와 llamacli 에서 지정하는 포트도 맞아야해 … 초기 llama
+ * 하고 … 초기 llama
  * 구동시 cpu 가 여러개 인경우에는 Nvidia gpu를 우선 순으로 정의 … 사용자 개입없이
  * 진행이 될수 있도록".
  *
@@ -28,12 +28,8 @@ import { stringify, parse } from "yaml";
 import { detectHardware, type Hardware } from "./hardware.js";
 import { tuneForHardware, type LlamaTuning } from "./tuning.js";
 import { findLlamaServer, buildLlamaCpp, defaultRun, type LlamaLocation, type Run } from "./llamaCpp.js";
-import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
-import { planPorts, tcpPortProbe, layaPortEnv, COMMON_PORTS, LLAMA_PORT, LAYA_PORT, type PortProbe } from "./ports.js";
+import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
 import { detectRunningServer } from "../backend/detect.js";
-import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
-import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
-import { calibrate, probeBackend, type Calibration } from "./calibration.js";
 import { rm } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 
@@ -50,11 +46,11 @@ export interface BootstrapReport {
   steps: BootstrapStep[];
   hardware?: Hardware;
   llama?: LlamaLocation;
-  model?: ModelChoice;
+  /** The model actually in use. There is no longer any way to pick or fetch
+   *  one, so this is only ever the path already recorded in the config. */
+  modelPath?: string;
   tuning?: LlamaTuning;
-  /** Present when `calibrate` ran; `degraded` means the probe was unusable. */
-  calibration?: Calibration;
-  ports?: { llamaPort: number; layaPort: number };
+  ports?: { llamaPort: number };
   /** The config that was (or would be) written. */
   config?: Record<string, unknown>;
   errors: string[];
@@ -78,58 +74,11 @@ export interface BootstrapOptions {
   env?: NodeJS.ProcessEnv;
   /** Injected so a test can supply a fake machine. */
   hardware?: Hardware;
-  /** An already-decided laya port, so an established install keeps it. */
-  layaPort?: number;
-  /**
-   * Re-derive everything from the CURRENT machine, ignoring what is already
-   * configured. This is what `/reset` uses.
-   *
-   *  Without it `/reset` would be a near no-op on a machine whose hardware has
-   *  not changed — the common case — and the user would conclude it did nothing.
-   *  With it the model choice, the llama flags and the ports are all recomputed,
-   *  and the report says what actually changed, so a "nothing changed" run reads
-   *  as "already optimal" rather than as "broken".
-   *
-   *  Never used on a normal launch: the bootstrap being idempotent — not
-   *  redoing this work every time — is the whole point. */
-  force?: boolean;
-  /**
-   * Probe the live backend's reported throughput and re-derive the llama
-   * settings from the measurement, not from the hardware table alone. `/reset`
-   * uses this.
-   *
-   *  The probe can only ever TIGHTEN the context downward, never raise it — see
-   *  calibration.ts for why one slow or mis-reported sample must not be able to
-   *  talk a machine into an OOM at load. */
-  calibrate?: boolean;
-  /**
-   * Tear the laya layer down: stop any running server, clear the laya config
-   *  block, and drop the project-local venv.
-   *
-   *  Included in `/reset` because a stale laya is invisible and poisonous. The
-   *  case that motivated it: a laya-serve left listening on :8000 while the
-   *  config said 8099, so every gate call burned a 30 s timeout and the UI
-   *  reported the resulting silence as a verdict. Nothing in the config looked
-   *  wrong; the running process simply predated the fix, so re-running /reset
-   *  could not fix it without actually killing it. */
-  /**
-   * Re-derive settings but never transfer a model. Used by `/reset`, which runs
-   * inside a live session: a multi-hour download there wedges the agent loop
-   * and the user sees a prompt that has stopped responding. The file is fetched
-   * on the next launch instead, where the progress can be shown properly.
-   */
-  noDownload?: boolean;
-  resetLaya?: boolean;
-  /** Injected so tests need not kill a real process. */
-  stopServer?: () => Promise<boolean>;
   /** Detects an already-running OpenAI-compatible server to adopt instead of
    *  spawning our own. Injected because the real probe talks to localhost, and
    *  a test that silently adopts whatever happens to be running on :8080 is
    *  testing the machine, not the code. Defaults to the real detector. */
   detectServer?: (host: string, ports: number[]) => Promise<{ baseUrl: string; model: string } | null>;
-  /** Candidate .gguf files already present in the models dir. Injected in
-   *  tests; read from disk otherwise. */
-  listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>;
 }
 
 export const DEFAULT_MODELS_DIR = pathJoin(process.env.HOME ?? "/root", "models");
@@ -213,16 +162,10 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // server serving that very file was up the whole time.
   //
   // So "is there already a server I can simply use?" is asked FIRST, and a yes
-  // ends the bootstrap before any model resolution, download or disk probe.
-  let existing = opts.force
-    ? keepUserOwnedKeys(await readConfig(opts.projectRoot))
-    : await readConfig(opts.projectRoot);
+  // ends the bootstrap before any model resolution or disk probe.
+  const existing = await readConfig(opts.projectRoot);
 
-  // `force` skips adoption on purpose: /reset exists to re-derive the model and
-  // the flags from the current hardware, so it must NOT be short-circuited by
-  // whatever happens to be running.
-  if (!opts.force) {
-  //
+  {
   // This was found by running the real bootstrap on a machine that already had
   // a llama-server up: planPorts saw 8080 busy and moved us to 8081, which
   // means llamacli spawns a SECOND llama-server. On this box that is fatal —
@@ -244,17 +187,12 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       detail: `이미 실행 중인 서버를 사용합니다: ${running.baseUrl} (${running.model})`,
     });
     log(`이미 실행 중인 llama-server 에 연결합니다: ${running.baseUrl}`);
-    steps.push({ name: "포트 결정", ok: true, detail: `llama ${adoptedPort} (기존 서버), laya ${opts.layaPort ?? LAYA_PORT}` });
+    steps.push({ name: "포트 결정", ok: true, detail: `llama ${adoptedPort} (기존 서버)` });
     const adopted: Record<string, unknown> = {
       ...(existing ?? {}),
       backend: "openai-compatible",
       baseUrl: running.baseUrl,
       model: running.model,
-      laya: {
-        ...(existing?.laya ?? {}),
-        port: opts.layaPort ?? LAYA_PORT,
-        baseUrl: `http://127.0.0.1:${opts.layaPort ?? LAYA_PORT}`,
-      },
     };
     if (opts.projectRoot) {
       await writeConfig(opts.projectRoot, adopted);
@@ -266,7 +204,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       hardware,
       llama: llama ?? undefined,
       tuning: undefined,
-      ports: { llamaPort: adoptedPort, layaPort: opts.layaPort ?? LAYA_PORT },
+      ports: { llamaPort: adoptedPort },
       config: adopted,
       errors,
     };
@@ -275,27 +213,32 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   }
 
   // ── 3. Model ──────────────────────────────────────────────────────────────
+  //
+  // MODEL ACQUISITION HAS BEEN REMOVED.
+  //
+  // There is no Hub search and no download. llamacli no longer contacts a model
+  // repository, never resolves a filename from a remote catalogue, and never
+  // transfers a GGUF. The only model it will ever run is the one already
+  // configured in `.llamacli/config.yaml`, or one an already-running
+  // llama-server reports.
+  //
+  // Why a removal and not a flag: a downloader still wired up behind a
+  // default-off switch is one `grep` from being re-enabled by accident, and it
+  // was the source of a concrete 20 GB re-download that ignored a model the
+  // machine had been serving all along.
+  //
+  // Consequence, stated honestly: a machine with no model cannot now obtain one
+  // by itself. That is the intended trade — the operator places the .gguf and
+  // points `llama.modelPath` at it, or starts a server, which is adopted.
   const modelsDir = opts.modelsDir ?? env.LLAMACLI_MODELS_DIR ?? DEFAULT_MODELS_DIR;
-  // Declared before the adoption block: the early return reports the model it
-  // found, even though step 3 (which fills it in) never runs on that path.
-  let model: ModelChoice | undefined;
-  // Declared here (not at the download step) so the "keep the model already in
-  // use" branch above can assign it.
-  let modelPath = "";
   // The model this install is ALREADY using, if that file still exists.
   //
-  // Checked before the Hub, and deliberately without consulting it. The Hub
-  // republishes filenames: this box's working model is
-  // `Ornith-1.5-35B-A3B-Q4_K_M.gguf` (21,864,081,056 bytes) while the same
-  // quant is published today as `Ornith-1.5-35B-Q4_K_M.gguf`
-  // (21,713,463,040) — different name, different size, same intended model.
-  // Resolving from the catalogue first therefore produced a filename that
-  // matches nothing on disk, and a 20 GB download of weights the machine had
-  // been serving all along. Observed twice, ~3h each at this link's speed.
-  //
-  // The config's own record of the working model is the authority: if that file
-  // is still present it is by definition correct, and re-deriving it from a
-  // remote catalogue can only make it worse.
+  // This is now the only source of a model. The config's own record is the
+  // authority: if the file is still present it is by definition correct, and
+  // re-deriving it from a remote catalogue could only make it worse — the Hub
+  // republishes filenames, so one model appears under a different name and a
+  // different byte count, and matching on that produced a 20 GB download of
+  // weights the machine already had.
   const configuredPaths = [
     typeof existing?.llama?.modelPath === "string" ? existing.llama.modelPath : undefined,
     typeof existing?.model === "string" ? existing.model : undefined,
@@ -304,167 +247,44 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   for (const p of configuredPaths) {
     if (p && (await fileSize(p)) > 0) { alreadyInUse = p; break; }
   }
+  let modelPath = "";
   if (alreadyInUse) {
-    const size = await fileSize(alreadyInUse);
     modelPath = alreadyInUse;
-    model = {
-      candidate: { repo: "(기존 설정)", filename: alreadyInUse.split("/").pop()!, sizeBytes: size, url: "" },
-      reason: `이미 사용 중인 모델을 유지합니다: ${alreadyInUse}`,
-      alternatives: [],
-    };
-    steps.push({ name: "모델 결정", ok: true, detail: `기존 모델 유지 (다운로드 불필요): ${alreadyInUse}` });
-    log(`이미 사용 중인 모델을 유지합니다 — 내려받지 않습니다: ${alreadyInUse}`);
-  } else if (!opts.offline) {
-    const gpu = hardware.gpus[0];
-    await step("모델 결정", async () => {
-      const { c35, c9 } = await resolveModel({ env, fetchImpl: opts.fetchImpl, log });
-      model = chooseModel({
-        vramTotalBytes: gpu?.vramTotalBytes ?? 0,
-        vramFreeBytes: gpu?.vramFreeBytes ?? 0,
-        ramTotalBytes: hardware.ramTotalBytes,
-        candidates35b: c35,
-        candidates9b: c9,
-      });
-      log(model.reason);
-      return model.reason;
+    steps.push({ name: "모델 확인", ok: true, detail: `설정된 모델 사용: ${alreadyInUse}` });
+    log(`설정된 모델을 사용합니다: ${alreadyInUse}`);
+  } else {
+    steps.push({
+      name: "모델 확인",
+      ok: false,
+      detail:
+        "설정된 모델을 찾지 못했습니다. llamacli는 모델을 내려받지 않습니다 — " +
+        "`.llamacli/config.yaml` 의 `llama.modelPath` 에 .gguf 경로를 지정하거나, " +
+        "이미 실행 중인 llama-server 에 연결하세요.",
     });
+    errors.push("모델: 설정된 모델을 찾지 못했습니다 (자동 다운로드 기능이 제거되었습니다).");
+    log("모델을 찾지 못했습니다. llama.modelPath 를 설정하거나 실행 중인 서버에 연결하세요.");
   }
 
-  // ── 4. Download ───────────────────────────────────────────────────────────
-  // Disk space is checked BEFORE the transfer, never during it. A download that
-  // runs the filesystem out doesn't fail at the start: it fills the disk, and
-  // then unrelated things on the machine start failing too (this repo's
-  // clipboard fallback lives in /tmp, which is often tmpfs). By the time a
-  // progress bar is on screen the space is already gone, so this has to be a
-  // precondition.
-  let equivalent: string | null = null;
-  if (model) {
-    const needed = (model.candidate.sizeBytes || 0) + RESERVE_BYTES;
-    const target = await selectModelPath({ requestedDir: modelsDir, neededBytes: needed, env });
 
-    if (!hasRoom(target, needed)) {
-      // Refuse. Proceeding here is exactly the failure this check exists for.
-      steps.push({ name: "모델 다운로드", ok: false, detail: target.reason });
-      errors.push(`모델 다운로드: ${target.reason}`);
-      log(target.reason);
-      log("모델을 다운로드하지 않습니다. 디스크 공간을 확보한 뒤 다시 실행하세요.");
-    } else {
-      if (target.switched) {
-        steps.push({ name: "저장 경로 변경", ok: true, detail: target.reason });
-        log(target.reason);
-      }
-      const dest = join(target.dir, model.candidate.filename);
-      const already = await fileSize(dest);
-      if (already > 0 && (model.candidate.sizeBytes === 0 || already >= model.candidate.sizeBytes)) {
-        modelPath = dest;
-        steps.push({ name: "모델 다운로드", ok: true, detail: `이미 있습니다: ${dest}` });
-        log(`모델 이미 있음: ${dest}`);
-      } else if ((equivalent = await findEquivalentModel(target.dir, model.candidate, opts))) {
-        // The Hub's filename and the filename on disk routinely disagree — the
-        // repo here publishes `Ornith-1.5-35B-Q4_K_M.gguf` while the copy on
-        // this machine is `Ornith-1.5-35B-A3B-Q4_K_M.gguf`. Matching on the
-        // quant plus the exact byte count means an existing, correct model is
-        // reused instead of re-downloading 20 GB of the same weights.
-        modelPath = equivalent;
-        steps.push({
-          name: "모델 다운로드",
-          ok: true,
-          detail: `동일한 모델이 다른 이름으로 이미 있습니다: ${equivalent}`,
-        });
-        log(`이미 있는 동일 모델을 사용합니다: ${equivalent}`);
-      } else if (opts.noDownload) {
-        // /reset runs INSIDE a live TUI session. A 20 GB fetch here blocks the
-        // agent loop for hours while the user watches a spinner on a prompt
-        // that will never answer — reported directly as "the prompt stops
-        // working after /reset".
-        //
-        // So /reset re-derives the SETTINGS and reports what would need
-        // downloading, but never transfers. The file is fetched on the next
-        // real launch, where the progress belongs on the normal scrollback
-        // instead of inside a running session.
-        steps.push({
-          name: "모델 다운로드",
-          ok: true,
-          detail: `세션 중에는 다운로드하지 않습니다: ${dest}`,
-        });
-        log(`모델은 다음 실행 시 내려받습니다: ${dest}`);
-        // Still recorded, so the config is complete and correct; the next
-        // launch's size check will simply find no file and download it.
-        modelPath = dest;
-      } else if (opts.offline) {
-        steps.push({ name: "모델 다운로드", ok: false, detail: "오프라인이라 건너뜁니다." });
-      } else {
-        await step("모델 다운로드", async () => {
-          await mkdir(dirname(dest), { recursive: true });
-          const result = await downloadFile(model!.candidate.url, dest, {
-            connections: 8,
-            label: model!.candidate.filename,
-            fetchImpl: opts.fetchImpl,
-            onProgress: renderProgressLine(log),
-          });
-          return `${result.bytes} 바이트 다운로드 완료 (${result.parallel ? "병렬 range" : "단일 스트림"})`;
-        });
-        modelPath = dest;
-      }
-    }
-  }
-
-  // `/reset` re-derives instead of inheriting. Everything below reads `existing`
-  // to PRESERVE user intent (apiKey, verify commands, the laya toggle); with
-  // `force` that is deliberately narrowed to the keys the user owns, because
-  // the whole point is to discard machine-derived values and recompute them.
   const plan = await planPorts({
     probe: opts.probe ?? tcpPortProbe,
     llamaPort: typeof existing?.llama?.port === "number" ? existing.llama.port : undefined,
-    layaPort: typeof existing?.laya?.port === "number" ? existing.laya.port : undefined,
   });
   steps.push({
     name: "포트 결정",
     ok: true,
     detail:
-      `llama ${plan.llamaPort}, laya ${plan.layaPort}` +
+      `llama ${plan.llamaPort}` +
       (plan.moved.length > 0 ? ` (변경: ${plan.moved.map((m) => `${m.what} ${m.from}→${m.to}`).join(", ")})` : ""),
   });
   for (const n of plan.notes) log(n);
 
   // ── 6. Tuning + config ────────────────────────────────────────────────────
-  let tuning = tuneForHardware(hardware, { modelBytes: model?.candidate.sizeBytes });
-  let calibration: Calibration | undefined;
+  let tuning = tuneForHardware(hardware);
 
-  if (opts.resetLaya) {
-    // Before the settings are recomputed, so the laya block that gets written
-    // reflects the NEW port rather than the stale one.
-    await step("laya 초기화", async () => {
-      const stopped = await (opts.stopServer ?? stopLayaServer)();
-      const venv = join(opts.projectRoot, ".llamacli", "laya-venv");
-      let removed = false;
-      try {
-        await rm(venv, { recursive: true, force: true });
-        removed = true;
-      } catch {
-        removed = false; // nothing there, or not ours to delete
-      }
-      return `기존 laya 서버 ${stopped ? "종료됨" : "실행 중이 아님"}, venv ${removed ? "삭제됨" : "없음"}`;
-    });
-  }
-
-  if (opts.calibrate) {
-    await step("백엔드 성능 측정", async () => {
-      const baseUrl = (existing?.baseUrl as string) ?? `http://127.0.0.1:${LLAMA_PORT}`;
-      const timings = await probeBackend(baseUrl, { fetchImpl: opts.fetchImpl, model: existing?.model });
-      calibration = calibrate({ hw: hardware, timings, modelBytes: model?.candidate.sizeBytes });
-      if (calibration.degraded) {
-        log(calibration.notes[0]);
-        return "측정 불가 — 하드웨어 정보 기반 설정 사용";
-      }
-      for (const n of calibration.notes) log(n);
-      return calibration.notes.join(" | ");
-    });
-  }
-  if (calibration && !calibration.degraded) tuning = calibration.tuning;
   for (const r of tuning.rationale) log(r);
 
-  const config = buildConfig({ existing, llama, modelPath, plan, tuning, portsEnv: layaPortEnv(plan.layaPort), resetLaya: opts.resetLaya });
+  const config = buildConfig({ existing, llama, modelPath, plan, tuning });
   if (opts.projectRoot) {
     // Wrapped like every other step, because until now this was the ONE call
     // that could throw straight out of the function — which contradicted the
@@ -499,10 +319,9 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     steps,
     hardware,
     llama: llama ?? undefined,
-    model,
+    modelPath: modelPath || undefined,
     tuning,
-    calibration,
-    ports: { llamaPort: plan.llamaPort, layaPort: plan.layaPort },
+    ports: { llamaPort: plan.llamaPort },
     config,
     errors,
   };
@@ -518,11 +337,8 @@ export function buildConfig(opts: {
   existing?: Record<string, any>;
   llama?: LlamaLocation;
   modelPath: string;
-  plan: { llamaPort: number; layaPort: number };
+  plan: { llamaPort: number };
   tuning: LlamaTuning;
-  portsEnv: Record<string, string>;
-  /** When true, derived laya keys are recomputed instead of inherited. */
-  resetLaya?: boolean;
 }): Record<string, unknown> {
   const base = opts.existing ?? {};
   const next: Record<string, any> = { ...base };
@@ -550,17 +366,6 @@ export function buildConfig(opts: {
       cacheTypeV: opts.tuning.cacheTypeV,
     };
   }
-  next.laya = {
-    // `resetLaya` strips the derived keys (port/baseUrl) so they are recomputed
-    // below rather than inherited from a stale block; the user's `enabled`
-    // toggle is kept either way, because that is a choice, not a measurement.
-    ...(opts.resetLaya ? pickUserLayaKeys(base.laya) : base.laya ?? {}),
-    port: opts.plan.layaPort,
-    // baseUrl is derived from the SAME port, so the two cannot drift — the
-    // failure in this repo's history was a config pointing at one port while
-    // the server bound another.
-    baseUrl: `http://127.0.0.1:${opts.plan.layaPort}`,
-  };
   return next;
 }
 
@@ -596,9 +401,6 @@ export function keepUserOwnedKeys(config: Record<string, any> | undefined): Reco
         : {}),
     };
   }
-  // The laya gate is a deliberate user choice (it costs a round-trip per turn),
-  // not a machine-derived value.
-  if (config.laya?.enabled !== undefined) kept.laya = { enabled: config.laya.enabled };
   return kept;
 }
 
@@ -622,131 +424,12 @@ async function fileSize(path: string): Promise<number> {
   }
 }
 
-/** The quant token in a GGUF filename, e.g. "Q4_K_M" out of
- *  "Ornith-1.5-35B-A3B-Q4_K_M.gguf". */
-export function quantOf(filename: string): string {
-  return /Q\d(_[A-Z0-9]+)+/i.exec(filename)?.[0]?.toUpperCase() ?? "";
-}
 
-/**
- * Looks for a file in `dir` that is the SAME MODEL under a different name.
- *
- * Matching is on the quant plus the exact byte size, never on the filename: the
- * two disagree constantly (Hub says `Ornith-1.5-35B-Q4_K_M.gguf`, the copy on
- * disk is `Ornith-1.5-35B-A3B-Q4_K_M.gguf`), and a name-based guess would be a
- * guess. An exact size match on the same quant IS the same file as far as
- * loading is concerned, and it is the only thing that stops a fresh install
- * re-downloading 20 GB the machine already has.
- *
- * Requires a KNOWN size on both sides. A GGUF of unknown size is not matched,
- * because "some .gguf with a Q4 somewhere in the name" is not evidence.
- */
-export async function findEquivalentModel(
-  dir: string,
-  candidate: { filename: string; sizeBytes: number },
-  opts: { listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]> } = {}
-): Promise<string | null> {
-  if (!candidate.sizeBytes) return null;
-  const wantQuant = quantOf(candidate.filename);
-  if (!wantQuant) return null;
-  const list = opts.listExistingModels ?? listGgufsIn;
-  let files: { path: string; sizeBytes: number }[];
-  try {
-    files = await list(dir);
-  } catch {
-    return null;
-  }
-  for (const f of files) {
-    const base = f.path.split("/").pop() ?? f.path;
-    if (base === candidate.filename) continue; // handled by the caller
-    if (f.sizeBytes !== candidate.sizeBytes) continue;
-    if (quantOf(base) !== wantQuant) continue;
-    return f.path;
-  }
-  return null;
-}
 
-async function listGgufsIn(dir: string): Promise<{ path: string; sizeBytes: number }[]> {
-  const { readdir, stat } = await import("node:fs/promises");
-  let entries: string[];
-  try {
-    entries = await readdir(dir);
-  } catch {
-    return [];
-  }
-  const out: { path: string; sizeBytes: number }[] = [];
-  for (const name of entries) {
-    if (!name.toLowerCase().endsWith(".gguf")) continue;
-    const path = join(dir, name);
-    try {
-      out.push({ path, sizeBytes: (await stat(path)).size });
-    } catch {
-      continue; // vanished between readdir and stat
-    }
-  }
-  return out;
-}
 
-/** A progress reporter for a long download.
- *
- *  Rewrites ONE terminal line rather than appending, because a 22 GB download
- *  at 4 updates/second would otherwise bury everything above it in thousands of
- *  lines. Falls back to periodic lines when the output is not a TTY, so a
- *  redirected log gets a readable record instead of one overwritten line. */
-export function renderProgressLine(log: (line: string) => void): (p: TransferProgress) => void {
-  const interactive = Boolean(process.stdout.isTTY);
-  // Last logged decile. The obvious test for "log every 10%" —
-  // `floor(percent) % 10 === 0` — is true for EVERY update while the download is
-  // still under 10% done, so a real 20 GB fetch emitted a line about four times
-  // a second for its first several minutes and buried everything above it.
-  // Caught by running the bootstrap for real against the live Hub.
-  let lastDecile = -1;
-  return (p) => {
-    if (interactive) {
-      process.stdout.write(`\r[2K${formatProgress(p)}`);
-      return;
-    }
-    const decile = p.percent < 0 ? -1 : Math.floor(p.percent / 10);
-    if (decile > lastDecile || p.percent >= 100) {
-      lastDecile = decile;
-      log(formatProgress(p));
-    }
-  };
-}
 
-/** The only laya key a user owns: whether the gate is on at all. */
-export function pickUserLayaKeys(laya: Record<string, any> | undefined): Record<string, any> {
-  return laya?.enabled !== undefined ? { enabled: laya.enabled } : {};
-}
 
-/**
- * Stops a project-local laya-serve, if one is running.
- *
- * Best-effort and never throws. The server is usually a transient systemd unit
- * (`systemd-run --user --collect`), so stopping the unit is the correct way to
- * stop it — killing the short-lived client that spawned it would leave the real
- * server running, which is precisely the stale-server situation this exists to
- * clear. The pgrep fallback covers the plain-Popen path.
- */
-export async function stopLayaServer(): Promise<boolean> {
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const run = promisify(execFile);
-  try {
-    await run("systemctl", ["--user", "stop", "laya-serve.service"], { timeout: 20_000 });
-    return true;
-  } catch {
-    // No systemd user session, or no such unit — fall through.
-  }
-  try {
-    const { stdout } = await run("pgrep", ["-f", "laya-serve"], { timeout: 10_000 });
-    const pids = stdout.trim().split("\n").filter(Boolean).map(Number);
-    if (pids.length === 0) return false;
-    for (const pid of pids) {
-      try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
+
+
+
+

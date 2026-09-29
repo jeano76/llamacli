@@ -29,7 +29,6 @@ import {
 } from "./harness.js";
 import { appendNote, clearNotes, readNotes, NOTES_HEADER } from "../compaction/notes.js";
 import { gitCheckpoint } from "./gitCheckpoint.js";
-import { decideGate, SYSTEM1_MAX_TOKENS } from "./gate.js";
 
 // Sent as the `tools` field on every main-loop request (never on the
 // compaction summary request, which omits tools entirely) — computed once
@@ -324,42 +323,6 @@ export interface AgentLoopOptions {
    *  previous process) already does this unconditionally — this extends the
    *  same behavior to a compaction that fires live, mid-session. */
   autoResume?: boolean;
-  /** Optional fast-check gate: an async callback invoked ONCE at the start
-   *  of each fresh user turn (here, before any tool work) so it can short-
-   *  circuit a low-complexity task with a quick decision instead of spending
-   *  the full model budget. Off by default — wired from config.yaml's `laya`
-   *  section via index.tsx. Deliberately failure-tolerant: any throw/reject
-   *  is swallowed (with a logged status line) so a disabled/broken gate can
-   *  never interrupt an ordinary Ornith turn. */
-  /** Optional before-turn "System 1" gate. Receives the user's raw input and,
-   *  when enabled, may run a fast pre-check whose verdict is surfaced to the
-   *  model (via UI) before Ornith turns — but its signature returns void and is
-   *  never awaited-fatal: any throw/reject is swallowed so an ordinary turn
-   *  always proceeds. */
-  /** Before taking over a fresh turn, the optional laya (fast "System 1")
-   *  gate evaluates whether the task is simple enough to skip the full
-   *  (slow, System 2 / Ornith) turn. Returns {skip:true} to answer directly;
-   *  {skip:false} (or any error) to proceed normally with Ornith. When
-   *  non-skip, an optional `reason` explains the verdict ("degraded" /
-   *  "truthful" prose) and is surfaced so reduced-quality answers aren't silent.
-   *  The callback never throws — a disabled/errored gate must not break an
-   *  ordinary turn. */
-  /**
-   * The laya pre-turn gate. Returns the judge's raw verdict; the mode it maps
-   * to (and the safety rail that can override it) is decided by
-   * `agent/gate.ts`, NOT here — see that module's doc comment for the
-   * measurement that forced "skip the model" to be replaced with "choose a
-   * reasoning budget".
-   *
-   * `verdict` is the judge's own "this is cheap" boolean, `conf` its
-   * confidence, `score` its raw probability. `reason`/`gateId` are for the UI.
-   */
-  layaGate?: (userText: string) => Promise<{ judgeSaysCheap: boolean; reason?: string; verdict?: string; score?: number; conf?: number; gateId?: number; failed?: boolean; failureReason?: string } | undefined>;
-  // Fired once per short-circuit verdict (skip:true) with the same payload
-  // layaGate returned. Lets the UI append a stable-id cumulative perf line
-  // even though the foldable summary is rendered elsewhere — see App.tsx's
-  // pushGateLog / onGateVerdict wiring.
-  onGateVerdict?: (result: { verdict?: string; score?: number; conf?: number; gateId?: number }) => void;
 }
 
 /**
@@ -370,13 +333,6 @@ export interface AgentLoopOptions {
  */
 export class AgentLoop {
   private messages: ChatMessage[];
-  /**
-   * When true, the current turn runs in "System-1" mode: no chain-of-thought,
-   * a small token cap, and no tools offered. Set by runSystem1Turn and read
-   * inside runUntilIdle's request — see agent/gate.ts for why this replaced
-   * the old "skip the model" short-circuit, which produced no answer at all.
-   */
-  private system1Mode = false;
   private breaker = new CircuitBreaker();
   /** Serializes every operation that reads/mutates `messages` (turns and
    *  compaction) so `/compact` can never race a turn's tool-call loop —
@@ -542,7 +498,7 @@ export class AgentLoop {
    *  serialization guarantee as any other queued task — never a concurrent
    *  mutation of `this.messages`) instead of redoing the same compaction
    *  redundantly a moment later. Errors are swallowed exactly like a
-   *  disabled/errored layaGate: a failed warm-up must never surface as a
+   *  disabled/errored backend: a failed warm-up must never surface as a
    *  crash or block the next real turn — the ordinary auto-threshold check
    *  inside send() still runs as a fallback either way. */
   warmCompactIfNeeded(): void {
@@ -580,105 +536,12 @@ export class AgentLoop {
       // session silently dropped it instead of picking the interrupted work
       // back up, even though a checkpoint was sitting on disk the whole
       // time. Check every time, not just at startup.
-      // Fast-check gate (laya integration): run ONCE per fresh turn, before
-      // any model tool work. Off by default; when it decides the task is
-      // simple enough to answer directly it returns {skip:true}, which skips
-      // the full (slow, System 2) turn and Ornith entirely. Always
-      // failure-tolerant — a disabled/errored gate must never break an ordinary
-      // turn, so its errors are swallowed here (status line only). Gate
-      // receives the real user text so laya can evaluate it directly.
-      //
-      // The gate returns the JUDGE's opinion; decideGate turns it into a
-      // reasoning budget. The previous contract here was `{skip: boolean}` and
-      // `skip: true` simply `return`ed — which, measured over 10 labelled
-      // prompts, swallowed 80% of all requests (including 67% of destructive
-      // ones) and produced zero characters in every case, because a skip has
-      // nothing to answer with. See agent/gate.ts.
-      let gateResult;
-      try {
-        gateResult = await this.opts.layaGate?.(userText);
-      } catch (e) {
-        this.opts.onStatus?.("laya gate skipped (using full model): " +
-          (e instanceof Error ? e.message : String(e)));
-        gateResult = undefined;
-      }
-
-      const decision = decideGate({
-        judgeSaysCheap: gateResult?.judgeSaysCheap ?? false,
-        conf: gateResult?.conf ?? 0,
-        text: userText,
-        judgeEnabled: Boolean(gateResult) && !gateResult?.failed,
-        // A gate that could not be reached is not a verdict. Reported
-        // separately so "the judge said no" and "the judge never answered"
-        // don't look the same on screen — see runLayaGate's `failed` doc.
-        gateFailed: Boolean(gateResult?.failed),
-        // The caller knows WHY the gate was unreachable; pass it through so the
-        // user is told which of "install it" / "restart it" applies.
-        failureReason: gateResult?.failureReason,
-      });
-      // Surface the verdict, but ONLY when the gate actually ran. When it is
-      // switched off, "gate: 꺼짐 — 전체 턴" on every single turn is pure
-      // noise — caught in a real pty capture of the disabled default, where
-      // it was the one non-blank line on screen and pushed the actual reply
-      // out of view. Silence is the correct output for a feature that is off.
-      if (gateResult) this.opts.onStatus?.(decision.reason);
-      if (decision.forced) {
-        this.opts.onGateVerdict?.({ ...gateResult, verdict: "forced-full" });
-      }
-
       await this.injectResumeContextIfPending();
       this.goal ??= userText.trim().slice(0, 200) || null;
       this.messages.push({ role: "user", content: userText });
-      if (decision.mode === "system1") {
-        await this.runSystem1Turn();
-        return;
-      }
       await this.runUntilIdle();
       this.checkForRealtimeImprovementAfterTurn();
     });
-  }
-
-  /**
-   * One cheap turn: chain-of-thought off, tight token cap, no tools, single
-   * round.
-   *
-   * This is what replaced the "skip the model" short-circuit. It still runs
-   * the model, which is the only reason it can produce an answer at all — but
-   * it runs it in the cheapest mode available, so a request the judge thought
-   * was simple costs a fraction of a normal turn instead of either (a) the
-   * full turn, or (b) nothing at all, which is what the old skip did.
-   *
-   * Implemented by setting `system1Mode` and delegating to runUntilIdle, so
-   * it reuses the existing streaming, truncation-retry, salvage and
-   * compaction machinery instead of forking a second request path that would
-   * silently miss every fix made to the first.
-   *
-   * Tools are deliberately withheld. The gate's premise is "this needs no
-   * looking at the project", and letting a no-reasoning turn call
-   * `run_shell` would be a worse version of the same miscalibration the old
-   * skip had: a confidently-wrong cheap verdict writing to the filesystem. The
-   * gate.ts risk rail is the first line; this is the second.
-   */
-  private async runSystem1Turn(): Promise<void> {
-    const userMessage = this.messages[this.messages.length - 1];
-    this.system1Mode = true;
-    try {
-      await this.runUntilIdle();
-    } finally {
-      this.system1Mode = false;
-    }
-    this.checkForRealtimeImprovementAfterTurn();
-    // The cheap turn's answer is the answer. If the model used its whole
-    // budget without producing a visible reply (all reasoning, or truncated),
-    // the user is left with nothing — so fall through to a normal turn rather
-    // than accept an empty screen as this mode's result.
-    const last = this.messages[this.messages.length - 1];
-    if (last?.role === "assistant" && !String(last.content ?? "").trim()) {
-      this.opts.onStatus?.("gate: 간단한 응답을 만들지 못해 전체 턴으로 이어갑니다.");
-      this.system1Mode = false;
-      if (userMessage) this.messages.push(userMessage);
-      await this.runUntilIdle();
-    }
   }
 
   /** Fires the (fire-and-forget) real-time improvement check only after the
@@ -863,11 +726,9 @@ export class AgentLoop {
           {
             model: this.opts.model,
             messages: this.messages,
-            // Withheld in system1Mode: see runSystem1Turn's doc comment. The
-            // tool schema is also a large chunk of the prompt, so dropping it
-            // makes the cheap turn cheaper in prompt-processing too, not just
-            // in generation.
-            tools: this.system1Mode ? undefined : activeToolDefs(),
+            // The tool schema is a large chunk of the prompt, so it is sent
+            // once and the loop reuses the same definition list.
+            tools: activeToolDefs(),
             stream: true,
             // Never leave this unset: without it llama-server defaults to
             // n_predict=-1 (unbounded), and a degenerate generation (no
@@ -882,9 +743,7 @@ export class AgentLoop {
             // 1 normally, but forced smaller after a tool call truncation
             // repeats verbatim, so a non-compliant model still physically
             // cannot regenerate the identical oversized content again.
-            max_tokens: this.system1Mode
-              ? SYSTEM1_MAX_TOKENS
-              : Math.max(512, Math.floor(this.computeMaxTokens(usedBeforeChat) * toolCallMaxTokensShrinkFactor)),
+            max_tokens: Math.max(512, Math.floor(this.computeMaxTokens(usedBeforeChat) * toolCallMaxTokensShrinkFactor)),
             // See ChatCompletionRequest.repeat_penalty's doc comment.
             repeat_penalty: this.opts.repeatPenalty ?? 1.1,
             // THE root cause behind a long run of "the model never
@@ -897,7 +756,7 @@ export class AgentLoop {
             // thinking OFF gave 0 reasoning deltas and 362 tool_calls
             // deltas from the identical budget. Everything else in this
             // file's truncation handling is a safety net under this.
-            ...(this.opts.enableThinking && !this.system1Mode ? {} : { chat_template_kwargs: { enable_thinking: false } }),
+            ...(this.opts.enableThinking ? {} : { chat_template_kwargs: { enable_thinking: false } }),
           },
           (chunk) => {
             // Defensive: `chunk.choices` isn't guaranteed non-empty/present

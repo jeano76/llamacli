@@ -383,81 +383,41 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 > 프로젝트에서 다른 `.llamacli/skills/*.md` 파일과 똑같은 방식으로 덮어쓰거나
 > 추가할 수 있다.
 
-## The `/fastcheck` gate — what it is, and what it is not
+## Removed features
 
-`/fastcheck` consults a second, smaller-scale system (laya) before each turn to
-decide how much reasoning budget the turn needs. **It ships disabled**, and
-that is a measured decision rather than caution.
+Three things that used to be here have been **removed, not disabled**. There is
+no flag to flip and no code path left to re-enable them.
 
-### What it used to do, and why that was wrong
+| Removed | What it did | Why it is gone |
+|---|---|---|
+| **Model search & download** | Queried HuggingFace for a GGUF, picked one to fit the GPU, and downloaded it during first-run bootstrap. | It produced a concrete 20 GB re-download of weights the machine was already serving, because the Hub republishes filenames and the byte counts disagree. A downloader still wired up behind a default-off switch is one `grep` from being re-enabled by accident. **llamacli now runs only the model recorded in `.llamacli/config.yaml`**, or one an already-running llama-server reports. It will never fetch a model. |
+| **`/fastcheck`** | Consulted a second "System 1" model before each turn to pick a reasoning budget, and could downgrade a turn to a cheap mode. | Measured over a labelled prompt set: it added ~0.11 s per turn, agreed with "this needs the real model" on 33% of the prompts that did, and could not be made to separate the classes by any prompt wording. See git history for the full measurement. |
+| **`/reset`** | Recomputed the model, llama flags and ports from current hardware, and re-ran backend calibration. | It existed to re-derive what the bootstrap now derives on its own. With model acquisition removed there is nothing for it to choose. |
 
-The original semantics were "skip the model": a confident *yes* meant the agent
-loop simply `return`ed. Measured against a labelled 10-prompt set on this box
-(re-runnable: `scripts/verify_fastcheck.py`):
+**Consequences, stated plainly:**
 
-| | |
-|---|---|
-| gate latency | 0.11 s mean per turn |
-| short-circuit rate | **80 %** (8/10) |
-| … on prompts that need the real model | 67 % |
-| … on destructive prompts | 67 % |
-| **characters produced by a "short-circuit"** | **0** |
+- A machine with **no model** cannot now obtain one by itself. Place a `.gguf`
+  and set `llama.modelPath` in `.llamacli/config.yaml`, or start a
+  `llama-server` and llamacli will adopt it.
+- Bootstrap reports a missing model as a **failed step with a reason**, rather
+  than silently degrading.
+- A `laya:` block left in an old `config.yaml` is **dropped, not preserved** —
+  nothing can act on it any more.
 
-It accepted *"write a python script that recursively deletes all node_modules
-directories"* with confidence 0.854, and *"permanently delete all git history
-and remote branches"* with 0.72. And because a skip has to be answered by
-*something*, and laya's `/v1/systemone` is a calibration endpoint that returns
-probabilities and never text, those turns produced no answer at all.
+The `laya` gate's risk rail (`highRiskMatches` / `decideGate`) went with it.
+It only ever mattered *because* a turn could be downgraded to a cheap mode; with
+no such mode, there is nothing to protect.
 
-### Why no amount of prompt tuning fixes it
-
-Four differently-worded judge questions were scored on the same labelled set,
-measuring how well each separates "truly trivial" from "needs the real model"
-(skip-class mean − full-class mean; > 0.25 usable):
-
-| Judge question | Separation |
-|---|---|
-| "can you answer this without a full reasoning turn?" | 0.190 |
-| "does this need to inspect the project?" | 0.183 |
-| "is this routine and safe?" | 0.093 |
-| "is it answerable from general knowledge?" | 0.223 |
-
-None cleared the bar. The reason is structural: **the judge is the same 35B MoE
-the gate is trying to avoid calling.** Every role in `~/.laya/settings.json` —
-`router`, `stager`, `chat`, `trace`, `omni` — points at this app's own
-`llama-server`. There is no small fast model to fall back on, so there is no
-latency win available even in principle.
-
-### What it does instead
-
-The gate now chooses a **reasoning budget** rather than skipping the model:
-
-- `system1` — same model, chain-of-thought off, 200-token cap, **no tools
-  offered**. Fast, and it still produces a real answer.
-- `full` — the normal turn.
-
-A wrong verdict now costs answer *quality*, not the answer. That is the whole
-point: the previous design turned a miscalibration into a silently dropped
-request, which is the one failure mode a coding agent must not have.
-
-On top of that, `src/agent/gate.ts` holds a **code-level rail** that forces a
-full turn on destructive requests no matter what the judge says. It is not a
-security control and does not pretend to be one — it cannot tell a safe delete
-from a dangerous one. It exists because the specific failure it prevents is a
-35B model confidently routing *"permanently delete all git history"* down a path
-that skips the reasoning step. Its patterns match presence, not word order: the
-first version only worked in English, because Korean puts the qualifier before
-the verb (`전부 삭제` vs `recursively delete everything`), and a test caught it.
-
-`/fastcheck status` prints the cost, the judge model, and the accuracy
-limitation, so the decision to switch it on is informed rather than assumed.
+**Binary self-update is unaffected.** `llamacli` still checks GitHub for a new
+release of itself at startup (opt out with `LLAMACLI_NO_UPDATE=1`). That is the
+app updating, not the model — a different code path, in `src/selfUpdate.ts`.
 
 ## Validation — what is actually checked, and what is not
 
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 618 unit tests
+npm test                                              # 525 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -465,9 +425,9 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **618** | pass |
-| Terminal identity (100 personas) | `persona_usability_check.ts` | **9,177** | 0 violations |
-| Project shape (100 real directories) | `project_persona_check.ts` | **7,020** | 0 violations |
+| Unit / regression | `npm test` | **525** | pass |
+| Terminal identity (100 personas) | `persona_usability_check.ts` | **5,877** | 0 violations |
+| Project shape (100 real directories) | `project_persona_check.ts` | **7,237** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
 | Hardware matrix (one-off sweep) | *(not committed — see below)* | 168,668 | 0 violations |
 
@@ -498,11 +458,11 @@ useful:
 
 The honest summary: the **decision and rendering logic** is now well covered,
 and the **OS and hardware layers are not covered at all**. Anyone reading
-"16,796 checks, all passing" as "this works everywhere" is reading it wrong.
+"13,713 checks, all passing" as "this works everywhere" is reading it wrong.
 
 ## Usability validation across 100 personas
 
-`scripts/persona_usability_check.ts` runs **9,177 assertions across 100
+`scripts/persona_usability_check.ts` runs **5,877 assertions across 100
 distinct usage configurations** — 3 platforms, 10 terminal families, 5 locales,
 6 terminal sizes and 4 colour modes, crossed so every value of every axis is
 exercised.
@@ -649,7 +609,7 @@ a read-only checkout, or a model file sitting inside the repo.
   path you type and the path on disk differ)
 - **5 locales**, **5 disk conditions**
 
-**7,020 checks across 100 real project directories.**
+**7,237 checks across 100 real project directories.**
 
 ### What it found
 
@@ -771,7 +731,7 @@ real thing.
 > `setup/tuning.ts`(코어 수 · VRAM · OS에 따른 플래그 결정 불변식),
 > `tui/terminal.ts` + `tui/SlashMenu.tsx`(터미널 능력 감지 · 팝업 높이),
 > `setup/bootstrap.ts` + `config.ts`(쓰기 불가 프로젝트에서의 점진적 저하).
-> 현재 **618개 테스트 전부 통과**.
+> 현재 **525개 테스트 전부 통과**.
 > 에이전트 루프와 TUI는
 > 통합 테스트 성격(도구 호출 루프, 스트리밍, 슬래시 명령)이라 실제 llama-server를
 > 대상으로 pty로 실제 키 입력을 흘려보내며 검증했다(git 히스토리 참고) — Ink 터미널

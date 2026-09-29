@@ -66,22 +66,6 @@ test("the adoption path is taken even when the served model file is NOT in the m
     assert.equal(cfg.model, "/some/other/place/old-build.gguf");
   }));
 
-test("/reset still re-derives, and is NOT short-circuited by a running server", () =>
-  withTempDir(async (dir) => {
-    await mkdir(join(dir, ".llamacli"), { recursive: true });
-    await writeFile(join(dir, ".llamacli", "config.yaml"), "llama:\n  contextSize: 65536\n");
-    // force + a running server: adoption must be skipped, otherwise /reset
-    // could never change anything on a machine that already has llamacli up —
-    // which is the normal case for a user running it.
-    await ensureLocalStack({
-      projectRoot: dir, offline: true, allowBuild: false, force: true, hardware: hw,
-      probe: async () => "free",
-      detectServer: async () => ({ baseUrl: "http://127.0.0.1:8080", model: "/x.gguf" }),
-    });
-    const cfg = parse(await readFile(join(dir, ".llamacli", "config.yaml"), "utf8"));
-    assert.notEqual(cfg.llama?.contextSize, 65536, "/reset actually re-derived the flags");
-  }));
-
 // ── Idempotence: the question actually asked ───────────────────────────────
 
 test("a second launch with everything in place does no network work at all", () =>
@@ -100,35 +84,3 @@ test("a second launch with everything in place does no network work at all", () 
 
 // ── /reset must not transfer inside a live session ─────────────────────────
 
-test("/reset re-derives settings without ever starting a download", () =>
-  withTempDir(async (dir) => {
-    await mkdir(join(dir, ".llamacli"), { recursive: true });
-    let transfers = 0;
-    // A fetchImpl that counts body requests and fails them: a real transfer
-    // would go through here, and the test's point is that it never does.
-    const countingFetch = (async (u: any, init: any) => {
-      if (init?.headers?.Range || init?.method === "POST") transfers++;
-      // Serve a tiny "model list" so resolution can succeed.
-      return {
-        ok: true, status: 200, url: String(u),
-        json: async () => ({ siblings: [{ rfilename: "M-Q4_K_M.gguf", size: 1024 }] }),
-        arrayBuffer: async () => new ArrayBuffer(8),
-        headers: { get: () => null },
-        body: null,
-      };
-    }) as unknown as typeof fetch;
-
-    await ensureLocalStack({
-      projectRoot: dir,
-      force: true,
-      noDownload: true,
-      hardware: hw,
-      probe: async () => "free",
-      detectServer: async () => null,
-      fetchImpl: countingFetch,
-    });
-    assert.equal(transfers, 0, "no model bytes were transferred during a /reset");
-    const cfg = parse(await readFile(join(dir, ".llamacli", "config.yaml"), "utf8"));
-    // The settings ARE re-derived — that is the feature.
-    assert.equal(cfg.llama?.gpuLayers, 999, "flags still re-derived");
-  }));

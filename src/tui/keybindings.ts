@@ -82,7 +82,6 @@ export const KEY_BINDINGS: KeyBindingGroup[] = [
       { keys: "/improve", description: "반복 실패 분석 → 룰 제안" },
       { keys: "/improve-apply", description: "마지막 제안을 룰 파일로 저장" },
       { keys: "/plan-clear", description: "멈춘 계획 표시 초기화" },
-      { keys: "/fastcheck [on|off]", description: "laya 빠른 판정 게이트 켜기/끄기" },
     ],
   },
 ];
