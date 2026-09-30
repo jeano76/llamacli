@@ -3,7 +3,8 @@
  * allowed to emit, per terminal, instead of one global "ANSI or not" flag.
  *
  * ── Why the single boolean wasn't enough ──────────────────────────────────────
- * `supportsAnsiTui()` (ansiSupport.ts) answered one question: "is this escape
+ * `supportsAnsiTui()` (the now-deleted ansiSupport.ts shim) answered one
+ * question: "is this escape
  * sequence going to be interpreted, or will it show up as literal garbage?"
  * That is necessary but not sufficient, because terminals do not fail in
  * all-or-nothing ways. Each of these is a real, independently-observed

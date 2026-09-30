@@ -38,6 +38,15 @@ test("win32 + WT_SESSION (Windows Terminal) is ANSI-capable", () => {
   assert.equal(caps.terminal, "Windows Terminal");
 });
 
+test("win32 + a recognized TERM_PROGRAM (e.g. VS Code) is ANSI-capable", () => {
+  // Moved here from the deleted ansiSupport shim's test. It is the one case
+  // that shim's suite pinned and this file did not, and it is a real signal:
+  // VS Code's integrated terminal is a plain conhost on Windows, so without
+  // TERM_PROGRAM being treated as a positive marker it reads as the bare
+  // console case above and loses ANSI entirely.
+  assert.equal(detectTerminal({ TERM_PROGRAM: "vscode" }, { ...TTY, platform: "win32" }).ansi, true);
+});
+
 test("win32 + ConEmuANSI=ON is ANSI-capable, but ConEmuANSI=OFF is NOT", () => {
   // The reported breakage was literal escape bytes in a Windows console.
   // ConEmu sets ConEmuANSI=OFF when its own ANSI mode is disabled, and
