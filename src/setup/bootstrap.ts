@@ -29,7 +29,10 @@ import { detectHardware, type Hardware } from "./hardware.js";
 import { tuneForHardware, type LlamaTuning } from "./tuning.js";
 import { findLlamaServer, buildLlamaCpp, defaultRun, type LlamaLocation, type Run } from "./llamaCpp.js";
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
-import { detectRunningServer } from "../backend/detect.js";
+import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
+import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
+import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
+import { discoverRunningServer } from "../backend/detect.js";
 import { rm } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 
@@ -46,8 +49,7 @@ export interface BootstrapReport {
   steps: BootstrapStep[];
   hardware?: Hardware;
   llama?: LlamaLocation;
-  /** The model actually in use. There is no longer any way to pick or fetch
-   *  one, so this is only ever the path already recorded in the config. */
+  model?: ModelChoice;
   modelPath?: string;
   tuning?: LlamaTuning;
   ports?: { llamaPort: number };
@@ -79,6 +81,9 @@ export interface BootstrapOptions {
    *  a test that silently adopts whatever happens to be running on :8080 is
    *  testing the machine, not the code. Defaults to the real detector. */
   detectServer?: (host: string, ports: number[]) => Promise<{ baseUrl: string; model: string } | null>;
+  /** Candidate .gguf files already present in the models dir. Injected in
+   *  tests; read from disk otherwise. */
+  listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>;
 }
 
 export const DEFAULT_MODELS_DIR = pathJoin(process.env.HOME ?? "/root", "models");
@@ -123,16 +128,29 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   log(steps[0].detail);
 
   // ── 2. llama-server binary ────────────────────────────────────────────────
-  const found = await findLlamaServer({ env, exists: undefined, home: env.HOME });
+  const { location: found, rejected } = await findLlamaServer({ env, home: env.HOME });
   let llama: LlamaLocation | undefined = found ?? undefined;
   if (!llama) {
+    // A binary that exists but cannot run is a different problem from a binary
+    // that is not installed, and reporting it as the latter sends the user
+    // looking for an install that is sitting right there.
+    const rejectedNote =
+      rejected.length > 0
+        ? ` (찾았지만 실행 불가: ${rejected.join(", ")})`
+        : "";
     if (opts.offline || opts.allowBuild === false) {
       steps.push({
         name: "llama.cpp",
         ok: false,
-        detail: "설치된 llama-server 를 찾지 못했습니다 (오프라인/빌드 금지 모드).",
+        detail: `설치된 llama-server 를 찾지 못했습니다 (오프라인/빌드 금지 모드).${rejectedNote}`,
       });
     } else {
+      if (rejected.length > 0) {
+        // Rebuilding will not fix a binary that is present and broken, and the
+        // 10-40 minutes it costs is better spent saying why.
+        log(`찾은 llama-server 가 실행되지 않습니다: ${rejected.join(", ")}`);
+        log("드라이버 또는 런타임 라이브러리 문제일 수 있습니다. 그래도 직접 빌드를 시도합니다.");
+      }
       const binPath = await step("llama.cpp 빌드", async () => {
         log("llama-server 를 찾지 못해 빌드합니다. CUDA 빌드는 10~40분 걸릴 수 있습니다.");
         return buildLlamaCpp({ hw: hardware, run, log });
@@ -163,9 +181,16 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   //
   // So "is there already a server I can simply use?" is asked FIRST, and a yes
   // ends the bootstrap before any model resolution or disk probe.
+  //
+  // `existing` is the UNTOUCHED config, and that matters more than it looks.
+  // An earlier version narrowed it to the user-owned keys on the theory that a
+  // re-derivation should discard machine-derived state — but the machine-owned
+  // keys are exactly the ones that identify the model this install is ALREADY
+  // running, so narrowing them made the "keep the model in use" check below
+  // fail every time and sent the bootstrap to the Hub for a model the machine
+  // was serving. Read whole, or not at all.
   const existing = await readConfig(opts.projectRoot);
 
-  {
   // This was found by running the real bootstrap on a machine that already had
   // a llama-server up: planPorts saw 8080 busy and moved us to 8081, which
   // means llamacli spawns a SECOND llama-server. On this box that is fatal —
@@ -177,8 +202,18 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // This is also the same probe config.ts already uses for a project with no
   // config, so "adopt the running server" and "detect a running server" are one
   // mechanism rather than two that can disagree.
-  const detect = opts.detectServer ?? ((h: string, p: number[]) => detectRunningServer(h, p));
-  const running = await detect("127.0.0.1", [LLAMA_PORT, ...COMMON_PORTS.slice(1)]);
+  //
+  // `discoverRunningServer`, not `detectRunningServer`: a llama-server binds its
+  // port before the model finishes loading and answers nothing until the
+  // weights are resident. A single fast probe cannot tell that apart from
+  // "nothing is running", and answering it wrongly is how this ended up
+  // spawning a SECOND llama-server beside a healthy one — which on an 8 GB
+  // card is an OOM, not a slowdown. A port that is loading is waited out
+  // instead.
+  const detect = opts.detectServer ?? ((h: string, p: number[]) => discoverRunningServer(h, p, {
+    onWait: (port, waited) => log(`${port} 포트 서버가 모델을 불러오는 중입니다 (${Math.round(waited / 1000)}초 경과)…`),
+  }));
+  const running = await detect("127.0.0.1", COMMON_PORTS);
   if (running) {
     const adoptedPort = Number(new URL(running.baseUrl).port);
     steps.push({
@@ -210,35 +245,25 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     };
   }
 
-  }
-
   // ── 3. Model ──────────────────────────────────────────────────────────────
   //
-  // MODEL ACQUISITION HAS BEEN REMOVED.
+  // llamacli searches HuggingFace for a GGUF, picks one that fits this
+  // machine's VRAM/RAM, and downloads it — but only after two things that are
+  // checked FIRST:
   //
-  // There is no Hub search and no download. llamacli no longer contacts a model
-  // repository, never resolves a filename from a remote catalogue, and never
-  // transfers a GGUF. The only model it will ever run is the one already
-  // configured in `.llamacli/config.yaml`, or one an already-running
-  // llama-server reports.
+  //   1. an already-running server (above), which ends the bootstrap outright;
+  //   2. the model this install is ALREADY using, below.
   //
-  // Why a removal and not a flag: a downloader still wired up behind a
-  // default-off switch is one `grep` from being re-enabled by accident, and it
-  // was the source of a concrete 20 GB re-download that ignored a model the
-  // machine had been serving all along.
-  //
-  // Consequence, stated honestly: a machine with no model cannot now obtain one
-  // by itself. That is the intended trade — the operator places the .gguf and
-  // points `llama.modelPath` at it, or starts a server, which is adopted.
   const modelsDir = opts.modelsDir ?? env.LLAMACLI_MODELS_DIR ?? DEFAULT_MODELS_DIR;
-  // The model this install is ALREADY using, if that file still exists.
+  let equivalent: string | null = null;
   //
-  // This is now the only source of a model. The config's own record is the
-  // authority: if the file is still present it is by definition correct, and
-  // re-deriving it from a remote catalogue could only make it worse — the Hub
-  // republishes filenames, so one model appears under a different name and a
-  // different byte count, and matching on that produced a 20 GB download of
-  // weights the machine already had.
+  // (2) exists because the Hub republishes filenames: this box's working model
+  // is `Ornith-1.5-35B-A3B-Q4_K_M.gguf` (21,864,081,056 B) while the same
+  // quant is published today as `Ornith-1.5-35B-Q4_K_M.gguf` (21,713,463,040)
+  // -- different name, different size, same intended model. Resolving from the
+  // catalogue first therefore produced a filename matching nothing on disk, and
+  // a 20 GB download of weights the machine had been serving all along.
+  // Observed twice, ~3h each at this link's speed.
   const configuredPaths = [
     typeof existing?.llama?.modelPath === "string" ? existing.llama.modelPath : undefined,
     typeof existing?.model === "string" ? existing.model : undefined,
@@ -247,28 +272,96 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   for (const p of configuredPaths) {
     if (p && (await fileSize(p)) > 0) { alreadyInUse = p; break; }
   }
+  let model: ModelChoice | undefined;
   let modelPath = "";
   if (alreadyInUse) {
+    const size = await fileSize(alreadyInUse);
     modelPath = alreadyInUse;
-    steps.push({ name: "모델 확인", ok: true, detail: `설정된 모델 사용: ${alreadyInUse}` });
-    log(`설정된 모델을 사용합니다: ${alreadyInUse}`);
-  } else {
-    steps.push({
-      name: "모델 확인",
-      ok: false,
-      detail:
-        "설정된 모델을 찾지 못했습니다. llamacli는 모델을 내려받지 않습니다 — " +
-        "`.llamacli/config.yaml` 의 `llama.modelPath` 에 .gguf 경로를 지정하거나, " +
-        "이미 실행 중인 llama-server 에 연결하세요.",
+    model = {
+      candidate: { repo: "(기존 설정)", filename: alreadyInUse.split("/").pop()!, sizeBytes: size, url: "" },
+      reason: `이미 사용 중인 모델을 유지합니다: ${alreadyInUse}`,
+      alternatives: [],
+    };
+    steps.push({ name: "모델 결정", ok: true, detail: `기존 모델 유지 (다운로드 불필요): ${alreadyInUse}` });
+    log(`이미 사용 중인 모델을 유지합니다 — 내려받지 않습니다: ${alreadyInUse}`);
+  } else if (!opts.offline) {
+    const gpu = hardware.gpus[0];
+    await step("모델 결정", async () => {
+      const { c35, c9 } = await resolveModel({ env, fetchImpl: opts.fetchImpl, log });
+      model = chooseModel({
+        vramTotalBytes: gpu?.vramTotalBytes ?? 0,
+        vramFreeBytes: gpu?.vramFreeBytes ?? 0,
+        ramTotalBytes: hardware.ramTotalBytes,
+        candidates35b: c35,
+        candidates9b: c9,
+      });
+      log(model.reason);
+      return model.reason;
     });
-    errors.push("모델: 설정된 모델을 찾지 못했습니다 (자동 다운로드 기능이 제거되었습니다).");
-    log("모델을 찾지 못했습니다. llama.modelPath 를 설정하거나 실행 중인 서버에 연결하세요.");
   }
 
+  // ── 4. Download ───────────────────────────────────────────────────────────
+  // Disk space is checked BEFORE the transfer, never during it. A download that
+  // runs the filesystem out doesn't fail at the start: it fills the disk, and
+  // then unrelated things on the machine start failing too. By the time a
+  // progress bar is on screen the space is already gone, so this has to be a
+  // precondition.
+  if (model) {
+    const needed = (model.candidate.sizeBytes || 0) + RESERVE_BYTES;
+    const target = await selectModelPath({ requestedDir: modelsDir, neededBytes: needed, env });
+
+    if (!hasRoom(target, needed)) {
+      steps.push({ name: "모델 다운로드", ok: false, detail: target.reason });
+      errors.push(`모델 다운로드: ${target.reason}`);
+      log(target.reason);
+      log("모델을 다운로드하지 않습니다. 디스크 공간을 확보한 뒤 다시 실행하세요.");
+    } else {
+      if (target.switched) {
+        steps.push({ name: "저장 경로 변경", ok: true, detail: target.reason });
+        log(target.reason);
+      }
+      const dest = join(target.dir, model.candidate.filename);
+      const already = await fileSize(dest);
+      if (already > 0 && (model.candidate.sizeBytes === 0 || already >= model.candidate.sizeBytes)) {
+        modelPath = dest;
+        steps.push({ name: "모델 다운로드", ok: true, detail: `이미 있습니다: ${dest}` });
+        log(`모델 이미 있음: ${dest}`);
+      } else if ((equivalent = await findEquivalentModel(target.dir, model.candidate, opts))) {
+        // The Hub's filename and the filename on disk routinely disagree, so an
+        // existing correct model is reused instead of re-downloading 20 GB of
+        // the same weights.
+        modelPath = equivalent;
+        steps.push({
+          name: "모델 다운로드",
+          ok: true,
+          detail: `동일한 모델이 다른 이름으로 이미 있습니다: ${equivalent}`,
+        });
+        log(`이미 있는 동일 모델을 사용합니다: ${equivalent}`);
+      } else if (opts.offline) {
+        steps.push({ name: "모델 다운로드", ok: false, detail: "오프라인이라 건너뜁니다." });
+      } else {
+        await step("모델 다운로드", async () => {
+          await mkdir(dirname(dest), { recursive: true });
+          const result = await downloadFile(model!.candidate.url, dest, {
+            connections: 8,
+            label: model!.candidate.filename,
+            fetchImpl: opts.fetchImpl,
+            onProgress: renderProgressLine(log),
+          });
+          return `${result.bytes} 바이트 다운로드 완료 (${result.parallel ? "병렬 range" : "단일 스트림"})`;
+        });
+        modelPath = dest;
+      }
+    }
+  }
 
   const plan = await planPorts({
     probe: opts.probe ?? tcpPortProbe,
     llamaPort: typeof existing?.llama?.port === "number" ? existing.llama.port : undefined,
+    // The ports discovery already looked at. Passing them keeps the walk-forward
+    // from landing on a port where a server was seen doing something — which is
+    // how a second llama-server ends up sharing a GPU with the first.
+    avoid: COMMON_PORTS,
   });
   steps.push({
     name: "포트 결정",
@@ -279,9 +372,8 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   });
   for (const n of plan.notes) log(n);
 
-  // ── 6. Tuning + config ────────────────────────────────────────────────────
-  let tuning = tuneForHardware(hardware);
-
+  // ── 5. Tuning + config ────────────────────────────────────────────────────
+  const tuning = tuneForHardware(hardware, { modelBytes: model?.candidate.sizeBytes });
   for (const r of tuning.rationale) log(r);
 
   const config = buildConfig({ existing, llama, modelPath, plan, tuning });
@@ -319,6 +411,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     steps,
     hardware,
     llama: llama ?? undefined,
+    model,
     modelPath: modelPath || undefined,
     tuning,
     ports: { llamaPort: plan.llamaPort },
@@ -326,6 +419,11 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     errors,
   };
 }
+
+/** Top-level config blocks whose feature was removed from llamacli. Kept as
+ *  data so the removal is a single list a re-introduction has to delete from,
+ *  rather than a `delete` scattered through the merge path. */
+export const REMOVED_CONFIG_BLOCKS = ["laya"] as const;
 
 /** Turns the report into a config object.
  *
@@ -342,6 +440,18 @@ export function buildConfig(opts: {
 }): Record<string, unknown> {
   const base = opts.existing ?? {};
   const next: Record<string, any> = { ...base };
+
+  // Config blocks belonging to features that no longer exist are DROPPED, not
+  // merged forward. `laya` configured the deleted System-1 gate; carrying the
+  // block forward would keep advertising a setting that nothing reads, and a
+  // reader debugging a config would reasonably conclude it still did something.
+  //
+  // This is explicit rather than a general "strip unknown keys" rule: an
+  // unknown key is far more likely to be a setting a NEWER llamacli wrote than
+  // garbage, and deleting it on every launch would be its own data loss.
+  for (const removed of REMOVED_CONFIG_BLOCKS) {
+    if (removed in next) delete next[removed];
+  }
 
   if (opts.llama) {
     // backend flips to local-llama ONLY when we have both a binary and a model.
@@ -377,12 +487,17 @@ async function readConfig(projectRoot: string): Promise<Record<string, any> | un
   }
 }
 
-/** The config keys a HUMAN owns, and which `/reset` must therefore not discard.
+/** The config keys a HUMAN owns, as opposed to the ones the machine derives.
  *
- *  Everything else (`llama.*`, `model`, `laya.port`, `backend`, `baseUrl`) is
- *  machine-derived — it is exactly what `/reset` exists to recompute. Throwing
- *  it away is the feature; throwing away an apiKey the user typed would be a
- *  data-loss bug wearing the feature's clothes. */
+ *  `llama.*`, `model`, `backend` and `baseUrl` are all machine-derived: they
+ *  describe what this box is currently running. Everything named here is a
+ *  human decision — a key they typed, a verification command they wrote — and
+ *  the bootstrap must never be the thing that discards it.
+ *
+ *  This used to exist to serve `/reset`, which is gone. It is kept because
+ *  `buildConfig` merges rather than replaces, and this is the list of what
+ *  "merges" is protecting; the persona harness asserts the separation is real
+ *  by checking a removed feature's block does not survive a merge. */
 export function keepUserOwnedKeys(config: Record<string, any> | undefined): Record<string, any> | undefined {
   if (!config) return config;
   const kept: Record<string, any> = {};
@@ -424,12 +539,90 @@ async function fileSize(path: string): Promise<number> {
   }
 }
 
+/** The quant token in a GGUF filename, e.g. "Q4_K_M" out of
+ *  "Ornith-1.5-35B-A3B-Q4_K_M.gguf". */
+export function quantOf(filename: string): string {
+  return /Q\d(_[A-Z0-9]+)+/i.exec(filename)?.[0]?.toUpperCase() ?? "";
+}
 
+/**
+ * Looks for a file in `dir` that is the SAME MODEL under a different name.
+ *
+ * Matching is on the quant plus the exact byte size, never on the filename: the
+ * two disagree constantly (Hub says `Ornith-1.5-35B-Q4_K_M.gguf`, the copy on
+ * disk is `Ornith-1.5-35B-A3B-Q4_K_M.gguf`), and a name-based guess would be a
+ * guess. An exact size match on the same quant IS the same file as far as
+ * loading is concerned, and it is the only thing that stops a fresh install
+ * re-downloading 20 GB the machine already has.
+ */
+export async function findEquivalentModel(
+  dir: string,
+  candidate: { filename: string; sizeBytes: number },
+  opts: { listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]> } = {}
+): Promise<string | null> {
+  if (!candidate.sizeBytes) return null;
+  const wantQuant = quantOf(candidate.filename);
+  if (!wantQuant) return null;
+  const list = opts.listExistingModels ?? listGgufsIn;
+  let files: { path: string; sizeBytes: number }[];
+  try {
+    files = await list(dir);
+  } catch {
+    return null;
+  }
+  for (const f of files) {
+    const base = f.path.split("/").pop() ?? f.path;
+    if (base === candidate.filename) continue;
+    if (f.sizeBytes !== candidate.sizeBytes) continue;
+    if (quantOf(base) !== wantQuant) continue;
+    return f.path;
+  }
+  return null;
+}
 
+async function listGgufsIn(dir: string): Promise<{ path: string; sizeBytes: number }[]> {
+  const { readdir, stat } = await import("node:fs/promises");
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const out: { path: string; sizeBytes: number }[] = [];
+  for (const name of entries) {
+    if (!name.toLowerCase().endsWith(".gguf")) continue;
+    const path = join(dir, name);
+    try {
+      out.push({ path, sizeBytes: (await stat(path)).size });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
 
-
-
-
-
-
-
+/** A progress reporter for a long download.
+ *
+ *  Rewrites ONE terminal line rather than appending, because a 22 GB download
+ *  at 4 updates/second would otherwise bury everything above it in thousands of
+ *  lines. Falls back to periodic lines when the output is not a TTY, so a
+ *  redirected log gets a readable record instead of one overwritten line. */
+export function renderProgressLine(log: (line: string) => void): (p: TransferProgress) => void {
+  const interactive = Boolean(process.stdout.isTTY);
+  // Last logged decile. `floor(percent) % 10 === 0` is true for EVERY update
+  // while the download is still under 10% done, so a real 20 GB fetch emitted a
+  // line about four times a second for its first several minutes and buried
+  // everything above it.
+  let lastDecile = -1;
+  return (p) => {
+    if (interactive) {
+      process.stdout.write(`\r[2K${formatProgress(p)}`);
+      return;
+    }
+    const decile = p.percent < 0 ? -1 : Math.floor(p.percent / 10);
+    if (decile > lastDecile || p.percent >= 100) {
+      lastDecile = decile;
+      log(formatProgress(p));
+    }
+  };
+}

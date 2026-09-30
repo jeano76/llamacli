@@ -6,6 +6,7 @@ import { loadConfig } from "./config.js";
 import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt, injectSkillIndexIntoSystemPrompt } from "./skills/loader.js";
 import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { LlamaServerManager } from "./backend/llamaServer.js";
+import { LLAMA_PORT } from "./setup/ports.js";
 import { OpenAICompatibleClient } from "./backend/openaiClient.js";
 import { AgentLoop, summarizeErrorForDisplay } from "./agent/loop.js";
 import { configureBrowserTools, configureSkills } from "./tools/index.js";
@@ -136,37 +137,6 @@ function exitAltScreen(): void {
  * while the app is idle is a single null check. The placement is read at write
  * time (not captured) so it always reflects the most recent prompt render.
  */
-/** A blocking y/N question, reusing the same in-log + input-box pattern the
- *  startup resume question uses.
- *
- *  Returns false on anything that isn't an explicit yes, so a stray keystroke,
- *  a closed stdin or a timeout all take the safe branch — a destructive
- *  command must never proceed on ambiguity. */
-function askYesNo(ui: any, question: string): Promise<boolean> {
-  ui?.pushStatus(`${question}\nY(예) / N(아니오) 를 입력해주세요.`, "status");
-  return new Promise<boolean>((resolve) => {
-    const onData = (chunk: Buffer) => {
-      const text = chunk.toString("utf8").trim().toLowerCase();
-      // Escape sequences (a mouse report, an arrow key) can arrive in the same
-      // chunk; only a chunk that is EXACTLY y/n counts as an answer, so a
-      // report can never be read as consent.
-      if (text === "y" || text === "\r" || text === "\n") {
-        process.stdin.off("data", onData);
-        process.stdin.setRawMode?.(false);
-        process.stdin.pause();
-        resolve(true);
-      } else if (text === "n" || text === "\x03") {
-        process.stdin.off("data", onData);
-        process.stdin.setRawMode?.(false);
-        process.stdin.pause();
-        resolve(false);
-      }
-    };
-    process.stdin.on("data", onData);
-  });
-}
-
-
 function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T): T {
   const original = stdout.write.bind(stdout);
   let reasserting = false;
@@ -362,9 +332,20 @@ async function main() {
   }
   enterAltScreen();
   let cleanedUp = false;
+  /** Teardown callbacks, run by `cleanup`. Anything holding an OS resource
+   *  (a spawned llama-server, above all) registers here so it is released on
+   *  every exit path, not only the graceful one. */
+  const cleanupRegistry: Array<() => void> = [];
   const cleanup = () => {
     if (cleanedUp) return;
     cleanedUp = true;
+    for (const fn of cleanupRegistry) {
+      try {
+        fn();
+      } catch {
+        // Teardown must not be able to mask the exit it is part of.
+      }
+    }
     exitAltScreen();
   };
   process.on("exit", cleanup);
@@ -423,11 +404,28 @@ async function main() {
       contextSize: config.llama.contextSize,
       threads: config.llama.threads,
       gpuLayers: config.llama.gpuLayers,
+      // The rest of the tuning, which the bootstrap derives and records. These
+      // were previously computed, written to config.yaml, shown back to the
+      // user — and never handed to the process, so `--n-cpu-moe` in particular
+      // was a value that existed only in a file. A spawned server on a small
+      // card therefore OOM'd on the model it was about to be told to page.
+      threadsBatch: config.llama.threadsBatch,
+      batchSize: config.llama.batchSize,
+      ubatchSize: config.llama.ubatchSize,
+      cpuMoeLayers: config.llama.cpuMoeLayers,
+      flashAttn: config.llama.flashAttn,
+      cacheTypeK: config.llama.cacheTypeK,
+      cacheTypeV: config.llama.cacheTypeV,
+      parallel: config.llama.parallel,
     });
     await manager.start();
+    // Explicit, in addition to the manager's own exit hook: SIGINT is handled
+    // above for the alt screen, and a server left running holds the model in
+    // VRAM for the rest of the machine's uptime.
+    cleanupRegistry.push(() => manager.stop());
     backend = manager.client();
   } else {
-    backend = new OpenAICompatibleClient(config.baseUrl ?? "http://127.0.0.1:8081", config.apiKey);
+    backend = new OpenAICompatibleClient(config.baseUrl ?? `http://127.0.0.1:${LLAMA_PORT}`, config.apiKey);
   }
 
   // Prefer the backend's own reported context size over the static config

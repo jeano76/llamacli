@@ -8,10 +8,11 @@ export interface SlashMenuItem {
   description: string;
 }
 
-// `/reset` and `/fastcheck` were removed from this list along with their
-// implementations — there is no model re-derivation left to trigger and no gate
-// left to toggle. They are not hidden behind a flag: the code that answered them
-// is deleted, so a stale config key or a keybinding document cannot revive them.
+// `/fastcheck` and `/reset` are both absent from this list, and both are absent
+// from the dispatcher behind it — they were removed outright, not hidden behind
+// a flag. `/fastcheck` drove the deleted laya gate; `/reset` drove a destructive
+// re-derivation of the model, the llama flags and the ports. Neither has any
+// code path left, so a stale config key or keybinding doc cannot revive them.
 export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   { key: "help", label: "/help", description: "도움말 + 키보드 단축키 전체" },
   { key: "keys", label: "/keys", description: "키보드 단축키만 보기" },

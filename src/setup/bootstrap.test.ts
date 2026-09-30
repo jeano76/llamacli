@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { planPorts, COMMON_PORTS, LLAMA_PORT, type PortState } from "./ports.js";
-import { findLlamaServer, installBuildPackages } from "./llamaCpp.js";
+import { findLlamaServer, installBuildPackages, candidatePaths } from "./llamaCpp.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
 
@@ -60,38 +60,151 @@ const only = (...paths: string[]) => {
 };
 
 test("an explicit LLAMACLI_LLAMA_SERVER wins over everything else", async () => {
-  const found = await findLlamaServer({
+  const { location } = await findLlamaServer({
     env: { LLAMACLI_LLAMA_SERVER: "/opt/mine/llama-server", PATH: "/usr/bin" },
     exists: only("/opt/mine/llama-server", "/usr/bin/llama-server"),
+    probe: async () => true,
   });
-  assert.equal(found?.binPath, "/opt/mine/llama-server");
-  assert.equal(found?.source, "env");
+  assert.equal(location?.binPath, "/opt/mine/llama-server");
+  assert.equal(location?.source, "env");
+});
+
+test("the documented LLAMA_SERVER_BIN name is honoured too", async () => {
+  // The header of llamaCpp.ts documented this variable while the code only
+  // read LLAMACLI_LLAMA_SERVER, so a user who followed the documentation set
+  // an environment variable nothing looked at and was told llama.cpp was not
+  // installed. The doc/code mismatch was the bug.
+  const { location } = await findLlamaServer({
+    env: { LLAMA_SERVER_BIN: "/opt/mine/llama-server", PATH: "" },
+    exists: only("/opt/mine/llama-server"),
+    probe: async () => true,
+  });
+  assert.equal(location?.binPath, "/opt/mine/llama-server");
+  assert.equal(location?.source, "env");
 });
 
 test("PATH is searched before any build tree, so an installed build wins", async () => {
-  const found = await findLlamaServer({
+  const { location } = await findLlamaServer({
     env: { PATH: "/usr/bin:/bin" },
     exists: only("/usr/bin/llama-server", "/home/u/llama.cpp/build/bin/llama-server"),
     home: "/home/u",
+    listDirs: async () => ["build"],
+    probe: async () => true,
   });
-  assert.equal(found?.source, "path");
+  assert.equal(location?.source, "path");
 });
 
 test("a CUDA-flavoured build directory is preferred over a plain build beside it", async () => {
   // Finding a CPU-only build first and silently using it is the expensive
   // mistake: a 35B MoE on CPU instead of the GPU.
-  const found = await findLlamaServer({
+  const { location } = await findLlamaServer({
     env: { PATH: "" },
     exists: only("/home/u/llama.cpp/build/bin/llama-server", "/home/u/llama.cpp/build-opt/bin/llama-server"),
     home: "/home/u",
+    listDirs: async () => ["build", "build-opt"],
+    probe: async () => true,
   });
-  assert.equal(found?.binPath, "/home/u/llama.cpp/build-opt/bin/llama-server");
-  assert.equal(found?.source, "existing-build");
-  assert.equal(found?.backend, "cuda");
+  assert.equal(location?.binPath, "/home/u/llama.cpp/build-opt/bin/llama-server");
+  assert.equal(location?.source, "existing-build");
+  assert.equal(location?.backend, "cuda");
 });
 
 test("nothing found means build, not a crash", async () => {
-  assert.equal(await findLlamaServer({ env: { PATH: "" }, exists: noExists, home: "/home/u" }), null);
+  const { location, rejected } = await findLlamaServer({
+    env: { PATH: "" },
+    exists: noExists,
+    listDirs: async () => [],
+    home: "/home/u",
+  });
+  assert.equal(location, null);
+  assert.deepEqual(rejected, []);
+});
+
+test("build-cpu — the directory THIS module's builder creates — is found again", async () => {
+  // The builder writes to `build-cpu` on a machine with no CUDA, and the
+  // preference list did not contain that name. So a CPU-only machine that let
+  // llamacli build its own server could not find it on the next launch, and
+  // rebuilt it: 10 to 40 minutes of compilation, every single start.
+  const { location } = await findLlamaServer({
+    env: { PATH: "" },
+    exists: only("/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server"),
+    home: "/home/u",
+    listDirs: async (dir) => (dir.endsWith(".llamacli/llama.cpp") ? ["build-cpu"] : []),
+    probe: async () => true,
+  });
+  assert.equal(location?.binPath, "/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server");
+  assert.equal(location?.source, "llamacli-build");
+});
+
+test("a build directory nobody anticipated is still found", async () => {
+  // People name build dirs after the CUDA version, the arch, or the date. A
+  // hardcoded list made all of them invisible, which turned "you already have
+  // a build" into a 10-40 minute rebuild.
+  const { location } = await findLlamaServer({
+    env: { PATH: "" },
+    exists: only("/home/u/llama.cpp/build-cuda-12.4-rocm/bin/llama-server"),
+    home: "/home/u",
+    listDirs: async () => ["build-cuda-12.4-rocm", "build"],
+    probe: async () => true,
+  });
+  assert.equal(location?.binPath, "/home/u/llama.cpp/build-cuda-12.4-rocm/bin/llama-server");
+});
+
+test("a `make`-built llama.cpp at the repo root is found", async () => {
+  // `make` puts the binaries at the checkout root, which is what a first-time
+  // user following llama.cpp's own README ends up with. Nothing looked there.
+  const { location } = await findLlamaServer({
+    env: { PATH: "" },
+    exists: only("/home/u/llama.cpp/llama-server"),
+    home: "/home/u",
+    listDirs: async () => [],
+    probe: async () => true,
+  });
+  assert.equal(location?.binPath, "/home/u/llama.cpp/llama-server");
+});
+
+test("a binary that exists but cannot run is skipped in favour of one that can", async () => {
+  // Existence is not usability. A build against an unavailable CUDA version, or
+  // one missing its libggml-cuda.so, is present and executable and still fails
+  // to start — and accepting it meant the failure surfaced later as an opaque
+  // spawn error instead of here, where the next candidate could be tried.
+  //
+  // The BROKEN one is the preferred directory on purpose: the search reaches it
+  // first, has to reject it, and only then fall through.
+  const { location, rejected } = await findLlamaServer({
+    env: { PATH: "" },
+    exists: only("/home/u/llama.cpp/build/bin/llama-server", "/home/u/llama.cpp/build-opt/bin/llama-server"),
+    home: "/home/u",
+    listDirs: async () => ["build", "build-opt"],
+    probe: async (p) => !p.includes("build-opt"),
+  });
+  assert.equal(location?.binPath, "/home/u/llama.cpp/build/bin/llama-server");
+  assert.deepEqual(rejected, ["/home/u/llama.cpp/build-opt/bin/llama-server"]);
+});
+
+test("when every candidate is broken, the reason is reported instead of 'not installed'", async () => {
+  const { location, rejected } = await findLlamaServer({
+    env: { PATH: "" },
+    exists: only("/home/u/llama.cpp/build/bin/llama-server"),
+    home: "/home/u",
+    listDirs: async () => ["build"],
+    probe: async () => false,
+  });
+  assert.equal(location, null);
+  assert.deepEqual(rejected, ["/home/u/llama.cpp/build/bin/llama-server"]);
+});
+
+test("the three real build layouts are all covered", () => {
+  const root = "/llama.cpp";
+  const paths = candidatePaths(root, ["build"]);
+  // cmake, the usual case
+  assert.ok(paths.includes(`${root}/build/bin/llama-server`));
+  // MSVC multi-config generators put the configuration last
+  assert.ok(paths.includes(`${root}/build/bin/Release/llama-server`));
+  // plain `make`, binaries at the checkout root
+  assert.ok(paths.includes(`${root}/llama-server`));
+  // and nothing invents paths that exist nowhere
+  assert.equal(paths.some((p) => p.includes("/bin/bin/")), false);
 });
 
 test("build dependencies try passwordless sudo first so the common case never prompts", async () => {

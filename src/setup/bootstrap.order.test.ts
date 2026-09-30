@@ -82,5 +82,3 @@ test("a second launch with everything in place does no network work at all", () 
     assert.equal(second, first, "byte-identical: a set-up machine does no work on launch");
   }));
 
-// ── /reset must not transfer inside a live session ─────────────────────────
-

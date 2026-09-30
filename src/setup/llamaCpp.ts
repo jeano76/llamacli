@@ -30,7 +30,7 @@
 
 import { access, constants } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Hardware } from "./hardware.js";
@@ -55,20 +55,52 @@ async function isExecutable(path: string): Promise<boolean> {
   }
 }
 
+/** The binary name for this platform. llama.cpp ships `llama-server.exe` on
+ *  Windows and nothing anywhere else. */
+const BIN_NAME = process.platform === "win32" ? "llama-server.exe" : "llama-server";
+
 export interface LlamaLocation {
   binPath: string;
   /** Where it was found, for an honest status line ("PATH", "기존 빌드", …). */
-  source: "env" | "path" | "existing-build" | "llamacli-build" | "built";
+  source: "env" | "path" | "existing-build" | "llamacli-build" | "systemd" | "built";
   /** Best guess at the accelerator it was compiled for, from the directory
    *  name / build flags. Verified separately by probeLlamaServer. */
   backend: "cuda" | "vulkan" | "cpu" | "unknown";
 }
 
-/** Build-directory names llama.cpp users actually end up with, in the order we
- *  prefer them. `build-opt` is the naming convention in wide use for an
- *  optimised CUDA build; a plain `build` is the cmake default and is whatever
- *  the last person configured. */
-const BUILD_DIR_PREFERENCE = ["build-opt", "build-cuda", "build", "build-release", "bin", "Release"];
+/**
+ * Build-directory names, best-first. This is a PREFERENCE ORDER, not an
+ * allowlist: `scanBuildDirs` below also tries every other directory it finds,
+ * so a build in a name nobody anticipated is still found. It only decides
+ * which of several real candidates wins.
+ *
+ * `build-opt` is the naming convention in wide use for an optimised CUDA
+ * build, `build-cuda` is explicit, and a plain `build` is the cmake default.
+ * `build-cpu` is what THIS module's own builder produces, so it has to be in
+ * here: without it, a CPU-only machine that let llamacli build its own server
+ * would fail to find that server on the next launch and rebuild it — 10 to 40
+ * minutes — on every single start.
+ *
+ * `bin` and `Release` are NOT build directories; they are the second path
+ * component of the two real layouts (`<root>/bin/llama-server` from a plain
+ * `make`, and `build/bin/Release/…` on MSVC). They are enumerated by
+ * `candidatePaths` instead, and listing them here produced paths like
+ * `~/llama.cpp/bin/bin/llama-server` that exist nowhere.
+ */
+const BUILD_DIR_PREFERENCE = ["build-opt", "build-cuda", "build-cpu", "build", "build-release"];
+
+/** Score for a build directory name; lower is better, and `undefined` means
+ *  "not a recognised build dir at all" (still searched, just last). */
+function buildDirRank(name: string): number | undefined {
+  const i = BUILD_DIR_PREFERENCE.indexOf(name);
+  if (i >= 0) return i;
+  // A `build*` directory with an unrecognised suffix is still a build dir —
+  // people name them after the CUDA version, the arch, the date. Ranking it
+  // after the known names but before non-build directories is what makes a
+  // `build-cuda-12.4` or `build-vulkan-rocm` discoverable.
+  if (/^build/i.test(name)) return BUILD_DIR_PREFERENCE.length;
+  return undefined;
+}
 
 function backendFromPath(p: string): LlamaLocation["backend"] {
   const s = p.toLowerCase();
@@ -78,61 +110,252 @@ function backendFromPath(p: string): LlamaLocation["backend"] {
   return "unknown";
 }
 
+/** Every place a `llama-server` binary lives inside one llama.cpp checkout.
+ *
+ *  Exported and pure so the layout coverage is testable without a checkout.
+ *  Three real layouts, none of which is a special case of the others:
+ *
+ *    1. `<root>/<buildDir>/bin/llama-server`   — cmake, the usual case
+ *    2. `<root>/bin/llama-server`              — plain `make`, which puts the
+ *                                                binaries at the repo root and
+ *                                                is what a first-time llama.cpp
+ *                                                user following the README
+ *                                                ends up with
+ *    3. `<root>/<buildDir>/bin/Release/…`      — MSVC multi-config generators
+ *                                                (Visual Studio), where the
+ *                                                configuration is a third path
+ *                                                component
+ *
+ *  Layout 2 in particular was unreachable before: nothing looked at the repo
+ *  root, so a `make`-built llama.cpp was invisible to llamacli no matter where
+ *  it lived. */
+export function candidatePaths(root: string, buildDirs: string[]): string[] {
+  // Sorted HERE rather than relying on the caller: the ranking is what decides
+  // which of several real builds wins, and a caller that supplies an unsorted
+  // list must not be able to make a CPU build beat a CUDA one.
+  const ranked = [...buildDirs].sort((a, b) => {
+    const ra = buildDirRank(a);
+    const rb = buildDirRank(b);
+    if (ra !== undefined && rb !== undefined) return ra - rb;
+    if (ra !== undefined) return -1;
+    if (rb !== undefined) return 1;
+    return a.localeCompare(b);
+  });
+  const out: string[] = [];
+  for (const dir of ranked) {
+    out.push(join(root, dir, "bin", BIN_NAME));
+    out.push(join(root, dir, "bin", "Release", BIN_NAME));
+  }
+  out.push(join(root, "bin", BIN_NAME));
+  out.push(join(root, BIN_NAME));
+  return out;
+}
+
+/** Directory names inside a llama.cpp checkout, best candidate first.
+ *
+ *  Injected in tests; `readdir` for real. A missing or unreadable directory
+ *  yields an empty list, which is the same as "no build here" — the caller
+ *  then moves to the next root. */
+async function listBuildDirs(root: string): Promise<string[]> {
+  try {
+    const { readdir } = await import("node:fs/promises");
+    const entries = await readdir(root, { withFileTypes: true });
+    // Unsorted: `candidatePaths` does the ranking, so the preference lives in
+    // exactly one place.
+    return entries.filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Locates a usable `llama-server` without building anything.
  *
  * Returns null when nothing usable is found, which is the caller's signal to
- * build. Exported with injectable `probe`/`env` so the search order itself is
- * testable — the order is the entire point of this function, and it is exactly
- * the kind of thing that silently rots when it can only be exercised by having
- * a real build on the machine.
+ * build. Exported with injectable `exists`/`env`/`listDirs` so the search order
+ * itself is testable — the order is the entire point of this function, and it
+ * is exactly the kind of thing that silently rots when it can only be exercised
+ * by having a real build on the machine.
+ *
+ * Every candidate is EXECUTED before it is accepted (`probeLlamaServer`).
+ * Existence is not usability: a binary built against a CUDA version this
+ * driver does not have, or one whose `libggml-cuda.so` was never installed, is
+ * present and executable and still fails to start — and accepting it means the
+ * failure surfaces much later as an opaque spawn error instead of here, where
+ * the next candidate could have been tried.
  */
 export async function findLlamaServer(opts: {
   env?: NodeJS.ProcessEnv;
   exists?: (path: string) => Promise<boolean>;
+  listDirs?: (dir: string) => Promise<string[]>;
+  probe?: (binPath: string) => Promise<boolean>;
   home?: string;
-} = {}): Promise<LlamaLocation | null> {
+  run?: Run;
+} = {}): Promise<FindResult> {
   const env = opts.env ?? process.env;
   const exists = opts.exists ?? isExecutable;
+  const listDirs = opts.listDirs ?? listBuildDirs;
   const home = opts.home ?? homedir();
+  const probe = opts.probe ?? (async (p: string) => (await probeLlamaServer(p, opts.run ?? defaultRun)).ok);
 
-  // 1. Explicit override. Cheapest and unambiguous, so it wins outright.
-  if (env.LLAMACLI_LLAMA_SERVER && (await exists(env.LLAMACLI_LLAMA_SERVER))) {
-    return { binPath: env.LLAMACLI_LLAMA_SERVER, source: "env", backend: "unknown" };
-  }
+  // Collected rather than returned on sight, so a candidate that exists but
+  // cannot run is skipped in favour of the next one.
+  const rejected: string[] = [];
+  const accept = async (
+    binPath: string,
+    source: LlamaLocation["source"]
+  ): Promise<LlamaLocation | null> => {
+    if (await probe(binPath)) {
+      return { binPath, source, backend: backendFromPath(binPath) };
+    }
+    rejected.push(binPath);
+    return null;
+  };
 
-  // 2. PATH. Note we check the name directly rather than running `command -v`,
-  //    so the same injectable `exists` seam covers every candidate below and
-  //    the whole search is testable.
-  const pathEntries = (env.PATH ?? "").split(":").filter(Boolean);
-  for (const dir of pathEntries) {
-    const candidate = join(dir, "llama-server");
-    if (await exists(candidate)) {
-      return { binPath: candidate, source: "path", backend: "unknown" };
+  // 1. Explicit overrides. Cheapest and unambiguous, so they win outright.
+  //    Both names are accepted: the header comment of this file documented
+  //    LLAMA_SERVER_BIN while the code only ever read LLAMACLI_LLAMA_SERVER, so
+  //    a user who followed the documentation set a variable nothing looked at
+  //    and were told llama.cpp could not be found.
+  for (const key of ["LLAMACLI_LLAMA_SERVER", "LLAMA_SERVER_BIN"]) {
+    const value = env[key];
+    if (value && (await exists(value))) {
+      const hit = await accept(value, "env");
+      if (hit) return { location: hit, rejected };
     }
   }
 
-  // 3./4. Conventional build trees. Order within each tree is the preference
-  //      list, and CUDA-ish names win over `build` because a CPU-only build
-  //      found first would be silently preferred over a GPU one beside it.
-  const roots = [join(home, "llama.cpp"), LLAMA_CPP_HOME];
+  // 2. PATH. Split on the platform's own separator — a hardcoded ":" made every
+  //    entry on Windows a single nonsensical path, so PATH search could never
+  //    succeed there. Checked by name rather than by running `command -v`, so
+  //    the same injectable `exists` seam covers every candidate.
+  const pathEntries = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  for (const dir of pathEntries) {
+    const candidate = join(dir, BIN_NAME);
+    if (await exists(candidate)) {
+      const hit = await accept(candidate, "path");
+      if (hit) return { location: hit, rejected };
+    }
+  }
+
+  // 3. llama.cpp checkouts. Every directory inside the checkout is a candidate
+  //    (see `listBuildDirs`), ranked so a recognised name wins, and each is
+  //    tried in all three real layouts. Previously only two hardcoded roots
+  //    were searched with a hardcoded list of directory names, so a
+  //    `make`-built checkout, a build named after its CUDA version, and a
+  //    second checkout anywhere else in the home directory were all invisible —
+  //    and on a machine where none matched, the answer was "build it", which
+  //    is 10 to 40 minutes of CUDA compilation to arrive at a binary the user
+  //    already had.
+  const roots = [
+    { dir: join(home, "llama.cpp"), source: "existing-build" as const },
+    // Derived from the injected `home`, not from the module-level constant:
+    // a search that honours an injected home for one root and the real one for
+    // the other cannot be tested, and on a machine where HOME differs from
+    // what `homedir()` reports it would look in two different places.
+    { dir: join(home, ".llamacli", "llama.cpp"), source: "llamacli-build" as const },
+  ];
   for (const root of roots) {
-    for (const dir of BUILD_DIR_PREFERENCE) {
-      const candidate = join(root, dir, "bin", "llama-server");
+    const buildDirs = await listDirs(root.dir);
+    for (const candidate of candidatePaths(root.dir, buildDirs)) {
       if (await exists(candidate)) {
-        return {
-          binPath: candidate,
-          source: root === LLAMA_CPP_HOME ? "llamacli-build" : "existing-build",
-          backend: backendFromPath(candidate),
-        };
+        const hit = await accept(candidate, root.source);
+        if (hit) return { location: hit, rejected };
       }
     }
   }
-  return null;
+
+  // 4. A systemd user unit. On a machine where llama-server is managed as a
+  //    service — a common way to run it on a workstation — the binary path is
+  //    declared in the unit file or the script it ExecStart's, and is
+  //    otherwise nowhere discoverable. This is what made a service-managed
+  //    install look like "llama.cpp is not installed" to llamacli.
+  for (const binPath of await systemdLlamaServerPaths(env, { exists, run: opts.run ?? defaultRun })) {
+    const hit = await accept(binPath, "systemd");
+    if (hit) return { location: hit, rejected };
+  }
+
+  return { location: null, rejected };
 }
 
-/** Asks a candidate binary what it actually is. Used to confirm the "cuda"
- *  guess from a directory name, which is only a guess. */
+/** A machine where a binary EXISTS but cannot run is otherwise reported as
+ *  "llama.cpp not found", which sends the user looking for an install that is
+ *  sitting right there. Returned alongside the result so the reason survives. */
+export interface FindResult {
+  location: LlamaLocation | null;
+  /** Paths that exist but failed `probeLlamaServer`. */
+  rejected: string[];
+}
+
+/** Parses a llama-server binary path out of a systemd user unit.
+ *
+ *  Two shapes are handled, because that is what exists in the wild:
+ *    - `ExecStart=/home/u/bin/run-server.sh`  → the path is inside the SCRIPT
+ *    - `ExecStart=/home/u/llama.cpp/build/bin/llama-server -m …`  → it is the
+ *      ExecStart itself
+ *
+ *  Reading the script matters as much as reading the unit: the unit almost
+ *  never names the binary, it names a wrapper that does.
+ */
+export async function systemdLlamaServerPaths(
+  env: NodeJS.ProcessEnv,
+  deps: { exists: (path: string) => Promise<boolean>; run: Run }
+): Promise<string[]> {
+  const unitDir = join(env.HOME ?? homedir(), ".config", "systemd", "user");
+  const out: string[] = [];
+  let text: string;
+  try {
+    const { readFile, readdir } = await import("node:fs/promises");
+    const units = (await readdir(unitDir)).filter((f) => /^llama.*\.service$/.test(f));
+    for (const unit of units) {
+      text = await readFile(join(unitDir, unit), "utf8");
+      for (const line of text.split("\n")) {
+        const m = /^\s*ExecStart\s*=\s*(\S+)/.exec(line);
+        if (!m) continue;
+        // systemd specifiers are the norm in a user unit: `%h` is the home
+        // directory, and it is what this very repo's unit uses
+        // (`ExecStart=%h/bin/run-server.sh`). Passed through unexpanded, the
+        // path does not exist and the unit looks like it names no binary at
+        // all.
+        const target = m[1]
+          .replace(/^"|"$/g, "")
+          .replace(/%h/g, env.HOME ?? homedir())
+          .replace(/%t/g, "/tmp");
+        // A wrapper script: look for the binary it launches.
+        if (/\.(sh|bash)$/.test(target) || !target.includes(BIN_NAME)) {
+          let body: string;
+          try {
+            body = await readFile(target, "utf8");
+          } catch {
+            continue; // the wrapper is named but absent — try the next unit
+          }
+          for (const assign of body.matchAll(/^\s*([A-Z_]*BIN[A-Z_]*)=["']?([^"'\s]+)["']?/gm)) {
+            const binPath = assign[2];
+            if (binPath.includes(BIN_NAME) && (await deps.exists(binPath))) out.push(binPath);
+          }
+          continue;
+        }
+        if (await deps.exists(target)) out.push(target);
+      }
+    }
+  } catch {
+    return out; // no systemd user dir, or unreadable — not an error
+  }
+  return out;
+}
+
+/** Asks a candidate binary what it actually is.
+ *
+ *  This used to exist and be called by nobody: the search accepted any file
+ *  that was executable, so a binary built against a CUDA version this driver
+ *  does not have — or one whose `libggml-cuda.so` was never installed — was
+ *  recorded in config.yaml and only failed much later, at spawn, with an
+ *  opaque error naming nothing useful. `findLlamaServer` now calls it on every
+ *  candidate, which is also what makes "exists but will not run" a state the
+ *  search can report instead of pass through.
+ *
+ *  `backendFromPath`'s guess is confirmed here too, when the binary says so.
+ */
 export async function probeLlamaServer(binPath: string, run: Run = defaultRun): Promise<{
   ok: boolean;
   version?: string;

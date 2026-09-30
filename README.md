@@ -383,24 +383,83 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 > 프로젝트에서 다른 `.llamacli/skills/*.md` 파일과 똑같은 방식으로 덮어쓰거나
 > 추가할 수 있다.
 
+## First run: finding llama.cpp, picking a port, and starting the server
+
+The bootstrap answers three questions in this order, and the order is the design.
+
+**1. Is a llama-server already running?** Checked before anything touches the
+network. A server that is found is **adopted** — llamacli connects to it and
+starts nothing. On a machine that already has a healthy server this is the whole
+bootstrap, and it is why a first launch costs a few `stat()` calls rather than a
+20 GB download.
+
+A port that is **listening but not yet answering** is treated as a server that
+is still loading its model, not as an absent one. llama-server binds its port
+before the weights are resident and serves nothing until they are, and loading a
+21 GB model takes minutes; a single fast probe cannot tell those two states
+apart. Getting that wrong is not a slowdown — it is llamacli planning a
+different port and spawning a **second** llama-server beside a healthy one, on a
+card that has no room for it.
+
+**2. Can we find a `llama-server` binary?** Cheapest and most likely first, and a
+build is only attempted after every candidate has failed:
+
+| Order | Source |
+|---|---|
+| 1 | `$LLAMACLI_LLAMA_SERVER` or `$LLAMA_SERVER_BIN` |
+| 2 | `llama-server` on `PATH` |
+| 3 | any `*/bin/llama-server` in a `llama.cpp` checkout — every build directory is enumerated, not a fixed name list |
+| 4 | `<root>/llama-server` — what a plain `make` produces |
+| 5 | a systemd user unit's `ExecStart`, and the `BIN=` it points a wrapper script at |
+| 6 | only then: clone and build |
+
+Every candidate is **executed** (`--version`) before it is accepted. Existence is
+not usability: a build against a CUDA version this driver does not have is
+present and executable and still fails to start, and accepting it turns a
+recoverable "try the next one" into an opaque spawn error much later. A binary
+that exists but will not run is reported as such rather than as "not installed".
+
+**3. Which port?** Only reached when discovery found nothing adoptable. An
+occupied port is walked forward, the move is reported, and ports discovery
+already visited are excluded so the walk cannot land back on one of them.
+
+Once `backend: local-llama` and a `modelPath` are both recorded, `index.tsx`
+spawns the server with **every** flag the tuning layer computed — including
+`--n-cpu-moe`, which is what makes a 35B MoE model loadable on a small card at
+all. The child's output is drained (an undrained pipe fills and blocks the server
+mid-load), the ready budget scales with the model, and the child is reaped on
+every exit path so no session leaves one holding VRAM behind it.
+
 ## Removed features
 
-Three things that used to be here have been **removed, not disabled**. There is
-no flag to flip and no code path left to re-enable them.
+Two things that used to be here have been **removed, not disabled**. There is no
+flag to flip and no code path left to re-enable them.
 
 | Removed | What it did | Why it is gone |
 |---|---|---|
-| **Model search & download** | Queried HuggingFace for a GGUF, picked one to fit the GPU, and downloaded it during first-run bootstrap. | It produced a concrete 20 GB re-download of weights the machine was already serving, because the Hub republishes filenames and the byte counts disagree. A downloader still wired up behind a default-off switch is one `grep` from being re-enabled by accident. **llamacli now runs only the model recorded in `.llamacli/config.yaml`**, or one an already-running llama-server reports. It will never fetch a model. |
 | **`/fastcheck`** | Consulted a second "System 1" model before each turn to pick a reasoning budget, and could downgrade a turn to a cheap mode. | Measured over a labelled prompt set: it added ~0.11 s per turn, agreed with "this needs the real model" on 33% of the prompts that did, and could not be made to separate the classes by any prompt wording. See git history for the full measurement. |
-| **`/reset`** | Recomputed the model, llama flags and ports from current hardware, and re-ran backend calibration. | It existed to re-derive what the bootstrap now derives on its own. With model acquisition removed there is nothing for it to choose. |
+| **`/reset`** | Re-derived the model, the llama flags and the ports from current hardware, discarding the recorded ones first. | It discarded exactly the keys that identify the model the machine was **already running**, so the "keep the model in use" check failed every time and the bootstrap went to HuggingFace for a different model. It also dropped `baseUrl` on its way out, leaving the next launch pointing at a port nothing was listening on. The bootstrap re-derives these settings on every launch anyway; the command added a way to lose them. |
 
 **Consequences, stated plainly:**
 
-- A machine with **no model** cannot now obtain one by itself. Place a `.gguf`
-  and set `llama.modelPath` in `.llamacli/config.yaml`, or start a
-  `llama-server` and llamacli will adopt it.
-- Bootstrap reports a missing model as a **failed step with a reason**, rather
-  than silently degrading.
+- Model acquisition is **back**, and it is what makes a first run on a fresh
+  machine possible. It runs only after the two checks that must come first: an
+  adoptable running server, and the model this install is already using. The
+  model recorded in `.llamacli/config.yaml` is never replaced while its file is
+  present, and an existing file is matched on **quant + exact byte size**, not on
+  filename — the Hub republishes names and sizes, which is how a 20 GB
+  re-download of weights the machine was already serving once happened.
+- `MODEL_REPO_35B` / `MODEL_REPO_9B` override the pinned repositories. The
+  defaults are the publisher's own (`ornith-ai/…`, verified: both list the
+  `Q4_K_M` quant). The un-namespaced form of those ids — which is what this
+  repository shipped for a while — is a repository that does not exist and
+  answers HTTP 401, so a machine with no model configured could not resolve
+  anything and the spawn condition was never satisfiable. A pinned repo that
+  becomes unreachable now falls back to a repository search, so a rename
+  degrades to a slower start rather than a dead one.
+- Bootstrap reports every failure as a **failed step with a reason** rather than
+  silently degrading, and a machine that ends up with a binary but no model
+  records that honestly instead of claiming a local backend it cannot serve.
 - A `laya:` block left in an old `config.yaml` is **dropped, not preserved** —
   nothing can act on it any more.
 
@@ -417,7 +476,7 @@ app updating, not the model — a different code path, in `src/selfUpdate.ts`.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 525 unit tests
+npm test                                              # 582 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -425,9 +484,9 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **525** | pass |
+| Unit / regression | `npm test` | **582** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,877** | 0 violations |
-| Project shape (100 real directories) | `project_persona_check.ts` | **7,237** | 0 violations |
+| Project shape (100 real directories) | `project_persona_check.ts` | **7,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
 | Hardware matrix (one-off sweep) | *(not committed — see below)* | 168,668 | 0 violations |
 

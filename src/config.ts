@@ -9,6 +9,10 @@ export interface LlamacliConfig {
   model: string;
   baseUrl?: string; // for openai-compatible / attach-existing
   apiKey?: string;
+  /** Explicit model file, when the user wants one particular GGUF rather than
+   *  whatever the Hub currently publishes for the chosen family. Takes
+   *  precedence over model acquisition on a first run. */
+  modelPath?: string;
   /** repeat_penalty sent with every chat request (see loop.ts's
    *  AgentLoopOptions.repeatPenalty for why this isn't left unset).
    *  Defaults to 1.1. */
@@ -20,6 +24,22 @@ export interface LlamacliConfig {
     contextSize: number;
     threads: number;
     gpuLayers: number;
+    /**
+     * The rest of the machine-derived tuning. Every field here is computed by
+     * the bootstrap AND handed to the spawned process — the two used to drift,
+     * leaving values in config.yaml that no server was ever started with.
+     *
+     * `cpuMoeLayers` is the one that matters most: without it a 35B MoE model
+     * does not fit a small card at all.
+     */
+    threadsBatch?: number;
+    batchSize?: number;
+    ubatchSize?: number;
+    cpuMoeLayers?: number;
+    flashAttn?: boolean;
+    cacheTypeK?: string;
+    cacheTypeV?: string;
+    parallel?: number;
   };
   /** Checks run after each file edit, keyed "*.ext" → command with {file}
    *  (merged over the built-in ones in agent/harness.ts), or false to turn
