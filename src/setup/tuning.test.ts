@@ -162,7 +162,56 @@ test("MoE expert offload is proportional to the shortfall and bounded", () => {
   assert.equal(fits.cpuMoeLayers, 0, "a model that fits must not be offloaded to the CPU");
   const huge = tuneForHardware(machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "small", totalGiB: 4, freeGiB: 3.5 } }), { modelBytes: 70 * GiB });
   assert.ok(huge.cpuMoeLayers >= 1, "a badly-fitting model must offload some experts");
-  assert.ok(huge.cpuMoeLayers <= 80, `cpuMoeLayers ${huge.cpuMoeLayers} exceeds the 60% cap`);
+  assert.ok(huge.cpuMoeLayers <= 32, `cpuMoeLayers ${huge.cpuMoeLayers} exceeds the 40% cap`);
+});
+
+// ── A measured value must outrank the formula ──────────────────────────────
+
+const box8gb = machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 7.2 } });
+const ORNITH_35B = 21_713_463_040; // the Q4_K_M this was measured on
+
+test("a benchmarked --n-cpu-moe is kept, not recomputed", () => {
+  // On this box the formula produced 48 where a benchmark produced 30 — a 1.6x
+  // overshoot, with the difference measured at +136% decode. The bootstrap runs
+  // on every launch, so a formula that wins overwrites a measurement once per
+  // start, forever.
+  const measured = tuneForHardware(box8gb, { modelBytes: ORNITH_35B, cpuMoeLayers: 30 });
+  assert.equal(measured.cpuMoeLayers, 30);
+  assert.ok(
+    measured.rationale.some((r) => /실측된 값/.test(r)),
+    "keeping a measured value must be stated, not silent"
+  );
+});
+
+test("without a measured value the formula applies, and lands on the measured value", () => {
+  const computed = tuneForHardware(box8gb, { modelBytes: ORNITH_35B });
+  // The old 0.6 cap produced 48 here. The benchmarked safe value is 30.
+  assert.ok(
+    computed.cpuMoeLayers <= 32,
+    `a computed value above the benchmarked point is a regression: got ${computed.cpuMoeLayers}`
+  );
+  assert.ok(computed.cpuMoeLayers > 0, "a 21 GB model on an 8 GB card does need CPU MoE paging");
+});
+
+test("a measured value of 0 means 'not measured', not 'measured as zero'", () => {
+  // 0 is llama.cpp's own default and is exactly what an 8 GB card cannot do,
+  // so it must not be honoured as a measurement.
+  const t = tuneForHardware(box8gb, { modelBytes: ORNITH_35B, cpuMoeLayers: 0 });
+  assert.ok(t.cpuMoeLayers > 0);
+});
+
+test("a caller's value is used verbatim, for a different model or quant", () => {
+  // The benchmarked number is per model+quant; nothing here second-guesses it.
+  assert.equal(tuneForHardware(box8gb, { modelBytes: ORNITH_35B, cpuMoeLayers: 26 }).cpuMoeLayers, 26);
+});
+
+test("a machine with no GPU is unaffected by any of this", () => {
+  const cpuOnly = tuneForHardware(
+    machine({ cpuCount: 12, ramGiB: 30, gpu: null }),
+    { modelBytes: ORNITH_35B }
+  );
+  assert.equal(cpuOnly.gpuLayers, 0);
+  assert.equal(cpuOnly.cpuMoeLayers, 0, "--n-cpu-moe is meaningless with no GPU");
 });
 
 test("every rationale line is non-empty, and every decision is explained", () => {

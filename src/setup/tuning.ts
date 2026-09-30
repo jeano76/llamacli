@@ -53,7 +53,36 @@ export interface LlamaTuning {
 
 const GiB = UNITS.GiB;
 
-export function tuneForHardware(hw: Hardware, opts?: { modelBytes?: number }): LlamaTuning {
+/** Ceiling on the fraction of a MoE model kept on the CPU.
+ *
+ *  This was 0.6, which is where the binding constraint sat on the 8 GB box: a
+ *  21.7 GB model against 8 GB of VRAM produced 48 expert layers, against a
+ *  benchmarked 30. More CPU MoE layers buy VRAM the card does not need at that
+ *  point and cost decode throughput linearly, so the cap is what decides
+ *  whether a fresh machine is configured well.
+ *
+ *  0.4 is the value that reproduces the measured 30 at the layer count this
+ *  assumes (0.4 x 80 = 32), and it is a conservative direction: erring low
+ *  costs a little VRAM, erring high costs speed on every token.
+ */
+const MAX_CPU_MOE_FRACTION = 0.4;
+
+export function tuneForHardware(
+  hw: Hardware,
+  opts?: {
+    modelBytes?: number;
+    /**
+     * A `--n-cpu-moe` value that came from MEASUREMENT on this machine, rather
+     * than from the formula below. It wins outright.
+     *
+     * This is the one field in this file that a person can genuinely know better
+     * than arithmetic, and the arithmetic is demonstrably wrong by a factor of
+     * 1.6 on the hardware this was written for. The bootstrap passes the
+     * configured value through so a benchmarked machine keeps its benchmark.
+     */
+    cpuMoeLayers?: number;
+  }
+): LlamaTuning {
   const rationale: string[] = [];
   const gpu = pickPrimaryGpu(hw);
   const vram = totalVram(hw);
@@ -168,22 +197,35 @@ export function tuneForHardware(hw: Hardware, opts?: { modelBytes?: number }): L
   // We pick N from the shortfall: how much model doesn't fit in the free VRAM.
   // The model file size is the honest proxy for "how much has to live somewhere"
   // and is passed in as `modelBytes` by the caller (which knows the download).
+  //
+  // A value that came from MEASUREMENT beats this formula, and the caller passes
+  // it in as `cpuMoeLayers`. That is not a preference: the arithmetic below has
+  // one unvalidated constant in it (`estimatedLayers`), and on the 8 GB machine
+  // this was developed on it produced 48 where a benchmark produced 30 — a
+  // 1.6x overshoot, with the difference measured at +136% decode for the smaller
+  // number. A guess must not silently outrank a measurement on every launch.
   let cpuMoeLayers = 0;
   const modelBytes = opts?.modelBytes;
-  if (gpu && modelBytes) {
+  const measuredCpuMoe = opts?.cpuMoeLayers;
+  if (measuredCpuMoe !== undefined && measuredCpuMoe > 0) {
+    cpuMoeLayers = measuredCpuMoe;
+    rationale.push(
+      `--n-cpu-moe ${cpuMoeLayers} 은(는) 이 머신에서 실측된 값이라 그대로 유지합니다 (자동 계산값으로 덮지 않습니다).`
+    );
+  } else if (gpu && modelBytes) {
     const deficit = modelBytes + 0.3 * GiB * (contextSize / 1024) - gpu.vramTotalBytes;
     if (deficit > 0) {
       // Each MoE expert layer moved to CPU buys back ~ (fileBytes/layers) of
       // VRAM but costs latency proportional to the fraction moved. We convert
       // the deficit into a layer count, then clamp: 0 if it already fits, and
-      // never more than 60% of the model offloaded (past that, decode speed
-      // collapses and the box is slower than the smaller model would be).
+      // never more than MAX_CPU_MOE_FRACTION of the model offloaded.
       const estimatedLayers = 80; // typical for a 35B-class MoE GGUF
-      const fraction = Math.min(0.6, deficit / modelBytes);
+      const fraction = Math.min(MAX_CPU_MOE_FRACTION, deficit / modelBytes);
       cpuMoeLayers = Math.max(1, Math.round(fraction * estimatedLayers));
       rationale.push(
-        `VRAM이 모델(${ (modelBytes / GiB).toFixed(1) } GiB)에 비해 부족해 MoE expert ${cpuMoeLayers}개 층을 CPU로 유지합니다 (--n-cpu-moe ${cpuMoeLayers}). ` +
-          `활성 파라미터(3B급)만 GPU에 남기 때문에 8 GB급 카드에서도 35B가 동작합니다.`
+        `VRAM이 모델(${(modelBytes / GiB).toFixed(1)} GiB)에 비해 부족해 MoE expert ${cpuMoeLayers}개 층을 CPU로 유지합니다 (--n-cpu-moe ${cpuMoeLayers}). ` +
+          `활성 파라미터(3B급)만 GPU에 남기 때문에 8 GB급 카드에서도 35B가 동작합니다. ` +
+          `이 값은 자동 계산이며, config 에 실측값이 있으면 그 값을 씁니다.`
       );
     }
   }

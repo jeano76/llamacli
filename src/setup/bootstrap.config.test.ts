@@ -132,7 +132,7 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
       projectRoot: dir,
       offline: true,
       allowBuild: false,
-      detectServer: async () => null,
+      detectServer: async () => ({ kind: "none" as const }),
       hardware: {
         cpuCount: 4, ramTotalBytes: 16 * 1024 ** 3, ramAvailableBytes: 12 * 1024 ** 3,
         gpus: [], gpuBackend: "none", canBuildCuda: false, tools: {}, platform: "linux",

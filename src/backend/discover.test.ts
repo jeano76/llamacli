@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, Server } from "node:http";
 import { createServer as createNetServer, Server as NetServer } from "node:net";
-import { discoverRunningServer, isListening, COMMON_PORTS } from "./detect.js";
+import { discoverRunningServer, isListening, modelLoadBudgetMs, COMMON_PORTS } from "./detect.js";
 import { LLAMA_PORT } from "../setup/ports.js";
 
 /** A TCP listener that accepts connections and never speaks HTTP — the state a
@@ -72,10 +72,14 @@ test("a port that is LISTENING but still loading its model is waited out, not de
       probeTimeoutMs: 100,
       pollMs: 50,
     });
-    // Nothing started serving, so nothing is adopted — but the call burned its
-    // budget rather than answering immediately, which is the behaviour that
-    // keeps the caller from claiming the port.
-    assert.equal(found, null);
+    // Nothing started serving inside the budget. The result must say the port
+    // is HELD, not that it is free: collapsing this into "none" is what let the
+    // caller plan a different port and bind a second llama-server onto the same
+    // GPU as the one that is still loading.
+    assert.equal(found.kind, "loading");
+    if (found.kind !== "loading") throw new Error("unreachable");
+    assert.equal(found.port, port);
+    assert.equal(found.baseUrl, `http://127.0.0.1:${port}`);
     assert.ok(
       Date.now() - started >= 500,
       "a LISTENING port must be waited out, not dismissed on the first probe"
@@ -107,9 +111,10 @@ test("a server that is slow to answer is adopted rather than declared absent", a
         probeTimeoutMs: 100,
         pollMs: 50,
       });
-      assert.ok(found, "a server that answers during the wait must be adopted");
-      assert.equal(found!.baseUrl, `http://127.0.0.1:${port}`);
-      assert.equal(found!.model, "/models/loaded.gguf");
+      assert.equal(found.kind, "found", "a server that answers during the wait must be adopted");
+      if (found.kind !== "found") throw new Error("unreachable");
+      assert.equal(found.server.baseUrl, `http://127.0.0.1:${port}`);
+      assert.equal(found.server.model, "/models/loaded.gguf");
       // The first request was abandoned at the 100 ms probe timeout, so a
       // SECOND request can only have been made by the loading-wait re-probing.
       // That re-probe is the behaviour under test: without it the port reads as
@@ -128,7 +133,7 @@ test("discovery gives up rather than hanging on a permanently silent listener", 
       probeTimeoutMs: 100,
       pollMs: 50,
     });
-    assert.equal(found, null);
+    assert.equal(found.kind, "loading", "a held port is reported as held");
     assert.ok(Date.now() - started < 5000, "the budget must actually bound the wait");
   });
 });
@@ -141,8 +146,43 @@ test("nothing listening anywhere returns immediately, without waiting", async ()
     loadingWaitMs: 30_000,
     probeTimeoutMs: 200,
   });
-  assert.equal(found, null);
+  assert.equal(found.kind, "none", "a refused connection is genuinely nothing there");
   assert.ok(Date.now() - started < 3000, "a refused connection is not a loading server");
+});
+
+test("a held port is reported as HELD, never as free", async () => {
+  // The invariant the two-server bug turned on. `none` means "you may bind
+  // this"; `loading` means "someone else has it". Collapsing the second into
+  // the first is what let the caller choose a different port and spawn a rival
+  // llama-server while a healthy one was still loading the same 21 GB model.
+  await withSilentListener(async (port) => {
+    const found = await discoverRunningServer("127.0.0.1", [port], {
+      loadingWaitMs: 200,
+      probeTimeoutMs: 50,
+      pollMs: 40,
+    });
+    assert.equal(found.kind, "loading");
+  });
+});
+
+// ── The wait budget has to outlast a real load ─────────────────────────────
+
+test("the loading budget scales with the model and covers a 21 GB USB load", () => {
+  const GiB = 1024 ** 3;
+  // A fixed 2-minute budget expired while a 21.8 GB model was still loading off
+  // a USB drive, and the caller fell straight through to spawning a second
+  // server. Size is the only input that predicts the duration.
+  const big = modelLoadBudgetMs(21.7 * GiB);
+  assert.ok(big > 3 * 60_000, `a 21.7 GB load needs minutes; budget was ${Math.round(big / 1000)}s`);
+  // Monotonic, and bounded at both ends.
+  assert.ok(modelLoadBudgetMs(40 * GiB) >= big);
+  assert.ok(modelLoadBudgetMs(0) <= 2 * 60_000, "an unknown size keeps a short floor, not an unbounded wait");
+  assert.ok(modelLoadBudgetMs(10_000 * GiB) <= 20 * 60_000, "a pathological size must not park a launch forever");
+});
+
+test("a small model still gets a usable floor", () => {
+  const GiB = 1024 ** 3;
+  assert.ok(modelLoadBudgetMs(5.5 * GiB) >= 2 * 60_000);
 });
 
 // ── One port list, so the two call sites cannot drift apart ────────────────

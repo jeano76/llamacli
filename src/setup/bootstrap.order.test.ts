@@ -34,7 +34,7 @@ test("a running server short-circuits BEFORE any Hub lookup — no download is a
       projectRoot: dir,
       hardware: hw,
       probe: async () => "free",
-      detectServer: async () => ({ baseUrl: "http://127.0.0.1:8080", model: "/media/usb/models/Ornith-A3B-Q4_K_M.gguf" }),
+      detectServer: async () => ({ kind: "found" as const, server: { baseUrl: "http://127.0.0.1:8080", model: "/media/usb/models/Ornith-A3B-Q4_K_M.gguf" } }),
       fetchImpl: explodingFetch,
     });
 
@@ -57,7 +57,7 @@ test("the adoption path is taken even when the served model file is NOT in the m
       hardware: hw,
       probe: async () => "free",
       modelsDir: "/nowhere/empty",
-      detectServer: async () => ({ baseUrl: "http://127.0.0.1:8080", model: "/some/other/place/old-build.gguf" }),
+      detectServer: async () => ({ kind: "found" as const, server: { baseUrl: "http://127.0.0.1:8080", model: "/some/other/place/old-build.gguf" } }),
       fetchImpl: (async () => { throw new Error("must not reach the network"); }) as unknown as typeof fetch,
     });
     assert.ok(report.ok);
@@ -72,7 +72,7 @@ test("a second launch with everything in place does no network work at all", () 
   withTempDir(async (dir) => {
     const run = () => ensureLocalStack({
       projectRoot: dir, hardware: hw, probe: async () => "free",
-      detectServer: async () => ({ baseUrl: "http://127.0.0.1:8080", model: "/models/m.gguf" }),
+      detectServer: async () => ({ kind: "found" as const, server: { baseUrl: "http://127.0.0.1:8080", model: "/models/m.gguf" } }),
       fetchImpl: (async () => { throw new Error("must not reach the network on a set-up machine"); }) as unknown as typeof fetch,
     });
     await run();

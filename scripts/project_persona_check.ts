@@ -266,7 +266,7 @@ async function invariantBootstrapSurvives(p: Persona, root: string): Promise<voi
       hardware: HW,
       offline: true,            // no network: this harness tests paths and state
       allowBuild: false,        // never compile anything
-      detectServer: async () => null,
+      detectServer: async () => ({ kind: "none" as const }),
       probe: async () => "free",
       run: (async () => "") as any,
       env: { ...process.env, HOME: home } as any,
@@ -341,7 +341,7 @@ async function invariantUserKeysSurvive(p: Persona, root: string): Promise<void>
   try {
     await ensureLocalStack({
       projectRoot, modelsDir, hardware: HW, offline: true, allowBuild: false,
-      detectServer: async () => null, probe: async () => "free",
+      detectServer: async () => ({ kind: "none" as const }), probe: async () => "free",
       run: (async () => "") as any,
       env: { ...process.env, HOME: home } as any,
     });
@@ -386,7 +386,7 @@ async function invariantDiskRefusalIsExplicit(p: Persona, root: string): Promise
   const { projectRoot, modelsDir, home } = await materialize(p, root);
   const report = await ensureLocalStack({
     projectRoot, modelsDir, hardware: HW, offline: false, allowBuild: false,
-    detectServer: async () => null,
+    detectServer: async () => ({ kind: "none" as const }),
     probe: async () => "free",
     // A model large enough that a tiny disk must refuse it.
     run: (async () => "") as any,
@@ -419,7 +419,7 @@ async function invariantExistingModelIsKept(p: Persona, root: string): Promise<v
   let fetches = 0;
   const report = await ensureLocalStack({
     projectRoot, modelsDir, hardware: HW, offline: false, allowBuild: false,
-    detectServer: async () => null, probe: async () => "free",
+    detectServer: async () => ({ kind: "none" as const }), probe: async () => "free",
     run: (async () => "") as any,
     fetchImpl: (async (...a: any[]) => {
       fetches++;

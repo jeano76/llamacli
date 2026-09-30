@@ -395,11 +395,18 @@ bootstrap, and it is why a first launch costs a few `stat()` calls rather than a
 
 A port that is **listening but not yet answering** is treated as a server that
 is still loading its model, not as an absent one. llama-server binds its port
-before the weights are resident and serves nothing until they are, and loading a
-21 GB model takes minutes; a single fast probe cannot tell those two states
-apart. Getting that wrong is not a slowdown — it is llamacli planning a
-different port and spawning a **second** llama-server beside a healthy one, on a
-card that has no room for it.
+before the weights are resident and serves nothing until they are. A single fast
+probe cannot tell those two states apart, and getting it wrong is not a
+slowdown — it is llamacli planning a different port and spawning a **second**
+llama-server beside a healthy one, on a card that has no room for it.
+
+The wait scales with the size of the model being loaded (a conservative 100 MB/s
+cold read, plus a minute for allocation and CUDA graph setup), because a fixed
+budget is shorter than a 21 GB load off a USB drive. When the budget runs out
+the port is still reported as **held**, and llamacli attaches to the loading
+server rather than binding a second one: requests fail until the load finishes,
+which the agent loop's existing transient-failure retry already handles, and no
+VRAM is spent on a duplicate.
 
 **2. Can we find a `llama-server` binary?** Cheapest and most likely first, and a
 build is only attempted after every candidate has failed:
@@ -424,11 +431,28 @@ occupied port is walked forward, the move is reported, and ports discovery
 already visited are excluded so the walk cannot land back on one of them.
 
 Once `backend: local-llama` and a `modelPath` are both recorded, `index.tsx`
-spawns the server with **every** flag the tuning layer computed — including
-`--n-cpu-moe`, which is what makes a 35B MoE model loadable on a small card at
-all. The child's output is drained (an undrained pipe fills and blocks the server
-mid-load), the ready budget scales with the model, and the child is reaped on
-every exit path so no session leaves one holding VRAM behind it.
+spawns the server with **every** flag the tuning layer computed. The child's
+output is drained (an undrained pipe fills and blocks the server mid-load), the
+ready budget scales with the model, and the child is reaped on every exit path so
+no session leaves one holding VRAM behind it.
+
+### `--n-cpu-moe` is the one flag a measurement beats a formula for
+
+`--n-cpu-moe N` keeps N Mixture-of-Experts layers in system RAM instead of VRAM.
+It is what lets a 35B MoE model load on a card that cannot hold it — only the
+~3B active parameters have to be resident, and the rest streams from RAM.
+
+The bootstrap can compute a value from the VRAM shortfall, and it does when
+there is nothing better. But on the 8 GB card this was developed on, that
+arithmetic produced **48** where a benchmark produced **30**, with the
+difference measured at **+136% decode**. More CPU expert layers buy VRAM the
+card does not need at that point and cost throughput on every token.
+
+So a value already in `llama.cpuMoeLayers` is **kept**, and
+`LLAMACLI_CPU_MOE_LAYERS` overrides both. The bootstrap runs on every launch; a
+formula that outranked a measurement would overwrite it once per start, forever.
+`0` is read as "not measured" rather than "measured as zero" — zero is
+llama.cpp's own default and is exactly what a small card cannot do.
 
 ## Removed features
 
@@ -476,7 +500,7 @@ app updating, not the model — a different code path, in `src/selfUpdate.ts`.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 582 unit tests
+npm test                                              # 590 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -484,7 +508,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **582** | pass |
+| Unit / regression | `npm test` | **590** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,877** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **7,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
@@ -595,8 +619,8 @@ or negative, and no GPU means `-ngl 0` while a GPU always wins over the CPU.
 
 ### What it found
 
-Three real bugs, all of which the previous 590 tests passed straight through —
-because each one is invisible on the machine they were written on.
+Three real bugs, all of which the entire suite of its day passed straight
+through — because each one is invisible on the machine they were written on.
 
 - **Threads exceeded the core count on 1–3 core machines** (`tuning.ts`). The GPU
   branch used a `Math.max(2, …)` floor, so a 1-core box was launched with

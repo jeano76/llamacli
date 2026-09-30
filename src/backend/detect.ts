@@ -78,6 +78,33 @@ export async function detectRunningServer(
 const LOADING_WAIT_MS = 120_000;
 const LOADING_POLL_MS = 1000;
 
+/** Conservative read throughput for a cold model load, in bytes/second.
+ *
+ *  100 MB/s — a slow USB 3.0 external SSD. The model on the machine this was
+ *  written for lives on one, and picking a fast number here would mean a budget
+ *  shorter than the load it is meant to cover, which is the bug in a different
+ *  coat. A load from an internal NVMe finishes well inside the budget; a load
+ *  from a slow drive still does, and the cost of over-estimating is only that
+ *  llamacli waits a little longer before giving up on someone else's server. */
+const COLD_READ_BYTES_PER_SEC = 100 * 1024 * 1024;
+
+/** How long to wait for a server that is loading a model of this size.
+ *
+ *  A fixed 2 minutes is shorter than loading a 21.8 GB model off a USB drive, so
+ *  the wait expired while the load was still going and the caller fell through
+ *  to spawning. Scaling by size is the only input that actually predicts the
+ *  duration. The floor keeps a small model's wait sane, and the ceiling keeps a
+ *  pathological size from parking a launch indefinitely.
+ */
+export function modelLoadBudgetMs(modelBytes: number): number {
+  const GiB = 1024 ** 3;
+  const readSeconds = (modelBytes / COLD_READ_BYTES_PER_SEC) * 1000;
+  // Plus a minute for allocation, context setup and the first CUDA graph build,
+  // none of which are I/O bound.
+  const budget = readSeconds + 60_000;
+  return Math.min(20 * 60_000, Math.max(LOADING_WAIT_MS, budget));
+}
+
 /** Polls a port that is accepting connections but not yet answering HTTP.
  *
  *  Returns the first successful probe, or null when the budget runs out. Kept
@@ -112,6 +139,19 @@ export async function waitForServer(
   }
 }
 
+/** What discovery found, including the case that must never be collapsed into
+ *  "absent".
+ *
+ *  `loading` is the load-bearing variant. Collapsing it into `none` is what let
+ *  a healthy server be written off as absent, and the caller then claimed a
+ *  different port and spawned a second one — on a card that could not hold both.
+ *  A caller that receives `loading` knows a port is TAKEN and must not bind it.
+ */
+export type Discovery =
+  | { kind: "found"; server: DetectedServer }
+  | { kind: "loading"; baseUrl: string; port: number; waitedMs: number }
+  | { kind: "none" };
+
 /** Finds a running server, waiting out one that is still loading its model.
  *
  *  This is the entry point the bootstrap should use. The distinction it makes
@@ -125,7 +165,8 @@ export async function waitForServer(
  *  than passed over, because a lower-numbered port that is mid-load is far more
  *  likely to be the intended one than a higher-numbered port that happens to be
  *  up. Bounded per port so a permanently-silent listener cannot hang a launch
- *  forever.
+ *  forever; when the budget runs out the port is reported as `loading` rather
+ *  than as free, because it is held.
  */
 export async function discoverRunningServer(
   host = "127.0.0.1",
@@ -136,12 +177,12 @@ export async function discoverRunningServer(
     pollMs?: number;
     onWait?: (port: number, waitedMs: number) => void;
   } = {}
-): Promise<DetectedServer | null> {
+): Promise<Discovery> {
   const budget = opts.loadingWaitMs ?? LOADING_WAIT_MS;
   // Probe every port once, fast, in parallel.
   const first = await Promise.all(ports.map((port) => probePort(host, port, opts.probeTimeoutMs)));
   const serving = first.find((r): r is DetectedServer => r !== null);
-  if (serving) return serving;
+  if (serving) return { kind: "found", server: serving };
 
   // Nothing is serving. Now find out which ports are merely LISTENING, and
   // give those a chance to finish loading.
@@ -154,15 +195,21 @@ export async function discoverRunningServer(
   );
   listeners.sort((a, b) => a - b);
   for (const port of listeners) {
+    const startedAt = Date.now();
     const hit = await waitForServer(host, port, {
       timeoutMs: budget,
       pollMs: opts.pollMs,
       probeTimeoutMs: opts.probeTimeoutMs,
       onWait: (waited) => opts.onWait?.(port, waited),
     });
-    if (hit) return hit;
+    if (hit) return { kind: "found", server: hit };
+    // Out of budget and still silent. The port is HELD — by a server that is
+    // almost certainly mid-load — so it is reported as such. Returning `none`
+    // here is what let the caller plan a different port and bind a second
+    // llama-server onto the same GPU.
+    return { kind: "loading", baseUrl: `http://${host}:${port}`, port, waitedMs: Date.now() - startedAt };
   }
-  return null;
+  return { kind: "none" };
 }
 
 /** Whether a TCP connection is accepted. Distinct from an HTTP probe. */

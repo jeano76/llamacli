@@ -32,7 +32,7 @@ import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } fro
 import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
-import { discoverRunningServer } from "../backend/detect.js";
+import { discoverRunningServer, modelLoadBudgetMs, type Discovery } from "../backend/detect.js";
 import { rm } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 
@@ -80,7 +80,7 @@ export interface BootstrapOptions {
    *  spawning our own. Injected because the real probe talks to localhost, and
    *  a test that silently adopts whatever happens to be running on :8080 is
    *  testing the machine, not the code. Defaults to the real detector. */
-  detectServer?: (host: string, ports: number[]) => Promise<{ baseUrl: string; model: string } | null>;
+  detectServer?: (host: string, ports: number[]) => Promise<Discovery>;
   /** Candidate .gguf files already present in the models dir. Injected in
    *  tests; read from disk otherwise. */
   listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>;
@@ -209,12 +209,72 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // "nothing is running", and answering it wrongly is how this ended up
   // spawning a SECOND llama-server beside a healthy one — which on an 8 GB
   // card is an OOM, not a slowdown. A port that is loading is waited out
-  // instead.
-  const detect = opts.detectServer ?? ((h: string, p: number[]) => discoverRunningServer(h, p, {
-    onWait: (port, waited) => log(`${port} 포트 서버가 모델을 불러오는 중입니다 (${Math.round(waited / 1000)}초 경과)…`),
-  }));
-  const running = await detect("127.0.0.1", COMMON_PORTS);
-  if (running) {
+  // instead, for as long as a model of the recorded size could plausibly take
+  // to load.
+  const waitBudget = modelLoadBudgetMs(
+    typeof existing?.model === "string" ? await fileSize(existing.model) : 0
+  );
+  const detect =
+    opts.detectServer ??
+    ((h: string, p: number[]) =>
+      discoverRunningServer(h, p, {
+        loadingWaitMs: waitBudget,
+        onWait: (port, waited) =>
+          log(`${port} 포트 서버가 모델을 불러오는 중입니다 (${Math.round(waited / 1000)}초 경과)…`),
+      }));
+  const discovery = await detect("127.0.0.1", COMMON_PORTS);
+
+  // ── A port that is held but still loading is NOT ours to take ─────────────
+  // The budget ran out while a server was mid-load. Binding a different port
+  // here is the exact failure this whole step exists to prevent: the loading
+  // server already holds most of the card, and a second one does not fit.
+  //
+  // So llamacli points at the loading server instead. Its requests will fail
+  // until the load finishes, which the agent loop's existing transient-failure
+  // retry already handles, and no VRAM is spent on a duplicate.
+  if (discovery.kind === "loading") {
+    const waitedSec = Math.round(discovery.waitedMs / 1000);
+    steps.push({
+      name: "기존 서버 연결",
+      ok: false,
+      detail:
+        `${discovery.baseUrl} 에서 서버가 아직 모델을 불러오는 중입니다 (${waitedSec}초 대기). ` +
+        `두 번째 서버를 띄우지 않고 이 서버를 사용합니다 — 곧 응답하기 시작합니다.`,
+    });
+    errors.push(`기존 서버 연결: ${discovery.port} 포트의 서버가 모델 로딩 중입니다 (${waitedSec}초 대기).`);
+    log(
+      `${discovery.baseUrl} 서버가 아직 모델을 불러오는 중이라 ${waitedSec}초 기다렸습니다. ` +
+        `두 번째 서버를 띄우지 않고 이 서버를 사용합니다.`
+    );
+    steps.push({ name: "포트 결정", ok: true, detail: `llama ${discovery.port} (로딩 중인 기존 서버)` });
+    const attached: Record<string, unknown> = {
+      ...(existing ?? {}),
+      backend: "openai-compatible",
+      baseUrl: discovery.baseUrl,
+      // The model id is unknown until the server answers, so the recorded one
+      // is kept: config.ts re-reads it live on every load anyway.
+      ...(typeof existing?.model === "string" ? {} : { model: "local-model" }),
+    };
+    if (opts.projectRoot) {
+      await step("설정 저장", async () => {
+        await writeConfig(opts.projectRoot!, attached);
+        return ".llamacli/config.yaml (로딩 중인 기존 서버)";
+      });
+    }
+    return {
+      ok: false,
+      steps,
+      hardware,
+      llama: llama ?? undefined,
+      tuning: undefined,
+      ports: { llamaPort: discovery.port },
+      config: attached,
+      errors,
+    };
+  }
+
+  if (discovery.kind === "found") {
+    const running = discovery.server;
     const adoptedPort = Number(new URL(running.baseUrl).port);
     steps.push({
       name: "기존 서버 연결",
@@ -373,7 +433,23 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   for (const n of plan.notes) log(n);
 
   // ── 5. Tuning + config ────────────────────────────────────────────────────
-  const tuning = tuneForHardware(hardware, { modelBytes: model?.candidate.sizeBytes });
+  // `--n-cpu-moe` is the one flag on this machine that was BENCHMARKED rather
+  // than computed, so a value already in the config is passed through instead
+  // of being replaced. Every other flag here is derived from hardware on every
+  // launch; this one would otherwise be a guess overwriting a measurement, on
+  // every single start.
+  const configuredCpuMoe = existing?.llama?.cpuMoeLayers;
+  const envCpuMoe = Number(env.LLAMACLI_CPU_MOE_LAYERS);
+  const measuredCpuMoe =
+    Number.isFinite(envCpuMoe) && envCpuMoe > 0
+      ? envCpuMoe
+      : typeof configuredCpuMoe === "number" && configuredCpuMoe > 0
+      ? configuredCpuMoe
+      : undefined;
+  const tuning = tuneForHardware(hardware, {
+    modelBytes: model?.candidate.sizeBytes,
+    cpuMoeLayers: measuredCpuMoe,
+  });
   for (const r of tuning.rationale) log(r);
 
   const config = buildConfig({ existing, llama, modelPath, plan, tuning });
