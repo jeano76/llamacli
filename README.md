@@ -385,13 +385,23 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 
 ## First run: finding llama.cpp, picking a port, and starting the server
 
-The bootstrap answers three questions in this order, and the order is the design.
+`src/backend/resolve.ts` answers three questions in this order, and the order is
+the design.
+
+**Where this runs matters as much as the order.** Resolution happens *after* the
+alt screen is up, behind a `DeferredBackend` — not before it. A first run
+installs llama.cpp and downloads a model, which is minutes of work, and doing
+that before `render()` left the terminal sitting on a blank screen, reported
+directly as "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져". So the banner
+appears immediately and every step is a status line inside the TUI. A message
+typed while setup is still running waits for it and then executes, rather than
+failing against a port nothing is listening on yet.
 
 **1. Is a llama-server already running?** Checked before anything touches the
-network. A server that is found is **adopted** — llamacli connects to it and
-starts nothing. On a machine that already has a healthy server this is the whole
-bootstrap, and it is why a first launch costs a few `stat()` calls rather than a
-20 GB download.
+network. A server that is found is **adopted** at its own endpoint and port —
+llamacli connects to it and starts nothing. On a machine that already has a
+healthy server this is the whole resolution, and it is why a first launch costs a
+few `stat()` calls rather than a 20 GB download.
 
 A port that is **listening but not yet answering** is treated as a server that
 is still loading its model, not as an absent one. llama-server binds its port
@@ -408,8 +418,19 @@ server rather than binding a second one: requests fail until the load finishes,
 which the agent loop's existing transient-failure retry already handles, and no
 VRAM is spent on a duplicate.
 
-**2. Can we find a `llama-server` binary?** Cheapest and most likely first, and a
-build is only attempted after every candidate has failed:
+**2. Is it installed and simply not running?** Checked **before** the installer,
+so a machine that already has both a binary and a recorded model never reaches
+HuggingFace. The model file's size is checked rather than just its path: a
+`modelPath` pointing at something deleted to reclaim disk reads as *no model*,
+not as a zero-byte one. A spawn failure here does **not** fall through to the
+installer either — the binary and the model are on disk and known, so rebuilding
+would burn 10–40 minutes to fix a port that was busy or a card that was full.
+The session starts on the recorded config and says which port to change instead.
+
+**3. Is it installed at all?** If not, `ensureLocalStack` finds or builds one,
+derives a model that fits this machine, downloads it, writes the config, and the
+server is started. Cheapest and most likely source first, and a build is only
+attempted after every candidate has failed:
 
 | Order | Source |
 |---|---|
@@ -426,15 +447,19 @@ present and executable and still fails to start, and accepting it turns a
 recoverable "try the next one" into an opaque spawn error much later. A binary
 that exists but will not run is reported as such rather than as "not installed".
 
-**3. Which port?** Only reached when discovery found nothing adoptable. An
-occupied port is walked forward, the move is reported, and ports discovery
-already visited are excluded so the walk cannot land back on one of them.
+**Which port?** Only reached when discovery found nothing adoptable. An occupied
+port is walked forward, the move is reported, and ports discovery already visited
+are excluded so the walk cannot land back on one of them.
 
-Once `backend: local-llama` and a `modelPath` are both recorded, `index.tsx`
-spawns the server with **every** flag the tuning layer computed. The child's
-output is drained (an undrained pipe fills and blocks the server mid-load), the
-ready budget scales with the model, and the child is reaped on every exit path so
-no session leaves one holding VRAM behind it.
+Once `backend: local-llama` and a `modelPath` are both recorded, the server is
+spawned with **every** flag the tuning layer computed. The child's output is
+drained (an undrained pipe fills and blocks the server mid-load), the ready
+budget scales with the model, and the child is reaped on every exit path so no
+session leaves one holding VRAM behind it.
+
+The server's real `n_ctx` is read back over `/props` once it is up and replaces
+the config's value: a config that says 8192 while the server runs `-c 65536`
+makes compaction fire 8× too eagerly and interrupts every turn.
 
 ### `--n-cpu-moe` is the one flag a measurement beats a formula for
 
@@ -442,15 +467,16 @@ no session leaves one holding VRAM behind it.
 It is what lets a 35B MoE model load on a card that cannot hold it — only the
 ~3B active parameters have to be resident, and the rest streams from RAM.
 
-The bootstrap can compute a value from the VRAM shortfall, and it does when
+The installer can compute a value from the VRAM shortfall, and it does when
 there is nothing better. But on the 8 GB card this was developed on, that
 arithmetic produced **48** where a benchmark produced **30**, with the
 difference measured at **+136% decode**. More CPU expert layers buy VRAM the
 card does not need at that point and cost throughput on every token.
 
 So a value already in `llama.cpuMoeLayers` is **kept**, and
-`LLAMACLI_CPU_MOE_LAYERS` overrides both. The bootstrap runs on every launch; a
-formula that outranked a measurement would overwrite it once per start, forever.
+`LLAMACLI_CPU_MOE_LAYERS` overrides both. The installer runs whenever the earlier
+cases did not resolve; a formula that outranked a measurement would overwrite it
+once per start, forever.
 `0` is read as "not measured" rather than "measured as zero" — zero is
 llama.cpp's own default and is exactly what a small card cannot do.
 

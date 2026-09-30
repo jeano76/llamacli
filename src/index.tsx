@@ -5,27 +5,22 @@ import { App } from "./tui/App.js";
 import { loadConfig } from "./config.js";
 import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt, injectSkillIndexIntoSystemPrompt } from "./skills/loader.js";
 import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
-import { LlamaServerManager } from "./backend/llamaServer.js";
-import { LLAMA_PORT } from "./setup/ports.js";
-import { OpenAICompatibleClient } from "./backend/openaiClient.js";
+import { resolveBackend } from "./backend/resolve.js";
+import { DeferredBackend } from "./backend/deferred.js";
 import { AgentLoop, summarizeErrorForDisplay } from "./agent/loop.js";
 import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { isBrowserAvailable } from "./tools/browser.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
 import { clearNotes } from "./compaction/notes.js";
-import { findOtherInstances, terminateInstance } from "./instanceGuard.js";
-import { createInterface } from "node:readline/promises";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
-import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth } from "./tui/terminal.js";
 import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
 import { getCursorPlacement } from "./tui/cursorPlacement.js";
-import { ensureLocalStack } from "./setup/bootstrap.js";
 import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
 
@@ -171,31 +166,15 @@ function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T
   return Object.create(stdout, { write: { value: patched, configurable: true } });
 }
 
-/** Before taking over the screen: if llamacli is already running in this
- *  project, ask whether to stop it (see instanceGuard.ts). Declining exits
- *  instead of running two sessions side by side. */
-async function ensureSingleInstance(): Promise<void> {
-  const others = findOtherInstances(process.cwd(), process.pid, process.argv[1] ?? "");
-  if (others.length === 0) return;
-  process.stdout.write(
-    `이 프로젝트에서 llamacli가 이미 실행 중입니다 (PID ${others.join(", ")}).\n` +
-      "기존 프로세스를 종료하고 새로 시작할까요? 저장된 체크포인트는 그대로 남습니다.\n"
-  );
-  let answer = "";
-  if (process.stdin.isTTY) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    answer = (await rl.question("[y/N] ")).trim().toLowerCase();
-    rl.close();
-  }
-  if (answer !== "y" && answer !== "yes") {
-    process.stdout.write("새 세션을 시작하지 않고 종료합니다.\n");
-    process.exit(1);
-  }
-  for (const pid of others) {
-    const gone = await terminateInstance(pid);
-    process.stdout.write(gone ? `PID ${pid} 종료됨.\n` : `PID ${pid}를 종료하지 못했습니다.\n`);
-    if (!gone) process.exit(1);
-  }
+/** A promise plus the function that settles it — used to hold backend
+ *  resolution until the TUI is on screen, so its first log line has somewhere
+ *  to go. */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value?: T) => void } {
+  let resolve!: (value?: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r as (value?: T) => void;
+  });
+  return { promise, resolve };
 }
 
 const REPO_URL = "https://github.com/jeano76/llamacli";
@@ -215,35 +194,6 @@ function startupVersion(): string {
     return "";
   }
 }
-
-/** Reported directly: "윈도우즈에서 프롬프트에서 한글을 입력시 일부
- *  문자코드가 깨지는 경우 강제 종료가 되는거 같은데?" — Ink already calls
- *  stdin.setEncoding('utf8') (which correctly buffers a multi-byte UTF-8
- *  sequence split across chunk boundaries via Node's own StringDecoder),
- *  so that's not the failure mode here. The much more likely cause on
- *  Windows specifically: the console's ACTIVE CODE PAGE isn't UTF-8
- *  (65001) — on an older conhost / non-Windows-Terminal session, keyboard
- *  input for multi-byte characters (Korean, or any non-ASCII text) can get
- *  encoded by the OS using whatever legacy codepage is active (e.g. CP949)
- *  instead of UTF-8, and Node — expecting UTF-8 — decodes those bytes into
- *  garbage/replacement characters, or lone surrogates, before this process
- *  ever sees valid text. `chcp` changes the ACTIVE CONSOLE's codepage (the
- *  same console handle the parent shell is attached to), not just this
- *  child process's own environment, so running it once here fixes it for
- *  the whole session exactly like running `chcp 65001` manually before
- *  launching would — done synchronously, before anything else touches
- *  stdin, and best-effort (never blocks or fails startup: an older/locked-
- *  down `chcp`, or none at all, just leaves the codepage as whatever it
- *  already was). */
-function ensureWindowsUtf8Console(): void {
-  if (process.platform !== "win32") return;
-  try {
-    execFileSync("chcp", ["65001"], { stdio: "ignore", shell: true });
-  } catch {
-    // Best-effort only — see doc comment above.
-  }
-}
-
 
 /** Requested directly: "CLI 구동시 신규 버전의 바이너리가 github에
  *  존재를 하면 해당 버전을 업데이트하고 cli는 재구동을 하는 기능을 넣어줘"
@@ -302,34 +252,16 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
 }
 
 async function main() {
-  ensureWindowsUtf8Console();
+  // The ONLY thing that runs before the alt screen: the self-update check.
+  // Everything else — including the whole first-run setup — happens after
+  // render(), behind the TUI. Running any of it here meant the screen was up
+  // and empty while minutes of installing and downloading went by, which is
+  // what made llamacli look like it vanished mid-"setup" (reported directly:
+  // "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져"). See
+  // backend/resolve.ts for the resolution itself and deferred.ts for why the
+  // loop can be handed a backend before one exists.
   await maybeSelfUpdateAndRestart();
-  await ensureSingleInstance();
   const projectRoot = process.cwd();
-  // ── First-run bootstrap ───────────────────────────────────────────────────
-  // Runs BEFORE the alt screen, so its progress lines land on the normal
-  // scrollback where they can scroll past, and before loadConfig so the config
-  // it writes is the one that gets loaded.
-  //
-  // Every step is idempotent and derived from measured hardware, so this is a
-  // few stat() calls on an already-set-up machine and a real install on a fresh
-  // one — with no prompt anywhere. It is also allowed to fail: the report is
-  // surfaced and the app continues, because a bootstrap that throws would take
-  // down a working install. `LLAMACLI_NO_BOOTSTRAP=1` skips it entirely.
-  let bootstrapReport: Awaited<ReturnType<typeof ensureLocalStack>> | undefined;
-  if (process.env.LLAMACLI_NO_BOOTSTRAP !== "1") {
-    try {
-      bootstrapReport = await ensureLocalStack({
-        projectRoot,
-        log: (line) => process.stdout.write(`[setup] ${line}\n`),
-      });
-    } catch (err) {
-      process.stdout.write(
-        `[setup] 자동 설정을 완료하지 못했습니다 (${err instanceof Error ? err.message : String(err)}). ` +
-          `기존 설정으로 계속합니다.\n`
-      );
-    }
-  }
   enterAltScreen();
   let cleanedUp = false;
   /** Teardown callbacks, run by `cleanup`. Anything holding an OS resource
@@ -394,53 +326,72 @@ async function main() {
   // the question at all.
   const pendingCheckpoint = await readCheckpoint(projectRoot);
 
-  let backend: OpenAICompatibleClient;
-  if (config.backend === "local-llama" && config.llama?.modelPath) {
-    const manager = new LlamaServerManager({
-      binPath: config.llama.binPath,
-      modelPath: config.llama.modelPath,
-      host: "127.0.0.1",
-      port: config.llama.port,
-      contextSize: config.llama.contextSize,
-      threads: config.llama.threads,
-      gpuLayers: config.llama.gpuLayers,
-      // The rest of the tuning, which the bootstrap derives and records. These
-      // were previously computed, written to config.yaml, shown back to the
-      // user — and never handed to the process, so `--n-cpu-moe` in particular
-      // was a value that existed only in a file. A spawned server on a small
-      // card therefore OOM'd on the model it was about to be told to page.
-      threadsBatch: config.llama.threadsBatch,
-      batchSize: config.llama.batchSize,
-      ubatchSize: config.llama.ubatchSize,
-      cpuMoeLayers: config.llama.cpuMoeLayers,
-      flashAttn: config.llama.flashAttn,
-      cacheTypeK: config.llama.cacheTypeK,
-      cacheTypeV: config.llama.cacheTypeV,
-      parallel: config.llama.parallel,
-    });
-    await manager.start();
-    // Explicit, in addition to the manager's own exit hook: SIGINT is handled
-    // above for the alt screen, and a server left running holds the model in
-    // VRAM for the rest of the machine's uptime.
-    cleanupRegistry.push(() => manager.stop());
-    backend = manager.client();
-  } else {
-    backend = new OpenAICompatibleClient(config.baseUrl ?? `http://127.0.0.1:${LLAMA_PORT}`, config.apiKey);
-  }
+  // ── Backend resolution ────────────────────────────────────────────────────
+  // Three cases, decided in order (see backend/resolve.ts for why the order is
+  // the whole design): an already-running server is adopted at its own
+  // endpoint/port; otherwise an installed llama.cpp is started on a free port;
+  // otherwise llama.cpp is installed, configured and given a model.
+  //
+  // It runs AFTER render() and behind a DeferredBackend, deliberately. Doing it
+  // before the screen came up is what made `llamacli` look like it vanished —
+  // reported directly: "llamacli 를 입력하면 setup 진행이 되면서 화면이
+  // 사라져". A first run installs llama.cpp and downloads a 20 GB model, so
+  // that wait is minutes long and cannot be spent with a blank screen. Running
+  // it behind the TUI means the banner is up immediately and every step is a
+  // status line the user can read, and a message typed during setup simply
+  // waits for it rather than failing against a dead port.
+  const thresholds = {
+    autoTriggerRatio: config.compaction.autoTriggerRatio,
+    // Provisional, replaced by the server's own report below. Read live on every
+    // turn (AgentLoop reads this object, not a captured copy), so updating it
+    // after setup takes effect without rebuilding the loop.
+    contextWindowTokens: config.llama?.contextSize ?? 8192,
+  };
+  const ui = () => (globalThis as any).__llamacli_ui;
+  // The work itself starts only after render() below (see startResolution) — the
+  // promise is created now because AgentLoop needs a backend to construct. Every
+  // line lands in the TUI's own log rather than on the normal screen, so the
+  // progress survives instead of being erased by the alt screen.
+  const startResolution = deferred();
+  const resolution = startResolution.promise.then(() =>
+    resolveBackend({
+      projectRoot,
+      config,
+      log: (line) => ui()?.pushStatus(line),
+      // Explicit, in addition to the manager's own exit hook: SIGINT is handled
+      // above for the alt screen, and a server left running holds the model in
+      // VRAM for the rest of the machine's uptime.
+      registerCleanup: (fn) => cleanupRegistry.push(fn),
+    })
+  );
+  const backend = new DeferredBackend(resolution.then((r) => r.backend));
 
-  // Prefer the backend's own reported context size over the static config
-  // value whenever possible — a config file can silently drift out of sync
-  // with whatever the server is actually running (seen live: config said
-  // 8192, the real server was -c 65536, so compaction fired 8x too eagerly
-  // and interrupted every single turn in an endless compact/resume loop).
-  // Falls back to config (then 8192) for backends that don't expose this.
-  let contextWindowTokens = config.llama?.contextSize ?? 8192;
-  try {
-    const reported = await backend.getContextSize?.();
-    if (reported) contextWindowTokens = reported;
-  } catch {
-    // Non-llama.cpp backend, or /props unavailable — config value stands.
-  }
+  // Prefer the backend's own reported context size over the static config value
+  // whenever possible — a config file can silently drift out of sync with
+  // whatever the server is actually running (seen live: config said 8192, the
+  // real server was -c 65536, so compaction fired 8x too eagerly and interrupted
+  // every single turn in an endless compact/resume loop). Runs after the
+  // backend exists, so the value comes from the server that is really serving.
+  resolution
+    .then(async (r) => {
+      if (r.kind === "unresolved") {
+        ui()?.pushStatus(`[설정 실패] ${r.reason}`);
+        return;
+      }
+      try {
+        const reported = await r.backend.getContextSize?.();
+        if (reported) thresholds.contextWindowTokens = reported;
+      } catch {
+        // Non-llama.cpp backend, or /props unavailable — the config value stands.
+      }
+    })
+    .catch(() => {
+      // resolveBackend never rejects for a resolution failure (it returns
+      // `unresolved`), so this is only reachable if something outside it threw.
+      // Reported rather than swallowed: a silent failure here would leave the
+      // TUI showing a ready-looking prompt against a backend that is not there.
+      ui()?.pushStatus("[설정 실패] 모델 백엔드를 준비하는 중 오류가 발생했습니다.");
+    });
 
 
 
@@ -450,10 +401,10 @@ async function main() {
     model: config.model,
     backend,
     systemPrompt,
-    thresholds: {
-      autoTriggerRatio: config.compaction.autoTriggerRatio,
-      contextWindowTokens,
-    },
+    // The same object the resolution above mutates, passed by reference: a copy
+    // here would freeze the provisional value and the server's real context size
+    // would never take effect.
+    thresholds,
     autoResume: config.compaction.autoResume,
     enableThinking: config.enableThinking ?? false,
     verify: config.verify?.afterEdit,
@@ -842,6 +793,12 @@ async function main() {
   );
 
   if (setupMessage) (globalThis as any).__llamacli_ui?.pushStatus(setupMessage);
+
+  // The screen is up and the log can accept lines, so backend resolution
+  // finally begins. Until this point it was only a pending promise, because a
+  // first run installs llama.cpp and downloads a model — minutes of work whose
+  // progress would otherwise be printed to a screen Ink is about to take over.
+  startResolution.resolve();
 
   // Resuming (or discarding) a found checkpoint now happens via the
   // App-rendered Y/N question (pendingResumeGoal/onResumeDecision above)

@@ -74,6 +74,13 @@ export interface BootstrapOptions {
   probe?: PortProbe;
   fetchImpl?: typeof fetch;
   env?: NodeJS.ProcessEnv;
+  /** Replaces the download progress reporter, wrapping the default one so the
+   *  caller does not have to reimplement it. Defaults to a single rewritten
+   *  terminal line (renderProgressLine), which is right when the bootstrap owns
+   *  a plain screen and WRONG when it does not: it writes `\r\x1b[2K` to
+   *  process.stdout directly, which corrupts an Ink app rendering into the same
+   *  terminal. The TUI passes a reporter that goes through its own log instead. */
+  onProgress?: (defaultReporter: (p: TransferProgress) => void) => (p: TransferProgress) => void;
   /** Injected so a test can supply a fake machine. */
   hardware?: Hardware;
   /** Detects an already-running OpenAI-compatible server to adopt instead of
@@ -406,7 +413,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
             connections: 8,
             label: model!.candidate.filename,
             fetchImpl: opts.fetchImpl,
-            onProgress: renderProgressLine(log),
+            onProgress: opts.onProgress ? opts.onProgress(() => renderProgressLine(log)) : renderProgressLine(log),
           });
           return `${result.bytes} 바이트 다운로드 완료 (${result.parallel ? "병렬 range" : "단일 스트림"})`;
         });
