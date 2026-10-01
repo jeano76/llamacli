@@ -164,17 +164,47 @@ export class OpenAICompatibleClient implements ModelBackend {
   /** llama.cpp-server-specific endpoint — callers must be ready for this to
    *  throw and fall back to the configured value.
 
-   *  Reads `model_info.n_ctx` from `/config`, which modern llama-server
-   *  exposes and which reflects whatever size it was actually launched with
-   *  (so the config.yaml contextSize is honoured). The old /props endpoint no
-   *  longer exists in current builds, so querying it always failed here and
-   *  forced a hard-coded 8192 fallback regardless of the true limit. */
+   *  Tries `/config` first (`model_info.n_ctx`), then `/props`
+   *  (`default_generation_settings.n_ctx`). Neither endpoint is present in every
+   *  build: the PrismML fork answers `/props` but 404s `/config`, and the stock
+   *  build here registers `/props` with no `/config` route at all.
+   *
+   *  Getting this wrong is not cosmetic. When both lookups fail, callers fall
+   *  back to `config.llama.contextSize ?? 8192`, so a server actually launched
+   *  with `-c 32768` gets budgeted as 8192. Compaction then fires ~4x too early
+   *  and its own summary request overruns the real limit — the compact/resume
+   *  loop this fallback exists to prevent (see index.tsx on compaction firing
+   *  "8x too eagerly"). */
   async getContextSize(): Promise<number> {
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/config`, { headers: this.headers() }, LIGHTWEIGHT_FETCH_TIMEOUT_MS, "getContextSize");
-    if (!res.ok) throw new Error(`getContextSize failed: ${res.status} ${await res.text()}`);
-    const json = (await res.json()) as { model_info?: { n_ctx?: number } };
-    const n_ctx = json.model_info?.n_ctx;
-    if (!n_ctx) throw new Error("getContextSize: /config response had no model_info.n_ctx field");
+    // Every failure mode here means "this endpoint did not tell us", never "stop".
+    // A reverse proxy that answers `/config` with an HTML login page, a build
+    // that 404s it, a fork that serves a different shape — all are answers, and
+    // the other endpoint is still worth asking. Letting any of them escape threw
+    // out of the `??` chain before the fallback ran, so a server whose `/props`
+    // would have reported 40960 instead raised a JSON parse error and the caller
+    // fell back to a hard-coded 8192.
+    const read = async (path: string, pick: (j: any) => number | undefined): Promise<number | null> => {
+      try {
+        const res = await this.fetchWithTimeout(`${this.baseUrl}${path}`, { headers: this.headers() }, LIGHTWEIGHT_FETCH_TIMEOUT_MS, "getContextSize");
+        if (!res.ok) return null;
+        return pick(await res.json()) ?? null;
+      } catch (err: any) {
+        // A malformed body is a shape mismatch, so keep looking on the other
+        // endpoint. A transport failure is not: if the server is unreachable or
+        // timing out, the second request will fail identically, and re-raising
+        // preserves the diagnosis ("timed out") that the catch would otherwise
+        // flatten into a generic "neither endpoint answered".
+        if (/timed out|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|fetch failed/i.test(err?.message ?? "")) {
+          throw err;
+        }
+        return null;
+      }
+    };
+
+    const n_ctx =
+      (await read("/config", (j) => j.model_info?.n_ctx)) ??
+      (await read("/props", (j) => j.default_generation_settings?.n_ctx));
+    if (!n_ctx) throw new Error("getContextSize: neither /config nor /props reported an n_ctx");
     return n_ctx;
   }
 

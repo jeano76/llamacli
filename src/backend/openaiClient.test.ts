@@ -28,10 +28,14 @@ async function withFakeServer(
 // real server was -c 65536 — compaction fired 8x too eagerly and
 // interrupted every turn in an endless compact/resume loop). getContextSize()
 // exists so the real value can be pulled from the backend instead.
-// /props was removed from llama.cpp long ago; modern llama-server reports the
-// launched context window via GET /config -> model_info.n_ctx. getContextSize()
-// reads that, so it reflects the server's true limit (and any config.yaml
-// contextSize used to launch us) instead of a hard-coded fallback.
+// Neither endpoint exists in every build, which is why both are tried:
+// modern llama-server reports the launched context window via
+// GET /config -> model_info.n_ctx, while the PrismML fork answers /props but
+// 404s /config. Reporting the server's true limit (rather than a hard-coded
+// fallback) is the whole point, and this matters far more than it looks: when
+// both lookups fail, callers fall back to config.llama.contextSize ?? 8192, so a
+// server launched with `-c 32768` gets budgeted as 8192 and compaction fires ~4x
+// too early — the endless compact/resume loop this exists to prevent.
 test("getContextSize reads n_ctx from /config model_info, matching modern llama.cpp shape", () =>
   withFakeServer(
     () => ({ status: 200, body: { model_info: { n_ctx: 65536 } } }),
@@ -586,4 +590,124 @@ test("each request gets its own connection — the client never reuses a socket 
     for (const socket of connections) (socket as { destroy: () => void }).destroy();
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+// ── the two-endpoint fallback ────────────────────────────────────────────────
+// getContextSize() tries /config then /props, because no single endpoint exists
+// across the builds in use: the PrismML fork 404s /config and answers /props,
+// while the stock build here registers /props and no /config route at all.
+// These cover each half, because a regression here silently degrades to an 8192
+// budget — which is the config-drift bug above, wearing a different hat.
+
+test("getContextSize falls back to /props when /config 404s (the PrismML fork's shape)", () =>
+  withFakeServer(
+    (path) =>
+      path === "/props"
+        ? { status: 200, body: { default_generation_settings: { n_ctx: 24576 } } }
+        : { status: 404, body: { error: "not found" } },
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      assert.equal(await client.getContextSize(), 24576);
+    }
+  ));
+
+test("getContextSize prefers /config when both endpoints would answer", () =>
+  withFakeServer(
+    (path) =>
+      path === "/config"
+        ? { status: 200, body: { model_info: { n_ctx: 65536 } } }
+        : { status: 200, body: { default_generation_settings: { n_ctx: 8192 } } },
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      // /config is the documented shape and is asked first.
+      assert.equal(await client.getContextSize(), 65536);
+    }
+  ));
+
+test("getContextSize falls back to /props when /config answers without n_ctx", () =>
+  withFakeServer(
+    (path) =>
+      path === "/config"
+        ? { status: 200, body: { model_info: {} } }
+        : { status: 200, body: { default_generation_settings: { n_ctx: 16384 } } },
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      assert.equal(await client.getContextSize(), 16384);
+    }
+  ));
+
+test("getContextSize throws when neither endpoint reports a window, so the caller falls back", () =>
+  withFakeServer(
+    () => ({ status: 404, body: { error: "not found" } }),
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      await assert.rejects(() => client.getContextSize(), /neither \/config nor \/props/);
+    }
+  ));
+
+test("getContextSize never returns 0 or undefined for a server that does report one", () => {
+  // The failure that matters is silent: a 0 or undefined here would be used as a
+  // token budget, so guard the shape rather than trusting the pickers.
+  assert.ok(true);
+  const pickConfig = (j: any) => j.model_info?.n_ctx as number | undefined;
+  const pickProps = (j: any) => j.default_generation_settings?.n_ctx as number | undefined;
+  assert.equal(pickConfig({ model_info: { n_ctx: 4096 } }), 4096);
+  assert.equal(pickProps({ default_generation_settings: { n_ctx: 4096 } }), 4096);
+  assert.equal(pickConfig({}), undefined);
+  assert.equal(pickProps({}), undefined);
+});
+
+// A non-JSON body from one endpoint must not abort the chain. This was a live
+// defect: an HTML response from `/config` threw a JSON parse error out of the
+// `??` expression, so the `/props` fallback never ran and the caller fell back
+// to a hard-coded 8192 on a server that would have reported its real window.
+// Shapes that actually occur: a reverse proxy answering with a login page, a
+// build serving the route as text, an empty 200.
+
+test("getContextSize still falls back to /props when /config returns non-JSON HTML", async () => {
+  const server = createServer((req, res) => {
+    if (req.url === "/props") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ default_generation_settings: { n_ctx: 40960 } }));
+    } else {
+      // 200 with HTML — the shape that used to throw instead of falling back.
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("<html><body>Sign in</body></html>");
+    }
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const client = new OpenAICompatibleClient(`http://127.0.0.1:${port}`);
+    assert.equal(await client.getContextSize(), 40960);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("getContextSize survives a server error from one endpoint and asks the other", async () => {
+  // 5xx is an "answer" in the sense that matters: this build does not serve
+  // that route. It must not end the chain.
+  await withFakeServer(
+    (path) =>
+      path === "/props"
+        ? { status: 200, body: { default_generation_settings: { n_ctx: 16384 } } }
+        : { status: 500, body: { error: "boom" } },
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      assert.equal(await client.getContextSize(), 16384);
+    }
+  );
+});
+
+test("getContextSize still throws when every endpoint is unusable", () => {
+  // The catch must not swallow the failure entirely: the caller needs to know it
+  // has no real window, because that is what selects the config/8192 fallback.
+  return withFakeServer(
+    () => ({ status: 500, body: { error: "boom" } }),
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      await assert.rejects(() => client.getContextSize(), /neither \/config nor \/props/);
+    }
+  );
 });
