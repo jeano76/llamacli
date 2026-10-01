@@ -47,9 +47,22 @@ export type Resolution =
   | { kind: "adopted"; backend: OpenAICompatibleClient; baseUrl: string; model: string; port: number }
   /** Cases 2 and 3 — llamacli owns the process and must stop it on exit. */
   | { kind: "spawned"; backend: OpenAICompatibleClient; stop: () => void; port: number; modelPath: string }
-  /** Case 3 could not finish. Never throws: the app still starts, with
-   *  whatever was configured, and reports the reason. */
-  | { kind: "unresolved"; backend: OpenAICompatibleClient; reason: string };
+  /** Resolution finished but the backend is degraded or unusable.
+   *
+   *  `usable` is what separates the two very different situations this one state
+   *  used to conflate:
+   *
+   *   - true  — a real server answered; it just answers badly (the health probe
+   *             judged its output garbage). The user has a working session they
+   *             can inspect and act on, so the app comes up and says what is
+   *             wrong. Killing it would strand a running server with no way to
+   *             reach it.
+   *   - false — there is nothing to talk to (nothing installed, start failed,
+   *             install failed). Prompt mode would be a ready-looking front for
+   *             a backend that cannot answer a single turn.
+   *
+   *  Never throws either way; `reason` is the sentence to show the user. */
+  | { kind: "unresolved"; backend: OpenAICompatibleClient; reason: string; usable: boolean };
 
 export interface ResolveOptions {
   projectRoot: string;
@@ -128,12 +141,14 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     if (health.verdict === "garbage") {
       const reason = describeUnhealthyBackend(`${server.baseUrl} (모델 ${server.model})`, health);
       log(reason);
-      // Reported, not fatal to the app: `unresolved` still carries a working
-      // backend, so the TUI comes up and the reason is on screen where the user
-      // can act on it. Deliberately NOT falling through to case 2 — the broken
-      // server is still holding the model in VRAM, and spawning a second one
-      // beside it is the out-of-memory this module's ordering exists to avoid.
-      return { kind: "unresolved", backend: adopted, reason };
+      // Reported, not fatal to the app: `usable` is true because a real server
+      // IS answering here — it just answers with garbage. The TUI comes up and
+      // the reason is on screen where the user can act on it. Deliberately NOT
+      // falling through to case 2 — the broken server is still holding the model
+      // in VRAM, and spawning a second one beside it is the out-of-memory this
+      // module's ordering exists to avoid. It also has to stay non-fatal: exiting
+      // would strand a running server the user can no longer reach.
+      return { kind: "unresolved", backend: adopted, reason, usable: true };
     }
     log(`이미 구동 중인 서버에 연결합니다: ${server.baseUrl} (모델 ${server.model})`);
     // Recorded so the next launch is a straight read of a known-good endpoint
@@ -190,7 +205,9 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
         if (health.verdict === "garbage") {
           const reason = describeUnhealthyBackend(`${started.baseUrl} (모델 ${recorded.modelPath})`, health);
           log(reason);
-          return { kind: "unresolved", backend: spawned, reason };
+          // Same reasoning as case 1: the server is up and ours, so the session
+          // comes up with the reason visible rather than exiting on the user.
+          return { kind: "unresolved", backend: spawned, reason, usable: true };
         }
         return {
           kind: "spawned",
@@ -213,6 +230,10 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
           `${recorded.binPath} 를 ${port} 포트에서 시작하지 못했습니다. ` +
           `llama.cpp 와 모델은 설치되어 있으므로 다시 설치하지 않았습니다 — 포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. ` +
           `.llamacli/config.yaml 의 llama.port 를 비어 있는 포트로 바꾸거나, 서버를 직접 실행한 뒤 다시 시도하세요.`,
+        // Nothing is listening on that endpoint — the process refused to start —
+        // so there is no session to hand the user. This is one of the outcomes
+        // that must NOT come up as a ready-looking prompt.
+        usable: false,
       };
     } else {
       log(`설정된 모델 파일이 없습니다: ${recorded.modelPath}`);
@@ -238,7 +259,7 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     // Should not happen (ensureLocalStack returns a report), but a throw here
     // must not take down the session: the app starts on the recorded config.
     const reason = err instanceof Error ? err.message : String(err);
-    return { kind: "unresolved", backend: fallbackClient(config), reason };
+    return { kind: "unresolved", backend: fallbackClient(config), reason, usable: false };
   }
 
   for (const error of report.errors) log(`[설정 경고] ${error}`);
@@ -294,6 +315,9 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     kind: "unresolved",
     backend: fallbackClient(config),
     reason: report.errors[0] ?? "llama.cpp 와 모델을 준비하지 못했습니다. .llamacli/config.yaml 을 직접 설정하세요.",
+    // The install itself did not complete, so there is no model and no server:
+    // prompt mode here would be a shell around nothing.
+    usable: false,
   };
 }
 

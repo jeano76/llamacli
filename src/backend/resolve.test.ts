@@ -400,3 +400,105 @@ http.createServer((req, res) => {
     await rm(root, { recursive: true, force: true });
   }
 });
+// ── `usable`: the distinction that decides exit-vs-launch ───────────────────
+//
+// `unresolved` used to be one state meaning two opposite things: "a server is
+// answering but its output is garbage" (the user has a session and should see
+// it) and "there is nothing to talk to" (prompt mode would be a shell around
+// nothing). index.tsx must be able to tell them apart, or it either strands a
+// running server or relaunches into a backend that cannot answer.
+
+test("a garbage-output server is unresolved but still usable, so the TUI comes up", async () => {
+  const res = await resolveBackend({
+    projectRoot: "/tmp/resolve-usable-1",
+    config: localConfig({}),
+    log: () => {},
+    discover: async () => ({
+      kind: "found",
+      server: { baseUrl: "http://127.0.0.1:9999", model: "some-model" },
+    }),
+    probe: async () => ({ verdict: "garbage", sample: "…", reason: "not echoing" }),
+  });
+  assert.equal(res.kind, "unresolved");
+  // Usable: a real server is answering. Killing the app here would leave a
+  // server holding VRAM with no way to reach it, and the user no way to see why.
+  assert.equal(res.kind === "unresolved" && res.usable, true);
+});
+
+test("a start failure is unresolved and NOT usable, so the app exits instead of prompting", async () => {
+  // Everything is installed, but nothing is listening: a prompt here is exactly
+  // the reported "준비 안 된 상태에서 바로 프롬프트 모드" bug.
+  const root = await mkdtemp(join(tmpdir(), "resolve-unusable-"));
+  try {
+    const modelPath = join(root, "m.gguf");
+    await writeFile(modelPath, "weights");
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig({
+        backend: "local-llama",
+        llama: { binPath: "/nonexistent/llama-server", modelPath, port: 8080, contextSize: 8192, threads: 4, gpuLayers: 0 },
+      }),
+      log: () => {},
+      discover: async () => none,
+      bootstrap: async () => {
+        throw new Error("the installer must not be consulted here");
+      },
+    });
+    assert.equal(res.kind, "unresolved");
+    assert.equal(res.kind === "unresolved" && res.usable, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed install is unresolved and NOT usable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "resolve-unusable-2-"));
+  try {
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig({}),
+      log: () => {},
+      discover: async () => none,
+      bootstrap: async () => ({ ok: false, steps: [], errors: ["install failed"] }) as unknown as BootstrapReport,
+    });
+    assert.equal(res.kind, "unresolved");
+    assert.equal(res.kind === "unresolved" && res.usable, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a bootstrap that throws is unresolved and NOT usable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "resolve-unusable-3-"));
+  try {
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig({}),
+      log: () => {},
+      discover: async () => none,
+      bootstrap: async () => {
+        throw new Error("network unreachable");
+      },
+    });
+    assert.equal(res.kind, "unresolved");
+    assert.equal(res.kind === "unresolved" && res.usable, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a healthy adopted server is not unresolved at all", async () => {
+  // The control: `usable` must not leak into the normal path and make every
+  // resolution look degraded.
+  const res = await resolveBackend({
+    projectRoot: "/tmp/resolve-usable-ok",
+    config: localConfig({}),
+    log: () => {},
+    discover: async () => ({
+      kind: "found",
+      server: { baseUrl: "http://127.0.0.1:9999", model: "some-model" },
+    }),
+    probe: async () => ({ verdict: "healthy", sample: "ok" }),
+  });
+  assert.equal(res.kind, "adopted");
+});

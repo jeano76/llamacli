@@ -241,15 +241,18 @@ const REPO_URL = "https://github.com/jeano76/llamacli";
  */
 function enableWindowsVirtualTerminal(): void {
   if (process.platform !== "win32") return;
+  // VT mode and the code page are INDEPENDENT settings, so neither call may
+  // short-circuit the other. An early `return` when VT was already on (Windows
+  // Terminal, or anyone who ran chcp before) skipped the code page entirely,
+  // which is the case that leaves Korean text as mojibake on the very terminals
+  // most likely to support VT in the first place.
   try {
     const stdout = process.stdout as NodeJS.WriteStream & {
       setWindowsVirtualTerminalProcessingMode?: (mode: boolean) => boolean;
       getWindowsVirtualTerminalProcessingMode?: () => boolean;
     };
-    if (typeof stdout.getWindowsVirtualTerminalProcessingMode === "function") {
-      if (stdout.getWindowsVirtualTerminalProcessingMode()) return; // already on
-    }
-    stdout.setWindowsVirtualTerminalProcessingMode?.(true);
+    const alreadyOn = stdout.getWindowsVirtualTerminalProcessingMode?.() === true;
+    if (!alreadyOn) stdout.setWindowsVirtualTerminalProcessingMode?.(true);
   } catch {
     // Not a console, or an OS that refuses. Detection handles it.
   }
@@ -471,27 +474,36 @@ async function main() {
     registerCleanup: (fn) => cleanupRegistry.push(fn),
   });
 
-  // Only an adopted or spawned server is a backend the TUI can actually use.
-  // `unresolved` covers the four real "not ready" outcomes resolve.ts reports:
-  // garbage output from an already-running server, garbage output from a freshly
-  // spawned one, a start failure with everything already installed (busy port /
-  // not enough VRAM), and a failed install. Entering prompt mode in any of them
-  // is the reported bug — a ready-looking prompt against a backend that cannot
-  // answer a single turn, with the reason scrolled away behind it.
+  // Prompt mode must not come up against a backend that cannot answer a single
+  // turn. `resolveBackend` distinguishes the two shapes of "not ready":
   //
-  // So leave the shell exactly as found, print what went wrong, exit non-zero.
-  // No alt screen was entered, so there is nothing to tear down; `cleanup` still
-  // runs so a server that DID start is not left holding VRAM.
-  if (resolution.kind === "unresolved") {
+  //   - NOT usable: nothing is installed, or a start failed, or the install
+  //     failed. There is genuinely nothing to talk to, so leave the shell as we
+  //     found it, print the reason, and exit non-zero. No alt screen was
+  //     entered, so there is nothing to tear down; `cleanup` still runs so a
+  //     server that DID start is not left holding VRAM.
+  //   - Usable but degraded: a real server answered, it just answers with
+  //     garbage (the health probe's verdict). The user has a live session to
+  //     inspect, and the reason is far more useful on screen than in a terminal
+  //     this process has already left — so the TUI comes up and says what is
+  //     wrong, which is what resolve.ts has always documented this state as.
+  //     Exiting here would strand a running server holding VRAM with no way to
+  //     reach it.
+  if (resolution.kind === "unresolved" && !resolution.usable) {
     console.error(`\n[설정 실패] ${resolution.reason}\n`);
     cleanup();
     process.exit(1);
   }
   const backend: Resolution["backend"] = resolution.backend;
 
-  // Everything below wants the alt screen, and only now is switching safe: the
-  // backend is confirmed usable, so this buffer will actually be used.
+  // Everything below wants the alt screen, and only now is switching safe:
+  // either resolution succeeded, or a server answered well enough for the user
+  // to see what is wrong with it.
   enterAltScreen();
+
+  // Carried into the TUI so a degraded backend says so on screen rather than
+  // looking like a healthy session that happens to answer oddly.
+  const degradedReason = resolution.kind === "unresolved" ? resolution.reason : null;
 
 
   // Prefer the backend's own reported context size over the static config value
@@ -843,6 +855,16 @@ async function main() {
   // `setupMessage` was already printed to the normal terminal before
   // resolution, so it survives in the shell's scrollback rather than being
   // scrolled away inside the TUI the moment setup output pushed past it.
+
+  // A degraded backend is reported HERE, inside the TUI, which is the whole
+  // point of letting that case through: the session is up, so the user needs to
+  // be able to read (and scroll back to) what is actually wrong. resolve.ts
+  // already printed it to the terminal before the alt screen opened; repeating
+  // it here is deliberate, because the terminal's copy is now behind the
+  // alternate buffer.
+  if (degradedReason) {
+    (globalThis as any).__llamacli_ui?.pushStatus(`[백엔드 경고] ${degradedReason}`);
+  }
 
   // Resuming (or discarding) a found checkpoint now happens via the
   // App-rendered Y/N question (pendingResumeGoal/onResumeDecision above)
