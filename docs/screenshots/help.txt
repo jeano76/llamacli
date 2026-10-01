@@ -6,8 +6,6 @@
   /compact                지금 컨텍스트 압축 실행
   /queue                  큐에 메시지 추가
   /skills, /rules         불러온 스킬 / 룰 목록
-  /improve                반복 실패 분석 → 룰 제안
-  /improve-apply          마지막 제안을 룰 파일로 저장
   /plan-clear             멈춘 계획 표시 초기화
   /fastcheck [on|off]     laya 빠른 판정 게이트 켜기/끄기
 
@@ -21,8 +19,6 @@
   /mouse           마우스 스크롤/클릭 켜기·끄기
   /skills          List loaded skills
   /rules           List loaded rules
-  /improve         Analyze repeated failures → propose a rule
-  /improve-apply   Save the last proposal as a rule file
   /plan-clear      Clear a stuck plan-progress indicator
   /fastcheck       Ask laya to short-circuit this turn (see docs)
 

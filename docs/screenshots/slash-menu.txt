@@ -16,8 +16,6 @@
 │   /mouse          마우스 스크롤/클릭 켜기·끄기                                                   │
 │   /skills         List loaded skills                                                             │
 │   /rules          List loaded rules                                                              │
-│   /improve        Analyze repeated failures → propose a rule                                     │
-│   /improve-apply  Save the last proposal as a rule file                                          │
 │   /plan-clear     Clear a stuck plan-progress indicator                                          │
 │   ↓ 아래 항목 있음                                                                               │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
