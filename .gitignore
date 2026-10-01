@@ -7,6 +7,9 @@ dist/
 # and committing it makes every user's machine share one machine's tuning.
 # `.llamacli/rules/` stays tracked: those are meant to be shared.
 .llamacli/config.yaml
+# Config backups written next to it by whichever session last rewrote it. They
+# capture one machine's endpoint/model, same as the config itself.
+.llamacli/*.bak*
 *.log
 .claude/
 __pycache__/
