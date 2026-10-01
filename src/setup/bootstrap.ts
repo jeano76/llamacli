@@ -25,7 +25,7 @@
 import { mkdir, writeFile, readFile, rename } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { stringify, parse } from "yaml";
-import { detectHardware, type Hardware } from "./hardware.js";
+import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB, type Hardware } from "./hardware.js";
 import { tuneForHardware, type LlamaTuning } from "./tuning.js";
 import { findLlamaServer, buildLlamaCpp, defaultRun, type LlamaLocation, type Run } from "./llamaCpp.js";
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
@@ -91,6 +91,12 @@ export interface BootstrapOptions {
   /** Candidate .gguf files already present in the models dir. Injected in
    *  tests; read from disk otherwise. */
   listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>;
+  /** PIDs of llama-server processes belonging to THIS install, whose VRAM is
+   *  discounted when sizing the context (see budgetVramGiB). Injected because
+   *  attributing a pid to our own server is a question about which binary we
+   *  launched, not something the tuner can answer; tests pass an empty list,
+   *  which is also correct for a genuine first run. */
+  serverPids?: readonly number[];
 }
 
 export const DEFAULT_MODELS_DIR = pathJoin(process.env.HOME ?? "/root", "models");
@@ -453,9 +459,30 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       : typeof configuredCpuMoe === "number" && configuredCpuMoe > 0
       ? configuredCpuMoe
       : undefined;
+  // Our own llama-server's VRAM is added back to the budget before the context
+  // is sized. This matters because the tuner runs on the path that STARTS a
+  // server, but the card is not guaranteed empty — a second llamacli, or any
+  // other CUDA process, may already be resident, and nvidia-smi's free-VRAM
+  // reading cannot tell those apart from our own weights. Without the
+  // add-back, memory we ourselves are holding reads as unavailable headroom and
+  // collapses the context. See budgetVramGiB's doc comment for the measured
+  // case (an 8 GiB card dropping from 16384 to 4096).
+  //
+  // Best-effort and additive-only: if the pid can't be attributed (no
+  // nvidia-smi, no permission, MIG), this is 0 and the plain free-VRAM reading
+  // stands, which is the correct conservative default.
+  //
+  // When the caller doesn't supply pids, we discover our own rather than
+  // leaving the credit permanently unused — attribution is restricted to a
+  // binary inside THIS install's build dir (see findOwnLlamaServerPids), so
+  // this cannot credit a system llama-server or another user's.
+  const serverPids =
+    opts.serverPids ?? (await findOwnLlamaServerPids(llama ? dirname(llama.binPath) : undefined, run));
+  const ownServerVramGiB = await ownLlamaServerVramGiB(serverPids, run);
   const tuning = tuneForHardware(hardware, {
     modelBytes: model?.candidate.sizeBytes,
     cpuMoeLayers: measuredCpuMoe,
+    ownServerVramGiB,
   });
   for (const r of tuning.rationale) log(r);
 

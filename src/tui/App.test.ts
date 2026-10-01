@@ -21,10 +21,10 @@ test("filterMenuItems matches a full command name", () => {
 });
 
 test("filterMenuItems matches a partial prefix", () => {
-  const result = filterMenuItems("/imp");
+  const result = filterMenuItems("/pla");
   assert.deepEqual(
     result.map((i) => i.key),
-    ["improve", "improve-apply"]
+    ["plan-clear"]
   );
 });
 
@@ -35,9 +35,10 @@ test("filterMenuItems is case-insensitive", () => {
 });
 
 test("filterMenuItems matches a substring anywhere in the command name, not just a prefix", () => {
-  const result = filterMenuItems("/apply");
+  // "lear" only occurs inside "plan-clear", never at its start.
+  const result = filterMenuItems("/lear");
   assert.equal(result.length, 1);
-  assert.equal(result[0].key, "improve-apply");
+  assert.equal(result[0].key, "plan-clear");
 });
 
 test("filterMenuItems returns an empty list when nothing matches, instead of falling back to all commands", () => {

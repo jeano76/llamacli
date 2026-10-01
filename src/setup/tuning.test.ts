@@ -221,3 +221,87 @@ test("every rationale line is non-empty, and every decision is explained", () =>
     for (const r of t.rationale) assert.ok(r.trim().length > 0, "no rationale line may be blank");
   }
 });
+
+// The context is sized from a KV-cache budget, so the two things that decide it
+// are the memory available and the model's own per-token cost. The regression
+// these cover: keying the context on card size alone gave a 35B the same
+// generous window as a 9B on the same GPU, which is the case that OOMs.
+const ORNITH_9B = 5_368_709_120; // 9B Q4_K_M, for the model-size comparison below
+
+test("the reference box reproduces the context its own server is demonstrably running", () => {
+  // Anchoring case. RTX 2070 SUPER 8 GiB with the 35B-A3B has been running
+  // `-c 16384`; a tuner that disagrees with a known-good configuration by 25%
+  // is not "more optimal", it is inventing a setting nobody has run.
+  const t = tuneForHardware(machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 7.28 } }), {
+    modelBytes: ORNITH_35B,
+  });
+  assert.equal(t.contextSize, 16384);
+});
+
+test("our own llama-server's VRAM does not shrink the context it is holding", () => {
+  // The bug: with our server up, nvidia-smi's free reading excludes exactly the
+  // weights we are sizing a context FOR, so the budget collapsed 4x (16384 ->
+  // 4096) purely because the box was working. Both readings describe the same
+  // machine and must produce the same answer.
+  const idle = machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 7.28 } });
+  // 1.46 GiB free while our server holds ~5.94 GiB of weights (6080 MiB, as
+  // reported by nvidia-smi's own per-process accounting).
+  const withServer = machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 1.46 } });
+
+  const withoutCredit = tuneForHardware(withServer, { modelBytes: ORNITH_35B });
+  const withCredit = tuneForHardware(withServer, { modelBytes: ORNITH_35B, ownServerVramGiB: 6080 / 1024 });
+
+  assert.ok(
+    withoutCredit.contextSize < tuneForHardware(idle, { modelBytes: ORNITH_35B }).contextSize,
+    "unattributed busy card should be treated as genuinely smaller"
+  );
+  assert.equal(withCredit.contextSize, tuneForHardware(idle, { modelBytes: ORNITH_35B }).contextSize);
+});
+
+test("another program's VRAM still counts against the budget", () => {
+  // The add-back is only ever for OUR server. Crediting an unrelated CUDA
+  // process would hand out a context the card cannot actually hold.
+  const busy = machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 2 } });
+  const idle = machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 7.28 } });
+  assert.ok(
+    tuneForHardware(busy, { modelBytes: ORNITH_35B }).contextSize < tuneForHardware(idle, { modelBytes: ORNITH_35B }).contextSize,
+    "an unrelated process occupying VRAM must still reduce the context"
+  );
+});
+
+test("a bigger model on the same card gets a smaller context, not the same one", () => {
+  // KV cost per token scales with the model, so card size alone cannot decide
+  // this — the 35B is the one that would OOM.
+  const gpu = { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 7.28 } as const;
+  const big = tuneForHardware(machine({ cpuCount: 12, ramGiB: 30, gpu }), { modelBytes: ORNITH_35B });
+  const small = tuneForHardware(machine({ cpuCount: 12, ramGiB: 30, gpu }), { modelBytes: ORNITH_9B });
+  assert.ok(small.contextSize > big.contextSize, `9B (${small.contextSize}) should exceed 35B (${big.contextSize})`);
+});
+
+test("a larger card buys a larger context for the same model", () => {
+  const m = ORNITH_35B;
+  const small = tuneForHardware(machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "small", totalGiB: 8, freeGiB: 7.28 } }), { modelBytes: m });
+  const large = tuneForHardware(machine({ cpuCount: 32, ramGiB: 64, gpu: { name: "RTX 4090", totalGiB: 24, freeGiB: 23 } }), { modelBytes: m });
+  assert.ok(large.contextSize > small.contextSize);
+  assert.equal(large.contextSize, 32768, "a 24 GiB card should reach the ceiling with this model");
+});
+
+test("the context never exceeds the card, however generous the machine looks", () => {
+  for (const gpu of [{ name: "x", totalGiB: 4, freeGiB: 4 }, { name: "y", totalGiB: 80, freeGiB: 80 }] as const) {
+    for (const modelBytes of [0, ORNITH_9B, ORNITH_35B, 70 * GiB]) {
+      const t = tuneForHardware(machine({ cpuCount: 8, ramGiB: 64, gpu }), { modelBytes, ownServerVramGiB: 12 });
+      assert.ok(t.contextSize >= 4096 && t.contextSize <= 32768);
+      assert.equal(t.contextSize % 4096, 0);
+      assert.ok(Number.isFinite(t.contextSize));
+    }
+  }
+});
+
+test("budgetVramGiB never invents memory beyond the card", () => {
+  const hw = machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 1 } });
+  const gpu = hw.gpus[0];
+  // An absurdly large "ours" reading is clamped to the card, minus reserve.
+  assert.ok(budgetVramGiB(hw, gpu, 64 * GiB) <= 8);
+  // And a negative/garbage one cannot reduce the budget below the floor.
+  assert.ok(budgetVramGiB(hw, gpu, -5 * GiB) >= 0.5);
+});

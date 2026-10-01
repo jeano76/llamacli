@@ -67,6 +67,45 @@ const GiB = UNITS.GiB;
  */
 const MAX_CPU_MOE_FRACTION = 0.4;
 
+/** Context bounds. The floor is llama.cpp's own practical minimum for a tool
+ *  loop that has to hold a system prompt plus a few tool results; the ceiling
+ *  keeps a single session from claiming a card's worth of KV on a machine whose
+ *  real limit is RAM (CPU-only inference pays the same KV cost, just slower). */
+const MIN_CONTEXT = 4096;
+const MAX_CONTEXT = 32768;
+
+/**
+ * Bytes of KV cache per token of context, from the model file size alone.
+ *
+ * The true figure is `2 * n_layer * n_kv_head * head_dim * bytes_per_element`,
+ * which needs the GGUF header to know exactly. We do not parse it here, so
+ * this is an estimate keyed on model size — deliberately, because the failure
+ * mode it replaces was worse: the previous code ignored the model entirely and
+ * keyed only on card size, so the LARGEST model (the one that OOMs) got the
+ * same generous context as a small one.
+ *
+ * The constants are calibrated against the reference model, a 35B-A3B Q4_K_M,
+ * whose measured KV cost at q8_0 is ~0.3 MiB/token — the same figure this file
+ * already used inline in the MoE deficit formula, so the two calculations stay
+ * consistent with each other. Smaller models get proportionally less per token,
+ * which is what lets a 9B on the same 8 GiB card carry a longer context than a
+ * 35B without OOMing.
+ *
+ * The floor matters more than it looks: at q4_0 (chosen below 3 GiB of budget)
+ * the real cost is roughly half, but under-estimating here would over-commit a
+ * card that is already the tightest case on the machine.
+ */
+function kvBytesPerToken(modelBytes?: number): number {
+  const MiB = UNITS.MiB;
+  if (!modelBytes || modelBytes <= 0) return 0.3 * MiB; // ~35B class, q8_0
+  const gib = modelBytes / GiB;
+  if (gib <= 6) return 0.08 * MiB; // ~7-9B dense
+  if (gib <= 12) return 0.13 * MiB; // ~12-14B
+  if (gib <= 20) return 0.18 * MiB; // ~20B dense
+  if (gib <= 30) return 0.24 * MiB; // ~30B dense
+  return 0.3 * MiB; // 35B-class MoE and up
+}
+
 export function tuneForHardware(
   hw: Hardware,
   opts?: {
@@ -81,6 +120,12 @@ export function tuneForHardware(
      * configured value through so a benchmarked machine keeps its benchmark.
      */
     cpuMoeLayers?: number;
+    /**
+     * VRAM already held by llamacli's own running llama-server. Added back to
+     * the free reading before the context budget is derived — see
+     * budgetVramGiB for why this is load-bearing rather than cosmetic.
+     */
+    ownServerVramGiB?: number;
   }
 ): LlamaTuning {
   const rationale: string[] = [];
@@ -88,6 +133,12 @@ export function tuneForHardware(
   const vram = totalVram(hw);
   const cpuCount = Math.max(1, hw.cpuCount);
   const ramGiB = hw.ramTotalBytes / GiB;
+  const modelBytes = opts?.modelBytes;
+  // Clamped to the card so a stale or oversized measurement can never inflate
+  // the budget past the hardware. 0 means "no server of ours identified",
+  // which is the correct conservative reading on a first run.
+  const oursGiB =
+    gpu && opts?.ownServerVramGiB ? Math.min(opts.ownServerVramGiB, gpu.vramTotalBytes / GiB) : 0;
 
   // --- GPU first ---------------------------------------------------------- //
   // "cpu가 여러개인 경우에는 Nvidia gpu를 우선" — on a multi-core machine the
@@ -121,21 +172,45 @@ export function tuneForHardware(
   // the file is downloaded, so this is a deliberately conservative table keyed
   // on the *budget* (free VRAM), not on the model — and the per-token constant
   // is scaled by the number of parallel slots, because KV is per-slot.
-  const budgetGiB = budgetVramGiB(hw, gpu);
-  let contextSize: number;
-  if (budgetGiB >= 20) {
-    contextSize = 32768;
-  } else if (budgetGiB >= 10) {
-    contextSize = 24576;
-  } else if (budgetGiB >= 6) {
-    contextSize = 16384;
-  } else if (budgetGiB >= 3) {
-    contextSize = 8192;
-  } else {
-    contextSize = 4096;
-  }
+  const budgetGiB = budgetVramGiB(hw, gpu, oursGiB * GiB);
+  // KV cache cost scales with the model's OWN shape, not with the card. A 35B
+  // and a 9B on the same GPU differ by roughly 4x per token, so sizing the
+  // context from VRAM alone systematically over-commits the big model — the
+  // one case that actually OOMs. We don't parse the GGUF here (see
+  // kvBytesPerToken's caller), so the model size stands in for it, which is
+  // monotonic in the true cost across the sizes llamacli ships.
+  const kvPerToken = kvBytesPerToken(modelBytes);
+  // Reserve for the weights and load-time overhead, then spend what's left on
+  // the KV cache.
+  //
+  // This is deliberately a FRACTION of the budget rather than the model file
+  // size, because the file size is a bad proxy for what is resident: llama.cpp
+  // memory-maps the weights and (with --n-cpu-moe, below) pages MoE experts
+  // from system RAM, so only the active slice is ever truly on the card. An
+  // earlier version of this reserved `min(modelSize, budget * 0.75)`, which
+  // reserved essentially the whole card on the reference box and collapsed a
+  // configuration that demonstrably runs to the 4096 floor.
+  //
+  // Calibrated against the reference box's own live server, which has been
+  // running `-c 16384` on a 6.28 GiB budget with a 21.4 GiB 35B-A3B Q4_K_M at
+  // ~0.3 MiB/token. Solving that measurement back gives a reserve of ~25% of
+  // the budget. Anchoring on a configuration known to work — rather than on
+  // whatever the arithmetic happens to produce — is the point: a tuner that
+  // disagrees with a working server by 25% is not "more optimal", it is
+  // inventing a setting nobody has ever run.
+  const RESERVE_FRACTION = 0.25;
+  const RESERVE_FLOOR_GIB = 0.5;
+  const reserveGiB = gpu ? Math.max(RESERVE_FLOOR_GIB, budgetGiB * RESERVE_FRACTION) : 0;
+  const kvBudgetGiB = Math.max(0.25, budgetGiB - reserveGiB);
+  const kvBudgetTokens = (kvBudgetGiB * GiB) / kvPerToken;
+  // 4096-aligned because llama.cpp's practical granularity for a coding
+  // agent's prompt shapes is a coarse block, and a round number is legible in
+  // /props and the logs when diagnosing "why did compaction fire".
+  let contextSize = Math.floor(kvBudgetTokens / 4096) * 4096;
+  contextSize = Math.max(MIN_CONTEXT, Math.min(MAX_CONTEXT, contextSize));
   rationale.push(
-    `컨텍스트는 ${contextSize} 토큰으로 설정했습니다 (사용 가능 VRAM ≈ ${budgetGiB.toFixed(1)} GiB 기준). ` +
+    `컨텍스트는 ${contextSize} 토큰으로 설정했습니다 (사용 가능 VRAM ≈ ${budgetGiB.toFixed(1)} GiB, ` +
+      `KV 예산 ≈ ${kvBudgetGiB.toFixed(1)} GiB ÷ ${(kvPerToken / 1024).toFixed(0)} KiB/토큰). ` +
       `이 값이 실제 서버보다 작으면 컴팩션이 과하게 자주, 크면 KV 캐시가 가중치 자리를 침범합니다.`
   );
 
@@ -205,7 +280,6 @@ export function tuneForHardware(
   // 1.6x overshoot, with the difference measured at +136% decode for the smaller
   // number. A guess must not silently outrank a measurement on every launch.
   let cpuMoeLayers = 0;
-  const modelBytes = opts?.modelBytes;
   const measuredCpuMoe = opts?.cpuMoeLayers;
   if (measuredCpuMoe !== undefined && measuredCpuMoe > 0) {
     cpuMoeLayers = measuredCpuMoe;
@@ -261,8 +335,29 @@ export function tuneForHardware(
  *  on GPU 0 on this box) and the transient allocations a load does before it
  *  settles. Without it, "free = 8192 MiB on a paper-spec card" plans a model
  *  that OOMs two seconds into loading — the failure mode this whole file
- *  exists to prevent. */
-export function budgetVramGiB(hw: Hardware, gpu: Gpu | null): number {
+ *  exists to prevent.
+ *
+ *  `oursBytes` is the VRAM our OWN llama-server is holding. It is added back,
+ *  and this is not a refinement — without it the budget collapses exactly when
+ *  llamacli is doing its job.
+ *
+ *  On a first launch — the only path that actually reaches the tuner, since
+ *  bootstrap returns early when it adopts an already-running server — the card
+ *  is empty apart from the compositor, so plain free VRAM is nearly the truth.
+ *  It stops being true the moment anything else touches the card: a
+ *  hardware-accelerated browser, another CUDA process, a second llamacli. That
+ *  memory is real and is still counted against the budget.
+ *
+ *  What must NOT be discounted is our own server's weights — they are what a
+ *  context is being sized FOR. Counting them as unavailable headroom makes the
+ *  tuner contradict the configuration it is about to launch with: on the
+ *  reference box (RTX 2070 SUPER, 8 GiB, 35B-A3B Q4_K_M) a card reporting
+ *  1.49 GiB free next to that server yields a 0.5 GiB budget and collapses the
+ *  context to 4096, against a server demonstrably running `-c 16384`.
+ *
+ *  So `oursBytes` adds back only what is attributable to our own server — see
+ *  ownLlamaServerVramGiB() in hardware.ts for how that is measured. */
+export function budgetVramGiB(hw: Hardware, gpu: Gpu | null, oursBytes = 0): number {
   if (!gpu) {
     // No GPU: the limit is RAM, and we can't have the model plus its KV cache
     // plus the OS out of a small box, so scale on RAM with a big reserve.
@@ -270,7 +365,8 @@ export function budgetVramGiB(hw: Hardware, gpu: Gpu | null): number {
   }
   const RESERVE_MIB = 1024;
   const free = gpu.vramFreeBytes > 0 ? gpu.vramFreeBytes : gpu.vramTotalBytes;
-  return Math.max(0.5, (free - RESERVE_MIB * UNITS.MiB) / GiB);
+  const usable = Math.min(gpu.vramTotalBytes, free + Math.max(0, oursBytes));
+  return Math.max(0.5, (usable - RESERVE_MIB * UNITS.MiB) / GiB);
 }
 
 /** System RAM headroom after accounting for a model file, for the "does this

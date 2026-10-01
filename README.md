@@ -457,9 +457,12 @@ drained (an undrained pipe fills and blocks the server mid-load), the ready
 budget scales with the model, and the child is reaped on every exit path so no
 session leaves one holding VRAM behind it.
 
-The server's real `n_ctx` is read back over `/props` once it is up and replaces
-the config's value: a config that says 8192 while the server runs `-c 65536`
-makes compaction fire 8× too eagerly and interrupts every turn.
+The server's real `n_ctx` is read back over `/config` (`model_info.n_ctx`) once
+it is up and replaces the config's value: a config that says 8192 while the
+server runs `-c 65536` makes compaction fire 8× too eagerly and interrupts every
+turn. (The old `/props` endpoint was removed from llama.cpp long ago, so reading
+it always failed and silently forced an 8192 fallback regardless of the true
+limit.)
 
 ### `--n-cpu-moe` is the one flag a measurement beats a formula for
 
@@ -1284,12 +1287,12 @@ Fixed two ways: corrected the stale config value for the immediate fix, and
 — since a config file can always drift out of sync with whatever the
 server actually ends up running as again — added
 `OpenAICompatibleClient.getContextSize()`, which reads the real `n_ctx`
-from llama.cpp's own `/props` endpoint
-(`default_generation_settings.n_ctx`). `index.tsx` now prefers this live
+from llama.cpp's own `/config` endpoint
+(`model_info.n_ctx`). `index.tsx` now prefers this live
 value over the static config at startup, falling back to config (then
 8192) only for backends that don't expose it. Verified directly against
 the real running server (`getContextSize()` correctly returned `65536`,
-matching `/props` output), plus 3 new unit tests against a fake `/props`
+matching `/config` output), plus 3 new unit tests against a fake `/config`
 server covering the real response shape, a missing-`n_ctx` response, and a
 non-OK response — all falling back rather than silently returning a bogus
 value.
@@ -2332,12 +2335,14 @@ progress.
 >
 > 두 가지로 수정: 우선 당장은 설정값 자체를 바로잡았고, 설정 파일이
 > 나중에 또 실제 서버와 어긋날 수 있으므로 — `OpenAICompatibleClient`에
-> `getContextSize()`를 추가해서 llama.cpp 자체의 `/props` 엔드포인트
-> (`default_generation_settings.n_ctx`)에서 실제 값을 읽어오게 함.
+> `getContextSize()`를 추가해서 llama.cpp 자체의 `/config` 엔드포인트
+> (`model_info.n_ctx`)에서 실제 값을 읽어오게 함. (옛 `/props` 엔드포인트는
+> 오래전에 llama.cpp에서 사라져서, 거 읽으면 항상 실패하고 8192로 조용히
+> 폴백했던 문제가 있었음.)
 > `index.tsx`는 이제 시작 시 이 실제 값을 정적 설정값보다 우선하고,
 > 이 엔드포인트가 없는 백엔드에서만 설정값(그다음 8192)으로 폴백함.
 > 실제로 돌고 있는 서버로 직접 검증함(`getContextSize()`가 실제
-> `/props` 출력과 일치하는 `65536`을 정확히 반환함), 가짜 `/props`
+> `/config` 출력과 일치하는 `65536`을 정확히 반환함), 가짜 `/config`
 > 서버를 만들어 실제 응답 형태·`n_ctx` 없는 응답·비정상 응답 3가지를
 > 다루는 새 유닛 테스트도 추가함 — 셋 다 엉뚱한 값을 조용히 반환하는
 > 대신 폴백하는지 검증.

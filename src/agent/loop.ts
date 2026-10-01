@@ -1,8 +1,6 @@
 import type { ChatMessage, ModelBackend } from "../backend/types.js";
 import { AGENT_STATE_TOOLS, FILE_TOOLS, activeToolDefs, executeTool } from "../tools/index.js";
 import { CircuitBreaker } from "../hermes/selfHeal.js";
-import { logFailure, getFailureLog } from "../hermes/selfHeal.js";
-import { proposeImprovement, writeProposedRule, appendImprovementLog, ImprovementProposal } from "../hermes/selfImprove.js";
 import {
   runCompaction,
   estimateTokens,
@@ -132,9 +130,8 @@ function normalizeForRepeat(text: string): string {
  *  JSON (nested quotes, `\n`, the file's own source code, ending in the
  *  literal `,"type":"server_error"}}`) straight onto the screen — visually
  *  indistinguishable from a crash, even though the turn had already ended
- *  cleanly and `/quit` still worked. `logFailure()` still gets the
- *  untouched original (debugging/self-improvement needs the real text);
- *  only what's shown to the user goes through this. */
+ *  cleanly and `/quit` still worked. Only what's shown to the user goes
+ *  through this summarizer. */
 // Growing backoff between compact()'s retries on a transient backend error
 // (see its own doc comment). Exported/settable so tests can run this near-
 // instantly instead of eating the real 2s/5s/10s delays.
@@ -377,22 +374,6 @@ export class AgentLoop {
    *  make that checkpoint file grow without limit too. */
   private executedToolLog: string[] = [];
   private static readonly MAX_EXECUTED_TOOL_LOG = 200;
-  /** Last self-improvement proposal shown to the user but not yet applied
-   *  (§3: never write a proposed rule without explicit approval). */
-  private pendingImprovement: ImprovementProposal | null = null;
-  /** Pattern signatures already written to the real-time improvement log
-   *  this session, so a still-recurring failure doesn't re-append (and
-   *  re-call the model for) the same finding on every new occurrence. */
-  private loggedImprovementSignatures = new Set<string>();
-  /** Set whenever a failure is logged during the current turn; checked
-   *  after the turn fully completes (see `send()`) rather than triggering
-   *  the improvement-check model call immediately inside the turn. This
-   *  server only has one inference slot (`-np 1`, confirmed from real
-   *  llama-server logs — llamacli's own background call was racing the
-   *  turn's own next request for that single slot and could delay it),
-   *  so a background analysis call must never fire while a turn is still
-   *  actively in flight. */
-  private hasNewFailuresThisTurn = false;
   /** Set by cancelCurrentTurn() (TUI: Esc → Y confirms), consumed by
    *  runUntilIdle() at the two points a turn can actually notice it — the
    *  chat() catch block and the top of the tool-call loop. Kept as a flag
@@ -469,7 +450,6 @@ export class AgentLoop {
       this.progress.reset(this.now());
       const resumed = await this.injectResumeContextIfPending();
       if (resumed) await this.runUntilIdle();
-      this.checkForRealtimeImprovementAfterTurn();
     });
   }
 
@@ -540,17 +520,7 @@ export class AgentLoop {
       this.goal ??= userText.trim().slice(0, 200) || null;
       this.messages.push({ role: "user", content: userText });
       await this.runUntilIdle();
-      this.checkForRealtimeImprovementAfterTurn();
     });
-  }
-
-  /** Fires the (fire-and-forget) real-time improvement check only after the
-   *  turn has fully finished — never while one is still in flight. See the
-   *  `hasNewFailuresThisTurn` docstring for why. */
-  private checkForRealtimeImprovementAfterTurn(): void {
-    if (!this.hasNewFailuresThisTurn) return;
-    this.hasNewFailuresThisTurn = false;
-    this.triggerRealtimeImprovementCheck();
   }
 
   /** Chains `task` onto the shared queue so it never overlaps a turn or a
@@ -697,13 +667,6 @@ export class AgentLoop {
           "[stopped] still no progress after a progress check — no edit to an existing file and no plan step completed. " +
             "Tell it what to do next (its working notes are in .llamacli/state/notes.md)."
         );
-        logFailure({
-          timestamp: new Date().toISOString(),
-          summary: "no progress after nudge",
-          toolName: "chat",
-          errorMessage: "progress guard stopped the turn",
-        });
-        this.hasNewFailuresThisTurn = true;
         return;
       }
       const { used: usedBeforeChat } = await this.maybeCompact();
@@ -828,13 +791,6 @@ export class AgentLoop {
             this.opts.onStatus?.(
               "[error] the conversation no longer fits the context window even after compaction — some content is too large to keep."
             );
-            logFailure({
-              timestamp: new Date().toISOString(),
-              summary: "backend chat request failed",
-              toolName: "chat",
-              errorMessage: err.message,
-            });
-            this.hasNewFailuresThisTurn = true;
             return;
           }
           continue;
@@ -1000,13 +956,6 @@ export class AgentLoop {
         // default backend URL): report it and end the turn gracefully so
         // the user can fix config/connectivity and try again.
         this.opts.onStatus?.(`[error] couldn't reach the model backend: ${summarizeErrorForDisplay(err.message)}`);
-        logFailure({
-          timestamp: new Date().toISOString(),
-          summary: "backend chat request failed",
-          toolName: "chat",
-          errorMessage: err.message,
-        });
-        this.hasNewFailuresThisTurn = true;
         return;
       }
       const message = res.choices[0].message;
@@ -1035,13 +984,6 @@ export class AgentLoop {
             `[stopped] the model gave the same response ${repeats} times in this turn — stopping so it doesn't keep looping. ` +
               "Tell it what to do differently to continue."
           );
-          logFailure({
-            timestamp: new Date().toISOString(),
-            summary: "repeated identical assistant response",
-            toolName: "chat",
-            errorMessage: `same response ${repeats} times in the last ${recentAssistantTexts.length}`,
-          });
-          this.hasNewFailuresThisTurn = true;
           return;
         }
       }
@@ -1154,13 +1096,6 @@ export class AgentLoop {
             "ERROR: refused — the content argument is the placeholder that replaces an earlier write's content in this " +
             "conversation, not real file content. Writing it would destroy the file. Call read_file on the path to see " +
             "its current content, then write the actual content you intend.";
-          logFailure({
-            timestamp: new Date().toISOString(),
-            summary: `tool ${call.function.name} refused: placeholder content`,
-            toolName: call.function.name,
-            errorMessage: "content was the elided-write placeholder",
-          });
-          this.hasNewFailuresThisTurn = true;
           this.messages.push({ role: "tool", tool_call_id: call.id, content });
           this.opts.onToolCallDone?.(call.function.name, call.function.arguments);
           continue;
@@ -1244,13 +1179,6 @@ export class AgentLoop {
           // trigger on its own, got compacted away before the model read it,
           // and the model reran it — a compaction every ~16s, live.
           content = capToolResult(`ERROR: ${err.message}`, this.opts.thresholds.contextWindowTokens);
-          logFailure({
-            timestamp: new Date().toISOString(),
-            summary: `tool ${call.function.name} failed`,
-            toolName: call.function.name,
-            errorMessage: err.message,
-          });
-          this.hasNewFailuresThisTurn = true;
         }
         this.messages.push({ role: "tool", tool_call_id: call.id, content });
         // Fires once this SPECIFIC call has fully finished (success or
@@ -1596,10 +1524,10 @@ export class AgentLoop {
     // Reported live: repeated "[compaction failed] chat timed out after
     // 120000ms" on a session sharing the server with other active llamacli
     // processes. A single IMMEDIATE retry (the original fix) turned out not
-    // to be enough — this machine's own self-improve log recorded the exact
+    // to be enough — this machine's own log recorded the exact
     // same "compact timed out after 120000ms" pattern recurring 37 times
     // across one long session sharing a single-slot server with several
-    // other concurrent llamacli/laya processes all day. An immediate retry
+    // other concurrent llamacli processes all day. An immediate retry
     // re-issues into the SAME still-busy slot if the congestion is a
     // sustained period rather than a brief blip — it only helps the blip
     // case. Raised to 3 retries with a growing backoff (2s/5s/10s) between
@@ -1659,65 +1587,9 @@ export class AgentLoop {
           `[compaction failed] ${summarizeErrorForDisplay(err.message)} — checkpoint was saved, but the conversation wasn't summarized; continuing with the current context.`
         );
         this.opts.onCompactionStatus?.("failed", new Date().toISOString());
-        logFailure({
-          timestamp: new Date().toISOString(),
-          summary: "compaction summary request failed",
-          toolName: "compact",
-          errorMessage: err.message,
-        });
-        this.hasNewFailuresThisTurn = true;
         return;
       }
     }
-  }
-
-  /**
-   * PROMPT.md §3 real-time extension: rather than waiting for the user to
-   * run /improve or for the session to end, re-check the failure log right
-   * after every new failure and — if a pattern is now recurring — append it
-   * to `.llamacli/state/improvement-log.md` immediately. This is
-   * fire-and-forget on purpose: analysis calls the model, which must never
-   * block the tool-call loop it's reacting to, and a failure here is
-   * itself just logged, never surfaced as a hard error (it's best-effort
-   * background journaling, not part of the main task). Writing to the log
-   * file is purely a *record* — never auto-loaded as a rule, so this can
-   * never change agent behavior on its own; only /improve-apply can.
-   */
-  private triggerRealtimeImprovementCheck(): void {
-    proposeImprovement(getFailureLog(), this.opts.backend, this.opts.model)
-      .then(async (proposal) => {
-        if (!proposal || this.loggedImprovementSignatures.has(proposal.signature)) return;
-        this.loggedImprovementSignatures.add(proposal.signature);
-        const path = await appendImprovementLog(this.opts.projectRoot, proposal);
-        this.opts.onStatus?.(
-          `[auto-improve] Noticed a recurring pattern — logged to ${path}. Run /improve to review, /improve-apply to turn it into a rule.`
-        );
-      })
-      .catch(() => {
-        // best-effort background analysis — never let it surface as a hard failure
-      });
-  }
-
-  /** Analyzes the accumulated failure log and, if a pattern recurs often
-   *  enough, asks the model to draft a rule that would prevent it. Does NOT
-   *  write anything — call applyPendingImprovement() after the user approves. */
-  async proposeSelfImprovement(): Promise<ImprovementProposal | null> {
-    const proposal = await proposeImprovement(getFailureLog(), this.opts.backend, this.opts.model);
-    this.pendingImprovement = proposal;
-    return proposal;
-  }
-
-  /** Writes the last proposed rule as a NEW file under .llamacli/rules/ — only
-   *  called after the user has explicitly seen and approved the proposal. */
-  async applyPendingImprovement(): Promise<string | null> {
-    if (!this.pendingImprovement) return null;
-    const path = await writeProposedRule(this.opts.projectRoot, this.pendingImprovement);
-    this.pendingImprovement = null;
-    return path;
-  }
-
-  hasFailureLog(): boolean {
-    return getFailureLog().length > 0;
   }
 
   /** Manually clears the plan-progress indicator and its on-disk checkpoint —

@@ -162,13 +162,19 @@ export class OpenAICompatibleClient implements ModelBackend {
   }
 
   /** llama.cpp-server-specific endpoint — callers must be ready for this to
-   *  throw and fall back to the configured value. */
+   *  throw and fall back to the configured value.
+
+   *  Reads `model_info.n_ctx` from `/config`, which modern llama-server
+   *  exposes and which reflects whatever size it was actually launched with
+   *  (so the config.yaml contextSize is honoured). The old /props endpoint no
+   *  longer exists in current builds, so querying it always failed here and
+   *  forced a hard-coded 8192 fallback regardless of the true limit. */
   async getContextSize(): Promise<number> {
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/props`, { headers: this.headers() }, LIGHTWEIGHT_FETCH_TIMEOUT_MS, "getContextSize");
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/config`, { headers: this.headers() }, LIGHTWEIGHT_FETCH_TIMEOUT_MS, "getContextSize");
     if (!res.ok) throw new Error(`getContextSize failed: ${res.status} ${await res.text()}`);
-    const json = (await res.json()) as { default_generation_settings?: { n_ctx?: number }; n_ctx?: number };
-    const n_ctx = json.default_generation_settings?.n_ctx ?? json.n_ctx;
-    if (!n_ctx) throw new Error("getContextSize: /props response had no n_ctx field");
+    const json = (await res.json()) as { model_info?: { n_ctx?: number } };
+    const n_ctx = json.model_info?.n_ctx;
+    if (!n_ctx) throw new Error("getContextSize: /config response had no model_info.n_ctx field");
     return n_ctx;
   }
 

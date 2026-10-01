@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentLoop, summarizeErrorForDisplay, setCompactionRetryBackoffMsForTests } from "./loop.js";
 import { readCheckpoint, writeCheckpoint, Checkpoint } from "../compaction/checkpoint.js";
-import { clearFailureLog } from "../hermes/selfHeal.js";
 import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
@@ -508,116 +507,6 @@ test("compaction summary failure doesn't crash the loop — reports a status mes
     assert.ok(await readCheckpoint(dir));
   }));
 
-/** Fire-and-forget background work (the real-time improvement check) has
- *  no promise the test can await directly — poll for its effect instead
- *  of a blind sleep, so the test is both fast and not flaky under load. */
-async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitUntil: condition never became true");
-    await new Promise((r) => setTimeout(r, 10));
-  }
-}
-
-test("a repeated real tool failure triggers a real-time improvement-log entry, not just on /improve", () =>
-  withTempProject(async (dir) => {
-    // getFailureLog() is module-level, shared across every AgentLoop in
-    // the process — without clearing it, an unrelated failure another
-    // test logged earlier could outrank this test's own pattern and this
-    // test would assert on the wrong recurring failure.
-    clearFailureLog();
-    // Two read_file calls on paths that don't exist — a real fs failure,
-    // not a scripted one, so this exercises the actual executeTool() catch
-    // path in runUntilIdle() that calls triggerRealtimeImprovementCheck().
-    const call1 = {
-      id: "c1",
-      type: "function" as const,
-      function: { name: "read_file", arguments: JSON.stringify({ path: join(dir, "missing-a.txt") }) },
-    };
-    const call2 = {
-      id: "c2",
-      type: "function" as const,
-      function: { name: "read_file", arguments: JSON.stringify({ path: join(dir, "missing-b.txt") }) },
-    };
-    const { backend } = scriptedBackend({
-      turnResponses: [assistantMessage(null, [call1, call2]), assistantMessage("done")],
-      tokenCounts: [1], // never crosses the compaction threshold — isolates this to the improvement check
-    });
-    const statusMessages: string[] = [];
-    const loop = new AgentLoop({
-      projectRoot: dir,
-      model: "m",
-      backend,
-      systemPrompt: "sys",
-      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100 },
-      onStatus: (s) => statusMessages.push(s),
-    });
-
-    await loop.send("read two files");
-
-    await waitUntil(() => statusMessages.some((s) => s.includes("[auto-improve]")));
-    const logPath = join(dir, ".llamacli", "state", "improvement-log.md");
-    const content = await readFile(logPath, "utf8");
-    assert.match(content, /read_file/);
-  }));
-
-test("the real-time improvement check never fires until the turn's own loop has fully finished", () =>
-  withTempProject(async (dir) => {
-    // Found by analyzing real llama-server logs: this backend has only one
-    // inference slot (-np 1), so a background improvement-check call
-    // firing WHILE a turn is still in flight races that turn's own next
-    // request for the single slot and can delay the user's response.
-    clearFailureLog();
-    const call1 = {
-      id: "c1",
-      type: "function" as const,
-      function: { name: "read_file", arguments: JSON.stringify({ path: join(dir, "missing-a.txt") }) },
-    };
-    const call2 = {
-      id: "c2",
-      type: "function" as const,
-      function: { name: "read_file", arguments: JSON.stringify({ path: join(dir, "missing-b.txt") }) },
-    };
-    const events: string[] = [];
-    let turnCallCount = 0;
-    const backend: ModelBackend = {
-      async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
-        // proposeImprovement()'s request is identifiable by its system prompt.
-        if (req.messages.some((m) => typeof m.content === "string" && m.content.includes("draft a short project rule"))) {
-          events.push("improvement-check-call");
-          return { choices: [{ message: { role: "assistant", content: "# rule\nsomething" }, finish_reason: "stop" } ] };
-        }
-        turnCallCount++;
-        events.push(`turn-call-${turnCallCount}`);
-        return turnCallCount === 1 ? assistantMessage(null, [call1, call2]) : assistantMessage("done");
-      },
-      async listModels() {
-        return [];
-      },
-      async tokenize() {
-        return 1; // stays well under threshold; isolates this to the improvement check
-      },
-    };
-    const loop = new AgentLoop({
-      projectRoot: dir,
-      model: "m",
-      backend,
-      systemPrompt: "sys",
-      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 100 },
-    });
-
-    await loop.send("read two files");
-    await waitUntil(() => events.includes("improvement-check-call"));
-
-    const idxCheck = events.indexOf("improvement-check-call");
-    const idxSecondTurnCall = events.indexOf("turn-call-2");
-    assert.ok(idxSecondTurnCall !== -1, `expected a second turn call, got: ${events.join(", ")}`);
-    assert.ok(
-      idxCheck > idxSecondTurnCall,
-      `expected the improvement check strictly after the turn finished, got order: ${events.join(", ")}`
-    );
-  }));
-
 test("every chat request sent to the backend caps max_tokens instead of leaving it unbounded", () =>
   withTempProject(async (dir) => {
     // Found live via the real backend's GET /slots: a request with no
@@ -1036,13 +925,6 @@ test("compact()'s own summary request retries once on the same transient backend
 
 test("compact()'s own summary request reports [compaction failed] (not silently swallowed) once its retry is also exhausted", () =>
   withTempProject(async (dir) => {
-    // This test's own failed-compaction attempt logs to the module-level
-    // failure log (see hermes/selfHeal.ts) that triggerRealtimeImprovementCheck()
-    // reads — a leftover entry from an EARLIER test in this file can push
-    // it over the "this pattern recurs" threshold and fire an extra,
-    // unrelated background chat() call, inflating summaryCallCount. Start
-    // from a clean log so this test only ever counts its own two calls.
-    clearFailureLog();
     setCompactionRetryBackoffMsForTests([0, 0, 0]);
     let summaryCallCount = 0;
     const statusMessages: string[] = [];

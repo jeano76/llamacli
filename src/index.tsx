@@ -6,7 +6,7 @@ import { loadConfig } from "./config.js";
 import { loadRules, loadSkillIndex, injectRulesIntoSystemPrompt, injectSkillIndexIntoSystemPrompt } from "./skills/loader.js";
 import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { resolveBackend } from "./backend/resolve.js";
-import { DeferredBackend } from "./backend/deferred.js";
+import type { Resolution } from "./backend/resolve.js";
 import { AgentLoop, summarizeErrorForDisplay } from "./agent/loop.js";
 import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { isBrowserAvailable } from "./tools/browser.js";
@@ -166,17 +166,6 @@ function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T
   return Object.create(stdout, { write: { value: patched, configurable: true } });
 }
 
-/** A promise plus the function that settles it — used to hold backend
- *  resolution until the TUI is on screen, so its first log line has somewhere
- *  to go. */
-function deferred<T = void>(): { promise: Promise<T>; resolve: (value?: T) => void } {
-  let resolve!: (value?: T) => void;
-  const promise = new Promise<T>((r) => {
-    resolve = r as (value?: T) => void;
-  });
-  return { promise, resolve };
-}
-
 const REPO_URL = "https://github.com/jeano76/llamacli";
 
 /** "vYYYYMMDD" — dist/index.js's own mtime (no separate build-info step
@@ -257,9 +246,11 @@ async function main() {
   // render(), behind the TUI. Running any of it here meant the screen was up
   // and empty while minutes of installing and downloading went by, which is
   // what made llamacli look like it vanished mid-"setup" (reported directly:
-  // "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져"). See
-  // backend/resolve.ts for the resolution itself and deferred.ts for why the
-  // loop can be handed a backend before one exists.
+  // "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져"). The fix now runs
+  // resolveBackend() BEFORE render() (see main) instead of deferring it, so the
+  // install/download/build happens in the foreground; progress is still streamed
+  // into the TUI via `log`. See backend/resolve.ts for why resolution can be
+  // slow and backend/deferred.ts for how a non-llama.cpp backend behaves.
   await maybeSelfUpdateAndRestart();
   const projectRoot = process.cwd();
   enterAltScreen();
@@ -332,14 +323,15 @@ async function main() {
   // endpoint/port; otherwise an installed llama.cpp is started on a free port;
   // otherwise llama.cpp is installed, configured and given a model.
   //
-  // It runs AFTER render() and behind a DeferredBackend, deliberately. Doing it
-  // before the screen came up is what made `llamacli` look like it vanished —
-  // reported directly: "llamacli 를 입력하면 setup 진행이 되면서 화면이
-  // 사라져". A first run installs llama.cpp and downloads a 20 GB model, so
-  // that wait is minutes long and cannot be spent with a blank screen. Running
-  // it behind the TUI means the banner is up immediately and every step is a
-  // status line the user can read, and a message typed during setup simply
-  // waits for it rather than failing against a dead port.
+  // It runs BEFORE render() now (the core fix), deliberately in the
+  // foreground. The old design ran it AFTER render(), behind a DeferredBackend:
+  // before the screen came up that is what made `llamacli` look like it vanished —
+  // reported directly: "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져". A first
+  // run installs llama.cpp and downloads a 20 GB model, so that wait was minutes
+  // long with a blank screen. Now the progress still streams live into the TUI as
+  // status lines the user can read (each line hits the real terminal first, then
+  // lands inside the UI), and a message typed during setup simply waits for it
+  // rather than failing against a dead port.
   const thresholds = {
     autoTriggerRatio: config.compaction.autoTriggerRatio,
     // Provisional, replaced by the server's own report below. Read live on every
@@ -348,52 +340,55 @@ async function main() {
     contextWindowTokens: config.llama?.contextSize ?? 8192,
   };
   const ui = () => (globalThis as any).__llamacli_ui;
-  // The work itself starts only after render() below (see startResolution) — the
-  // promise is created now because AgentLoop needs a backend to construct. Every
-  // line lands in the TUI's own log rather than on the normal screen, so the
-  // progress survives instead of being erased by the alt screen.
-  const startResolution = deferred();
-  const resolution = startResolution.promise.then(() =>
-    resolveBackend({
-      projectRoot,
-      config,
-      log: (line) => ui()?.pushStatus(line),
-      // Explicit, in addition to the manager's own exit hook: SIGINT is handled
-      // above for the alt screen, and a server left running holds the model in
-      // VRAM for the rest of the machine's uptime.
-      registerCleanup: (fn) => cleanupRegistry.push(fn),
-    })
-  );
-  const backend = new DeferredBackend(resolution.then((r) => r.backend));
+
+  // Resolve the backend and set up AgentLoop BEFORE render. This is the core fix
+  // for "setup finishes behind the alt screen / app just terminates": on a first
+  // run resolveBackend installs llama.cpp, downloads a model, builds it — minutes
+  // of work that used to race past while a blank-ish alt screen was already
+  // mounted. Awaiting here puts it in the foreground instead; the boot progress
+  // still streams live into the TUI via `log`, so nothing is lost (a line lands
+  // on the real screen first, then inside the UI). A backend that fails to
+  // resolve now exits non-zero rather than leaving a ready-looking prompt
+  // against an empty back-end.
+  const resolution = await resolveBackend({
+    projectRoot,
+    config,
+    log: (line) => ui()?.pushStatus(line),
+    // Explicit, in addition to the manager's own exit hook: SIGINT is handled
+    // above for the alt screen, and a server left running holds the model in
+    // VRAM for the rest of the machine's uptime.
+    registerCleanup: (fn) => cleanupRegistry.push(fn),
+  });
+
+  // Resolve the backend before render; an unresolved one exits. Elsewhere is an
+  // OpenAI-compatible client (spawned or adopted llama.cpp / remote endpoint) —
+  // no separate ModelBackend type needed.
+  let backend: Resolution["backend"];
+  if (resolution.kind === "unresolved") {
+    // Nothing to run against: leave the alt screen and exit so this can't be
+    // mistaken for a ready app that merely hasn't answered yet. This replaces
+    // the old behaviour, which only pushed a status line into a UI nothing had
+    // told it had failed behind — the very bug being fixed here.
+    exitAltScreen();
+    console.error(`[설정 실패] ${resolution.reason}`);
+    process.exit(1);
+  } else {
+    backend = resolution.backend;
+  }
+
 
   // Prefer the backend's own reported context size over the static config value
   // whenever possible — a config file can silently drift out of sync with
   // whatever the server is actually running (seen live: config said 8192, the
   // real server was -c 65536, so compaction fired 8x too eagerly and interrupted
-  // every single turn in an endless compact/resume loop). Runs after the
-  // backend exists, so the value comes from the server that is really serving.
-  resolution
-    .then(async (r) => {
-      if (r.kind === "unresolved") {
-        ui()?.pushStatus(`[설정 실패] ${r.reason}`);
-        return;
-      }
-      try {
-        const reported = await r.backend.getContextSize?.();
-        if (reported) thresholds.contextWindowTokens = reported;
-      } catch {
-        // Non-llama.cpp backend, or /props unavailable — the config value stands.
-      }
-    })
-    .catch(() => {
-      // resolveBackend never rejects for a resolution failure (it returns
-      // `unresolved`), so this is only reachable if something outside it threw.
-      // Reported rather than swallowed: a silent failure here would leave the
-      // TUI showing a ready-looking prompt against a backend that is not there.
-      ui()?.pushStatus("[설정 실패] 모델 백엔드를 준비하는 중 오류가 발생했습니다.");
-    });
-
-
+  // every single turn in an endless compact/resume loop). The backend now exists
+  // by this point, so the value comes from the server that is really serving.
+  try {
+    const reported = await backend.getContextSize?.();
+    if (reported) thresholds.contextWindowTokens = reported;
+  } catch {
+    // Non-llama.cpp backend, or /props unavailable — the config value stands.
+  }
 
 
   const loop = new AgentLoop({
@@ -441,12 +436,6 @@ async function main() {
     onCompactionDetail: (detail) => (globalThis as any).__llamacli_ui?.pushCompactionDetail(detail),
     onTurnStart: () => (globalThis as any).__llamacli_ui?.collapseDiffs(),
   });
-
-  // Session-end self-improvement gate (PROMPT.md §3): if failures were
-  // logged and never reviewed, /quit shows the proposal instead of exiting —
-  // a second /quit confirms. Applying the proposal (if any) always requires
-  // the separate explicit /improve-apply, never happens on quit itself.
-  let quitConfirmed = false;
 
   // Every quit path ends here: show the save-in-progress animation (App's
   // quitting state), save, then ALWAYS exit — on success, on failure, or
@@ -532,8 +521,7 @@ async function main() {
           .finally(() => ui?.setBusy(false));
       }}
       onForceQuit={() => {
-        // The "force" exit: no self-improvement-proposal gate (see
-        // AppProps.onForceQuit) — just save and go.
+        // The "force" exit — just save and go (see AppProps.onForceQuit).
         exitAfterSaving();
       }}
       onQuitWithoutSaving={exitNow}
@@ -562,41 +550,15 @@ async function main() {
         const ui = (globalThis as any).__llamacli_ui;
         switch (key) {
           case "quit": {
-            if (quitConfirmed || !loop.hasFailureLog()) {
-              // Requested directly: quitting should save current progress
-              // to disk first, the same way compaction already does
-              // before/after summarizing — so the next launch resumes
-              // where this one left off instead of losing whatever wasn't
-              // already captured by a plan-progress checkpoint. Never lets
-              // a save failure block quitting itself (unmount() always
-              // runs, success or not) — matches the rest of the app's
-              // "an internal failure reports itself, never hangs the
-              // whole thing" approach.
-              // Save current progress first so the next launch resumes
-              // where this one left off (see exitAfterSaving above).
-              exitAfterSaving();
-              break;
-            }
-            quitConfirmed = true;
-            ui?.pushStatus("[analyzing for self-improvement before quitting...]");
-            loop
-              .proposeSelfImprovement()
-              .then((proposal) => {
-                if (!proposal) {
-                  ui?.pushStatus("No recurring failure pattern found, nothing to propose. Press /quit again to exit.");
-                  return;
-                }
-                ui?.pushStatus(
-                  [
-                    `[self-improvement proposal] ${proposal.summary}`,
-                    "",
-                    proposal.ruleMarkdown,
-                    "",
-                    "Run /improve-apply to save it, or press /quit again to exit without applying it.",
-                  ].join("\n")
-                );
-              })
-              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${summarizeErrorForDisplay(err.message)}`));
+            // Quitting saves current progress to disk first, the same way
+            // compaction already does before/after summarizing — so the next
+            // launch resumes where this one left off instead of losing
+            // whatever wasn't already captured by a plan-progress checkpoint.
+            // Never lets a save failure block quitting itself (unmount()
+            // always runs, success or not) — matches the rest of the app's
+            // "an internal failure reports itself, never hangs the whole
+            // thing" approach. See exitAfterSaving above.
+            exitAfterSaving();
             break;
           }
           case "help": {
@@ -728,37 +690,6 @@ async function main() {
                 : "No rules applied (.llamacli/rules/ or .clinerules)."
             );
             break;
-          case "improve":
-            ui?.pushStatus("[analyzing for self-improvement...]");
-            loop
-              .proposeSelfImprovement()
-              .then((proposal) => {
-                ui?.pushStatus(
-                  proposal
-                    ? [
-                        `[self-improvement proposal] ${proposal.summary}`,
-                        "",
-                        proposal.ruleMarkdown,
-                        "",
-                        "Run /improve-apply to apply it (nothing is written to disk until you do).",
-                      ].join("\n")
-                    : "No recurring failure pattern yet, nothing to propose."
-                );
-              })
-              .catch((err: any) => ui?.pushStatus(`[self-improvement analysis failed] ${summarizeErrorForDisplay(err.message)}`));
-            break;
-          case "improve-apply":
-            loop
-              .applyPendingImprovement()
-              .then((path) => {
-                ui?.pushStatus(
-                  path
-                    ? `[rule saved] ${path} (injected into the system prompt automatically from the next session on)`
-                    : "No pending proposal to apply. Run /improve first."
-                );
-              })
-              .catch((err: any) => ui?.pushStatus(`[rule save failed] ${summarizeErrorForDisplay(err.message)}`));
-            break;
           case "plan-clear":
             loop
               .clearPlan()
@@ -794,11 +725,10 @@ async function main() {
 
   if (setupMessage) (globalThis as any).__llamacli_ui?.pushStatus(setupMessage);
 
-  // The screen is up and the log can accept lines, so backend resolution
-  // finally begins. Until this point it was only a pending promise, because a
-  // first run installs llama.cpp and downloads a model — minutes of work whose
-  // progress would otherwise be printed to a screen Ink is about to take over.
-  startResolution.resolve();
+  // NOTE: backend resolution now happens synchronously before render() above,
+  // so nothing here is a pending promise anymore. The alt screen was torn down
+  // and the backend installed/downloaded in the foreground; AgentLoop below only
+  // constructs because `backend` already exists by this point. See main().
 
   // Resuming (or discarding) a found checkpoint now happens via the
   // App-rendered Y/N question (pendingResumeGoal/onResumeDecision above)

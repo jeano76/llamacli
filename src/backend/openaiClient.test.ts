@@ -28,16 +28,20 @@ async function withFakeServer(
 // real server was -c 65536 — compaction fired 8x too eagerly and
 // interrupted every turn in an endless compact/resume loop). getContextSize()
 // exists so the real value can be pulled from the backend instead.
-test("getContextSize reads n_ctx from default_generation_settings, matching real llama.cpp /props shape", () =>
+// /props was removed from llama.cpp long ago; modern llama-server reports the
+// launched context window via GET /config -> model_info.n_ctx. getContextSize()
+// reads that, so it reflects the server's true limit (and any config.yaml
+// contextSize used to launch us) instead of a hard-coded fallback.
+test("getContextSize reads n_ctx from /config model_info, matching modern llama.cpp shape", () =>
   withFakeServer(
-    () => ({ status: 200, body: { default_generation_settings: { n_ctx: 65536 }, total_slots: 1 } }),
+    () => ({ status: 200, body: { model_info: { n_ctx: 65536 } } }),
     async (baseUrl) => {
       const client = new OpenAICompatibleClient(baseUrl);
       assert.equal(await client.getContextSize(), 65536);
     }
   ));
 
-test("getContextSize throws when /props has no n_ctx anywhere, so callers fall back instead of silently using 0/undefined", () =>
+test("getContextSize throws when /config has no n_ctx anywhere, so callers fall back instead of silently using 0/undefined", () =>
   withFakeServer(
     () => ({ status: 200, body: { total_slots: 1 } }),
     async (baseUrl) => {

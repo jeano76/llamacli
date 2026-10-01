@@ -29,8 +29,6 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   { key: "copy", label: "/copy", description: "화면 로그 복사 (드래그 선택과 같은 클립보드)" },
   { key: "skills", label: "/skills", description: "List loaded skills" },
   { key: "rules", label: "/rules", description: "List loaded rules" },
-  { key: "improve", label: "/improve", description: "Analyze repeated failures → propose a rule" },
-  { key: "improve-apply", label: "/improve-apply", description: "Save the last proposal as a rule file" },
   // Label and key must agree. This one didn't: the key is "plan-clear"
   // (what index.tsx dispatches) while the label read "/plan clear", so
   // typing exactly what the menu advertised matched no item and the user got

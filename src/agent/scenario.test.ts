@@ -4,7 +4,6 @@ import { mkdtemp, rm, readFile as readFileFs, writeFile as writeFileFs } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
-import { clearFailureLog } from "../hermes/selfHeal.js";
 import { setRunShellTimeoutForTests } from "../tools/index.js";
 import type { ChatCompletionRequest, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -313,7 +312,6 @@ test(
   "many concurrent long-running developer sessions, across different languages and program types, never produce an unhandled crash",
   { timeout: 60_000 },
   async () => {
-    clearFailureLog();
     // Real toolchain commands (go/rustc/java/etc.) aren't necessarily
     // installed in this environment, and this scenario runs many of them
     // for real, concurrently, across many developers — keep any one call

@@ -185,10 +185,100 @@ export async function loadSkillBody(entry: SkillIndexEntry): Promise<string> {
   return readFile(entry.path, "utf8");
 }
 
-export function injectRulesIntoSystemPrompt(basePrompt: string, rules: RuleFile[]): string {
+/**
+ * Hard ceiling on how many characters of project rules may go into the system
+ * prompt.
+ *
+ * Rules are injected into the SYSTEM message, and compaction never shrinks it:
+ * `composeSystemMessage` (compaction/compactor.ts) keeps `splitSystemMessage`'s
+ * `base` verbatim and only ever replaces the summary block that follows it. So
+ * whatever lands here is a permanent floor for every request in the session —
+ * unbounded growth is not recoverable the way conversation history is.
+ *
+ * That was a live bug: `writeProposedRule` (hermes/selfImprove.ts) wrote a NEW
+ * `hermes-proposed-<timestamp>.md` for every applied proposal, `loadRules`
+ * reads every file in `.llamacli/rules/`, and the old injection concatenated
+ * all of them. Each /improve-apply therefore permanently raised the baseline,
+ * and when context filled up the compactor could only drop summary/tail — the
+ * rules stayed. This budget makes the growth structurally impossible instead of
+ * merely unlikely. Kept generous (roughly 8-10K tokens) so a real CLAUDE.md
+ * still fits whole; only a runaway pile-up gets truncated.
+ */
+export const MAX_RULE_PROMPT_CHARS = 32_000;
+
+/**
+ * Injects rules into the system prompt under a total character budget.
+ *
+ * Files are added in the order `loadRules` produced them (its RULE_SOURCES
+ * order, then readdir order within a directory) until the budget is spent;
+ * the rest are dropped with an explicit, visible marker. Rules are truncated
+ * per-file at the boundary rather than the whole list being dropped, so one
+ * huge file can't silently push every later rule out of the prompt.
+ */
+export function injectRulesIntoSystemPrompt(
+  basePrompt: string,
+  rules: RuleFile[],
+  maxChars: number = MAX_RULE_PROMPT_CHARS
+): string {
   if (rules.length === 0) return basePrompt;
-  const ruleText = rules.map((r) => `--- ${r.path} ---\n${r.content}`).join("\n\n");
-  return `${basePrompt}\n\n# Project Rules (always apply)\n${ruleText}`;
+
+  const header = "# Project Rules (always apply)";
+  const TRUNCATION_NOTE = "[truncated: rule exceeds the prompt budget]";
+  // Reserved up front so the trailing "N files omitted" marker can never push
+  // the block past maxChars. It is kept short by naming at most a few paths —
+  // without that, a directory with 50 rule files would need ~700 chars of
+  // marker, which is exactly the kind of unbounded term the budget exists to
+  // rule out.
+  const MARKER_RESERVE = 320;
+  const MAX_OMITTED_NAMES = 5;
+
+  // What the header itself costs, so the budget covers the whole injected
+  // block rather than silently overshooting by the header + separators.
+  let used = header.length + 2;
+  const parts: string[] = [];
+  const omitted: string[] = [];
+
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i];
+    const block = `--- ${rule.path} ---\n${rule.content}`;
+    const cost = block.length + 2;
+    if (used + cost + MARKER_RESERVE <= maxChars) {
+      parts.push(block);
+      used += cost;
+      continue;
+    }
+
+    // Doesn't fit whole. Take as much of this one file as still leaves room
+    // for both markers, cut at a line boundary so the prompt never ends
+    // mid-sentence.
+    const prefix = `--- ${rule.path} ---\n`;
+    const suffix = `\n${TRUNCATION_NOTE}`;
+    const bodyRoom = maxChars - used - MARKER_RESERVE - prefix.length - suffix.length;
+    if (bodyRoom > 200) {
+      const cut = rule.content.slice(0, bodyRoom);
+      const lastNewline = cut.lastIndexOf("\n");
+      const body = (lastNewline > 0 ? cut.slice(0, lastNewline) : cut).trimEnd();
+      if (body) {
+        const partial = prefix + body + suffix;
+        parts.push(partial);
+        used += partial.length + 2;
+      }
+    }
+    // This one is only partly in, so it counts as omitted too — and so does
+    // every rule after it, which never got considered.
+    for (let j = i; j < rules.length; j++) omitted.push(rules[j].path);
+    break;
+  }
+
+  let ruleText = parts.join("\n\n");
+  if (omitted.length > 0) {
+    const shown = omitted.slice(0, MAX_OMITTED_NAMES);
+    const more = omitted.length - shown.length;
+    ruleText +=
+      `\n\n[${omitted.length} further rule file(s) omitted to stay within the context budget: ` +
+      `${shown.join(", ")}${more > 0 ? `, +${more} more` : ""}]`;
+  }
+  return `${basePrompt}\n\n${header}\n${ruleText}`;
 }
 
 /** Lists the available skills' names + triggers (never their full bodies —

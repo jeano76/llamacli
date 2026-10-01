@@ -267,6 +267,10 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
       modelPath: llama.modelPath,
       host: "127.0.0.1",
       port: typeof llama.port === "number" ? llama.port : 8080,
+      // Respect the operator's config rather than always spawning at a
+      // fixed 8192. The compaction thresholds (see index.tsx) are derived
+      // from this, so an explicit contextSize in config.yaml must not be
+      // silently dropped when we launch the server ourselves.
       contextSize: typeof llama.contextSize === "number" ? llama.contextSize : 8192,
       threads: typeof llama.threads === "number" ? llama.threads : 4,
       gpuLayers: typeof llama.gpuLayers === "number" ? llama.gpuLayers : 0,

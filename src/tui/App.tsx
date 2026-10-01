@@ -34,10 +34,8 @@ export interface AppProps {
    *  resume later"). Wired in index.tsx to: cancel the in-flight turn (if
    *  one is running) or save the current conversation (if idle) — either
    *  way writing a resumable checkpoint — and then actually exit the app
-   *  (unmount + let the process end), skipping /quit's normal
-   *  self-improvement-proposal gate entirely. That gate is a "review before
-   *  you go" nicety; Esc is the emergency/quick exit and must never block
-   *  on it. The checkpoint reuses the exact same mechanism a mid-batch
+   *  (unmount + let the process end). Esc is the emergency/quick exit and must
+   *  never block on anything. The checkpoint reuses the exact same mechanism a mid-batch
    *  compaction interruption already writes, so the next launch's startup
    *  resume-confirmation prompt (pendingResumeGoal below) picks it back up
    *  with no extra wiring. */
@@ -438,8 +436,8 @@ function renderRow(row: RenderedRow, shimmerTick?: number) {
 
 /** `input` is the raw text box content, which starts with "/" while the
  *  menu is open — everything after that is the filter query. Matches
- *  against the command's key (e.g. "improve-apply"), not its "/"-prefixed
- *  label, so typing "imp" also finds "/improve-apply" via a plain
+ *  against the command's key (e.g. "plan-clear"), not its "/"-prefixed
+ *  label, so typing "pla" also finds "/plan-clear" via a plain
  *  substring check — simple and predictable over fuzzier matching. */
 /** Reported directly: "flastcheck on 입력의 동작등이 될수 없어" — confirmed
  *  live. Every registered command's own `key` is a single token (no
@@ -658,10 +656,9 @@ export function runHintText(columns: number): string {
   // selection; Shift+right-click opens the terminal's own Copy/Paste menu.
   // Esc and /quit are NOT the same thing — Esc cancels the running turn and
   // exits right away (a checkpoint is written first so it resumes next
-  // time), while /quit waits for the turn to finish and runs the normal
-  // self-improvement-review gate first. Spelled out directly (강제종료 vs
-  // 정상종료) rather than just "Esc: 종료" for both, which didn't say which
-  // was which.
+  // time), while /quit waits for the turn to finish and saves progress
+  // first. Spelled out directly (강제종료 vs 정상종료) rather than
+  // just "Esc: 종료" for both, which didn't say which was which.
   const forms = [
     "  실행 중 · Esc: 강제종료 · 드래그: 선택·복사 · 가장자리: 자동 스크롤 · Shift+우클릭: 붙여넣기",
     "  Esc: 강제종료 · 드래그: 선택·복사",
@@ -1539,8 +1536,8 @@ export function App({
 
     // Esc (menu not open, no confirmation already showing) opens the force-
     // quit confirmation above — works at any time, not just while a turn is
-    // running, so it doubles as a quick "get me out of here" independent of
-    // /quit's normal self-improvement-review gate. Also echoed into the log
+    // running, so it doubles as a quick "get me out of here". Also echoed
+    // into the log
     // (not just the input box) for the same visibility reason as the
     // startup resume question above.
     if (key.escape) {

@@ -104,7 +104,7 @@ test("every command mentioned in the keybinding table exists in the slash menu",
   // A binding that advertises "/compact" while the command is actually
   // "/compactx" is worse than no binding. Cheap guard against the two lists
   // drifting apart as commands are added. Hyphens are part of a menu key
-  // ("/improve-apply", "/plan-clear"), so the pattern has to allow them.
+  // ("/plan-clear"), so the pattern has to allow them.
   const menuKeys = new Set(SLASH_MENU_ITEMS.map((i) => i.key));
   const referenced = new Set<string>();
   for (const b of allBindings) {

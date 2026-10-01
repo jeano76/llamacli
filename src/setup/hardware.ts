@@ -13,6 +13,7 @@
  */
 
 import { cpus, totalmem, freemem, platform } from "node:os";
+import { resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -101,6 +102,126 @@ export function parseNvidiaSmiCsv(csv: string): Gpu[] {
 
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
+
+/** Per-process VRAM, straight from the driver's own accounting.
+ *
+ *  `nvidia-smi`'s memory.total/memory.free pair cannot tell us WHICH process is
+ *  holding the card, and that distinction is the whole point: the tuner needs
+ *  to discount llamacli's own llama-server (whose weights are the memory it is
+ *  sizing a context FOR) while still respecting an unrelated app. The compute
+ *  apps table is the only query that attributes memory to a pid, so this is
+ *  what makes the discount safe rather than a guess.
+ */
+const NVIDIA_COMPUTE_QUERY_ARGS = ["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"];
+
+/** Parses the compute-apps table into pid → bytes.
+ *
+ *  Rows can be absent (no CUDA processes), and MIG/driver states have produced
+ *  "N/A" in the used_memory column, so a row is skipped rather than poisoning
+ *  the map with NaN. A missing pid therefore means "no measurable usage",
+ *  which callers treat as 0 — the conservative direction.
+ */
+export function parseNvidiaComputeAppsCsv(csv: string): Map<number, number> {
+  const byPid = new Map<number, number>();
+  for (const line of csv.split("\n")) {
+    const row = line.trim();
+    if (!row) continue;
+    const tail = row.split(",");
+    if (tail.length < 2) continue;
+    const pid = Number(tail[0].trim());
+    const usedMiB = Number(tail[tail.length - 1].trim());
+    if (!Number.isFinite(pid) || !Number.isFinite(usedMiB) || usedMiB <= 0) continue;
+    byPid.set(pid, usedMiB * MiB);
+  }
+  return byPid;
+}
+
+/**
+ * Finds llama-server processes belonging to THIS install.
+ *
+ * Attribution is deliberately narrow, because a false positive here hands out a
+ * context the card cannot hold. A pid qualifies only if it is running a binary
+ * whose realpath is inside this install's llama.cpp build directory — which is
+ * what llamacli launches (see bootstrap's buildLlamaCpp) — and not merely
+ * anything named "llama-server", since a system-wide package or another user's
+ * session would match on name alone.
+ *
+ * Best-effort by construction: no `pgrep` (minimal containers, Windows), or a
+ * permission error, yields an empty list, and the caller then keeps the plain
+ * free-VRAM reading. That is the safe direction — crediting nothing never
+ * over-allocates.
+ */
+export async function findOwnLlamaServerPids(
+  llamaDir: string | undefined,
+  run: Run = defaultRun
+): Promise<number[]> {
+  if (!llamaDir) return [];
+  let out: string;
+  try {
+    // `pgrep -f` matches the full command line, which is where the binary path
+    // appears; -x is deliberately NOT used because the command line carries
+    // flags (-m, --port, ...) we do not want to pin exactly.
+    out = await run("pgrep", ["-f", `llama-server`]);
+  } catch {
+    return []; // pgrep exits 1 when nothing matched — that is not an error
+  }
+  const pids = out
+    .split("\n")
+    .map((l) => Number(l.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (pids.length === 0) return [];
+
+  // Confirm each candidate's executable really lives in our build dir.
+  const own: number[] = [];
+  for (const pid of pids) {
+    try {
+      const exe = (await run("readlink", ["-f", `/proc/${pid}/exe`])).trim();
+      if (exe && isInsideDir(exe, llamaDir)) own.push(pid);
+    } catch {
+      // Can't read it (permissions, or the process exited between the two
+      // calls) — not provably ours, so not credited.
+    }
+  }
+  return own;
+}
+
+/** True when `child` resolves to a path inside `dir` (or `dir` itself).
+ *
+ *  Compared on resolved, separator-normalised paths so a trailing slash or a
+ *  `..` segment can't produce a match, and a sibling directory that merely
+ *  shares a prefix ("/opt/llamacli-2" vs "/opt/llamacli") is correctly
+ *  rejected. */
+function isInsideDir(child: string, dir: string): boolean {
+  const norm = (p: string) => resolve(p).replace(/\\/g, "/").replace(/\/+$/, "");
+  const c = norm(child);
+  const d = norm(dir);
+  return c === d || c.startsWith(d + "/");
+}
+
+/**
+ * VRAM held by a llama-server belonging to THIS install, in GiB.
+ *
+ * Pid set is passed in rather than discovered here because "is this llama-server
+ * ours" is a question about which binary we launched, not about the driver. Only
+ * positively-attributed pids count, and the result is clamped to the card size
+ * in the caller. Returns 0 when nothing is attributable, which keeps a first run
+ * (genuinely empty card) on the plain free-VRAM reading.
+ */
+export async function ownLlamaServerVramGiB(
+  serverPids: readonly number[],
+  run: Run = defaultRun
+): Promise<number> {
+  if (serverPids.length === 0) return 0;
+  try {
+    const byPid = parseNvidiaComputeAppsCsv(await run("nvidia-smi", NVIDIA_COMPUTE_QUERY_ARGS));
+    let total = 0;
+    for (const pid of serverPids) total += byPid.get(pid) ?? 0;
+    return total / GiB;
+  } catch {
+    // No nvidia-smi / no permission / MIG: fall back to discounting nothing.
+    return 0;
+  }
+}
 
 /** Toolchain we need before a from-source llama.cpp build can even be
  *  attempted. `curl` is not a build dep but IS needed to download a model, and
