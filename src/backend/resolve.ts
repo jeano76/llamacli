@@ -3,6 +3,7 @@ import { formatBytes, type TransferProgress } from "../setup/download.js";
 import { LlamaServerManager, type LlamaServerConfig } from "./llamaServer.js";
 import { OpenAICompatibleClient } from "./openaiClient.js";
 import { discoverRunningServer, type Discovery } from "./detect.js";
+import { probeBackendHealth, describeUnhealthyBackend, type BackendHealth } from "./healthCheck.js";
 import type { LlamacliConfig } from "../config.js";
 import {
   ensureLocalStack,
@@ -62,6 +63,9 @@ export interface ResolveOptions {
   /** Injected so tests do not depend on what is actually running on this
    *  machine's ports — nor on the network. */
   discover?: () => Promise<Discovery>;
+  /** Injected for the same reason. Answers "does this backend actually produce
+   *  text, or just well-formed noise?" — see healthCheck.ts. */
+  probe?: (backend: OpenAICompatibleClient) => Promise<BackendHealth>;
   /** Injected for the same reason; runs the real first-run installer. */
   bootstrap?: (opts: BootstrapOptions) => Promise<BootstrapReport>;
   bootstrapOptions?: Partial<BootstrapOptions>;
@@ -114,12 +118,29 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
   if (discovery.kind === "found") {
     const server = discovery.server;
     const port = Number(new URL(server.baseUrl).port);
+    const adopted = new OpenAICompatibleClient(server.baseUrl);
+    // "It answered" is not "it works". A server serving unusable weights loads,
+    // reports its model, accepts every request and returns HTTP 200 with a
+    // perfectly well-formed completion full of nothing — so case 1 adopted one
+    // for seven hours before anyone noticed, and nothing between the model file
+    // and the screen ever asked whether the output was language.
+    const health = await (opts.probe ?? probeBackendHealth)(adopted);
+    if (health.verdict === "garbage") {
+      const reason = describeUnhealthyBackend(`${server.baseUrl} (모델 ${server.model})`, health);
+      log(reason);
+      // Reported, not fatal to the app: `unresolved` still carries a working
+      // backend, so the TUI comes up and the reason is on screen where the user
+      // can act on it. Deliberately NOT falling through to case 2 — the broken
+      // server is still holding the model in VRAM, and spawning a second one
+      // beside it is the out-of-memory this module's ordering exists to avoid.
+      return { kind: "unresolved", backend: adopted, reason };
+    }
     log(`이미 구동 중인 서버에 연결합니다: ${server.baseUrl} (모델 ${server.model})`);
     // Recorded so the next launch is a straight read of a known-good endpoint
     // instead of a fresh scan. Only when the config does not already say this,
     // so a user's hand-written baseUrl is never overwritten by a probe result.
     await persistAdoption(projectRoot, config, server.baseUrl, server.model).catch(() => {});
-    return { kind: "adopted", backend: new OpenAICompatibleClient(server.baseUrl), baseUrl: server.baseUrl, model: server.model, port };
+    return { kind: "adopted", backend: adopted, baseUrl: server.baseUrl, model: server.model, port };
   }
 
   if (discovery.kind === "loading") {
@@ -159,9 +180,21 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
       log(`설치된 llama-server 를 ${port} 포트에서 시작합니다: ${recorded.binPath}`);
       const started = await tryStart(startCfg, opts.registerCleanup);
       if (started) {
+        const spawned = new OpenAICompatibleClient(started.baseUrl);
+        // Same check as case 1, and for the same reason: a config that points
+        // at a corrupt model file produces a server that loads and answers just
+        // as convincingly as a good one. This one is nearly free — the spawn
+        // path already waited out a multi-minute model load, so a single small
+        // request adds nothing to what the user is waiting for.
+        const health = await (opts.probe ?? probeBackendHealth)(spawned);
+        if (health.verdict === "garbage") {
+          const reason = describeUnhealthyBackend(`${started.baseUrl} (모델 ${recorded.modelPath})`, health);
+          log(reason);
+          return { kind: "unresolved", backend: spawned, reason };
+        }
         return {
           kind: "spawned",
-          backend: new OpenAICompatibleClient(started.baseUrl),
+          backend: spawned,
           stop: started.stop,
           port,
           modelPath: recorded.modelPath,

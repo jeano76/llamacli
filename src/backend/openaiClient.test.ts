@@ -532,3 +532,54 @@ test("a complete tool call still comes back normally (no regression)", () =>
       assert.equal(res.choices[0].message.tool_calls?.[0].function.arguments, '{"path":"a.txt"}');
     }
   ));
+
+// The keep-alive reuse bug, asserted deterministically rather than by racing
+// the real server. llama-server advertises `Keep-Alive: timeout=5` and really
+// does drop an idle connection after 5s; Node's global agent (keepAlive: true
+// since Node 19) never reads that header back, so it keeps the socket in its
+// free pool and hands it out again. The next request writes to a socket the
+// server has already closed and dies with "socket hang up" before a single
+// response byte arrives.
+//
+// Measured against the real backend: 8 sequential streaming requests came back
+// 4 ok / 4 "socket hang up" through the global agent, and 8 ok / 0 failed with
+// keep-alive off. In the agent loop a chat failure ends the turn, so this
+// surfaced to the user as llamacli randomly dying mid-task with no model
+// fault at all.
+//
+// The race itself is untestable in CI (it needs a real 5s idle window), so
+// this asserts the property that eliminates it: the client never returns a
+// connection to a reuse pool, so every request gets its own socket. That
+// fails deterministically against the old code and cannot flake.
+test("each request gets its own connection — the client never reuses a socket the backend may have already closed", async () => {
+  const connections = new Set<object>();
+  const server: Server = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(sseChunk({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }));
+  });
+  server.on("connection", (socket) => connections.add(socket));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (typeof address !== "object" || address === null) throw new Error("no server address");
+  try {
+    const client = new OpenAICompatibleClient(`http://127.0.0.1:${address.port}`);
+    const bodies: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      let text = "";
+      const res = await client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 100 }, (chunk) => {
+        if (chunk.choices[0]?.delta.content) text += chunk.choices[0].delta.content as string;
+      });
+      assert.equal(res.choices[0].finish_reason, "stop");
+      bodies.push(text);
+    }
+    assert.deepEqual(bodies, ["ok", "ok", "ok"], "every request must still return its real body");
+    assert.equal(
+      connections.size,
+      3,
+      "3 requests must not share a connection: a pooled socket is one llama-server may have already closed"
+    );
+  } finally {
+    for (const socket of connections) (socket as { destroy: () => void }).destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

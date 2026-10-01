@@ -1,4 +1,5 @@
 import fetch from "node-fetch";
+import { Agent } from "node:http";
 import type {
   ChatCompletionChunk,
   ChatCompletionRequest,
@@ -7,6 +8,34 @@ import type {
   ModelBackend,
   ToolDef,
 } from "./types.js";
+
+/** Every request this client makes opts out of HTTP keep-alive.
+ *
+ *  Node's global agent has `keepAlive: true` (Node >= 19), and it does NOT
+ *  honor the server's advertised keep-alive window — there is no code path
+ *  that reads `Keep-Alive: timeout=N` back out of the response. llama-server
+ *  advertises `Keep-Alive: timeout=5, max=100` and really does close an idle
+ *  connection after 5s, but Node keeps that socket in its free pool and
+ *  happily hands it back out. The next request writes onto a socket the
+ *  server has already torn down, and the client sees a RST before a single
+ *  response byte arrives.
+ *
+ *  Measured against the real backend, 8 sequential streaming requests:
+ *  implicit global agent → 4 ok / 4 failed ("socket hang up"); the same
+ *  requests with keep-alive off → 8 ok / 0 failed. The failures are pure
+ *  connection-reuse races: they surface in 0.0s, and llama-server's own log
+ *  shows no task ever launched for them, so the request never reached
+ *  inference at all.
+ *
+ *  This reached the user as `llamacli` randomly failing a turn with an
+ *  unexplained network error, and — worse — the agent loop treats a chat
+ *  failure as end-of-turn, so a failed retry looked like the model had simply
+ *  stopped working.
+ *
+ *  Disabling keep-alive costs one TCP handshake per request, which is free on
+ *  the loopback backend this is built for; the server was closing the
+ *  connection anyway, so there is no reuse left to lose. */
+const HTTP_AGENT = new Agent({ keepAlive: false });
 
 // Found auditing for the same class of bug already fixed three times
 // (run_shell's missing timeout, browser.ts's missing CDP timeout, the
@@ -80,7 +109,7 @@ export class OpenAICompatibleClient implements ModelBackend {
   ) {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await fetch(url, { ...options, signal: controller.signal as any });
+      return await fetch(url, { ...options, signal: controller.signal as any, agent: HTTP_AGENT });
     } catch (err: any) {
       if (err?.name === "AbortError") {
         if (controller.signal.reason === CANCELLED_REASON) throw new Error("cancelled by user");
@@ -208,6 +237,7 @@ export class OpenAICompatibleClient implements ModelBackend {
         headers: this.headers(),
         body: JSON.stringify({ ...req, stream: true }),
         signal: controller.signal as any, // node-fetch's AbortSignal type predates the global one
+        agent: HTTP_AGENT, // see HTTP_AGENT — keep-alive reuse fails against llama-server
       });
     } catch (err: any) {
       if (err?.name === "AbortError") {

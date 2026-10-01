@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, readFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
@@ -265,6 +265,138 @@ test("every log line is non-empty — a blank status line explains nothing", asy
     assert.ok(lines.length > 0, "the adopted case must report which endpoint it took");
     for (const l of lines) assert.ok(l.trim().length > 0);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── Backend health check ─────────────────────────────────────────────────────
+// "It answered" is not "it works". A server whose weights are unusable loads,
+// reports its model and returns HTTP 200 with a well-formed completion full of
+// nothing — one was adopted for seven hours before anyone noticed. These pin
+// the two boundaries that matter: a garbage backend must not be adopted, and an
+// inconclusive probe must never be mistaken for one.
+
+const garbageHealth = async () => ({ verdict: "garbage", sample: "steps steps steps steps", reason: "not an echo" }) as const;
+
+test("case 1: a server that answers with garbage is NOT adopted — it is reported with the model's own words", async () => {
+  const root = await project();
+  try {
+    const lines: string[] = [];
+    let bootstrapCalls = 0;
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig(),
+      log: (l) => lines.push(l),
+      discover: async () => ({ kind: "found", server: { baseUrl: "http://127.0.0.1:9099", model: "broken-x" } }),
+      probe: garbageHealth,
+      bootstrap: async () => {
+        bootstrapCalls++;
+        throw new Error("bootstrap must not run for a broken server either");
+      },
+    });
+    assert.equal(res.kind, "unresolved");
+    if (res.kind !== "unresolved") return;
+    assert.match(res.reason, /steps steps steps steps/, "the user must see what the model actually said");
+    assert.match(res.reason, /모델 파일이 손상/);
+    assert.ok(lines.some((l) => /steps steps steps steps/.test(l)), "the TUI log must carry it too");
+    assert.equal(bootstrapCalls, 0, "a broken server must not trigger a 20 GB reinstall");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("case 1: a garbage server must not fall through to spawning a second one beside it", async () => {
+  const root = await project();
+  try {
+    const res = await resolveBackend({
+      projectRoot: root,
+      // A config that WOULD otherwise start a server — the broken one is still
+      // holding the model in VRAM, and a second llama-server is an OOM.
+      config: localConfig({ backend: "local-llama", llama: { binPath: "/bin/true", modelPath: "/bin/true", port: 9099 } } as any),
+      log: () => {},
+      discover: async () => ({ kind: "found", server: { baseUrl: "http://127.0.0.1:9099", model: "broken-x" } }),
+      probe: garbageHealth,
+      bootstrap: async () => ({ ok: true, steps: [], errors: [] }) as BootstrapReport,
+    });
+    assert.equal(res.kind, "unresolved");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("case 1: a healthy probe adopts exactly as before (no regression)", async () => {
+  const root = await project();
+  try {
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig(),
+      log: () => {},
+      discover: async () => ({ kind: "found", server: { baseUrl: "http://127.0.0.1:9099", model: "m-x" } }),
+      probe: async () => ({ verdict: "healthy", sample: "ZQXVKJ" }),
+      bootstrap: async () => ({ ok: true, steps: [], errors: [] }) as BootstrapReport,
+    });
+    assert.equal(res.kind, "adopted");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Connectivity is the agent loop's job to report, not the probe's. Reading an
+// unreachable backend as "broken model" would lock the user out of a server
+// that is merely slow to answer.
+test("case 1: an inconclusive probe still adopts — a slow backend is not a broken one", async () => {
+  const root = await project();
+  try {
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig(),
+      log: () => {},
+      discover: async () => ({ kind: "found", server: { baseUrl: "http://127.0.0.1:9099", model: "m-x" } }),
+      probe: async () => ({ verdict: "unknown", sample: "", reason: "chat failed: 503" }),
+      bootstrap: async () => ({ ok: true, steps: [], errors: [] }) as BootstrapReport,
+    });
+    assert.equal(res.kind, "adopted");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("case 2: a freshly spawned server serving garbage is reported, not handed to the agent loop", async () => {
+  const root = await project();
+  const cleanup: Array<() => void> = [];
+  try {
+    const model = join(root, "model.gguf");
+    await writeFile(model, Buffer.alloc(64));
+    // A real process answering /v1/models, so the spawn genuinely succeeds and
+    // the probe is reached — stubbing tryStart's readiness away would test
+    // nothing about the path that matters.
+    const fake = join(root, "fake-llama-server");
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const http = require("http");
+const i = process.argv.indexOf("--port");
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ data: [{ id: "fake" }] }));
+}).listen(Number(process.argv[i + 1]), "127.0.0.1");
+`
+    );
+    await chmod(fake, 0o755);
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig({ backend: "local-llama", llama: { binPath: fake, modelPath: model, port: 9097 } } as any),
+      log: () => {},
+      discover: async () => none,
+      probe: garbageHealth,
+      registerCleanup: (fn) => cleanup.push(fn),
+      bootstrap: async () => ({ ok: true, steps: [], errors: [] }) as BootstrapReport,
+    });
+    assert.equal(res.kind, "unresolved");
+    if (res.kind !== "unresolved") return;
+    assert.match(res.reason, /steps steps steps steps/);
+  } finally {
+    for (const fn of cleanup) fn();
     await rm(root, { recursive: true, force: true });
   }
 });
