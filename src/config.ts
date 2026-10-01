@@ -93,26 +93,27 @@ export interface LlamacliConfig {
     enabled?: boolean;
   };
   /** Whether to let the model emit chain-of-thought (`reasoning_content`)
-   *  before its actual answer/tool call. Defaults to FALSE — measured
-   *  directly against the real backend, and it is the root cause behind a
-   *  long run of "the model never finished writing the file" failures:
+   *  before its actual answer/tool call. Defaults to TRUE.
    *
-   *    same 420-token budget, same prompt:
-   *      thinking on  -> 420 reasoning_content deltas, 0 tool_calls deltas
-   *      thinking off ->   0 reasoning_content deltas, 362 tool_calls deltas
+   *  It used to default false, and the recorded reason was a real measurement
+   *  — but the measurement was misread. What was actually observed:
    *
-   *  With it on, the model spent the ENTIRE max_tokens budget on thinking
-   *  and never even began the tool call — so nothing was written, nothing
-   *  could be salvaged (there were no tool_call deltas to recover), and
-   *  the UI showed nothing at all while it happened (llamacli renders
-   *  `content` deltas, not `reasoning_content`), which is what "it looks
-   *  stuck" actually was. llama-server itself warns about this at startup:
-   *  "chat template supports preserving reasoning, it is enabled by
-   *  default (may use more tokens, disable via --no-reasoning-preserve)".
+   *    same prompt, same model, varying the reply budget:
+   *      420  -> thinking on: 1874 chars reasoning, 0 content, finish=length
+   *      420  -> thinking off: 293 chars content, finish=stop
+   *      1024 -> thinking on: reasoning AND content, finish=stop
    *
-   *  Set true to opt back in (a model/task where visible deliberation is
-   *  worth the budget); llamacli then also streams the reasoning to the UI
-   *  rather than going silent. */
+   *  The failure was never "thinking is expensive" — it was that `max_tokens`
+   *  had no allowance for reasoning, and reasoning is drawn from the same budget
+   *  and spent first. A 420-token budget cannot hold both. `computeMaxTokens`
+   *  now reserves THINKING_TOKEN_ALLOWANCE and lifts the floor to 1,024 when
+   *  this is on, so the starvation the old default was avoiding no longer
+   *  happens; with that fixed, disabling it by default only removed deliberation
+   *  that was working correctly at any reasonable budget.
+   *
+   *  Set false to turn it off, which also keeps `enable_thinking: false` out
+   *  of requests and hides reasoning from the log. Note that a server started
+   *  with `--reasoning on` emits reasoning regardless of this setting. */
   enableThinking?: boolean;
 
 }

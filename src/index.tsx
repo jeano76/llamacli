@@ -608,7 +608,13 @@ async function main() {
     // would never take effect.
     thresholds,
     autoResume: config.compaction.autoResume,
-    enableThinking: config.enableThinking ?? false,
+    // Default ON. The old `?? false` was guarding against a budgeting bug — the
+    // reply budget had no allowance for reasoning, so a tight budget produced
+    // reasoning-only responses with zero tool calls (measured: 420 tokens ->
+    // 1874 chars of reasoning, 0 of content). computeMaxTokens now reserves
+    // THINKING_TOKEN_ALLOWANCE when thinking is enabled, so the guard is no
+    // longer load-bearing and the default only cost us working deliberation.
+    enableThinking: config.enableThinking ?? true,
     verify: config.verify?.afterEdit,
     gitCheckpoint: config.checkpoint?.git ?? false,
     repeatPenalty: config.repeatPenalty,

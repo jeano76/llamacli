@@ -286,10 +286,13 @@ function wrapLogLine(line: LogLine, width: number): string[] {
   // eye actually uses to classify a line.
   if (line.kind === "user") return wrapToWidth(`${glyph("❯", ">", caps)} ${line.text}`, width);
   if (line.kind === "tool") return wrapToWidth(`${glyph("⚡", "*", caps)} ${line.text}`, width);
-  // Chain-of-thought, shown only when enableThinking is on (loop.ts's
-  // onReasoningDelta). Kept visually distinct (dim, prefixed) from the
-  // real answer so it reads as "thinking out loud", not the final reply —
-  // this is display-only and never re-enters the conversation.
+  // Chain-of-thought. Shown whenever the backend sends `reasoning_content`,
+  // NOT gated on `enableThinking`: a server started with `--reasoning on` (the
+  // llama-server default is `auto`) emits it whatever we requested, and it was
+  // reported live as thinking text in the log while the config said it was
+  // off. Kept visually distinct (dim, prefixed) from the real answer so it
+  // reads as "thinking out loud", not the final reply — display-only, and it
+  // never re-enters the conversation.
   if (line.kind === "reasoning") return wrapToWidth(`  ${line.text}`, width);
   return wrapToWidth(line.text, width);
 }

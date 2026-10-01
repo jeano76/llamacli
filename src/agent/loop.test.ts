@@ -2703,3 +2703,114 @@ test("warmCompactIfNeeded is a no-op when context usage is already under the aut
 
     assert.ok(!compactionRan, "warmCompactIfNeeded must not force a compaction when nothing crossed the threshold");
   }));
+
+// ── thinking needs a reply budget of its own ─────────────────────────────────
+//
+// Measured against the real backend on this box, same prompt and model, only
+// the budget varying:
+//
+//   max_tokens=420   thinking off -> 293 chars content, finish=stop
+//                    thinking on  -> 1874 chars reasoning, 0 content, finish=length
+//   max_tokens=1024  thinking on  -> reasoning AND content, finish=stop
+//
+// Reasoning and the answer come out of ONE budget and reasoning is spent first,
+// so a budget that leaves no allowance produces a reasoning-only response with
+// zero tool calls — which was the original reason thinking defaulted off. The
+// fix is to size the budget, not to avoid the feature.
+
+test("thinking on gives the reply budget an allowance beyond what the window allows", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({ turnResponses: [assistantMessage("done")], tokenCounts: [10] });
+    const mk = (enableThinking: boolean) => {
+      const l = new AgentLoop({
+        projectRoot: dir,
+        model: "m",
+        backend,
+        systemPrompt: "sys",
+        thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+        enableThinking,
+      });
+      return l;
+    };
+    await mk(false).send("hi");
+    const offBudget = turnRequests[0].max_tokens!;
+    await mk(true).send("hi");
+    const onBudget = turnRequests[1].max_tokens!;
+    // The window math is identical in both cases, so any difference is the
+    // reasoning allowance — and it must be an addition, not a subtraction.
+    assert.ok(
+      onBudget > offBudget,
+      `thinking on should raise the budget, got off=${offBudget} on=${onBudget}`
+    );
+  }));
+
+test("thinking on never returns a reply budget below the floor reasoning needs", () =>
+  withTempProject(async (dir) => {
+    // A tight window is exactly the case that used to starve reasoning: the
+    // ceiling is a fraction of the window, so a small window produced a budget
+    // smaller than one reasoning round.
+    const { backend, turnRequests } = scriptedBackend({ turnResponses: [assistantMessage("done")], tokenCounts: [10] });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 2048 },
+      enableThinking: true,
+    });
+    await loop.send("hi");
+    assert.ok(
+      turnRequests[0].max_tokens! >= 1024,
+      `expected at least the 1024 floor, got ${turnRequests[0].max_tokens}`
+    );
+  }));
+
+test("thinking off keeps the original 512 floor and sends the disable flag", () =>
+  withTempProject(async (dir) => {
+    const { backend, turnRequests } = scriptedBackend({ turnResponses: [assistantMessage("done")], tokenCounts: [10] });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 2048 },
+      enableThinking: false,
+    });
+    await loop.send("hi");
+    assert.equal(turnRequests[0].max_tokens!, 512, "the off path must not have gained a floor");
+    assert.deepEqual(turnRequests[0].chat_template_kwargs, { enable_thinking: false });
+  }));
+
+test("reasoning from the backend reaches the log even when thinking is off", () =>
+  withTempProject(async (dir) => {
+    // A server launched with `--reasoning on` (llama-server defaults to
+    // `auto`) emits reasoning whatever we request, and it was reported live as
+    // thinking text appearing in the log while the config said it was off.
+    // Hiding it would misrepresent what the model did — and the tokens are
+    // spent either way.
+    const reasoning: string[] = [];
+    const backend: ModelBackend = {
+      async chat(_req, onChunk) {
+        onChunk?.({ choices: [{ delta: { reasoning_content: "let me think" } }] } as any);
+        onChunk?.({ choices: [{ delta: { content: "answer" } }] } as any);
+        return { choices: [{ message: { role: "assistant", content: "answer" } }] } as any;
+      },
+      async listModels() {
+        return [];
+      },
+      async tokenize() {
+        return 10;
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 16384 },
+      enableThinking: false,
+      onReasoningDelta: (t) => reasoning.push(t),
+    });
+    await loop.send("hi");
+    assert.deepEqual(reasoning, ["let me think"], "reasoning must be surfaced regardless of the setting");
+  }));

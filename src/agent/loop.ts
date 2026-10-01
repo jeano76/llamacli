@@ -49,6 +49,31 @@ function toolDefsJson(): string {
   return JSON.stringify(activeToolDefs());
 }
 
+/** Tokens reserved for `reasoning_content` when thinking is on.
+ *
+ *  Measured against the real backend on this box, same prompt and model, only
+ *  the reply budget varying:
+ *
+ *    max_tokens=420   thinking off -> 293 chars of content, finish=stop
+ *                    thinking on  -> 1874 chars of reasoning, 0 of content, finish=length
+ *    max_tokens=1024  thinking on  -> reasoning AND content, finish=stop
+ *
+ *  So reasoning and the answer are drawn from ONE budget and the model spends
+ *  the reasoning first. 2,048 covers the observed ~560-token round with room
+ *  to spare, and stays a fraction of any realistic window.
+ *
+ *  Added AFTER the window/ceiling arithmetic rather than subtracted from it, so
+ *  this extends the reply budget instead of eroding the headroom the safety
+ *  margin protects. */
+const THINKING_TOKEN_ALLOWANCE = 2048;
+
+/** Floor for the reply budget when thinking is on.
+ *
+ *  The plain 512 floor sits below what reasoning plus an answer needs — 420 was
+ *  measured to produce zero content — so thinking-on requests start at 1,024,
+ *  the budget that was measured to yield both. */
+const THINKING_MIN_REPLY_TOKENS = 1024;
+
 // A single tool result (e.g. read_file on a large or binary-ish file, a
 // noisy shell command's stdout) had no size limit before this was added —
 // its full raw content went straight into `this.messages` and from there,
@@ -233,9 +258,24 @@ export interface AgentLoopOptions {
   backend: ModelBackend;
   systemPrompt: string;
   thresholds: CompactionThresholds;
-  /** Off by default — see config.ts's `enableThinking` for the measured
-   *  reason (an entire max_tokens budget spent on invisible
-   *  `reasoning_content` before the tool call even began). */
+  /** ON by default. Was off, and the measured reason it was off turned out to be
+   *  a budgeting bug rather than a property of thinking: reasoning and the
+   *  answer share ONE `max_tokens` budget and the model spends the reasoning
+   *  first, so a small budget produced reasoning-only responses with zero tool
+   *  calls. Measured on the real backend:
+   *
+   *    420  -> 1874 chars reasoning, 0 content, finish=length   (broken)
+   *    1024 -> reasoning AND content, finish=stop              (fine)
+   *
+   *  `computeMaxTokens` now reserves THINKING_TOKEN_ALLOWANCE and raises the
+   *  floor when this is set, so enabling it no longer starves the answer. With
+   *  that in place the original objection no longer applies. Set
+   *  `enableThinking: false` in config.yaml to go back.
+   *
+   *  Note this only controls what WE send and what WE display. A server
+   *  launched with `--reasoning on` (or a template that defaults to
+   *  reasoning) emits `reasoning_content` regardless, and it is surfaced either
+   *  way — see the onReasoningDelta call site. */
   enableThinking?: boolean;
   /** Per-extension checks run after each file edit (see harness.ts);
    *  false turns them off. From config.yaml's verify.afterEdit. */
@@ -744,6 +784,19 @@ export class AgentLoop {
             }
             if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
             const reasoning = (delta as any)?.reasoning_content;
+            // Surface reasoning whenever the backend sends it, INCLUDING when
+            // `enableThinking` is off — because a server can emit reasoning on
+            // its own regardless of what we ask for. llama-server defaults
+            // `--reasoning` to `auto`, which enables it whenever the chat
+            // template supports it, and it was reported live as thinking text
+            // appearing in the log while the config said it was disabled.
+            //
+            // Suppressing it here would mean hiding something the model
+            // actually did, and the display path is separate from the request
+            // path by design: `enableThinking` controls what we ASK for
+            // (`enable_thinking: false` in chat_template_kwargs), not what we
+            // show. Hiding it would also make the setting look effective when
+            // it never was — the model would still be spending the tokens.
             if (typeof reasoning === "string" && reasoning) this.opts.onReasoningDelta?.(reasoning);
           }
         );
@@ -1427,7 +1480,29 @@ export class AgentLoop {
     const CEILING_FRACTION = 0.75;
     const available = window - usedTokens - SAFETY_MARGIN_TOKENS;
     const ceiling = Math.floor(window * CEILING_FRACTION);
-    return Math.max(512, Math.min(available, ceiling));
+
+    // With thinking on, `max_tokens` has to cover BOTH the reasoning and the
+    // answer — they are drawn from one budget, and the model spends the
+    // reasoning first. Measured against the real backend, same prompt, same
+    // model, only the budget varying:
+    //
+    //   max_tokens=420   thinking off -> 293 chars of content
+    //                   thinking on  -> 1874 chars of reasoning, 0 of content, finish=length
+    //   max_tokens=1024  thinking on  -> reasoning AND content, finish=stop
+    //
+    // So the failure this reserve prevents is not hypothetical, and it is not a
+    // reason to keep thinking off: it is a reason to size the budget for it.
+    // Without this, enabling thinking made the first turn emit zero tool calls
+    // — and since `reasoning_content` is not what the tool-call salvage path
+    // reads, there was nothing to recover either.
+    //
+    // The floor matters more than the subtraction: `max(x, 512)` let a tight
+    // window produce a budget too small for reasoning to fit alongside an
+    // answer, which is the exact case that produced the original "the model
+    // never finished writing the file" failures.
+    const reasoningAllowance = this.opts.enableThinking ? THINKING_TOKEN_ALLOWANCE : 0;
+    const floor = this.opts.enableThinking ? THINKING_MIN_REPLY_TOKENS : 512;
+    return Math.max(floor, Math.min(available, ceiling) + reasoningAllowance);
   }
 
   /** Sizes the summary and the kept tail so that the COMPACTED conversation
