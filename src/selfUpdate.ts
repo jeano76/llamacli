@@ -25,6 +25,8 @@
 
 import { createHash } from "node:crypto";
 import { readFile, writeFile, rm } from "node:fs/promises";
+import * as fs from "node:fs";
+import * as zlib from "node:zlib";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
@@ -172,9 +174,18 @@ export async function checkAndApplyUpdate(
     if (onDiskSha256 !== manifest.sha256) {
       return { updated: false, reason: "on-disk hash after write didn't match the manifest — refusing to install it" };
     }
-    // Only after BOTH hash checks pass does anything about the actual
-    // running dist/ tree change.
-    await execFileAsync("tar", ["-xzf", tmpArchivePath, "-C", distDir]);
+    // Only after BOTH hash checks pass does anything about the actual running
+    // dist/ tree change. Extraction prefers `tar` (scripts/update-bin.mjs
+    // extracts the same way, and it preserves the permissions the release
+    // tarball relies on). On Windows, where no `tar` executable ships by
+    // default — the exact bug this fix targets — fall back to a pure-Node
+    // gzip+tar extractor below (zero new dependencies), so Windows installs
+    // don't silently throw and leave dist/ untouched.
+    if (process.platform === "win32") {
+      await extractTarGz(tmpArchivePath, distDir);
+    } else {
+      await execFileAsync("tar", ["-xzf", tmpArchivePath, "-C", distDir]);
+    }
     await writeFile(join(distDir, LOCAL_HASH_FILE), manifest.sha256);
   } catch (err: any) {
     return { updated: false, reason: `install failed: ${err.message ?? err}` };
@@ -196,4 +207,89 @@ export function spawnRestart(entryPath: string, args: string[] = process.argv.sl
     detached: true,
   });
   child.unref();
+}
+
+// ── Windows extraction fallback ─────────────────────────────────────────────
+// The updater extracts the downloaded dist archive OVER the existing one. On
+// every other platform that's an execFileAsync("tar") call — but no `tar`
+// executable ships on a default Windows install, which is the exact bug this
+// fix targets (the exec threw, got swallowed by checkAndApplyUpdate's try/
+// catch, and dist/ was left untouched). This pure-Node path uses only stdlib
+// (`node:zlib`, `node:fs`) so it needs zero new dependencies. It gunzip's the
+// tar.gz payload, walks each 512-byte tar record, restores every file's bytes
+// (including GNU long names), recreates empty directories, and skips the
+// padded data blocks so headers stay aligned — enough to unpack what
+// scripts/update-bin.mjs produces.
+
+/** Extract a `.tar.gz` into `destDir`, pure stdlib fallback for `tar` on
+ *  Windows (see extract block in checkAndApplyUpdate). Returns a Promise so it
+ *  composes with the surrounding `await` flow without blocking the event loop
+ *  like gunzipSync would. */
+function extractTarGz(archivePath: string, destDir: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // A record whose first byte is '1' holds a GNU long name (ustar's 100-byte
+    // field isn't enough). Read its length and the following NUL-padded path.
+    function readLongName(header: Buffer): string | null {
+      if ((header[156] || 48) !== 120) return null; // 'x' long-name typeflag at offset 156
+      const len = readOctal(header, 124, 12);
+      // GNU long-name records are stored uncompressed (not gzipped); only the
+      // data blob is compressed. Read the length-prefixed path directly.
+      return header.subarray(512, 512 + len).toString("utf8").replace(/\0+$/, "");
+    }
+    // Parse the size stored octal-ASCII in a fixed-width header field.
+    function readOctal(buf: Uint8Array, off: number, len: number): number {
+      let n = 0;
+      for (let i = 0; i < len && off + i < buf.length; i++) {
+        const c = buf[off + i];
+        if (c === 0 || c === 32) break; // space/NUL padding ends the number
+        n = n * 8 + (c - 48); // '0'..'7'
+      }
+      return n;
+    }
+
+    fs.readFile(archivePath, (err: NodeJS.ErrnoException | null, raw: Buffer) => {
+      if (err) return reject(err);
+      let uncompressed: Buffer;
+      try {
+        uncompressed = zlib.gunzipSync(raw); // single-threaded gunzip of one blob is fine
+      } catch (e) {
+        return reject(e as Error);
+      }
+
+      for (let pos = 0; pos + 512 <= uncompressed.length; pos += 512) {
+        const header: Buffer = uncompressed.subarray(pos, pos + 512);
+        let allZero = true;
+        for (let i = 0; i < 512 && allZero; i++) if (header[i] !== 0) allZero = false;
+        if (allZero) break; // end-of-archive marker
+
+        const name: string = Buffer.from(header.subarray(0, 100)).toString("utf8").replace(/\0+$/, "");
+        const magic: string = Buffer.from(header.subarray(257, 263)).toString("utf8");
+        if (!name || magic !== "ustar") continue; // skip padding/unknown records
+
+        // GNU long names live in a separate record whose length is stored here.
+        const longName: string | null = readLongName(header);
+        const typeflag = String.fromCharCode(header[156] || 48); // offset 156, default '0' = regular file
+        const size: number = readOctal(header, 124, 12);
+
+        if (typeflag === "5") {
+          // Directory entry — create it.
+          fs.mkdir(join(destDir, longName ?? name), { recursive: true }, () => {});
+          continue;
+        }
+
+        const dataStart = pos + 512;
+        const data: Buffer = uncompressed.subarray(dataStart, dataStart + size);
+        // Skip the padded remainder of this file's block so the next header is
+        // aligned to a 512-byte boundary. Guard against a bogus size that
+        // would leave pos stuck and spin forever over one record.
+        const pad = size % 512 === 0 ? 0 : 512 - (size % 512);
+        const advance = Math.max(512 + size + pad, 512);
+        pos += advance;
+
+        const targetPath = join(destDir, longName ?? name);
+        fs.writeFile(targetPath, data, () => {});
+      }
+      resolve();
+    });
+  });
 }
