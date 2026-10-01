@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { renderProgressLine } from "./bootstrap.js";
+import { resetTerminalCache } from "../tui/terminal.js";
 
 // A first run prints download progress for tens of minutes, and this reporter is
 // the only thing the user sees during it. Both bugs below were found by driving
@@ -18,13 +19,31 @@ function withIsTTY(value: boolean, fn: () => void): void {
   }
 }
 
+/** Sets LLAMACLI_FORCE_ANSI and restores both it and the capability cache.
+ *
+ *  `getCapabilities()` memoizes its result process-wide on first read, so
+ *  clearing the env var alone is not enough — without the reset, a FORCE_ANSI
+ *  set here would silently apply to whatever test reads capabilities next in the
+ *  same process. */
+function withForcedAnsi(fn: () => void): void {
+  const real = process.env.LLAMACLI_FORCE_ANSI;
+  process.env.LLAMACLI_FORCE_ANSI = "1";
+  resetTerminalCache();
+  try {
+    fn();
+  } finally {
+    if (real === undefined) delete process.env.LLAMACLI_FORCE_ANSI;
+    else process.env.LLAMACLI_FORCE_ANSI = real;
+    resetTerminalCache();
+  }
+}
+
 const at = (percent: number) => ({ receivedBytes: percent * 2e8, totalBytes: 2e10, percent }) as any;
 
 test("the in-place rewrite uses a real ESC[2K, never the literal text [2K", () => {
   // The bug: the sequence was written as `\r[2K`, so the erase-line control code
   // reached the terminal as four visible characters at the start of every update.
-  process.env.LLAMACLI_FORCE_ANSI = "1";
-  try {
+  withForcedAnsi(() => {
     const lines: string[] = [];
     withIsTTY(true, () => {
       const rep = renderProgressLine((l) => lines.push(l));
@@ -36,27 +55,24 @@ test("the in-place rewrite uses a real ESC[2K, never the literal text [2K", () =
       `literal "[2K" leaked to the terminal: ${JSON.stringify(lines)}`
     );
     assert.ok(lines.some((l) => l.includes("\r\x1b[2K")), "expected a proper carriage-return + erase-line");
-  } finally {
-    delete process.env.LLAMACLI_FORCE_ANSI;
-  }
+  });
 });
 
 test("progress is written through the log sink, never straight to stdout", () => {
   // Writing to process.stdout directly bypasses whatever sink the caller gave
   // us — which is how this used to corrupt the TUI it shared a terminal with.
-  process.env.LLAMACLI_FORCE_ANSI = "1";
   const lines: string[] = [];
-  withIsTTY(true, () => renderProgressLine((l) => lines.push(l))(at(50)));
+  withForcedAnsi(() => {
+    withIsTTY(true, () => renderProgressLine((l) => lines.push(l))(at(50)));
+  });
   assert.equal(lines.length, 1, "the caller's log must receive the update");
   assert.match(lines[0], /50%/);
-  delete process.env.LLAMACLI_FORCE_ANSI;
 });
 
 test("the first update does not carriage-return over unread scrollback", () => {
   // A leading \r on the first line would blank whatever the user has not read
   // yet; only subsequent rewrites need it.
-  process.env.LLAMACLI_FORCE_ANSI = "1";
-  try {
+  withForcedAnsi(() => {
     const lines: string[] = [];
     withIsTTY(true, () => {
       const rep = renderProgressLine((l) => lines.push(l));
@@ -65,9 +81,7 @@ test("the first update does not carriage-return over unread scrollback", () => {
     });
     assert.ok(!lines[0].startsWith("\r"), `first line started with \\r: ${JSON.stringify(lines[0])}`);
     assert.ok(lines[1].startsWith("\r"), "later lines must rewrite in place");
-  } finally {
-    delete process.env.LLAMACLI_FORCE_ANSI;
-  }
+  });
 });
 
 test("a terminal that cannot interpret escapes gets plain lines, no control bytes", () => {
