@@ -219,6 +219,51 @@ const SHIMMER_BAND_WIDTH = 10;
 const SHIMMER_SPEED_CHARS_PER_TICK = 2;
 export const SHIMMER_TICK_MS = 80;
 
+/**
+ * Writes a control sequence straight to the real stdout, past Ink.
+ *
+ * Ink owns the screen, but cursor placement and input-row clearing have to be
+ * written outside its render pass or they land mid-frame. That is why these
+ * three sites cannot go through the stdout wrapper `index.tsx` hands Ink: they
+ * must write when Ink is not.
+ *
+ * Two things this has to get right, both of which were live bugs:
+ *
+ *   1. **A failing write must never be fatal.** The cursor backstop is a
+ *      2-second `setInterval`, so it keeps firing long after the terminal is
+ *      gone — a closed pty, an ssh session dropped, a window closed. Writing
+ *      then fails, and an unhandled write error from inside a timer callback is
+ *      an `uncaughtException`, which takes the whole process down. Confirmed in
+ *      the field: `.llamacli/crash.log` held `Error: write EIO` with
+ *      `Timeout._onTimeout → App.js:1798` — this exact write — so the session
+ *      died of it, and it happened again on the next launch.
+ *   2. **Escapes must not reach a terminal that cannot read them.** The stdout
+ *      wrapper strips these for Ink's frames, but it cannot cover writes made
+ *      here, so a bare Windows cmd printed `2;69;19H`-style fragments as visible
+ *      text — exactly what was seen on screen.
+ *
+ * So: suppress writes once stdout is known to be gone (a terminal does not come
+ * back), and strip when the capability layer says escapes are not interpreted.
+ */
+function writeDirect(seq: string): void {
+  if (directWritesDead) return;
+  const caps = getCapabilities();
+  const payload = caps.ansi ? seq : stripAnsi(seq);
+  if (!payload) return;
+  try {
+    process.stdout.write(payload);
+  } catch {
+    // EIO/EPIPE from a vanished terminal. Going silent is right: the reason we
+    // are writing — keeping the cursor on the input line — has no meaning
+    // without a terminal to draw it on, and every later attempt would fail the
+    // same way and throw again.
+    directWritesDead = true;
+  }
+}
+
+/** Latches once a direct write fails, so we stop asking a dead terminal. */
+let directWritesDead = false;
+
 /** Wraps one log entry into terminal rows (unpadded). */
 function wrapLogLine(line: LogLine, width: number): string[] {
   // Read once per entry: the two line-classification glyphs below and the
@@ -1997,7 +2042,7 @@ export function App({
       const hi = Math.max(prevInputTopBorderRow, inputTopBorderRow);
       let clearSeq = "";
       for (let r = lo; r < hi; r++) clearSeq += `\x1b[${r};1H\x1b[2K`;
-      process.stdout.write(clearSeq);
+      writeDirect(clearSeq);
     }
     prevInputTopBorderRowRef.current = inputTopBorderRow;
 
@@ -2044,7 +2089,7 @@ export function App({
     // placement survive an Ink repaint — see cursorPlacement.ts for why a
     // write from this effect is not enough on its own.
     setCursorPlacement(lastCursorWriteRef.current);
-    process.stdout.write(lastCursorWriteRef.current);
+    writeDirect(lastCursorWriteRef.current);
   });
 
   // Reported directly: the blinking cursor sometimes ends up sitting
@@ -2067,7 +2112,7 @@ export function App({
   useEffect(() => {
     const id = setInterval(() => {
       if (!getCapabilities().altScreen || !lastCursorWriteRef.current) return;
-      process.stdout.write(lastCursorWriteRef.current);
+      writeDirect(lastCursorWriteRef.current);
     }, 2000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps

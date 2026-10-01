@@ -177,9 +177,27 @@ function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T
   // cannot read escapes receives text it can actually display.
   const caps = getCapabilities();
   const stripEscapes = !caps.ansi;
+  // Latches when the terminal is gone. This is the write path for EVERY Ink
+  // frame, so a vanished terminal (closed pty, dropped ssh, closed window)
+  // turns every subsequent render into another `write EIO`. Unguarded, that
+  // throw propagates out of Ink's `onImmediateRender` — which sits in no
+  // try/catch — and kills the process as an uncaughtException. Confirmed in the
+  // field, with this exact frame named in `.llamacli/crash.log`:
+  //   at WriteStream.patched (dist/index.js:132)
+  //   at Object.value [as onImmediateRender] (ink/build/ink.js:158)
+  let terminalGone = false;
   const patched = ((chunk: any, ...rest: any[]): boolean => {
+    if (terminalGone) return true;
     const out = stripEscapes && typeof chunk === "string" ? stripAnsi(chunk) : chunk;
-    const result = original(out, ...rest);
+    let result = true;
+    try {
+      result = original(out, ...rest);
+    } catch {
+      // EIO/EPIPE. Nothing is left to draw on and Ink keeps asking for frames,
+      // so stop answering instead of throwing once per frame.
+      terminalGone = true;
+      return true;
+    }
     // `placement` is a raw CSI cursor-positioning sequence, so on a terminal
     // classified as not ANSI-capable it must not be written at all — that is the
     // whole point of `stripEscapes` above. buildSequences() already returns ""
@@ -203,6 +221,12 @@ function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T
         // The background is read from buildSequences rather than hard-coded so
         // the color-depth fallback (16-colour SGR 40) stays in one place.
         original(buildSequences(getCapabilities()).backgroundOn + placement);
+      } catch {
+        // Same dead-terminal case as above, on the re-assertion half. Guarded
+        // separately because this is the write most likely to be the one that
+        // fails: it lands after Ink's own write, when the terminal may already
+        // have gone between the two.
+        terminalGone = true;
       } finally { reasserting = false; }
     }
     return result;
@@ -263,6 +287,46 @@ function enableWindowsVirtualTerminal(): void {
     execFileSync("chcp", ["65001"], { stdio: "ignore", windowsHide: true });
   } catch {
     // Left at the system code page; unicode detection already accounts for it.
+  }
+}
+
+/**
+ * Puts the terminal back into cooked mode (line editing, echo, signal chars).
+ *
+ * Ink turns this off to receive keypresses one at a time, and only restores it
+ * from `unmount()`. Every exit path that skips `unmount()` therefore leaves the
+ * user's shell unusable, and that is not cosmetic: with `icanon` and `echo` off,
+ * line editing and history stop working, Ctrl-C stops interrupting and Ctrl-S
+ * stops pausing — the shell looks alive and does nothing. Measured on a real pty
+ * left behind by a crashed session:
+ *
+ *   before: -isig -icanon -iexten -echo      after: isig icanon iexten echo
+ *
+ * The crash path is the one that matters. `process.on("exit")` and the crash
+ * handler both run on their way out, and `setRawMode(false)` cannot be relied on
+ * from either — the usual reason to be there is that something already failed.
+ *
+ * Best-effort by design: a non-TTY stdin (a pipe, a service) has nothing to
+ * restore, and the reset is not available everywhere.
+ */
+function restoreTerminalModes(): void {
+  try {
+    const stdin = process.stdin as NodeJS.ReadStream & {
+      isTTY?: boolean;
+      setRawMode?: (mode: boolean) => void;
+    };
+    if (!stdin.isTTY) return;
+    stdin.setRawMode?.(false);
+  } catch {
+    // Fall through to the tcsetattr path below.
+  }
+  try {
+    // Belt and braces: `setRawMode(false)` is a no-op on some terminals, and the
+    // shell is what the user is left holding. The child's stdin must BE the
+    // terminal for `stty` to apply, hence the explicit redirect.
+    execFileSync("stty", ["sane"], { stdio: ["ignore", "ignore", "ignore"], timeout: 2000 });
+  } catch {
+    // No stty, not a shell tty, or already gone. Nothing further to try.
   }
 }
 
@@ -376,6 +440,12 @@ async function main() {
       }
     }
     exitAltScreen();
+    // Restoring the terminal modes is deliberately part of the generic teardown
+    // rather than of `exitNow`: `cleanup` is what the crash handler and the
+    // `exit` event run, and those are exactly the paths that skip Ink's
+    // `unmount()` — so without this the user is left with a shell whose line
+    // editing, echo and Ctrl-C are switched off. See restoreTerminalModes.
+    restoreTerminalModes();
   };
   process.on("exit", cleanup);
   process.on("SIGINT", () => {
