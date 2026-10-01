@@ -334,3 +334,59 @@ test("stripAnsi removes both CSI and OSC sequences", () => {
   assert.equal(stripAnsi("\x1b]8;;https://x.dev\x07link\x1b]8;;\x07"), "link");
   assert.equal(stripAnsi("plain"), "plain");
 });
+
+// ── non-ANSI terminals must receive no escape bytes at all ──────────────────
+//
+// The failure these guard is specific: a terminal that IS a TTY (so Ink decides
+// to emit cursor/erase sequences) but cannot interpret them (a bare cmd.exe that
+// never negotiated VT mode). Detection answers "not ANSI-capable" there, and
+// index.tsx's stdout wrapper strips the bytes before they reach the screen.
+// Verified by driving a real Ink render rather than by reasoning.
+
+test("stripAnsi removes Ink's cursor-visibility sequences, the ones a bare cmd prints literally", () => {
+  // Ink emits this on unmount; on a cmd.exe without VT mode it appears on screen
+  // as the literal text "[?25h".
+  assert.equal(stripAnsi("\x1b[?25h"), "");
+  assert.equal(stripAnsi("\x1b[?25l"), "");
+  assert.equal(stripAnsi("\x1b[2J\x1b[H"), "");
+  assert.equal(stripAnsi("\x1b[?1049h\x1b[?1049l"), "");
+  // Cursor positioning, which the app's own placement logic writes.
+  assert.equal(stripAnsi("\x1b[3;10H"), "");
+});
+
+test("stripAnsi leaves text intact while removing only control bytes", () => {
+  // Korean text, box drawing and emoji must survive — stripping must not become
+  // a lossy character filter.
+  const text = "한글 \u2713 \u2588\u2593 \ud83d\ude80 \u2500\u2500";
+  assert.equal(stripAnsi(`\x1b[36m${text}\x1b[0m`), text);
+});
+
+test("stripAnsi handles a multi-sequence frame the way Ink batches them", () => {
+  const frame = "\x1b[?25l\x1b[2J\x1b[H\x1b[36m한글\x1b[0m\x1b[3;1H\x1b[?25h";
+  assert.equal(stripAnsi(frame), "한글");
+});
+
+test("a non-ANSI capability report yields empty sequences for every control feature", () => {
+  // The other half of the same fix: buildSequences must emit nothing at all, so
+  // no call site can reintroduce an escape byte behind the wrapper's back.
+  const caps = detectTerminal({ LLAMACLI_NO_ANSI: "1" } as NodeJS.ProcessEnv, TTY);
+  const seq = buildSequences(caps);
+  for (const value of Object.values(seq)) {
+    if (typeof value === "string") {
+      assert.ok(!value.includes("\x1b"), `sequence leaked an escape byte: ${JSON.stringify(value)}`);
+    }
+  }
+});
+
+test("windows-cmd detection is the case that needs the strip, and it is reached", () => {
+  // Pin the exact classification the strip exists for: a win32 TTY with none of
+  // the recognized markers. If this ever starts reporting ansi:true without VT
+  // mode actually being on, this is the test that would say so.
+  const caps = detectTerminal({ TERM: "xterm" } as NodeJS.ProcessEnv, {
+    stdoutIsTTY: true,
+    stdinIsTTY: true,
+    platform: "win32",
+  });
+  assert.equal(caps.ansi, false);
+  assert.match(caps.reason, /win32 without a recognized terminal marker/);
+});

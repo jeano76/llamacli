@@ -12,3 +12,11 @@ dist/
 __pycache__/
 *.pyc
 .venv/
+
+# Scratch verification harnesses. These are throwaway scripts used to prove a
+# single behaviour against a real payload (e.g. checking the pure-Node tar
+# extractor against GNU long names) — the assertions that matter are in the real
+# test suite, not in a copy of the logic pasted into a standalone file where it
+# can drift from src/ and rot.
+tmp_*.mjs
+tmp_*/
