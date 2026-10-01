@@ -26,6 +26,7 @@ import { mkdir, writeFile, readFile, rename } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { stringify, parse } from "yaml";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB, type Hardware } from "./hardware.js";
+import { getCapabilities } from "../tui/terminal.js";
 import { tuneForHardware, type LlamaTuning } from "./tuning.js";
 import { findLlamaServer, buildLlamaCpp, defaultRun, type LlamaLocation, type Run } from "./llamaCpp.js";
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
@@ -716,7 +717,25 @@ async function listGgufsIn(dir: string): Promise<{ path: string; sizeBytes: numb
  *  Rewrites ONE terminal line rather than appending, because a 22 GB download
  *  at 4 updates/second would otherwise bury everything above it in thousands of
  *  lines. Falls back to periodic lines when the output is not a TTY, so a
- *  redirected log gets a readable record instead of one overwritten line. */
+ *  redirected log gets a readable record instead of one overwritten line.
+ *
+ *  Two things were wrong with the interactive branch, both visible in a real
+ *  capture of a first run:
+ *
+ *  1. `\r[2K` was missing its ESC byte. The erase-line control sequence is
+ *     `\x1b[2K`, so what actually reached the terminal was a carriage return
+ *     followed by the literal characters `[2K` — visible garbage at the start
+ *     of every update. Confirmed by driving this reporter directly: the bytes
+ *     written were `"\r[2K[████..."`, and a whole download painted the line with
+ *     `[2K` smeared across it.
+ *  2. It wrote to `process.stdout` directly instead of going through `log`. That
+ *     bypasses the caller's sink entirely, which is exactly why a TUI passing
+ *     its own reporter had to wrap this one (see `onProgress`'s doc comment) —
+ *     and why the bootstrap's own progress could never be routed anywhere else.
+ *     Writing through `log` also means the line is suppressible on a terminal
+ *     that cannot interpret escapes, instead of smearing control bytes over
+ *     whatever is on screen.
+ */
 export function renderProgressLine(log: (line: string) => void): (p: TransferProgress) => void {
   const interactive = Boolean(process.stdout.isTTY);
   // Last logged decile. `floor(percent) % 10 === 0` is true for EVERY update
@@ -724,9 +743,19 @@ export function renderProgressLine(log: (line: string) => void): (p: TransferPro
   // line about four times a second for its first several minutes and buried
   // everything above it.
   let lastDecile = -1;
+  // Carriage return + erase-line + cursor-to-column-1, or nothing at all when
+  // the sink cannot take escapes (a non-ANSI terminal would print these
+  // literally). Written through `log` so it honours that decision instead of
+  // assuming stdout is a capable terminal.
+  const canRewrite = interactive && supportsAnsiOutput();
+  let first = true;
   return (p) => {
-    if (interactive) {
-      process.stdout.write(`\r[2K${formatProgress(p)}`);
+    if (canRewrite) {
+      // The leading `\r` on the first update would blank a line of scrollback
+      // the user has not read yet; later updates genuinely need it to rewrite
+      // in place.
+      log(`${first ? "" : "\r\x1b[2K"}${formatProgress(p)}`);
+      first = false;
       return;
     }
     const decile = p.percent < 0 ? -1 : Math.floor(p.percent / 10);
@@ -735,4 +764,16 @@ export function renderProgressLine(log: (line: string) => void): (p: TransferPro
       log(formatProgress(p));
     }
   };
+}
+
+/** Whether escape sequences can be written to the process's own stdout.
+ *
+ *  Deliberately narrower than the full TUI capability report: a redirected
+ *  stdout is not a terminal, and a terminal that cannot interpret escapes would
+ *  print `\x1b[2K` as text. Reuses the TUI's own verdict so this and the
+ *  renderer can never disagree — terminal.ts pulls in chalk and nothing from
+ *  React, so importing it here costs no dependency the setup path was avoiding. */
+function supportsAnsiOutput(): boolean {
+  if (!process.stdout.isTTY) return false;
+  return getCapabilities().ansi;
 }
