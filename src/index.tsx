@@ -18,8 +18,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
-import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth } from "./tui/terminal.js";
+import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth, stripAnsi } from "./tui/terminal.js";
 import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
+import { execFileSync } from "node:child_process";
 import { getCursorPlacement } from "./tui/cursorPlacement.js";
 import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
@@ -109,9 +110,27 @@ function enterAltScreen(): void {
   // is already painted on black rather than flashing the terminal's own
   // background for one repaint.
   process.stdout.write(seq.backgroundOn + seq.altScreenOn + seq.mouseOn);
+  altScreenActive = true;
 }
 
+/** Whether we have actually switched the terminal to the alternate buffer.
+ *
+ *  Setup (install / build / model download) runs BEFORE that switch, and it can
+ *  fail. Without this, a setup failure would run the teardown sequences against
+ *  a buffer that was never entered — the user's shell would keep the alternate
+ *  screen's scrollback rules and lose its own, which is exactly the reported
+ *  "설치 중 화면이 깨진다".
+ *
+ *  Also makes teardown idempotent: the failure path calls `cleanup()` (which
+ *  calls this) and then `process.exit(1)`, which fires the `exit` handler that
+ *  calls `cleanup()` again. Writing the restore sequences twice is harmless in
+ *  a healthy terminal but visibly wrong in one that does not have them, so the
+ *  second call is suppressed. */
+let altScreenActive = false;
+
 function exitAltScreen(): void {
+  if (!altScreenActive) return;
+  altScreenActive = false;
   const seq = buildSequences(getCapabilities());
   // backgroundOff is NOT optional. Without it the black background outlives the
   // process and recolours the user's shell for the rest of the session — the
@@ -135,9 +154,37 @@ function exitAltScreen(): void {
 function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T): T {
   const original = stdout.write.bind(stdout);
   let reasserting = false;
+  // Ink decides whether to emit control sequences from `stdout.isTTY`, not from
+  // anything we tell it. On a terminal we have classified as NOT ANSI-capable
+  // that is the wrong answer twice over, and both halves were verified by
+  // driving a real render:
+  //
+  //   - isTTY:false  -> Ink writes plain text, no escapes at all. Correct, but
+  //                     it also disables cursor-hide, so the terminal's cursor
+  //                     blinks at whatever row the last line landed on — the
+  //                     "하단이 갑자기 깜빡인다" symptom.
+  //   - isTTY:true   -> Ink emits real cursor/erase sequences. On a Windows cmd
+  //                     that never negotiated VT mode (no WT_SESSION,
+  //                     TERM_PROGRAM, ConEmuANSI, ANSICON or MSYSTEM, which is
+  //                     exactly the `win32 without a recognized terminal marker`
+  //                     case in terminal.ts) those bytes are NOT interpreted:
+  //                     they appear on screen literally. Measured here: a bare
+  //                     render emitted a trailing `\x1b[?25h`.
+  //
+  // So keep isTTY true (Ink needs it for width/rows/resize, and we manage the
+  // cursor ourselves via the placement below) and strip the escape bytes in
+  // `write` instead. That way Ink still lays out correctly, and a terminal that
+  // cannot read escapes receives text it can actually display.
+  const caps = getCapabilities();
+  const stripEscapes = !caps.ansi;
   const patched = ((chunk: any, ...rest: any[]): boolean => {
-    const result = original(chunk, ...rest);
-    const placement = getCursorPlacement();
+    const out = stripEscapes && typeof chunk === "string" ? stripAnsi(chunk) : chunk;
+    const result = original(out, ...rest);
+    // `placement` is a raw CSI cursor-positioning sequence, so on a terminal
+    // classified as not ANSI-capable it must not be written at all — that is the
+    // whole point of `stripEscapes` above. buildSequences() already returns ""
+    // for the background half of this line; this guards the other half.
+    const placement = stripEscapes ? undefined : getCursorPlacement();
     if (placement && !reasserting) {
       // Guard against recursion: a write that itself triggers another write
       // (possible if stdout is a pipe being drained synchronously) would
@@ -167,6 +214,54 @@ function wrapStdoutWithCursorReassertion<T extends NodeJS.WriteStream>(stdout: T
 }
 
 const REPO_URL = "https://github.com/jeano76/llamacli";
+
+/**
+ * Turns on Windows VT processing for this console, if we are on Windows.
+ *
+ * A stock cmd.exe leaves the console in a mode where escape bytes are printed
+ * literally rather than interpreted. Node can flip it through
+ * `setWindowsVirtualTerminalProcessingMode`, which is the difference between
+ * this app degrading to ASCII on cmd and working properly on it — the
+ * detection in terminal.ts has to answer "not ANSI-capable" for a cmd.exe that
+ * never negotiated VT, and this is what stops that from being the answer on a
+ * cmd.exe that could have.
+ *
+ * Deliberately silent on failure. It returns false where the API is missing
+ * (Node < 16.11), where the console predates VT (pre-Windows 10), and throws
+ * when the handle is not a console at all (a pipe, a service). All three are
+ * normal, and in every one of them `detectTerminal`'s existing answer is already
+ * the right one — so there is nothing useful to report to the user.
+ *
+ * Also sets the console output code page to UTF-8 where possible. Without it a
+ * cmd.exe on a non-UTF-8 system code page renders every Korean string in the
+ * banner and the UI as mojibake, and — worse for layout — `stringWidth` reasons
+ * about characters the terminal is not displaying at the width we assumed, so
+ * fixed-width boxes desynchronize. Setting it is not available from Node, so
+ * this shells out once and ignores any failure.
+ */
+function enableWindowsVirtualTerminal(): void {
+  if (process.platform !== "win32") return;
+  try {
+    const stdout = process.stdout as NodeJS.WriteStream & {
+      setWindowsVirtualTerminalProcessingMode?: (mode: boolean) => boolean;
+      getWindowsVirtualTerminalProcessingMode?: () => boolean;
+    };
+    if (typeof stdout.getWindowsVirtualTerminalProcessingMode === "function") {
+      if (stdout.getWindowsVirtualTerminalProcessingMode()) return; // already on
+    }
+    stdout.setWindowsVirtualTerminalProcessingMode?.(true);
+  } catch {
+    // Not a console, or an OS that refuses. Detection handles it.
+  }
+  try {
+    // `chcp 65001` writes its confirmation to stdout, which must not happen
+    // before the TUI owns the screen, so the output is discarded rather than
+    // shown. Failure (locked-down policy, redirected handle) is harmless.
+    execFileSync("chcp", ["65001"], { stdio: "ignore", windowsHide: true });
+  } catch {
+    // Left at the system code page; unicode detection already accounts for it.
+  }
+}
 
 /** "vYYYYMMDD" — dist/index.js's own mtime (no separate build-info step
  *  exists to read a date from). Computed here (needs fs access) and handed
@@ -241,19 +336,27 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
 }
 
 async function main() {
-  // The ONLY thing that runs before the alt screen: the self-update check.
-  // Everything else — including the whole first-run setup — happens after
-  // render(), behind the TUI. Running any of it here meant the screen was up
-  // and empty while minutes of installing and downloading went by, which is
-  // what made llamacli look like it vanished mid-"setup" (reported directly:
-  // "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져"). The fix now runs
-  // resolveBackend() BEFORE render() (see main) instead of deferring it, so the
-  // install/download/build happens in the foreground; progress is still streamed
-  // into the TUI via `log`. See backend/resolve.ts for why resolution can be
-  // slow and backend/deferred.ts for how a non-llama.cpp backend behaves.
+  // Windows first, before anything reads the terminal: a bare cmd.exe only
+  // interprets escape sequences after its console has VT processing turned on.
+  // terminal.ts deliberately treats "win32 with no recognized marker" as
+  // NOT ANSI-capable, because that is the safe default when the mode is off —
+  // the user sees literal `\x1b[?25h` garbage otherwise. But that default is
+  // only reached because the enabling call was never made, and it can be: Node
+  // exposes `process.stdout.setWindowsVirtualTerminalProcessingMode` for
+  // exactly this. Turning it on lets a stock cmd.exe get the full experience
+  // instead of a permanently degraded ASCII fallback.
+  //
+  // Best-effort and deliberately silent: it returns false on older consoles and
+  // throws if the handle is not a console at all, and in every such case the
+  // detection layer's conservative answer is already correct.
+  enableWindowsVirtualTerminal();
+
+  // The ONLY thing that runs before anything is drawn: the self-update check.
+  // It deliberately runs OUTSIDE the alt screen — a restart tears the screen
+  // down and rebuilds it, so doing it inside would flash an empty buffer at the
+  // user on every update.
   await maybeSelfUpdateAndRestart();
   const projectRoot = process.cwd();
-  enterAltScreen();
   let cleanedUp = false;
   /** Teardown callbacks, run by `cleanup`. Anything holding an OS resource
    *  (a spawned llama-server, above all) registers here so it is released on
@@ -323,15 +426,24 @@ async function main() {
   // endpoint/port; otherwise an installed llama.cpp is started on a free port;
   // otherwise llama.cpp is installed, configured and given a model.
   //
-  // It runs BEFORE render() now (the core fix), deliberately in the
-  // foreground. The old design ran it AFTER render(), behind a DeferredBackend:
-  // before the screen came up that is what made `llamacli` look like it vanished —
-  // reported directly: "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져". A first
-  // run installs llama.cpp and downloads a 20 GB model, so that wait was minutes
-  // long with a blank screen. Now the progress still streams live into the TUI as
-  // status lines the user can read (each line hits the real terminal first, then
-  // lands inside the UI), and a message typed during setup simply waits for it
-  // rather than failing against a dead port.
+  // It runs BEFORE the alt screen is entered, and that ordering is the whole
+  // fix for both startup symptoms.
+  //
+  // A first run installs llama.cpp, builds it, and downloads a 20 GB model —
+  // tens of minutes. An earlier revision moved resolution ahead of render()
+  // but left enterAltScreen() at the top of main, so the terminal switched to
+  // the alternate buffer and painted its black background and then sat there
+  // COMPLETELY EMPTY for the whole install: Ink draws only once render() runs,
+  // and render() was waiting on this very await. Reported as "오스 구동시 화면이 장시난 어둠다" (the screen stays dark for a long
+  // time), plus the two follow-on symptoms of the same cause — a crash or Ctrl-C
+  // during setup dropped straight back to the shell prompt with the progress
+  // output gone (it had been painted into the alt buffer, which the teardown
+  // erased), and the screen could come back visibly mangled.
+  //
+  // So setup progress goes to the NORMAL terminal instead: scrollable, and it
+  // stays in the shell's scrollback after exit. More importantly there is no
+  // half-built alternate buffer to lose if anything goes wrong. Only once the
+  // backend is confirmed usable does the alt screen open and the TUI take over.
   const thresholds = {
     autoTriggerRatio: config.compaction.autoTriggerRatio,
     // Provisional, replaced by the server's own report below. Read live on every
@@ -341,40 +453,45 @@ async function main() {
   };
   const ui = () => (globalThis as any).__llamacli_ui;
 
-  // Resolve the backend and set up AgentLoop BEFORE render. This is the core fix
-  // for "setup finishes behind the alt screen / app just terminates": on a first
-  // run resolveBackend installs llama.cpp, downloads a model, builds it — minutes
-  // of work that used to race past while a blank-ish alt screen was already
-  // mounted. Awaiting here puts it in the foreground instead; the boot progress
-  // still streams live into the TUI via `log`, so nothing is lost (a line lands
-  // on the real screen first, then inside the UI). A backend that fails to
-  // resolve now exits non-zero rather than leaving a ready-looking prompt
-  // against an empty back-end.
+  // Pre-TUI progress sink. Writes to the real terminal rather than the UI,
+  // because there is no UI yet — and before the alt screen opens there must not
+  // be one: anything painted here would be erased by teardown. Once resolution
+  // returns this callback is unreachable anyway.
+  const log = (line: string) => {
+    process.stdout.write(`${line}\n`);
+  };
+  if (setupMessage) log(setupMessage);
+
   const resolution = await resolveBackend({
     projectRoot,
     config,
-    log: (line) => ui()?.pushStatus(line),
-    // Explicit, in addition to the manager's own exit hook: SIGINT is handled
-    // above for the alt screen, and a server left running holds the model in
-    // VRAM for the rest of the machine's uptime.
+    log,
+    // Explicit, in addition to the manager's own exit hook, and a server left
+    // running holds the model in VRAM for the rest of the machine's uptime.
     registerCleanup: (fn) => cleanupRegistry.push(fn),
   });
 
-  // Resolve the backend before render; an unresolved one exits. Elsewhere is an
-  // OpenAI-compatible client (spawned or adopted llama.cpp / remote endpoint) —
-  // no separate ModelBackend type needed.
-  let backend: Resolution["backend"];
+  // Only an adopted or spawned server is a backend the TUI can actually use.
+  // `unresolved` covers the four real "not ready" outcomes resolve.ts reports:
+  // garbage output from an already-running server, garbage output from a freshly
+  // spawned one, a start failure with everything already installed (busy port /
+  // not enough VRAM), and a failed install. Entering prompt mode in any of them
+  // is the reported bug — a ready-looking prompt against a backend that cannot
+  // answer a single turn, with the reason scrolled away behind it.
+  //
+  // So leave the shell exactly as found, print what went wrong, exit non-zero.
+  // No alt screen was entered, so there is nothing to tear down; `cleanup` still
+  // runs so a server that DID start is not left holding VRAM.
   if (resolution.kind === "unresolved") {
-    // Nothing to run against: leave the alt screen and exit so this can't be
-    // mistaken for a ready app that merely hasn't answered yet. This replaces
-    // the old behaviour, which only pushed a status line into a UI nothing had
-    // told it had failed behind — the very bug being fixed here.
-    exitAltScreen();
-    console.error(`[설정 실패] ${resolution.reason}`);
+    console.error(`\n[설정 실패] ${resolution.reason}\n`);
+    cleanup();
     process.exit(1);
-  } else {
-    backend = resolution.backend;
   }
+  const backend: Resolution["backend"] = resolution.backend;
+
+  // Everything below wants the alt screen, and only now is switching safe: the
+  // backend is confirmed usable, so this buffer will actually be used.
+  enterAltScreen();
 
 
   // Prefer the backend's own reported context size over the static config value
@@ -723,12 +840,9 @@ async function main() {
     { exitOnCtrlC: false, stdout: wrapStdoutWithCursorReassertion(process.stdout) }
   );
 
-  if (setupMessage) (globalThis as any).__llamacli_ui?.pushStatus(setupMessage);
-
-  // NOTE: backend resolution now happens synchronously before render() above,
-  // so nothing here is a pending promise anymore. The alt screen was torn down
-  // and the backend installed/downloaded in the foreground; AgentLoop below only
-  // constructs because `backend` already exists by this point. See main().
+  // `setupMessage` was already printed to the normal terminal before
+  // resolution, so it survives in the shell's scrollback rather than being
+  // scrolled away inside the TUI the moment setup output pushed past it.
 
   // Resuming (or discarding) a found checkpoint now happens via the
   // App-rendered Y/N question (pendingResumeGoal/onResumeDecision above)
@@ -737,7 +851,12 @@ async function main() {
 }
 
 main().catch((err) => {
-  exitAltScreen(); // otherwise this error is drawn into the alt-screen and lost when it's torn down
+  // Only tear the alt screen down if it is actually up. Setup runs before the
+  // switch, so a failure during install/download lands here with the normal
+  // terminal still in place — running the teardown there would write the exit
+  // sequences against a buffer that was never entered, leaving the user's shell
+  // in a visibly wrong state (which is the reported "화면이 깨진다").
+  if (altScreenActive) exitAltScreen();
   console.error(err);
   process.exit(1);
 });
