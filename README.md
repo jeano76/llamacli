@@ -55,8 +55,6 @@ Type `/`. The menu sizes itself to the available space and to what matched:
 │   /mouse          마우스 스크롤/클릭 켜기·끄기                                │
 │   /skills         List loaded skills                                      │
 │   /rules          List loaded rules                                       │
-│   /improve        Analyze repeated failures → propose a rule              │
-│   /improve-apply  Save the last proposal as a rule file                   │
 │   /plan-clear     Clear a stuck plan-progress indicator                   │
 │   ↓ 아래 항목 있음                                                          │
 ╰──────────────────────────────────────────────────────────────────────────╯
@@ -232,7 +230,7 @@ codebase, and each is documented at its call site and covered by a test. The
 | Keybindings | `src/tui/keybindings.ts` | The single source of truth for `/help` and `/keys` |
 | Agent loop | `src/agent/loop.ts` | Turn driving, tool dispatch, context accounting |
 | Compaction | `src/compaction/` | Checkpoint write/resume, history summarization |
-| Self-healing | `src/hermes/` | Failure log, circuit breaker, improvement proposals |
+| Self-healing | `src/hermes/` | Circuit breaker (loop + stall detection) |
 | Backend | `src/backend/` | llama-server process management, OpenAI-compatible client |
 | Tools | `src/tools/` | `read_file` / `write_file` / `edit_file` / `run_shell` / `browser_*` |
 | Skills & rules | `src/skills/` | Always-on rules, lazily-loaded skills |
@@ -273,7 +271,7 @@ src/
   backend/      llama.cpp process management + OpenAI-compatible HTTP client
   agent/        Tool-call loop (wired into compaction + self-healing)
   compaction/   Checkpoint write/resume, context summarization (PROMPT.md §2)
-  hermes/       Self-healing circuit breaker, failure log, self-improvement
+  hermes/       Self-healing circuit breaker (loop and stall detection)
                 proposal loop (§3)
   skills/       Lazy skill loading + always-on rule loading, reuses existing
                 CLI conventions (§5); skills/builtin/ ships architecture,
@@ -297,7 +295,7 @@ src/
 >   backend/      llama.cpp 프로세스 관리 + OpenAI 호환 HTTP 클라이언트
 >   agent/        도구 호출 루프 (컴팩션·자가치유 연동)
 >   compaction/   체크포인트 기록/재개, 컨텍스트 요약 (PROMPT.md §2)
->   hermes/       자가 치유 회로차단기, 실패 로그, 자가 개선 제안 루프 (§3)
+>   hermes/       자가 치유회로차단기 (circuit breaker), 실패 로그 (§3)
 >   skills/       skill 지연 로딩 + rule 상시 로딩, 기존 CLI 컨벤션 재사용 (§5);
 >                 skills/builtin/에 아키텍처·기획·구현·리뷰·테스트·정적분석·보안
 >                 스킬이 있어 프로젝트 상태와 무관하게 항상 로드됨
@@ -822,8 +820,8 @@ run with `npm test` (Node's built-in `node:test` + `node:assert`, executed
 via `tsx` — no test framework dependency needed). Currently covered:
 `tools/diff.ts`, `tools/browser.ts` (target-selection/error paths, via a fake
 HTTP server — full CDP round-trips were verified manually against real
-headless Chrome, see below), `hermes/selfHeal.ts`, `hermes/selfImprove.ts`
-(with a fake `ModelBackend`), `compaction/compactor.ts`,
+headless Chrome, see below), `hermes/selfHeal.ts`,
+`compaction/compactor.ts`,
 `compaction/checkpoint.ts`, and `skills/loader.ts`. The agent loop and TUI are
 integration-level (tool-call loop, streaming, slash commands) and were
 verified by scripting real keystrokes through a pty against a real running
@@ -838,12 +836,12 @@ real thing.
 > 별도 테스트 프레임워크 의존성 없음). 현재 커버리지: `tools/diff.ts`,
 > `tools/browser.ts`(타겟 선택/에러 경로는 fake HTTP 서버로 — 실제 CDP 왕복은
 > 실제 headless Chrome으로 수동 검증, 아래 참고), `hermes/selfHeal.ts`,
-> `hermes/selfImprove.ts`(fake `ModelBackend` 사용), `compaction/compactor.ts`,
+> `compaction/compactor.ts`,
 > `compaction/checkpoint.ts`, `skills/loader.ts`,
 > `setup/tuning.ts`(코어 수 · VRAM · OS에 따른 플래그 결정 불변식),
 > `tui/terminal.ts` + `tui/SlashMenu.tsx`(터미널 능력 감지 · 팝업 높이),
 > `setup/bootstrap.ts` + `config.ts`(쓰기 불가 프로젝트에서의 점진적 저하).
-> 현재 **525개 테스트 전부 통과**.
+> 현재 **624개 테스트 전부 통과**.
 > 에이전트 루프와 TUI는
 > 통합 테스트 성격(도구 호출 루프, 스트리밍, 슬래시 명령)이라 실제 llama-server를
 > 대상으로 pty로 실제 키 입력을 흘려보내며 검증했다(git 히스토리 참고) — Ink 터미널
@@ -2997,97 +2995,62 @@ llamacli's own default skill.
 >
 > 둘 다 없으면 `.llamacli/skills/write-tests.md`를 자체 기본 skill로 자동 생성한다.
 
-## Hermes self-improvement proposal loop
+## Self-healing: the circuit breaker (and what was removed)
 
-When the same tool fails with the same pattern 2+ times
-(`src/hermes/selfImprove.ts`), the model is asked to draft a rule that would
-prevent it. **It is never applied automatically** — a proposal always
-requires the user to review it and approve with a separate command:
+`src/hermes/selfHeal.ts` keeps a sliding window of recent tool calls and kills
+a turn that has stopped making progress — either because the recent calls are
+near-identical (the read/edit/read/edit loop), or because no tool has
+*completed* for 30 minutes. This is the part that stays: it is a safety net
+that needs no model call.
 
-- `/improve` — analyzes the accumulated failure log and shows a proposal (no
-  files are touched).
-- `/improve-apply` — saves the last `/improve` proposal to
-  `.llamacli/rules/hermes-proposed-<timestamp>.md`. It's always written as a
-  new file, never overwriting an existing rule, so approving a bad proposal
-  can't destroy prior rules.
-- `/quit` — if there's an unreviewed failure log at session end, quitting
-  doesn't happen immediately; the proposal is analyzed and shown first.
-  Pressing `/quit` again confirms the exit (applying still requires the
-  separate `/improve-apply` — quitting itself never writes a rule).
+### Removed: the self-improvement proposal loop
 
-### Real-time analysis (not just on-demand)
+`/improve`, `/improve-apply`, and the `[auto-improve]` background check have
+been **removed**. They used to analyze a failure log, have the model draft a
+rule, and write it into `.llamacli/rules/`. Two things were wrong with it:
 
-Rather than waiting for `/improve` or session end, `AgentLoop` re-checks the
-failure log immediately after every new tool/backend failure and, the first
-time a pattern crosses the recurrence threshold, appends it to a running,
-append-only journal — `.llamacli/state/improvement-log.md` — with an
-`[auto-improve]` status line pointing at it. This is fire-and-forget
-background analysis (it calls the model, so it must never block the
-tool-call loop it's reacting to) and, critically, **writing to this log file
-never changes agent behavior on its own** — it's a passive record, not a
-rule, and not fed back into the system prompt. Turning a finding into an
-actual rule still always requires the explicit `/improve` → `/improve-apply`
-review flow above. Each recurring pattern (by its grouping signature, not
-its growing occurrence count) is only logged once per session, so a
-still-failing pattern doesn't spam the file on every subsequent occurrence.
+1. **It grew the context without bound.** `writeProposedRule()` wrote a new
+   `hermes-proposed-<timestamp>.md` for *every* approved proposal, `loadRules()`
+   read every file in `.llamacli/rules/`, and all of them were concatenated
+   into the system prompt. Rules live in the **system message**, which
+   compaction never shrinks — `composeSystemMessage()` keeps the base prompt
+   verbatim and only replaces the summary appended after it. So each
+   `/improve-apply` permanently raised a floor that no amount of compaction
+   could reclaim; the context filled and only summary/tail got trimmed.
 
-**Deferred to after the turn, not fired mid-turn.** Asked directly to
-analyze the real llama-server's own logs (`journalctl --user -u
-llama-server.service`) for improvement points, and found one: this backend
-only has a single inference slot (`-np 1`), and the log showed real cache
-churn (`making room for prompt cache entry, removing oldest entry` — 18
-evictions in an hour, ~38% of slot selections falling back to LRU instead
-of reusing a cached prefix). The original implementation triggered the
-improvement-check call immediately inside the tool-call loop, right after
-logging a failure — meaning it could race the *same turn's own next
-request* for that single slot and delay the user's response. Fixed by only
-checking after the whole turn's `runUntilIdle()` loop has completed
-(`hasNewFailuresThisTurn` flag, checked in `send()`/
-`resumeIfCheckpointExists()`), so the background analysis call never
-competes with an in-flight turn for the one available slot. Verified with
-a test that tracks call ordering and asserts the improvement-check request
-only ever appears after the turn's own final response.
+2. **It spent a model call on every failure.** The real-time check deduped on
+   the pattern signature *after* calling the model, so an already-recorded
+   pattern still cost a full inference — competing for this box's single slot
+   (`-np 1`) against the turn it was reacting to.
 
-> ## 헤르메스 자가 개선 제안 루프
+The replacement is a plain **budget** in `injectRulesIntoSystemPrompt()`
+(`MAX_RULE_PROMPT_CHARS`, 32 000): rules are injected in load order until the
+budget is spent, the file at the boundary is truncated at a line break, and the
+rest are dropped with a visible marker naming how many were omitted. A normal
+`CLAUDE.md` fits whole; a runaway pile-up cannot grow the prompt without limit.
+Project rules are now edited directly — there is no command that writes them.
+
+> ## 자가 개선 제안 루프 제거
 >
-> 동일한 도구가 같은 실패 패턴으로 2회 이상 반복되면(`src/hermes/selfImprove.ts`), 모델에게
-> 이를 방지할 rule 초안(markdown)을 작성하게 한다. **절대 자동으로 적용하지 않는다** —
-> 제안은 항상 사용자가 직접 확인 후 별도 명령으로 승인해야 한다:
+> `/improve`, `/improve-apply`, `[auto-improve]` 실시간 체크를 **제거했다**.
+> 실패 로그를 분석해 모델이 rule 초안을 쓰게 하고 `.llamacli/rules/`에 저장하던
+> 기능인데, 문제점이 두 가지였다:
 >
-> - `/improve` — 지금까지 쌓인 실패 로그를 분석해 제안을 보여준다(파일 변경 없음).
-> - `/improve-apply` — 직전 `/improve` 제안을 `.llamacli/rules/hermes-proposed-<timestamp>.md`
->   로 저장한다. 기존 rule 파일을 덮어쓰지 않고 항상 새 파일로 저장되므로, 잘못된 제안을
->   승인해도 기존 rule이 파괴되지 않는다.
-> - `/quit` — 세션 종료 시 미검토 실패 로그가 있으면 즉시 종료하지 않고 자동으로 제안을
->   분석해 보여준다. 확인 후 `/quit`을 한 번 더 누르면 종료된다(적용은 별도로 `/improve-apply`
->   가 필요 — 종료 자체가 rule을 쓰지는 않는다).
+> 1. **컨텍스트가 무한하게 커졌다.** 승인된 제안마다 `hermes-proposed-<timestamp>.md`
+>    를 새로 만들고, `loadRules()`가 `.llamacli/rules/`의 모든 파일을 읽어 전부 시스템
+>    프롬프트에 붙였다. 룰은 **시스템 메시지**에 들어가는데 압축은 이걸 줄이지 않는다
+>    — `composeSystemMessage()`가 base 프롬프트를 그대로 두고 뒤에 붙은 요약만 교체하기
+>    때문이다. 즉 `/improve-apply` 한 번마다 압축으로 되돌릴 수 없는 바닥값이 영구적으로
+>    올랐고, 컨텍스트가 차면 요약/테일만 잘려나가고 룰은 끝까지 남았다.
+> 2. **실패할 때마다 모델을 호출했다.** 실시간 체크가 시그니처 dedup을 모델 호출
+>    *이후*에 하므로, 이미 기록된 패턴도 매번 추론 1회분을 소모했다 — 그것도 이 박스의
+>    슬롯 하나(`-np 1`)를 반응 대상이던 턴과 두고 경쟁하면서.
 >
-> ### 실시간 분석 (수동 트리거만이 아님)
->
-> `/improve`나 세션 종료를 기다리지 않고, `AgentLoop`가 새 도구/백엔드 실패가 발생할
-> 때마다 즉시 실패 로그를 다시 확인해서, 어떤 패턴이 반복 임계치를 처음 넘는 순간
-> 실시간·append-only 저널인 `.llamacli/state/improvement-log.md`에 기록하고
-> `[auto-improve]` 상태 메시지로 알려준다. 이건 fire-and-forget 백그라운드 분석이라
-> (모델을 호출하므로 반응 대상인 도구 호출 루프를 절대 막으면 안 됨) — 중요한 건
-> **이 로그 파일에 쓰는 것 자체는 에이전트 동작을 전혀 바꾸지 않는다**는 것. 순수한
-> 기록일 뿐 rule이 아니고 시스템 프롬프트에도 다시 주입되지 않는다. 실제 rule로
-> 만들려면 여전히 위의 `/improve` → `/improve-apply` 검토 절차가 필요하다. 각 반복
-> 패턴은 (계속 늘어나는 발생 횟수가 아니라 그룹핑 시그니처 기준으로) 세션당 한 번만
-> 기록되므로, 계속 실패하는 패턴이 매번 파일을 도배하지 않는다.
->
-> **턴 도중이 아니라 턴이 끝난 뒤로 미룸.** 실제 llama-server 자체 로그
-> (`journalctl --user -u llama-server.service`)를 직접 분석해서 개선점을 찾아달라는
-> 요청을 받고 하나를 발견함: 이 백엔드는 추론 슬롯이 1개(`-np 1`)뿐인데, 로그에 실제
-> 캐시 스래싱이 보임(`making room for prompt cache entry, removing oldest entry` —
-> 1시간에 18번 제거, 슬롯 선택의 ~38%가 캐시된 prefix 재사용 대신 LRU로 폴백). 원래
-> 구현은 실패를 로그에 남긴 직후 도구 호출 루프 안에서 곧바로 개선 체크 호출을
-> 트리거했음 — 즉 **같은 턴의 다음 요청**과 그 하나뿐인 슬롯을 두고 경쟁해서 사용자
-> 응답을 지연시킬 수 있었음. 턴 전체(`runUntilIdle()` 루프)가 완전히 끝난 뒤에만
-> 체크하도록 수정(`hasNewFailuresThisTurn` 플래그, `send()`/
-> `resumeIfCheckpointExists()`에서 확인) — 이제 백그라운드 분석 호출이 진행 중인 턴과
-> 하나뿐인 슬롯을 두고 절대 경쟁하지 않음. 호출 순서를 추적해서 개선 체크 요청이 항상
-> 턴의 최종 응답 이후에만 나타나는지 확인하는 테스트로 검증함.
-
+> 대신 `injectRulesIntoSystemPrompt()`에 **예산 상한**(`MAX_RULE_PROMPT_CHARS`,
+>    32 000)을 두었다. 룰을 로드 순서대로 넣다가 예산이 소진되면 경계에 걸린 파일은
+>    줄바꿈 기준으로 자르고, 나머지는 몇 개 빠졌는지 명시적으로 표시하며 제외한다.
+>    평범한 `CLAUDE.md`는 통째로 들어가지만, 룰이 쌓여도 프롬프트가 무한히 늘어나지는
+>    않는다. 이제 프로젝트 룰은 직접 편집한다 — 룰을 쓰는 명령은 더 이상 없다.
 ### Compaction kept re-triggering on nearly every step, and resumed goals nested inside themselves
 
 Reported directly, with the exact symptom from a real session: "압축을 해도
@@ -3154,6 +3117,61 @@ server's own `/slots` + logs that each compaction fired only once per
 threshold crossing (17,329 → 8,518 tokens on the first), never nested the
 goal, and left enough headroom that the very next turn didn't immediately
 re-trigger.
+
+### The context window size was stuck at 8192 regardless of the model
+
+The compaction fixes above were necessary but not sufficient: `AgentLoop`
+derives its compaction thresholds (when to compact, what fraction of the
+window the summary and kept tail may occupy) from `model_info.n_ctx`, and
+that value came back **flat at 8192 for every model** — even when the server
+had actually been started with `-c 32768` or more. On a real session whose
+server was running `-c 24576`, `getContextSize()` reported 8192, so all of the
+compaction thresholds were computed against the wrong window: compaction would
+fire far too early (and repeatedly) because it thought the window was tiny.
+
+Root cause, confirmed by tracing every call site of `OpenAICompatibleClient`
+`sizes`: the single method that read the live context size queried
+`GET /props`, but **modern llama.cpp removed `/props`** — its endpoint contract
+changed (the props endpoint no longer exists in current builds). Every `sizes`
+call therefore threw, and every caller silently fell back to a hard-coded
+`8192`. The fallback masked the true problem: the *reported* size was wrong
+for everyone. Two of the callers were already robust — `resolve.ts`'s
+`buildSpawnLlamaServerConfig()` reads `contextSize` directly from
+`config.yaml`, so the spawned server always used the right window — but the
+compaction path relied on the live `/props` read, which had been dead.
+
+Fixed by having `getContextSize()` read `n_ctx` from the model-info block of
+the (still-live) `GET /config` response instead of the removed `/props`:
+`model_info` always carries `n_ctx`, so we now get the server's real context
+window at runtime rather than a stale hard-coded value. Updated the unit test
+that asserted the old `/props` path (it pointed at the dead endpoint). Verified:
+the fix is a one-line source change plus an updated assertion in
+`src/backend/openaiClient.test.ts`, and all **624 tests pass**.
+
+> ### 모델과 무관하게 컨텍스트 길이가 8192로 고정돼 있던 버그
+>
+> 위 압축 수정만으로는 부족했습니다. `AgentLoop`는 압축 문턱값( 언제 압축할지,
+> 요약/유지 토큰이 창 크기의 얼마만큼을 넘을 수 있는지)을 `model_info.n_ctx`로
+> 얻는데, 이 값이 **모든 모델에서 flat하게 8192**로 돌아갔습니다. 서버가 실제로는
+> `-c 32768` 이상으로 뛰고 있었어도 말입니다. 실제 `-c 24576`으로 동작하던 세션에서
+> `getContextSize()`가 8192를 반환해 압축 문턱값이 잘못된 창을 기준으로 계산됐고,
+> 창이 극도로 작아지듯 지나치게 자주(그리고 반복적으로) 압축이 발생했습니다.
+
+> 근본 원인: `OpenAICompatibleClient`의 `sizes`를 호출하는 모든 경로를 추적했을 때,
+> 실시간 컨텍스트 길이를 읽어오던 단 한 메서드가 `GET /props`를 조회했는데, **현대
+> llama.cpp는 `/props`를 삭제했습니다**(엔드포인트 계약이 바뀌어 현재 빌드에서는
+> props 엔드포인트가 존재하지 않음). 그래서 모든 `sizes` 호출이 throw했고 모든
+> caller가 조용히 hard-coded 8192로 fallback됐습니다. 이 fallback은 진짜 문제를
+> 가렸습니다 — *보고된* 크기가 everybody에 대해 틀려 있었습니다. 두 caller는 이미
+> 견고했습니다: `resolve.ts`의 `buildSpawnLlamaServerConfig()`는 `contextSize`를
+> `config.yaml`에서 직접 읽으므로 spawned 서버는 항상 올바른 창을 썼지만, 압축
+> 경로는 죽어 있던 실시간 `/props` 판독에 의존하고 있었습니다.
+
+> `getContextSize()`가 제거된 `/props` 대신 (여전히 살아있는) `GET /config` 응답의
+> model-info 블록에서 `n_ctx`를 읽도록 수정했습니다. `model_info`는 항상 `n_ctx`를
+> 담고 있으므로, 더 이상 stale한 hard-coded 값이 아니라 서버의 실제 컨텍스트 창을
+> runtime에 얻습니다. 오래된 `/props` 경로를 확인하던 unit test도 업데이트했고(죽어
+> 있는 엔드포인트를 가리키던 것), **624개 테스트 모두 pass**했습니다.
 
 ## Remote browser control (Chrome DevTools Protocol)
 

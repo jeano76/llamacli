@@ -73,8 +73,15 @@ const compactedMessages: ChatMessage[] = [
 
 여기서 사라지는 것은 `src/index.tsx`의 `BASE_SYSTEM_PROMPT`뿐이 아니다.
 `injectRulesIntoSystemPrompt(BASE_SYSTEM_PROMPT, rules)`로 주입된 **`.llamacli/rules/*` 프로젝트
-규칙 전체**가 같이 날아간다. 사용자가 `/improve-apply`로 애써 만든 규칙도 첫 압축과 동시에
-무효가 된다.
+규칙 전체**가 같이 날아간다. 프로젝트 규칙까지 첫 압축과 동시에 무효가 된다.
+
+> **현재 상태: 수정됨.** `composeSystemMessage()`가 원본 base 프롬프트를 그대로 보존하고
+> 뒤에 붙은 요약만 교체하도록 바뀌었고, 규칙은 압축에서 살아남는다. 다만 압축이 못 줄이는
+> 대신 `injectRulesIntoSystemPrompt()`에 총 예산 상한(`MAX_RULE_PROMPT_CHARS`)을 두어,
+> 룰이 무한히 쌓여 시스템 프롬프트가 커지는 일은 막았다.
+>
+> 참고로 이 버그는 `/improve-apply`가 매번 새 룰 파일을 만들던 것과 맞물려 실제로
+> 컨텍스트를 무한 증가시키는 원인이었다. 그 자가 개선 루프는 이후 제거되었다.
 
 ### 재현 (실행해서 확인함)
 

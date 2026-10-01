@@ -195,9 +195,10 @@ export async function loadSkillBody(entry: SkillIndexEntry): Promise<string> {
  * whatever lands here is a permanent floor for every request in the session —
  * unbounded growth is not recoverable the way conversation history is.
  *
- * That was a live bug: `writeProposedRule` (hermes/selfImprove.ts) wrote a NEW
- * `hermes-proposed-<timestamp>.md` for every applied proposal, `loadRules`
- * reads every file in `.llamacli/rules/`, and the old injection concatenated
+ * That was a live bug: every applied proposal wrote a NEW
+ * `hermes-proposed-<timestamp>.md` file (now removed — the self-improvement
+ * proposal loop that emitted these was deleted; see README §3), and `loadRules`
+ * reads every file in `.llamacli/rules/`, so the old injection concatenated
  * all of them. Each /improve-apply therefore permanently raised the baseline,
  * and when context filled up the compactor could only drop summary/tail — the
  * rules stayed. This budget makes the growth structurally impossible instead of

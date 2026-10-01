@@ -7,7 +7,7 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
 
 - **Cline**: 파일 편집/도구 실행 중심의 에이전틱 코딩 루프
 - **OpenCode CLI**: 터미널 UX, 세션/모델 관리
-- **Hermes**: 자가 치유(self-healing) 및 자가 개선(self-improvement) 루프
+- **Hermes**: 자가 치유(self-healing) 회로차단기
 
 메모리(8GB) 제약이 있는 로컬 환경에서 장시간·장문맥 작업을 안정적으로 수행하는 것이
 핵심 목표다. 특히 **컨텍스트가 길어지며 이전 지시나 진행 상황을 잊어버리는 문제**를
@@ -178,15 +178,14 @@ CLI를 구현한다. 이 프로그램은 다음 세 가지의 장점을 하나�
    실제 터미널에선 항상 유효한 크기가 잡히므로 코드 결함은 아니지만, 이 CLI를 다시
    자동화 테스트할 때 반드시 참고할 것.
 6. ✅ skill/rule 로딩 — `/skills`, `/rules` 슬래시 명령으로 로드된 목록 조회까지 연결.
-7. ✅ 헤르메스 자가 치유/개선 루프 (회로차단기 포함)
-   — 회로차단기(반복 패턴 감지 + 하드 타임아웃)에 이어 "자가 개선 제안"(§3 두 번째 항목)도
-   구현: `src/hermes/selfImprove.ts`가 실패 로그를 도구+정규화된 에러 시그니처로 그룹핑해
-   같은 패턴이 2회 이상 반복될 때만 모델에게 rule 초안을 작성하게 한다. 실제 모델로 검증
-   (동일 `edit_file` 실패 3회 입력 → 구체적인 예방 rule markdown 생성 확인). **절대 자동
-   적용하지 않음** — `/improve`(제안만 보여줌, 파일 변경 없음) / `/improve-apply`(승인 후
-   `.llamacli/rules/hermes-proposed-<timestamp>.md`로 새 파일 저장, 기존 rule은 절대
-   덮어쓰지 않음)로 분리. `/quit` 시 미검토 실패 로그가 있으면 자동으로 제안을 보여주고
-   한 번 더 `/quit`해야 종료되도록 세션 종료 시점 트리거도 연결.
+7. ✅ 헤르메스 자가 치유 루프 (회로차단기)
+   — 반복 패턴 감지 + 하드 타임아웃 회로차단기(`src/hermes/selfHeal.ts`)만 유지.
+   **자가 개선 제안 루프(`/improve`, `/improve-apply`, `[auto-improve]`)는 제거함.**
+   제거 사유: ① 룰이 **시스템 메시지**에 들어가 압축으로 줄어들지 않는데
+   (`composeSystemMessage()`가 base를 보존하고 뒤 요약만 교체) 제안마다 새 룰 파일이
+   추가되어 시스템 프롬프트의 바닥값이 무한히 올라갔다. ② 실시간 체크가 dedup을
+   모델 호출 *이후*에 해 매 실패마다 추론 1회분을 낭비했다. 대체로는
+   `injectRulesIntoSystemPrompt()`의 총 예산 상한(`MAX_RULE_PROMPT_CHARS`).
 
 ### 8.1 남은 TODO — 전부 해결됨 (README "구현 상태"와 동기화)
 - ✅ 체크포인트의 `pendingToolCall` 수집 — `AgentLoop`에 `maybeCompact()` 헬퍼를 추가해
@@ -227,8 +226,10 @@ whitebox-testing/blackbox-testing/static-analysis/security 8개 skill을 추가�
 ✅ **모든 로직 있는 모듈에 유닛테스트를 붙임** (Node 내장 `node:test`, `tsx --test`로
 구동, 별도 프레임워크 의존성 없음, `npm test`): `tools/diff.ts`, `tools/browser.ts`
 (fake HTTP 서버로 타겟 선택/에러 경로 커버), `hermes/selfHeal.ts`,
-`hermes/selfImprove.ts`(fake `ModelBackend`), `compaction/compactor.ts`,
-`compaction/checkpoint.ts`, `skills/loader.ts` — 총 44개 테스트, 전부 통과.
+`compaction/compactor.ts`, `compaction/checkpoint.ts`, `skills/loader.ts`,
+`setup/tuning.ts`, `setup/hardware.ts` — 현재 624개 테스트, 전부 통과.
+(당시 `hermes/selfImprove.ts`도 fake `ModelBackend`로 테스트했으나, 자가 개선 루프
+제거와 함께 파일 자체가 삭제되어 해당 테스트도 함께 제거됨.)
 **테스트 작성 중 실제 버그를 하나 발견해 수정함**: 브라우저 디버그 포트에 아예
 연결이 안 될 때(`fetch()` 자체가 reject) 안내 메시지 없이 raw `TypeError: fetch
 failed`가 그대로 전파되던 문제 — `listTargets`에서 fetch 실패도 감싸도록 고침.
