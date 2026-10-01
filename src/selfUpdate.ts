@@ -30,6 +30,9 @@ import * as zlib from "node:zlib";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
+import { isSourceCheckout, APPLIED_UPDATE_FILE } from "./buildStamp.js";
+
+const { existsSync } = fs;
 
 const execFileAsync = promisify(execFile);
 
@@ -65,6 +68,17 @@ export function updateAvailable(localSha256: string, manifest: UpdateManifest): 
  *  every startup just to find out nothing changed. */
 export const LOCAL_HASH_FILE = ".self-update-sha256";
 
+/** The sha of the archive the last successful install claims to have applied,
+ *  or null when there has never been one or the file is unreadable. */
+export async function readAppliedUpdate(distDir: string): Promise<string | null> {
+  try {
+    const value = (await readFile(join(distDir, APPLIED_UPDATE_FILE), "utf8")).trim().toLowerCase();
+    return SHA256_HEX_RE.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 export const DEFAULT_MANIFEST_URL = "https://raw.githubusercontent.com/jeano76/llamacli/main/bin/manifest.json";
 export const DEFAULT_ARCHIVE_URL = "https://raw.githubusercontent.com/jeano76/llamacli/main/bin/llamacli-dist.tar.gz";
 
@@ -83,6 +97,58 @@ export const DEFAULT_ARCHIVE_URL = "https://raw.githubusercontent.com/jeano76/ll
  */
 export function selfUpdateDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.LLAMACLI_NO_UPDATE === "1";
+}
+
+/** The escape hatch for "I really do want the published build here".
+ *
+ *  Separate from `LLAMACLI_NO_UPDATE=1` on purpose. That one means "stop
+ *  touching my dist at all"; this one means "yes, I understand this is a
+ *  checkout, overwrite it anyway" — a deliberate act that destroys local work,
+ *  so it should never be the default response to running the tool. */
+export function selfUpdateForced(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.LLAMACLI_FORCE_UPDATE === "1";
+}
+
+/**
+ * Refuses to install an update when `distDir` belongs to a source checkout.
+ *
+ * This is the root cause of "my change compiled, the tests pass, and the
+ * program still behaves as if it were never written" — reproduced three times
+ * while fixing a llama-server build-mismatch bug, each time as:
+ *
+ *   1. `npm run build`, `grep` confirms the new symbol is in dist/.
+ *   2. `llamacli` is run to try the change.
+ *   3. Startup compares the local build's sha256 to the published one, sees a
+ *      difference — which for ANY local build is guaranteed, since it is not
+ *      the published build — downloads the published archive and extracts it
+ *      over dist/.
+ *   4. The local build is gone, replaced byte for byte by the published one.
+ *
+ * Step 4 is invisible from the outside: the sources still have the change, so
+ * the natural conclusion is a compiler or file-watcher problem. The giveaway is
+ * that every file in dist/ then carries the *published* build's mtime, because
+ * `tar` restores archived mtimes.
+ *
+ * For an installed user the overwritten directory is disposable. For someone
+ * building llamacli it is the only copy of the work they just did, so the
+ * default has to be refusal. The cost is one missed auto-update for a
+ * developer, against silently reverting their work; `LLAMACLI_FORCE_UPDATE=1`
+ * picks the other trade explicitly.
+ */
+export function updateRefusedForCheckout(
+  distDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = existsSync
+): { refused: boolean; reason?: string } {
+  if (!isSourceCheckout(distDir, exists)) return { refused: false };
+  if (selfUpdateForced(env)) return { refused: false };
+  return {
+    refused: true,
+    reason:
+      `refusing to self-update over a source checkout (${distDir}) — it would ` +
+      `replace the local build with the published one. Set ` +
+      `LLAMACLI_FORCE_UPDATE=1 to do it anyway.`,
+  };
 }
 
 export interface SelfUpdateResult {
@@ -124,6 +190,14 @@ export async function checkAndApplyUpdate(
   if (selfUpdateDisabled(opts.env)) {
     return { updated: false, reason: "self-update disabled via LLAMACLI_NO_UPDATE=1" };
   }
+  // Before any network call, and for the same reason as the opt-out above:
+  // the answer cannot change what is already on disk, so there is nothing to
+  // learn from asking GitHub. See updateRefusedForCheckout for the failure
+  // this prevents — it is the one that silently reverted three local builds.
+  const refusal = updateRefusedForCheckout(distDir, opts.env ?? process.env);
+  if (refusal.refused) {
+    return { updated: false, reason: refusal.reason! };
+  }
   const fetchImpl = opts.fetchImpl ?? fetch;
   const manifestUrl = opts.manifestUrl ?? opts.env?.LLAMACLI_UPDATE_MANIFEST_URL ?? DEFAULT_MANIFEST_URL;
   const archiveUrl = opts.archiveUrl ?? opts.env?.LLAMACLI_UPDATE_ARCHIVE_URL ?? DEFAULT_ARCHIVE_URL;
@@ -146,6 +220,31 @@ export async function checkAndApplyUpdate(
 
   if (!updateAvailable(localSha256, manifest)) {
     return { updated: false, reason: "already up to date" };
+  }
+
+  // Loop breaker. Reaching here means the manifest's sha disagrees with what
+  // this dist/ records about itself. If the sha we last CLAIMED to install is
+  // this same one, then a previous startup already downloaded and extracted
+  // this exact archive, wrote LOCAL_HASH_FILE from the manifest anyway, and
+  // the disagreement survived — so the bytes that run are still not the bytes
+  // the manifest describes. Repeating the download cannot fix that; it can only
+  // loop forever, because each pass restarts the process and the next pass
+  // sees the same mismatch.
+  //
+  // An extraction that "succeeds" but does not take effect is a real mode
+  // here: `tar` missing (Windows), an archive whose entries land somewhere
+  // unexpected, or a dist/ tree the process is not actually running from. In
+  // every such case the honest outcome is a refusal with an explanation, not
+  // an unbounded restart loop.
+  const previouslyApplied = await readAppliedUpdate(distDir);
+  if (previouslyApplied && previouslyApplied === manifest.sha256.toLowerCase()) {
+    return {
+      updated: false,
+      reason:
+        `already applied ${manifest.version} (${manifest.sha256.slice(0, 12)}…) on a previous ` +
+        `startup, and this build still doesn't match it — the update did not take effect. ` +
+        `Not retrying; run \`npm run build\` to rebuild from source.`,
+    };
   }
 
   opts.onUpdateFound?.(manifest);
@@ -187,6 +286,11 @@ export async function checkAndApplyUpdate(
       await execFileAsync("tar", ["-xzf", tmpArchivePath, "-C", distDir]);
     }
     await writeFile(join(distDir, LOCAL_HASH_FILE), manifest.sha256);
+    // Recorded only after both hash checks and the extraction succeeded, and
+    // read back at the next startup as the loop breaker above: the honest
+    // signal that this sha was installed here, so a surviving mismatch means
+    // the install did not take rather than meaning there is something new.
+    await writeFile(join(distDir, APPLIED_UPDATE_FILE), manifest.sha256);
   } catch (err: any) {
     return { updated: false, reason: `install failed: ${err.message ?? err}` };
   } finally {

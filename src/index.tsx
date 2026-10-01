@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
+import { checkBuildFreshness, stalenessMessage } from "./buildStamp.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth, stripAnsi } from "./tui/terminal.js";
 import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
 import { execFileSync } from "node:child_process";
@@ -385,7 +386,18 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
       );
     },
   }).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
-  if (!result.updated) return;
+  if (!result.updated) {
+    // Said out loud rather than swallowed. A silent no-op is indistinguishable
+    // from "up to date", which is how a developer ends up believing they ran
+    // the published build when in fact they ran something else — or, worse,
+    // believing a local change took effect when the refusal is precisely why
+    // it did not. Only the checkout case is worth a line; the routine
+    // "already up to date" stays quiet.
+    if (/source checkout|disabled/i.test(result.reason)) {
+      process.stderr.write(`[self-update] ${result.reason}\n`);
+    }
+    return;
+  }
   process.stdout.write(
     `[self-update] ${result.reason} — 업데이트가 끝났습니다. 지금 바로 새 버전으로 재시작합니다...\n`
   );
@@ -399,6 +411,28 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
   }
   spawnRestart(entryPath);
   process.exit(0);
+}
+
+/** Compares the running dist/ against the src/ beside it and says so on
+ *  stderr when they disagree. A no-op outside a source checkout (an installed
+ *  package has no src/ to compare against, which is not a problem). */
+function warnIfStaleBuild(): void {
+  let distDir: string;
+  try {
+    const entry = fileURLToPath(import.meta.url);
+    // Only a built .js entry has a dist/ to compare; under `tsx` this file is
+    // the source itself and is always current by definition.
+    if (!entry.endsWith(".js")) return;
+    distDir = dirname(entry);
+  } catch {
+    return;
+  }
+  try {
+    const message = stalenessMessage(checkBuildFreshness(distDir));
+    if (message) process.stderr.write(message + "\n");
+  } catch {
+    // Provenance reporting must never be the reason startup fails.
+  }
 }
 
 async function main() {
@@ -416,6 +450,19 @@ async function main() {
   // throws if the handle is not a console at all, and in every such case the
   // detection layer's conservative answer is already correct.
   enableWindowsVirtualTerminal();
+
+  // Before anything is drawn, and independent of the self-update check below:
+  // this is the check that survives the self-update check being bypassed.
+  //
+  // The two are deliberately separate. `maybeSelfUpdateAndRestart` is the thing
+  // that CAUSES a local build to be replaced by the published one (it extracts
+  // the downloaded archive straight over dist/), and it now refuses to do that
+  // in a checkout. But the same end state is reachable several other ways — a
+  // forced update, a manual extraction, a `tsc` invocation that wrote
+  // somewhere else — and when it happens the only symptom is that the running
+  // program disagrees with the sources it was built from. This line is what
+  // turns that from a mystery into a sentence.
+  warnIfStaleBuild();
 
   // The ONLY thing that runs before anything is drawn: the self-update check.
   // It deliberately runs OUTSIDE the alt screen — a restart tears the screen

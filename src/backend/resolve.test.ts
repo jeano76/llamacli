@@ -590,3 +590,235 @@ test("the installer is still reached when no model path points at a real file", 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ── a recorded binary that cannot read the recorded model ────────────────────
+//
+// The failure this covers was reported four times in a row, always as:
+//
+//   [llamacli] llama-server 시작 실패: ... (code=1)
+//   tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)
+//   [설정 실패] ... 포트(8080)가 사용 중이거나 GPU 메모리가 부족할 수 있습니다.
+//
+// None of those three lines was the cause. Two llama.cpp builds coexist on this
+// machine — a stock one whose ggml type registry stops at 42, and a PrismML
+// fork that reads ternary 1-bit quants. The config named the stock build, and
+// the stock build cannot read the model. Type 143 is neither a busy port nor a
+// corrupt download, and saying so sent the user after a setting that was never
+// involved.
+
+const MISMATCH = "tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)";
+
+/**
+ * A config naming a real model file, which is what the Case-2 gate requires
+ * before it will spawn anything.
+ *
+ * Passed as the `config` OPTION rather than written to `.llamacli/config.yaml`:
+ * the gate reads `config.llama` directly, and the model path is additionally
+ * stat()ed for a non-zero size. A config whose model file does not exist skips
+ * Case 2 entirely and lands in the installer — a different code path that would
+ * have let these tests pass for entirely the wrong reason.
+ */
+async function configWithModel(dir: string, binPath: string): Promise<LlamacliConfig> {
+  const modelPath = join(dir, "model.gguf");
+  await writeFile(modelPath, Buffer.alloc(4096));
+  return localConfig({
+    model: modelPath,
+    llama: { binPath, modelPath, port: 8080, contextSize: 4096, threads: 4, gpuLayers: 0 },
+  });
+}
+
+/** Nothing is listening, so the recorded binary is the one that gets spawned,
+ *  and its failure is what ends the session. `bootstrap` throws on purpose: a
+ *  binary and a model that are both present must never reach the installer,
+ *  which would burn 10-40 minutes of CUDA compilation to fix nothing. */
+const NO_SERVER = {
+  discover: async () => ({ kind: "none" }) as const,
+  bootstrap: async () => {
+    throw new Error("a present binary and model must not trigger the installer");
+  },
+  probe: async () => ({ verdict: "unknown", sample: "", reason: "not running" } as const),
+};
+
+const NO_REPLACEMENT = async () => ({ location: null, rejected: [], rejectedForModel: [] });
+
+test("a build mismatch is never reported as a port or VRAM problem", async () => {
+  const root = await project();
+  try {
+    const config = await configWithModel(root, "/home/jeano/llama.cpp/build-opt/bin/llama-server");
+    const res = await resolveBackend({
+      projectRoot: root,
+      config,
+      log: () => {},
+      ...NO_SERVER,
+      probeModel: async () => ({ ok: false, error: MISMATCH }),
+      findLlamaServer: NO_REPLACEMENT,
+    });
+
+    assert.equal(res.kind, "unresolved");
+    const reason = (res as { reason?: string }).reason ?? "";
+    assert.match(reason, /양자화/, "the message must name the actual cause");
+    assert.match(reason, /binPath/, "and say what to change");
+    // Asserted against the OFFER of those explanations, not the words: the
+    // message legitimately says "this is not a port or VRAM problem", which is
+    // the useful part. What must be gone is the suggestion to go change them.
+    assert.doesNotMatch(reason, /사용 중이거나 GPU 메모리가 부족할 수 있습니다/);
+    assert.doesNotMatch(reason, /포트\(8080\)가 사용 중/);
+    assert.match(reason, /포트나 GPU 메모리 문제가 아니며/, "and it rules them out explicitly");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a genuine spawn failure still offers the port/VRAM explanation", async () => {
+  // The other branch must survive the split. A busy port and a full card are
+  // real and common, and that message is correct for them — collapsing both
+  // failures into one string would have fixed the reported bug and broken this.
+  const root = await project();
+  try {
+    const config = await configWithModel(root, "/home/jeano/llama.cpp/build-opt/bin/llama-server");
+    const res = await resolveBackend({
+      projectRoot: root,
+      config,
+      log: () => {},
+      ...NO_SERVER,
+      probeModel: async () => ({ ok: true }),
+      findLlamaServer: NO_REPLACEMENT,
+    });
+
+    assert.equal(res.kind, "unresolved");
+    const reason = (res as { reason?: string }).reason ?? "";
+    assert.match(reason, /포트\(8080\)가 사용 중|GPU 메모리/);
+    assert.doesNotMatch(reason, /양자화/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a bare binary name is still explained as a PATH problem", async () => {
+  // The pre-existing branch the split had to preserve: "llama-server" without a
+  // slash resolves only through PATH, and telling that user to change the port
+  // wastes their time on a setting that was never involved.
+  const root = await project();
+  try {
+    const config = await configWithModel(root, "llama-server");
+    const res = await resolveBackend({
+      projectRoot: root,
+      config,
+      log: () => {},
+      ...NO_SERVER,
+      probeModel: async () => ({ ok: true }),
+      findLlamaServer: NO_REPLACEMENT,
+    });
+
+    assert.equal(res.kind, "unresolved");
+    assert.match((res as { reason?: string }).reason ?? "", /PATH/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unusable backend never comes up looking like a usable prompt", async () => {
+  // Whichever cause, this outcome must not present as a session: the user would
+  // type into a shell with no model behind it.
+  const root = await project();
+  try {
+    const config = await configWithModel(root, "/home/jeano/llama.cpp/build-opt/bin/llama-server");
+    const res = await resolveBackend({
+      projectRoot: root,
+      config,
+      log: () => {},
+      ...NO_SERVER,
+      probeModel: async () => ({ ok: false, error: MISMATCH }),
+      findLlamaServer: NO_REPLACEMENT,
+    });
+    assert.equal((res as { usable?: boolean }).usable, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the fallback search is told which model it must be able to read", async () => {
+  // A replacement build is only useful if it can read THIS model, so the path
+  // has to reach the search. Getting it wrong would substitute a binary that
+  // fails identically.
+  const root = await project();
+  try {
+    const config = await configWithModel(root, "/home/jeano/llama.cpp/build-opt/bin/llama-server");
+    let searchedFor: string | undefined;
+    await resolveBackend({
+      projectRoot: root,
+      config,
+      log: () => {},
+      ...NO_SERVER,
+      probeModel: async () => ({ ok: false, error: MISMATCH }),
+      findLlamaServer: (async (opts: { modelPath?: string } = {}) => {
+        searchedFor = opts.modelPath;
+        return { location: null, rejected: [], rejectedForModel: [] };
+      }) as never,
+    });
+    assert.equal(searchedFor, config.model);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the recorded binary is stripped from the search environment", async () => {
+  // Env overrides are ranked FIRST, so leaving the known-bad binPath in place
+  // would hand back the very build that just failed — a retry that changes
+  // nothing while appearing to try something.
+  const root = await project();
+  try {
+    const config = await configWithModel(root, "/opt/bad/llama-server");
+    const previous = process.env.LLAMACLI_LLAMA_SERVER;
+    process.env.LLAMACLI_LLAMA_SERVER = "/opt/bad/llama-server";
+    try {
+      let seen: NodeJS.ProcessEnv | undefined;
+      await resolveBackend({
+        projectRoot: root,
+        config,
+        log: () => {},
+        ...NO_SERVER,
+        probeModel: async () => ({ ok: false, error: MISMATCH }),
+        findLlamaServer: (async (opts: { env?: NodeJS.ProcessEnv } = {}) => {
+          seen = opts.env;
+          return { location: null, rejected: [], rejectedForModel: [] };
+        }) as never,
+      });
+      assert.ok(seen, "the search must have been consulted");
+      assert.equal(seen!.LLAMACLI_LLAMA_SERVER, undefined, "the known-bad override must not be passed through");
+    } finally {
+      if (previous === undefined) delete process.env.LLAMACLI_LLAMA_SERVER;
+      else process.env.LLAMACLI_LLAMA_SERVER = previous;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("no replacement build means the user is told where the search actually looked", async () => {
+  // The working fork on this machine lives in neither PATH nor a llama.cpp
+  // checkout, so the automatic search genuinely cannot reach it. "Not found"
+  // alone would leave no hint that naming the path by hand is the fix.
+  const root = await project();
+  try {
+    const config = await configWithModel(root, "/home/jeano/llama.cpp/build-opt/bin/llama-server");
+    const lines: string[] = [];
+    await resolveBackend({
+      projectRoot: root,
+      config,
+      log: (line) => lines.push(line),
+      ...NO_SERVER,
+      probeModel: async () => ({ ok: false, error: MISMATCH }),
+      findLlamaServer: async () => ({
+        location: null,
+        rejected: [],
+        rejectedForModel: ["/home/jeano/llama.cpp/build-opt/bin/llama-server"],
+      }),
+    });
+    const said = lines.join("\n");
+    assert.match(said, /PATH/, "the searched locations must be stated");
+    assert.match(said, /binPath/, "and the way to point at a build by hand");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

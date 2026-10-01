@@ -14,7 +14,7 @@
 import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -24,6 +24,34 @@ const archivePath = join(binDir, "llamacli-dist.tar.gz");
 const manifestPath = join(binDir, "manifest.json");
 
 mkdirSync(binDir, { recursive: true });
+
+// ── build provenance ─────────────────────────────────────────────────────────
+// Written BEFORE the archive is taken, so the stamp ships inside it: an
+// installed copy can say which src/ tree it came from, and — more to the point
+// — a build that produced nothing still gets recorded as having produced
+// nothing, instead of leaving a stale stamp that claims otherwise.
+//
+// hashTree comes from the just-compiled dist/, not from a second copy written
+// here. Two implementations of one hashing scheme is two hashes waiting to
+// disagree, and a disagreement shows up as a permanently "stale" build with no
+// way to clear it. If dist/buildStamp.js is missing the build fails right here,
+// which is the correct outcome: tsc did not emit what it was supposed to.
+const stampModule = await import(pathToFileURL(join(distDir, "buildStamp.js")).href).catch((err) => {
+  console.error(
+    `build stamp unavailable: ${distDir}/buildStamp.js could not be imported (${err?.message ?? err}).\n` +
+      `The build did not emit its output — check tsc's errors above.`
+  );
+  process.exit(1);
+});
+const { hashTree, writeBuildStamp } = stampModule;
+const gitSha = (() => {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  } catch {
+    return "unknown";
+  }
+})();
+const srcHash = hashTree(join(root, "src"));
 // Tar from INSIDE dist/ (-C distDir .) so archive entries are relative
 // ("index.js", "tui/App.js", ...) — matches how src/selfUpdate.ts extracts
 // it back over an existing dist/ directory.
@@ -45,4 +73,12 @@ writeFileSync(manifestPath, JSON.stringify({ version, sha256, builtAt: new Date(
 // re-tarring the whole dist/ tree just to find out nothing changed.
 writeFileSync(join(distDir, ".self-update-sha256"), sha256);
 
+// Written last so it is never ahead of the archive it describes. The archive
+// deliberately does NOT contain this stamp: a self-update extracts over dist/,
+// and shipping the stamp inside the archive would overwrite the local one with
+// a claim about the published tree, making a developer's checkout look fresh
+// after being overwritten — the exact failure this exists to make visible.
+writeBuildStamp(distDir, { srcHash, gitSha, builtAt: new Date().toISOString(), version });
+
 console.log(`bin/ updated: ${version} (sha256 ${sha256.slice(0, 12)}…, ${(archiveContent.length / 1024).toFixed(1)} KiB)`);
+console.log(`build stamp: src ${srcHash.slice(0, 12)}… @ ${gitSha.slice(0, 7)}`);

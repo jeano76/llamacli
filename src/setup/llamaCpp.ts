@@ -215,7 +215,21 @@ export async function findLlamaServer(opts: {
   // builds and the one picked cannot read this quant" is a completely
   // different instruction from "that binary is broken".
   const rejectedForModel: string[] = [];
-  const accept = async (
+  // Memoised per path, because `candidatePaths` yields the same binary under
+  // each of the three real build layouts and the loop below tries all three.
+  // Without this, one binary is probed with `--version` up to three times and —
+  // far worse — `probeModelCompatibility` is a PROCESS SPAWN that parses a GGUF
+  // header, so a stock build rejected for a ternary model was launched and
+  // re-read three times over, and reported to the user three times.
+  const decided = new Map<string, Promise<LlamaLocation | null>>();
+  const accept = (binPath: string, source: LlamaLocation["source"]): Promise<LlamaLocation | null> => {
+    const cached = decided.get(binPath);
+    if (cached) return cached;
+    const verdict = decide(binPath, source);
+    decided.set(binPath, verdict);
+    return verdict;
+  };
+  const decide = async (
     binPath: string,
     source: LlamaLocation["source"]
   ): Promise<LlamaLocation | null> => {

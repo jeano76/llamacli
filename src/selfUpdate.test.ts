@@ -6,7 +6,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sha256Hex, parseManifest, updateAvailable, checkAndApplyUpdate, LOCAL_HASH_FILE } from "./selfUpdate.js";
+import {
+  sha256Hex, parseManifest, updateAvailable, checkAndApplyUpdate, LOCAL_HASH_FILE,
+  updateRefusedForCheckout, selfUpdateForced, readAppliedUpdate,
+} from "./selfUpdate.js";
+import { APPLIED_UPDATE_FILE } from "./buildStamp.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -332,5 +336,273 @@ test("with no opt-out set, the default URLs are still used", async () => {
     await checkAndApplyUpdate(dir, { fetchImpl, env: {} });
     assert.equal(seen.length, 1);
     assert.match(seen[0], /manifest\.json$/);
+  });
+});
+
+// ── never clobber a developer's build ────────────────────────────────────────
+//
+// This is the root cause behind "my fix compiled, the tests pass, and running
+// the tool shows the old behaviour anyway", hit three times in a row while
+// fixing an unrelated llama-server bug. The sequence, every time:
+//
+//   1. npm run build          → dist/ is correct
+//   2. llamacli               → startup self-update runs
+//   3. local sha != GitHub sha → true for ANY local build, by definition
+//   4. download + extract     → the published archive lands on top of dist/
+//
+// Step 4 leaves the sources holding the change and the running program without
+// it, which reads as a compiler failure. The published archive carries the
+// published build's mtimes and tar restores them, so every file in dist/ then
+// bears a date that is not the local build's — that discrepancy was the only
+// thing that identified it.
+
+/**
+ * Runs `fn` with a live directory. `withTempDirReturning` cannot be used for
+ * the cases below: it cleans up in a `finally` that runs before the caller
+ * ever sees the path, so every assertion made afterwards is against a deleted
+ * tree. The body has to run inside.
+ */
+async function withLiveDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-checkout-"));
+  try {
+    return await fn(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** dist/ beside src/ — the layout whose contents must never be replaced. */
+async function makeCheckout(root: string): Promise<string> {
+  await mkdir(join(root, "src"), { recursive: true });
+  await mkdir(join(root, "dist"), { recursive: true });
+  await writeFile(join(root, "package.json"), '{"name":"llamacli"}');
+  await writeFile(join(root, "src", "index.tsx"), "export {};");
+  await writeFile(join(root, "dist", "index.js"), "// published build\n");
+  return join(root, "dist");
+}
+
+/** dist/ with no src/ beside it — an ordinary installed package. */
+async function makeInstalled(root: string): Promise<string> {
+  await mkdir(join(root, "dist"), { recursive: true });
+  await writeFile(join(root, "dist", "index.js"), "// old\n");
+  return join(root, "dist");
+}
+
+/** A fetch double serving one manifest + one archive, counting archive hits. */
+function publishDouble(sha256: string, bytes: Buffer) {
+  const state = { archiveDownloads: 0, manifestFetches: 0 };
+  const impl = (async (url: string) => {
+    if (String(url).endsWith("manifest.json")) {
+      state.manifestFetches++;
+      return new Response(JSON.stringify({ version: "v20261002", sha256 }), { status: 200 });
+    }
+    state.archiveDownloads++;
+    return new Response(new Uint8Array(bytes), { status: 200 });
+  }) as unknown as typeof fetch;
+  return { impl, state };
+}
+
+test("a checkout's dist/ is never overwritten by a published update", async () => {
+  await withLiveDir(async (root) => {
+    const distDir = await makeCheckout(root);
+    const before = await readFile(join(distDir, "index.js"), "utf8");
+
+    const { impl, state } = publishDouble("a".repeat(64), Buffer.from("unused"));
+    const result = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: impl,
+    });
+
+    assert.equal(result.updated, false);
+    assert.match(result.reason ?? "", /source checkout/);
+    assert.equal(await readFile(join(distDir, "index.js"), "utf8"), before, "dist/ must be untouched");
+    assert.equal(state.manifestFetches, 0, "the refusal must happen before any network call");
+  });
+});
+
+test("LLAMACLI_FORCE_UPDATE=1 opts back in, for a developer who means it", async () => {
+  await withLiveDir(async (root) => {
+    const distDir = await makeCheckout(root);
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "// from github\n" });
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "0".repeat(64));
+    const { impl } = publishDouble(sha256, bytes);
+
+    const result = await checkAndApplyUpdate(distDir, {
+      env: { LLAMACLI_FORCE_UPDATE: "1" },
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: impl,
+    });
+
+    assert.equal(result.updated, true, result.reason);
+    assert.match(await readFile(join(distDir, "index.js"), "utf8"), /from github/);
+  });
+});
+
+test("an installed package still self-updates — the fix is not a blanket disable", async () => {
+  // The whole point of detecting a checkout rather than disabling updates.
+  await withLiveDir(async (root) => {
+    const distDir = await makeInstalled(root);
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "// new\n" });
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "0".repeat(64));
+    const { impl } = publishDouble(sha256, bytes);
+
+    const result = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: impl,
+    });
+
+    assert.equal(result.updated, true, result.reason);
+    assert.match(await readFile(join(distDir, "index.js"), "utf8"), /new/);
+  });
+});
+
+test("updateRefusedForCheckout decides without touching the filesystem", () => {
+  // Injected so the decision itself is testable independently of the layout,
+  // including the case where the layout is exactly what it claims to be.
+  const all = () => true;
+  const none = () => false;
+  assert.equal(updateRefusedForCheckout("/x/dist", {}, all).refused, true);
+  assert.equal(updateRefusedForCheckout("/x/dist", {}, none).refused, false);
+  assert.equal(updateRefusedForCheckout("/x/dist", { LLAMACLI_FORCE_UPDATE: "1" }, all).refused, false);
+  assert.match(updateRefusedForCheckout("/x/dist", {}, all).reason ?? "", /LLAMACLI_FORCE_UPDATE/);
+  assert.equal(selfUpdateForced({ LLAMACLI_FORCE_UPDATE: "1" }), true);
+  assert.equal(selfUpdateForced({ LLAMACLI_FORCE_UPDATE: "0" }), false);
+  assert.equal(selfUpdateForced({ LLAMACLI_FORCE_UPDATE: "true" }), false);
+});
+
+test("LLAMACLI_NO_UPDATE=1 still wins over everything, including the force flag", async () => {
+  await withLiveDir(async (root) => {
+    const distDir = await makeCheckout(root);
+    const result = await checkAndApplyUpdate(distDir, {
+      env: { LLAMACLI_NO_UPDATE: "1", LLAMACLI_FORCE_UPDATE: "1" },
+      fetchImpl: (async () => {
+        throw new Error("must not fetch");
+      }) as unknown as typeof fetch,
+    });
+    assert.equal(result.updated, false);
+    assert.match(result.reason ?? "", /NO_UPDATE/);
+  });
+});
+
+// ── an update that did not take must not loop ────────────────────────────────
+
+test("a successful install records the sha it applied", async () => {
+  await withLiveDir(async (root) => {
+    const distDir = await makeInstalled(root);
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "// applied\n" });
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "0".repeat(64));
+    const { impl } = publishDouble(sha256, bytes);
+
+    const result = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: impl,
+    });
+    assert.equal(result.updated, true, result.reason);
+    assert.equal(await readAppliedUpdate(distDir), sha256);
+  });
+});
+
+test("the same sha is not re-applied on the next startup — the restart loop breaks", async () => {
+  // Without this, an extraction that "succeeds" without taking effect loops
+  // forever: each pass writes LOCAL_HASH_FILE from the manifest, restarts,
+  // sees the same mismatch, downloads again. Reported live as the terminal
+  // silently dropping to a bare shell prompt and coming back.
+  await withLiveDir(async (root) => {
+    const distDir = await makeInstalled(root);
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "// applied\n" });
+    // Stands in for the pre-update build, which by definition is not the
+    // published one — otherwise there is no update to apply and the loop this
+    // guards against never starts.
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "0".repeat(64));
+    const first = publishDouble(sha256, bytes);
+
+    const result = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: first.impl,
+    });
+    assert.equal(result.updated, true, result.reason);
+    assert.equal(await readFile(join(distDir, "index.js"), "utf8"), "// applied\n");
+
+    // The next startup sees LOCAL_HASH_FILE rewritten to the manifest's sha and
+    // STILL disagrees — which is the state the marker exists to catch.
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "0".repeat(64));
+    const second = publishDouble(sha256, bytes);
+    const again = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: second.impl,
+    });
+
+    assert.equal(again.updated, false);
+    assert.match(again.reason ?? "", /did not take effect/);
+    assert.equal(second.state.archiveDownloads, 0, "the archive must not be downloaded again");
+    assert.equal(await readAppliedUpdate(distDir), sha256);
+  });
+});
+
+test("a different published sha is still applied after a previous one", async () => {
+  // The marker gates on the SPECIFIC sha, not on having updated before —
+  // otherwise the second genuine update would be refused as a repeat.
+  await withLiveDir(async (root) => {
+    const distDir = await makeInstalled(root);
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "// second\n" });
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "1".repeat(64));
+    await writeFile(join(distDir, APPLIED_UPDATE_FILE), "2".repeat(64));
+    const { impl } = publishDouble(sha256, bytes);
+
+    const result = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: impl,
+    });
+    assert.equal(result.updated, true, result.reason);
+  });
+});
+
+test("an absent or junk applied-marker is ignored rather than fatal", async () => {
+  await withLiveDir(async (dir) => {
+    assert.equal(await readAppliedUpdate(dir), null);
+    await writeFile(join(dir, APPLIED_UPDATE_FILE), "not-a-sha");
+    assert.equal(await readAppliedUpdate(dir), null, "a malformed marker must not gate anything");
+  });
+});
+
+test("a genuine newer build after a mismatched one is not mistaken for a stuck loop", async () => {
+  // The guard above must not become a permanent disable: once the local build
+  // agrees with what the updater applied, a later, different published sha has
+  // to go through.
+  await withLiveDir(async (root) => {
+    const distDir = await makeInstalled(root);
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "// v2\n" });
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "0".repeat(64));
+    const { impl } = publishDouble(sha256, bytes);
+    const result = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: impl,
+    });
+    assert.equal(result.updated, true, result.reason);
+    // Now local == manifest, so the ordinary path reports up-to-date.
+    const quiet = publishDouble(sha256, bytes);
+    const next = await checkAndApplyUpdate(distDir, {
+      env: {},
+      manifestUrl: "https://example.test/manifest.json",
+      archiveUrl: "https://example.test/dist.tar.gz",
+      fetchImpl: quiet.impl,
+    });
+    assert.equal(next.updated, false);
+    assert.match(next.reason ?? "", /up to date/);
   });
 });

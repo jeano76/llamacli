@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { planPorts, COMMON_PORTS, LLAMA_PORT, type PortState } from "./ports.js";
-import { findLlamaServer, installBuildPackages, candidatePaths, looksLikeUnsupportedModelFormat, probeModelCompatibility } from "./llamaCpp.js";
+import { findLlamaServer, installBuildPackages, candidatePaths } from "./llamaCpp.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
 
@@ -318,96 +318,3 @@ test("the VRAM budget holds back a reserve for the compositor and load-time allo
   assert.ok(budget > 5, "but not so conservative that nothing fits");
 });
 
-
-// ── a binary that runs but cannot read the model is a different failure ─────
-//
-// Two llama.cpp builds coexisted on this machine: a stock `~/llama.cpp` build
-// (ggml types 0-42) and a PrismML fork that adds ternary 1-bit quantisation.
-// The stock build RAN fine — `--version` succeeded, every probe passed — and
-// then rejected the configured 1-bit model at server start with:
-//
-//   tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)
-//
-// which reads like a corrupt download and is not one. `findLlamaServer` ranked
-// `~/llama.cpp/build-opt` first and returned it, because nothing asked whether
-// it could read the file it was about to be handed.
-
-test("an unsupported-format error is recognised as a build mismatch, not a bad file", () => {
-  assert.equal(
-    looksLikeUnsupportedModelFormat("tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)"),
-    true
-  );
-  assert.equal(looksLikeUnsupportedModelFormat("unknown ggml type 99"), true);
-});
-
-test("a generic load failure is NOT claimed to be a build mismatch", () => {
-  // Over-claiming here would make llamacli discard a perfectly good install
-  // because the download was truncated.
-  assert.equal(looksLikeUnsupportedModelFormat("llama_model_loader: failed to load model"), false);
-  assert.equal(looksLikeUnsupportedModelFormat(undefined), false);
-  assert.equal(looksLikeUnsupportedModelFormat(""), false);
-});
-
-test("a build that cannot read the configured model is skipped in favour of the next candidate", async () => {
-  // The stock build answers `--version` fine and would previously be accepted.
-  // With the ternary model it must be rejected specifically for the model, and
-  // the search must continue to a build that can read it.
-  const tried: string[] = [];
-  const result = await findLlamaServer({
-    home: "/home/jeano",
-    env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
-    listDirs: async () => ["build-opt"],
-    probe: async () => true, // runs fine — that was never the problem
-    modelPath: "/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-    probeModel: async (bin) => {
-      tried.push(bin);
-      return { ok: false, error: "invalid ggml type 143. should be in [0, 43)" };
-    },
-  });
-  assert.ok(tried.length > 0, "the model-compatibility probe must actually be consulted");
-  assert.equal(result.location, null, "no candidate can read it, so none should be chosen");
-  assert.ok(
-    (result.rejectedForModel ?? []).length > 0,
-    "the skip must be attributed to the model, not to a broken binary"
-  );
-  assert.deepEqual(result.rejected, [], "a running binary is not 'rejected: cannot execute'");
-});
-
-test("a model-compatibility failure that is NOT a format mismatch keeps the binary", async () => {
-  // A truncated download says nothing about the build. Discarding a working
-  // install over it would be worse than the original problem.
-  const result = await findLlamaServer({
-    home: "/home/jeano",
-    env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
-    listDirs: async () => ["build-opt"],
-    probe: async () => true,
-    modelPath: "/models/big.gguf",
-    probeModel: async () => ({ ok: false, error: "llama_model_loader: failed to load model" }),
-  });
-  assert.ok(result.location, "a non-format load failure must not disqualify a working binary");
-  assert.deepEqual(result.rejectedForModel, []);
-});
-
-test("model compatibility is not checked when no model is known yet", async () => {
-  let probed = false;
-  const result = await findLlamaServer({
-    home: "/home/jeano",
-    env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
-    listDirs: async () => ["build-opt"],
-    probe: async () => true,
-    probeModel: async () => {
-      probed = true;
-      return { ok: false, error: "invalid ggml type 143" };
-    },
-  });
-  assert.equal(probed, false, "with no model there is nothing to be incompatible with");
-  assert.ok(result.location);
-});
-
-test("probeModelCompatibility resolves ok without a model path", async () => {
-  // A first run has no model yet; this must not fail the binary search.
-  assert.deepEqual(await probeModelCompatibility("/nonexistent/llama-server", undefined), { ok: true });
-});

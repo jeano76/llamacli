@@ -12,6 +12,11 @@ import {
   type BootstrapOptions,
   type BootstrapReport,
 } from "../setup/bootstrap.js";
+import {
+  probeModelCompatibility,
+  looksLikeUnsupportedModelFormat,
+  findLlamaServer,
+} from "../setup/llamaCpp.js";
 
 /**
  * Turns a project directory into a working model backend, in three cases, and
@@ -82,6 +87,16 @@ export interface ResolveOptions {
   /** Injected for the same reason; runs the real first-run installer. */
   bootstrap?: (opts: BootstrapOptions) => Promise<BootstrapReport>;
   bootstrapOptions?: Partial<BootstrapOptions>;
+  /** Injected: asks whether a llama-server build can read a given model file.
+   *
+   *  The default really does spawn the binary and parse the model's GGUF
+   *  header, which is the point — a build's type registry is the only thing
+   *  that knows — but it makes "which message does the user get" untestable
+   *  without a multi-megabyte file and whichever llama-server happens to be
+   *  installed on the machine running the tests. */
+  probeModel?: typeof probeModelCompatibility;
+  /** Injected for the same reason: the search for a replacement build. */
+  findLlamaServer?: typeof findLlamaServer;
 }
 
 const GiB = 1024 ** 3;
@@ -214,8 +229,13 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     const startCfg: LlamaServerConfig = { ...recorded, host: "127.0.0.1", modelPath: recordedModel };
     const port = recorded.port;
     log(`설치된 llama-server 를 ${port} 포트에서 시작합니다: ${recorded.binPath}`);
-    const started = await tryStart(startCfg, opts.registerCleanup);
-    if (started) {
+    const started = await startWithCompatibleFallback(startCfg, {
+      registerCleanup: opts.registerCleanup,
+      log,
+      probeModel: opts.probeModel,
+      find: opts.findLlamaServer,
+    });
+    if (started.ok) {
       const spawned = new OpenAICompatibleClient(started.baseUrl);
       // Same check as case 1, and for the same reason: a config that points
       // at a corrupt model file produces a server that loads and answers just
@@ -246,20 +266,30 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     // when something is present and merely refused to start.
     //
     // The reason names the actual situation rather than assuming the common
-    // one. `binPath` is frequently a bare name like "llama-server", which only
-    // resolves through PATH, so the most frequent ENOENT here is "not on PATH"
-    // - and telling that user to change the port would send them to edit a
-    // setting that was never the problem.
+    // one, and the two failure kinds get different text because they have
+    // nothing else in common.
+    //
+    // A build mismatch is NOT a port problem. Telling that user the port might
+    // be busy sends them to edit a setting that was never involved, which is
+    // exactly what happened here: the real cause was a stock llama.cpp build
+    // (ggml types 0-42) being handed a ternary 1-bit model, and it was reported
+    // as "the port may be in use" while a working fork sat on the same disk.
     const binIsBare = !recorded.binPath.includes("/");
+    const cause =
+      started.kind === "build-mismatch"
+        ? `설정된 llama-server 가 이 모델의 양자화 형식을 읽지 못합니다 (${started.detail}). ` +
+          `이것은 포트나 GPU 메모리 문제가 아니며, 모델도 손상되지 않았습니다. ` +
+          `.llamacli/config.yaml 의 llama.binPath 를 ternary/1-bit 를 지원하는 빌드로 바꾸세요. `
+        : binIsBare
+        ? `경로에 있는 이름이라 PATH에서 찾지 못한 것 같습니다. .llamacli/config.yaml 의 llama.binPath 에 전체 경로(예: /home/.../llama-server)를 적으세요. `
+        : `포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. `;
     return {
       kind: "unresolved",
       backend: fallbackClient(config),
       reason:
         `${recorded.binPath} 를 ${port} 포트에서 시작하지 못했습니다. ` +
         `llama.cpp 와 모델은 설치되어 있으므로 다시 설치하지 않았습니다 - ` +
-        (binIsBare
-          ? `경로에 있는 이름이라 PATH에서 찾지 못한 것 같습니다. .llamacli/config.yaml 의 llama.binPath 에 전체 경로(예: /home/.../llama-server)를 적으세요. `
-          : `포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. `) +
+        cause +
         `서버를 직접 실행한 뒤 다시 시도하세요.`,
       // Nothing is listening on that endpoint - the process refused to start -
       // so there is no session to hand the user. This is one of the outcomes
@@ -334,8 +364,13 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
       cacheTypeV: llama.cacheTypeV,
       parallel: llama.parallel,
     };
-    const started = await tryStart(cfg, opts.registerCleanup);
-    if (started) {
+    const started = await startWithCompatibleFallback(cfg, {
+      registerCleanup: opts.registerCleanup,
+      log,
+      probeModel: opts.probeModel,
+      find: opts.findLlamaServer,
+    });
+    if (started.ok) {
       log(`준비가 끝났습니다. ${started.baseUrl} 에서 llama-server 를 구동했습니다.`);
       return { kind: "spawned", backend: new OpenAICompatibleClient(started.baseUrl), stop: started.stop, port: cfg.port, modelPath: cfg.modelPath };
     }
@@ -351,26 +386,120 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
   };
 }
 
-/** Spawns a llama-server and waits for it to answer. Returns null instead of
- *  throwing: "could not start" is a reportable state, not a crash, and each
+/** Outcome of a spawn attempt. The two failure kinds are kept apart because
+ *  they call for different messages and, merged into a single `null`, produced
+ *  one that named the wrong thing: a build that cannot read the model was
+ *  reported as "the port may be in use". */
+export type StartOutcome =
+  | { ok: true; baseUrl: string; stop: () => void }
+  /** The binary runs but its type registry rejects this model's quant. */
+  | { ok: false; kind: "build-mismatch"; binary: string; detail: string }
+  /** The binary could not be executed, or the server did not come up. */
+  | { ok: false; kind: "spawn-failed"; binary: string; detail: string };
+
+/** Spawns a llama-server and waits for it to answer. Reports failure instead
+ *  of throwing: "could not start" is a reportable state, not a crash, and each
  *  caller here has a sensible fallback that is better than a stack trace. */
 async function tryStart(
   cfg: LlamaServerConfig,
-  registerCleanup?: (fn: () => void) => void
-): Promise<{ baseUrl: string; stop: () => void } | null> {
+  registerCleanup?: (fn: () => void) => void,
+  probeModel: typeof probeModelCompatibility = probeModelCompatibility
+): Promise<StartOutcome> {
+  // A recorded binPath is trusted until it proves otherwise, and this is where
+  // it is proved. Two llama.cpp builds coexist on this machine — a stock one
+  // whose ggml type registry stops at 42, and a fork that reads ternary 1-bit
+  // quants — and a config recorded against the wrong one produced:
+  //
+  //   tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)
+  //
+  // which is not a corrupt model and not a busy port. Spawning to find that out
+  // costs a model load and dumps a raw llama-server log at the user, so the
+  // compatibility question is asked first, and cheaply.
+  const compat = await probeModel(cfg.binPath, cfg.modelPath);
+  if (!compat.ok && looksLikeUnsupportedModelFormat(compat.error)) {
+    const line =
+      (compat.error ?? "").split("\n").find((l: string) => /invalid ggml type/i.test(l))?.trim() ??
+      "이 모델의 양자화 형식을 지원하지 않음";
+    process.stderr.write(`[llamacli] ${cfg.binPath} 는 이 모델의 양자화 형식을 읽지 못합니다: ${line}\n`);
+    return { ok: false, kind: "build-mismatch", binary: cfg.binPath, detail: line };
+  }
+
   const manager = new LlamaServerManager(cfg);
   try {
     await manager.start();
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[llamacli] llama-server 시작 실패: ${detail}\n`);
-    return null;
+    return { ok: false, kind: "spawn-failed", binary: cfg.binPath, detail };
   }
   const stop = () => manager.stop();
   // Registered so the model is released from VRAM on every exit path — a
   // surviving server is the direct cause of the next session OOMing.
   registerCleanup?.(stop);
-  return { baseUrl: manager.baseUrl, stop };
+  return { ok: true, baseUrl: manager.baseUrl, stop };
+}
+
+/**
+ * Starts the configured binary, and on a build mismatch goes looking for one
+ * that can actually read the model before giving up.
+ *
+ * The fallback is the difference between a dead end and a working session. The
+ * machine this was written for has both builds on disk: a stock `~/llama.cpp`
+ * whose ggml type registry stops at 42, and a fork that reads ternary 1-bit
+ * quants and was serving the same model on another port at the time. A config
+ * recorded against the wrong one could only report "this binary is wrong" —
+ * true, and not actionable, when the working binary is one search away.
+ *
+ * Only the mismatch case retries. A spawn failure (busy port, full card) is not
+ * fixed by a different binary, and searching there would add a filesystem walk
+ * to a failure the user is already waiting on.
+ */
+export async function startWithCompatibleFallback(
+  cfg: LlamaServerConfig,
+  opts: {
+    registerCleanup?: (fn: () => void) => void;
+    log?: (line: string) => void;
+    env?: NodeJS.ProcessEnv;
+    find?: typeof findLlamaServer;
+    probeModel?: typeof probeModelCompatibility;
+    tryStartImpl?: typeof tryStart;
+  } = {}
+): Promise<StartOutcome> {
+  const start =
+    opts.tryStartImpl ?? ((c: LlamaServerConfig, r?: (fn: () => void) => void) => tryStart(c, r, opts.probeModel));
+  const first = await start(cfg, opts.registerCleanup);
+  if (first.ok || first.kind !== "build-mismatch") return first;
+
+  const log = opts.log ?? (() => {});
+  const find = opts.find ?? findLlamaServer;
+  const probeModel = opts.probeModel ?? probeModelCompatibility;
+
+
+  // The recorded binary is removed from the environment before searching, so
+  // the search cannot simply return the same build again: env overrides are
+  // ranked first, and this one is known to be the wrong build.
+  const env = { ...(opts.env ?? process.env) };
+  delete env.LLAMACLI_LLAMA_SERVER;
+  delete env.LLAMA_SERVER_BIN;
+
+  const alt = await find({ env, modelPath: cfg.modelPath, probeModel }).catch(() => null);
+  const replacement = alt?.location?.binPath;
+  if (!replacement || replacement === first.binary) {
+    const skipped = [...new Set(alt?.rejectedForModel ?? [])];
+    log(
+      `이 모델을 읽을 수 있는 llama-server 빌드를 찾지 못했습니다` +
+        (skipped.length > 0 ? ` (모델 미지원으로 제외됨: ${skipped.join(", ")})` : "") +
+        `. 확인한 위치는 환경변수 지정값, PATH, ~/llama.cpp 및 ~/.llamacli/llama.cpp 빌드, systemd 사용자 유닛입니다 — ` +
+        `그 밖의 위치에 있는 llama.cpp 빌드는 이 검색이 자동으로 찾지 못합니다. ` +
+        `해당 경로를 .llamacli/config.yaml 의 llama.binPath 에 직접 적으세요.`
+    );
+    return first;
+  }
+
+  log(`${first.binary} 는 이 모델의 양자화 형식을 읽지 못합니다 — 사용할 수 있는 ${replacement} 로 다시 시도합니다.`);
+  const second = await start({ ...cfg, binPath: replacement }, opts.registerCleanup);
+  if (second.ok) log(`llama-server 를 대체 빌드로 시작했습니다: ${replacement}`);
+  return second;
 }
 
 /** The endpoint to use when nothing could be prepared. Deliberately the

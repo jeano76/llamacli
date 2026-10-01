@@ -8,11 +8,12 @@
     "llamacli": "./dist/index.js"
   },
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.json && mkdir -p dist/skills/builtin && cp src/skills/builtin/*.md dist/skills/builtin/ && chmod +x dist/index.js && node scripts/update-bin.mjs",
+    "build": "rm -rf dist && tsc -p tsconfig.json && mkdir -p dist/skills/builtin && cp src/skills/builtin/*.md dist/skills/builtin/ && chmod +x dist/index.js && node scripts/update-bin.mjs && node scripts/verify-build.mjs",
     "dev": "tsx src/index.tsx",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test \"src/**/*.test.ts\""
+    "test": "tsx --test \"src/**/*.test.ts\"",
+    "verify-build": "node scripts/verify-build.mjs"
   },
   "dependencies": {
     "ink": "^4.4.1",

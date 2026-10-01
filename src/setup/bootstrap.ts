@@ -382,13 +382,14 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   } else if (!opts.offline) {
     const gpu = hardware.gpus[0];
     await step("모델 결정", async () => {
-      const { c35, c9 } = await resolveModel({ env, fetchImpl: opts.fetchImpl, log });
+      const { c35, c9, bonsai } = await resolveModel({ env, fetchImpl: opts.fetchImpl, log });
       model = chooseModel({
         vramTotalBytes: gpu?.vramTotalBytes ?? 0,
         vramFreeBytes: gpu?.vramFreeBytes ?? 0,
         ramTotalBytes: hardware.ramTotalBytes,
         candidates35b: c35,
         candidates9b: c9,
+        bonsai,
       });
       log(model.reason);
       return model.reason;
