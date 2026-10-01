@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, rm, readFile, chmod } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
-import { resolveBackend } from "./resolve.js";
+import { resolveBackend, startWithCompatibleFallback } from "./resolve.js";
 import { DEFAULT_CONFIG, type LlamacliConfig } from "../config.js";
 import type { Discovery } from "./detect.js";
 import type { BootstrapOptions, BootstrapReport } from "../setup/bootstrap.js";
@@ -821,4 +821,139 @@ test("no replacement build means the user is told where the search actually look
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ── the fallback must report the binary that actually failed ────────────────
+//
+// Verified live: the substitution found a working fork, the fork then failed
+// with "cudaMalloc failed: out of memory", and the message named the stock
+// build that had been rejected two steps earlier. Correct-looking text about a
+// binary that never ran.
+
+const SPAWN_CFG = {
+  binPath: "/stock/llama-server",
+  modelPath: "/m/bonsai.gguf",
+  host: "127.0.0.1",
+  port: 8080,
+  contextSize: 4096,
+  threads: 4,
+  gpuLayers: 0,
+};
+
+/** A search that finds the fork sitting beside the model files. */
+const REPLACEMENT_FOUND = async () => ({
+  location: { binPath: "/opt/fork/llama-server", source: "model-adjacent", backend: "cuda" },
+  rejected: [],
+  rejectedForModel: [],
+});
+
+test("a mismatch retries with the replacement binary", async () => {
+  const attempted: string[] = [];
+  const outcome = await startWithCompatibleFallback(SPAWN_CFG, {
+    env: {},
+    log: () => {},
+    find: REPLACEMENT_FOUND as never,
+    tryStartImpl: (async (cfg: { binPath: string }) => {
+      attempted.push(cfg.binPath);
+      return attempted.length === 1
+        ? { ok: false, kind: "build-mismatch", binary: "/stock/llama-server", detail: "invalid ggml type 143" }
+        : { ok: true, baseUrl: "http://127.0.0.1:8080", stop: () => {} };
+    }) as never,
+  });
+  assert.deepEqual(attempted, ["/stock/llama-server", "/opt/fork/llama-server"]);
+  assert.equal(outcome.ok, true);
+});
+
+test("when the substituted build also fails, the outcome carries ITS path", async () => {
+  // The bug: the caller used the CONFIGURED binPath for its message, so a
+  // failure of the replacement was attributed to a binary already rejected.
+  let attempt = 0;
+  const outcome = await startWithCompatibleFallback(SPAWN_CFG, {
+    env: {},
+    log: () => {},
+    find: REPLACEMENT_FOUND as never,
+    tryStartImpl: (async (cfg: { binPath: string }) =>
+      attempt++ === 0
+        ? { ok: false, kind: "build-mismatch", binary: "/stock/llama-server", detail: "invalid ggml type 143" }
+        : { ok: false, kind: "spawn-failed", binary: cfg.binPath, detail: "cudaMalloc failed: out of memory" }) as never,
+  });
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.ok === false && outcome.binary, "/opt/fork/llama-server",
+    "the failure must name the binary that actually ran");
+});
+
+test("with no replacement found, the outcome carries the original and nothing is retried", async () => {
+  let attempts = 0;
+  const outcome = await startWithCompatibleFallback(SPAWN_CFG, {
+    env: {},
+    log: () => {},
+    find: NO_REPLACEMENT as never,
+    tryStartImpl: (async (cfg: { binPath: string }) => {
+      attempts++;
+      return { ok: false, kind: "build-mismatch", binary: cfg.binPath, detail: "invalid ggml type 143" };
+    }) as never,
+  });
+  assert.equal(attempts, 1, "nothing to substitute means nothing to retry");
+  assert.equal(outcome.ok === false && outcome.binary, "/stock/llama-server");
+});
+
+test("a spawn failure is never retried with a different binary", async () => {
+  // A busy port or a full card is not fixed by a different build, and looking
+  // for one would add a filesystem walk to a failure already being waited on.
+  let attempts = 0;
+  let searched = false;
+  const outcome = await startWithCompatibleFallback(SPAWN_CFG, {
+    env: {},
+    log: () => {},
+    find: (async () => {
+      searched = true;
+      return { location: { binPath: "/opt/fork/llama-server", source: "path", backend: "cuda" }, rejected: [], rejectedForModel: [] };
+    }) as never,
+    tryStartImpl: (async (cfg: { binPath: string }) => {
+      attempts++;
+      return { ok: false, kind: "spawn-failed", binary: cfg.binPath, detail: "cudaMalloc failed" };
+    }) as never,
+  });
+  assert.equal(attempts, 1);
+  assert.equal(searched, false, "the search must not run for a non-mismatch failure");
+  assert.equal(outcome.ok === false && outcome.kind, "spawn-failed");
+});
+
+test("the configured binary is not handed back to the search as its own candidate", async () => {
+  // Env overrides rank first, so passing the known-bad path through would return
+  // the build that just failed and the "retry" would change nothing.
+  let seen: NodeJS.ProcessEnv | undefined;
+  const outcome = await startWithCompatibleFallback(SPAWN_CFG, {
+    env: { LLAMACLI_LLAMA_SERVER: "/stock/llama-server", LLAMA_SERVER_BIN: "/stock/llama-server" },
+    log: () => {},
+    find: (async (opts: { env?: NodeJS.ProcessEnv } = {}) => {
+      seen = opts.env;
+      return { location: null, rejected: [], rejectedForModel: [] };
+    }) as never,
+    tryStartImpl: (async (cfg: { binPath: string }) => ({
+      ok: false, kind: "build-mismatch", binary: cfg.binPath, detail: "invalid ggml type 143",
+    })) as never,
+  });
+  assert.equal(outcome.ok === false && outcome.binary, "/stock/llama-server");
+  assert.ok(seen, "the search must have run");
+  assert.equal(seen!.LLAMACLI_LLAMA_SERVER, undefined);
+  assert.equal(seen!.LLAMA_SERVER_BIN, undefined);
+});
+
+test("the model path reaches the search even when the binary came from env", async () => {
+  // The fork is found by being adjacent to the MODEL. Without the path the
+  // search has nothing to anchor on and returns nothing useful.
+  let searchedFor: string | undefined;
+  await startWithCompatibleFallback(SPAWN_CFG, {
+    env: {},
+    log: () => {},
+    find: (async (opts: { modelPath?: string } = {}) => {
+      searchedFor = opts.modelPath;
+      return { location: null, rejected: [], rejectedForModel: [] };
+    }) as never,
+    tryStartImpl: (async (cfg: { binPath: string }) => ({
+      ok: false, kind: "build-mismatch", binary: cfg.binPath, detail: "invalid ggml type 143",
+    })) as never,
+  });
+  assert.equal(searchedFor, "/m/bonsai.gguf");
 });

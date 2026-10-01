@@ -28,7 +28,11 @@ import { stringify, parse } from "yaml";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB, type Hardware } from "./hardware.js";
 import { getCapabilities } from "../tui/terminal.js";
 import { tuneForHardware, type LlamaTuning } from "./tuning.js";
-import { findLlamaServer, buildLlamaCpp, defaultRun, type LlamaLocation, type Run } from "./llamaCpp.js";
+import {
+  findLlamaServer, buildLlamaCpp, defaultRun,
+  probeModelCompatibility, looksLikeUnsupportedModelFormat,
+  type LlamaLocation, type Run,
+} from "./llamaCpp.js";
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
 import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
@@ -394,6 +398,39 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       log(model.reason);
       return model.reason;
     });
+  }
+
+  // ── 3.5 Does the chosen binary plausibly read the chosen model? ────────────
+  // The binary is settled in step 2 and the model in step 3, so a fresh install
+  // has never seen them together. That gap is not theoretical: this machine has
+  // two llama.cpp builds, one of which cannot read the ternary quants the
+  // Bonsai ladder prefers, and the model is 5.5 GB. Downloading first and
+  // discovering the mismatch at server start costs the whole transfer and then
+  // reports a failure that reads like a port problem.
+  //
+  // What can be checked here is narrower than full compatibility, and is stated
+  // as such: the model's own filename carries its quantisation, and the ternary
+  // quant names are not stock llama.cpp's at all. So a model that needs a fork
+  // can be recognised without the file being on disk. The reverse is not
+  // claimed — a normal quant on a fork build passes silently, because proving
+  // otherwise would require the file this step exists to avoid needing.
+  if (model && llama) {
+    const already = join(modelsDir, model.candidate.filename);
+    const detail = await checkBinaryAgainstChosenModel(llama.binPath, model.candidate.filename, already);
+    if (detail) {
+      steps.push({ name: "모델/빌드 호환성", ok: false, detail });
+      errors.push(detail);
+      log(detail);
+      // Deliberately a warning rather than a hard stop: llama.cpp forks carry
+      // these quants and stock builds do not, but llamacli cannot read a
+      // binary's type registry from outside, and refusing outright would block
+      // every user whose build does support it. Saying it BEFORE a 5.5 GB
+      // transfer is the part that matters.
+      log(
+        `선택된 llama-server 빌드가 이 모델을 읽을 수 있는지 아직 확인되지 않았습니다. ` +
+        `다운로드 후에도 실패한다면 llama.binPath 를 ternary/1-bit 를 지원하는 빌드로 바꾸세요.`
+      );
+    }
   }
 
   // ── 4. Download ───────────────────────────────────────────────────────────
@@ -814,4 +851,90 @@ export function renderProgressLine(log: (line: string) => void): (p: TransferPro
 function supportsAnsiOutput(): boolean {
   if (!process.stdout.isTTY) return false;
   return getCapabilities().ansi;
+}
+
+
+/**
+ * Quant names that exist only in a llama.cpp fork, measured rather than guessed.
+ *
+ * Diffing `llama-quantize`'s supported list between the two builds on this
+ * machine gives exactly two: `PQ2_0` and `PTQ1_0`. Everything else — `Q1_0`,
+ * `Q2_0`, `Q4_K_M`, the IQ and MXFP families, `TQ*` — is shared, so none of it
+ * may be treated as evidence of anything.
+ *
+ * That measurement is also why the match is anchored to the quant SUFFIX. An
+ * earlier version of this matched the substring `Ternary` anywhere in the
+ * filename, which flagged `Ternary-Bonsai-4B-Q2_0.gguf` as needing a fork —
+ * a false positive produced by the model FAMILY name, on a quant every
+ * llama.cpp build reads. Telling a user their build is wrong when it is not is
+ * worse than saying nothing.
+ */
+const NON_STOCK_QUANT_SUFFIXES = new Set(["PTQ1_0", "PQ2_0"]);
+
+/** The quantisation token of a model filename.
+ *
+ *  `Ternary-Bonsai-2-27B-PTQ1_0.gguf` → `PTQ1_0`.
+ *
+ *  Two details that are both wrong without saying so:
+ *
+ *  - The character class excludes `-`, so the match starts at the LAST dash.
+ *    Leaving it in makes the pattern greedy from the first dash and yields
+ *    `BONSAI-2-27B-PTQ1_0`, which is in no quant set and silently reports every
+ *    model as stock-compatible.
+ *  - A `-00001-of-00002` shard tag is stripped first. Otherwise a sharded
+ *    ternary model reads as quant `00002` and produces a false negative — the
+ *    one direction that lets a doomed download start. */
+export function quantSuffixOf(modelFilename: string): string {
+  const withoutShard = modelFilename.replace(/-\d{5}-of-\d{5}(?=\.(?:gguf|safetensors)$)/i, "");
+  const match = /-([^-/\\]+)\.(?:gguf|safetensors)$/i.exec(withoutShard);
+  return match ? match[1].toUpperCase() : "";
+}
+
+/** Whether this model requires a llama.cpp build with fork-only quant support. */
+export function needsTernaryBuild(modelFilename: string): boolean {
+  return NON_STOCK_QUANT_SUFFIXES.has(quantSuffixOf(modelFilename));
+}
+
+/**
+ * The pre-download compatibility check for step 3.5. Returns a message when
+ * there is something to say, null when there is not.
+ *
+ * Two levels of evidence, strongest first:
+ *
+ *  1. The model file is already on disk — then the binary is actually asked, and
+ *     the answer is exact. This is the common case for anyone who has run
+ *     llamacli before and is merely re-resolving.
+ *  2. The file is not there yet — then only the filename's quant is available,
+ *     which proves a fork is REQUIRED but says nothing about whether the
+ *     selected build happens to be one.
+ *
+ * Level 2 never claims incompatibility it has not established. It names the
+ * requirement and leaves the verdict open, because "this will fail" from a
+ * filename guess would be wrong for every user whose build does support it.
+ */
+export async function checkBinaryAgainstChosenModel(
+  binPath: string,
+  modelFilename: string,
+  existingModelPath: string,
+  opts: { probeModel?: typeof probeModelCompatibility } = {}
+): Promise<string | null> {
+  if ((await fileSize(existingModelPath)) > 0) {
+    const compat = await (opts.probeModel ?? probeModelCompatibility)(binPath, existingModelPath);
+    if (!compat.ok && looksLikeUnsupportedModelFormat(compat.error)) {
+      const line =
+        (compat.error ?? "").split("\n").find((l: string) => /invalid ggml type/i.test(l))?.trim() ??
+        "형식 미지원";
+      return `${basename(binPath)} 는 ${modelFilename} 의 양자화 형식을 읽지 못합니다: ${line}`;
+    }
+    // Readable, or failing for a reason that is not the binary's type registry.
+    // Either way there is nothing to warn about before downloading.
+    return null;
+  }
+  if (needsTernaryBuild(modelFilename)) {
+    return (
+      `${modelFilename} 는 ternary(3값) 양자화입니다. 이 형식은 stock llama.cpp 가 읽지 못하며 ` +
+      `ternary 지원 빌드(PrismML 계열 등)가 필요합니다 — 현재 선택된 빌드는 ${basename(binPath)} 입니다.`
+    );
+  }
+  return null;
 }

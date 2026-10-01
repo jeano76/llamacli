@@ -274,7 +274,16 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     // exactly what happened here: the real cause was a stock llama.cpp build
     // (ggml types 0-42) being handed a ternary 1-bit model, and it was reported
     // as "the port may be in use" while a working fork sat on the same disk.
-    const binIsBare = !recorded.binPath.includes("/");
+    // The binary that ACTUALLY failed, which is not necessarily the one in the
+    // config. On a build mismatch the fallback may have substituted a different
+    // llama-server, and if that one then failed — a full card, say — reporting
+    // the configured path describes a binary that never ran. Observed directly:
+    // the substitution found a working fork, the fork then hit
+    // "cudaMalloc failed: out of memory", and the message named the stock build
+    // that had been rejected two steps earlier.
+    const failedBin = started.ok ? recorded.binPath : started.binary;
+    const substituted = failedBin !== recorded.binPath;
+    const binIsBare = !failedBin.includes("/");
     const cause =
       started.kind === "build-mismatch"
         ? `설정된 llama-server 가 이 모델의 양자화 형식을 읽지 못합니다 (${started.detail}). ` +
@@ -282,12 +291,13 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
           `.llamacli/config.yaml 의 llama.binPath 를 ternary/1-bit 를 지원하는 빌드로 바꾸세요. `
         : binIsBare
         ? `경로에 있는 이름이라 PATH에서 찾지 못한 것 같습니다. .llamacli/config.yaml 의 llama.binPath 에 전체 경로(예: /home/.../llama-server)를 적으세요. `
-        : `포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. `;
+        : `포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. ` +
+          (substituted ? ` (설정된 경로 대신 대체 빌드로 시도했습니다) ` : ``);
     return {
       kind: "unresolved",
       backend: fallbackClient(config),
       reason:
-        `${recorded.binPath} 를 ${port} 포트에서 시작하지 못했습니다. ` +
+        `${failedBin} 를 ${port} 포트에서 시작하지 못했습니다. ` +
         `llama.cpp 와 모델은 설치되어 있으므로 다시 설치하지 않았습니다 - ` +
         cause +
         `서버를 직접 실행한 뒤 다시 시도하세요.`,

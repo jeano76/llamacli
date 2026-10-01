@@ -30,7 +30,7 @@
 
 import { access, constants } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Hardware } from "./hardware.js";
@@ -62,7 +62,7 @@ const BIN_NAME = process.platform === "win32" ? "llama-server.exe" : "llama-serv
 export interface LlamaLocation {
   binPath: string;
   /** Where it was found, for an honest status line ("PATH", "기존 빌드", …). */
-  source: "env" | "path" | "existing-build" | "llamacli-build" | "systemd" | "built";
+  source: "env" | "path" | "existing-build" | "llamacli-build" | "model-adjacent" | "systemd" | "built";
   /** Best guess at the accelerator it was compiled for, from the directory
    *  name / build flags. Verified separately by probeLlamaServer. */
   backend: "cuda" | "vulkan" | "cpu" | "unknown";
@@ -149,6 +149,64 @@ export function candidatePaths(root: string, buildDirs: string[]): string[] {
   out.push(join(root, "bin", BIN_NAME));
   out.push(join(root, BIN_NAME));
   return out;
+}
+
+/**
+ * llama-server builds installed NEXT TO the models they serve.
+ *
+ * This is a second real install shape, and the one that was invisible here.
+ * llama.cpp publishes prebuilt release archives (`llama-bNNNN-bin-ubuntu-x64`)
+ * that are unpacked, not compiled — which puts a complete runtime with its own
+ * `llama-server` and its `.so` files wherever the user keeps their models. That
+ * is not a llama.cpp *checkout*, so it appears in neither PATH nor any of the
+ * `~/llama.cpp` roots searched above, and the binary that runs the model is
+ * simply not among the candidates.
+ *
+ * Observed directly: the model lives at
+ * `<drive>/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf` and the only
+ * build that can read it is `<drive>/bonsai2-runtime/llama-server`, which no
+ * existing rule reached. The result was a dead end — the one working binary was
+ * on the same disk, two directories away.
+ *
+ * Scanned from the model's own directory upward, because that is the one
+ * location already known to be relevant. Depth is bounded: an unbounded walk
+ * out of `/media/<user>/<volume>` would eventually reach the whole filesystem.
+ *
+ * What this does NOT decide is whether a candidate is any good — widening where
+ * we look is safe precisely because `probeModelCompatibility` still arbitrates.
+ * An unrelated sibling that happens to contain a `llama-server` is probed and
+ * rejected, and appears in the rejection list, rather than being launched.
+ */
+export const MODEL_RUNTIME_SCAN_DEPTH = 3;
+
+/** Directories that hold a llama-server beside the given model.
+ *
+ *  Returns absolute paths in scan order, nearest first. Empty when there is no
+ *  model path — with no model there is nothing for a runtime to be adjacent to,
+ *  and guessing at directories is what this function exists to avoid. */
+export async function runtimeCandidatesNearModel(
+  modelPath: string | undefined,
+  opts: { exists?: (p: string) => Promise<boolean>; listDirs?: (dir: string) => Promise<string[]> } = {}
+): Promise<string[]> {
+  if (!modelPath) return [];
+  const exists = opts.exists ?? isExecutable;
+  const listDirs = opts.listDirs ?? listBuildDirs;
+  const found = new Set<string>();
+  let dir = dirname(modelPath);
+  for (let depth = 0; depth <= MODEL_RUNTIME_SCAN_DEPTH; depth++) {
+    const parent = dirname(dir);
+    // Stop at the filesystem root rather than spinning on `dirname("/") === "/"`.
+    if (parent === dir) break;
+    for (const entry of await listDirs(dir)) {
+      const candidate = join(dir, entry, BIN_NAME);
+      // A file, not a directory: `llama-server` itself must not be treated as
+      // its own parent directory.
+      if (entry === BIN_NAME) continue;
+      if (await exists(candidate)) found.add(candidate);
+    }
+    dir = parent;
+  }
+  return [...found];
 }
 
 /** Directory names inside a llama.cpp checkout, best candidate first.
@@ -307,7 +365,19 @@ export async function findLlamaServer(opts: {
     }
   }
 
-  // 4. A systemd user unit. On a machine where llama-server is managed as a
+  // 4. Runtimes installed beside the models. Ranked below every declared
+  //    location on purpose: a build the user put in PATH or named in a unit
+  //    file is a decision, whereas this is a guess about where an unpacked
+  //    release archive ended up. It is tried because being unable to reach the
+  //    one working binary is a dead end, not because it should ever win.
+  if (opts.modelPath) {
+    for (const binPath of await runtimeCandidatesNearModel(opts.modelPath, { exists, listDirs })) {
+      const hit = await accept(binPath, "model-adjacent");
+      if (hit) return { location: hit, rejected, rejectedForModel };
+    }
+  }
+
+  // 5. A systemd user unit. On a machine where llama-server is managed as a
   //    service — a common way to run it on a workstation — the binary path is
   //    declared in the unit file or the script it ExecStart's, and is
   //    otherwise nowhere discoverable. This is what made a service-managed

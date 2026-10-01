@@ -1,10 +1,13 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, basename } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { planPorts, COMMON_PORTS, LLAMA_PORT, type PortState } from "./ports.js";
 import { findLlamaServer, installBuildPackages, candidatePaths } from "./llamaCpp.js";
+import { needsTernaryBuild, quantSuffixOf, checkBinaryAgainstChosenModel } from "./bootstrap.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
-
 const GiB = 1024 ** 3;
 
 /** A probe over a fixed set of busy ports. */
@@ -318,3 +321,105 @@ test("the VRAM budget holds back a reserve for the compositor and load-time allo
   assert.ok(budget > 5, "but not so conservative that nothing fits");
 });
 
+
+// ── telling a fork-only quant from a family name ─────────────────────────────
+//
+// The binary is settled in bootstrap step 2 and the model in step 3, so a fresh
+// install never sees them together. That gap cost this machine a 5.5 GB
+// download before failing, and it fails at server start in terms that blame
+// the port. So the quant is read off the filename — the only thing available
+// before a download.
+//
+// The set is MEASURED, not assumed: diffing `llama-quantize`'s supported list
+// between this machine's stock build and its PrismML fork leaves exactly two
+// names, `PTQ1_0` and `PQ2_0`. Everything else is shared.
+
+test("the quant suffix is the token after the last dash", () => {
+  assert.equal(quantSuffixOf("Ternary-Bonsai-2-27B-PTQ1_0.gguf"), "PTQ1_0");
+  assert.equal(quantSuffixOf("Ornith-1.5-35B-A3B-Q4_K_M.gguf"), "Q4_K_M");
+  assert.equal(quantSuffixOf("gemma-2-9b-it-Q8_0.gguf"), "Q8_0");
+});
+
+test("a shard tag is stripped before the quant is read", () => {
+  // Without this the quant reads as `00002` and the model silently looks
+  // stock-compatible — the one direction that lets a doomed download start.
+  assert.equal(quantSuffixOf("Ternary-Bonsai-2-27B-PTQ1_0-00001-of-00002.gguf"), "PTQ1_0");
+  assert.equal(needsTernaryBuild("Ternary-Bonsai-2-27B-PTQ1_0-00001-of-00002.gguf"), true);
+});
+
+test("the fork-only quants are recognised", () => {
+  for (const f of ["Ternary-Bonsai-2-27B-PTQ1_0.gguf", "Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-8B-PQ2_0.gguf"]) {
+    assert.equal(needsTernaryBuild(f), true, f);
+  }
+});
+
+test("a model whose FAMILY name contains 'Ternary' is not called fork-only", () => {
+  // The false positive that motivated anchoring to the suffix: this is the real
+  // filename of a Bonsai 4B at Q2_0, and Q2_0 is in stock llama.cpp. Telling
+  // that user their build is wrong when it is not is worse than saying nothing.
+  assert.equal(needsTernaryBuild("Ternary-Bonsai-4B-Q2_0.gguf"), false);
+  assert.equal(needsTernaryBuild("Ternary-Bonsai-4B-Q2_0_g64.gguf"), false);
+  assert.equal(needsTernaryBuild("Ternary-Bonsai-4B-F16.gguf"), false);
+});
+
+test("every stock quant llamacli offers is not called fork-only", () => {
+  for (const f of ["Ornith-1.5-35B-A3B-Q4_K_M.gguf", "gemma-2-9b-it-Q8_0.gguf", "m-Q6_K.gguf", "m-F16.gguf", ""]) {
+    assert.equal(needsTernaryBuild(f), false, f);
+  }
+});
+
+test("with the model already on disk, the binary is asked instead of the filename", async () => {
+  // The definitive branch. It is worth a seam: without one this can only be
+  // exercised against whatever llama-server the test machine happens to have,
+  // and the branch that produces a certain verdict would be the one untested.
+  const root = await mkdtemp(join(tmpdir(), "llamacli-compat-"));
+  try {
+    const model = join(root, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+    await writeFile(model, Buffer.alloc(1024));
+
+    const mismatch = await checkBinaryAgainstChosenModel("/stock/llama-server", basename(model), model, {
+      probeModel: async () => ({ ok: false, error: "invalid ggml type 143. should be in [0, 43)" }),
+    });
+    assert.match(mismatch ?? "", /읽지 못합니다/);
+    assert.match(mismatch ?? "", /143/, "the actual reason must be quoted, not paraphrased");
+
+    // A build that CAN read the model says nothing, even though the filename is
+    // fork-only — the exact probe outranks the filename heuristic.
+    const readable = await checkBinaryAgainstChosenModel("/fork/llama-server", basename(model), model, {
+      probeModel: async () => ({ ok: true }),
+    });
+    assert.equal(readable, null, "the file is present and readable: no warning is warranted");
+
+    // A load failure that is NOT a format mismatch says nothing about the
+    // binary either, and must not be turned into a build warning.
+    const corrupt = await checkBinaryAgainstChosenModel("/fork/llama-server", basename(model), model, {
+      probeModel: async () => ({ ok: false, error: "llama_model_loader: failed to load model" }),
+    });
+    assert.equal(corrupt, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("with no model on disk, a fork-only model warns and a stock model does not", async () => {
+  const missing = join(tmpdir(), "definitely-not-here-12345", "model.gguf");
+  const ternary = await checkBinaryAgainstChosenModel("/build/llama-server", "Ternary-Bonsai-2-27B-PTQ1_0.gguf", missing);
+  assert.match(ternary ?? "", /ternary/);
+  assert.match(ternary ?? "", /필요합니다/, "it must say what is required, not merely complain");
+
+  const stock = await checkBinaryAgainstChosenModel("/build/llama-server", "Ornith-1.5-35B-A3B-Q4_K_M.gguf", missing);
+  assert.equal(stock, null, "an ordinary quant must not raise a warning nobody can act on");
+});
+
+test("the warning never claims the build is incompatible when it was not asked", async () => {
+  // Level-2 evidence (filename only) proves a fork is REQUIRED, not that the
+  // selected build is wrong. Saying "this will fail" from a filename guess
+  // would be false for every user whose build does support it.
+  const msg = (await checkBinaryAgainstChosenModel(
+    "/opt/fork/llama-server",
+    "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    join(tmpdir(), "nope-98765", "m.gguf")
+  )) ?? "";
+  assert.doesNotMatch(msg, /읽지 못합니다/);
+  assert.doesNotMatch(msg, / 실패|불가능합니다/);
+});

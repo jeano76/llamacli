@@ -125,10 +125,21 @@ function parseBonsaiRepoOverrides(raw: string | undefined): Partial<Record<Bonsa
  *  equally last, making `best()` arbitrary rather than deliberate.
  *
  *  PTQ1_0 leads on purpose. This family exists for the quant — a 27B dense in
- *  5.5 GB is what lets it stay resident on a small card — and the measured cost
- *  of that choice is the quality loss the format itself implies, not a policy
- *  decision llamacli should be second-guessing with no evidence of its own. */
-const BONSAI_QUANT_PREFERENCE = ["PTQ1_0", "PQ2_0", "Q2_0", "Q2_0_g64", "F16"];
+ *  5.5 GB is what lets it stay resident on a small card — and it is also the
+ *  smallest option available, so nothing is traded away by ranking it first.
+ *
+ *  `PQ2_0` is ranked BELOW `Q2_0` even though it sorts earlier alphabetically,
+ *  because it is one of only two quants in this family that a stock llama.cpp
+ *  cannot read (measured: diffing `llama-quantize`'s supported list between the
+ *  two builds on this machine leaves exactly `PTQ1_0` and `PQ2_0`). On the 4B
+ *  rung the two are the same size on disk — 1.00 GiB either way — so preferring
+ *  the fork-only one would cost a working install for nothing. Where the two
+ *  differ in size, PTQ1_0 already wins above both.
+ *
+ *  F16 stays last regardless of size: it is the one quant here that is
+ *  unambiguously the largest, and choosing it for quality would turn a 1 GB
+ *  download into a 7.5 GB one on a card that cannot hold the result. */
+const BONSAI_QUANT_PREFERENCE = ["PTQ1_0", "Q2_0", "Q2_0_g64", "PQ2_0", "F16"];
 
 /** The `best()` variant for Bonsai: same contract, Bonsai's own quant order. */
 function bestBonsai(list: ModelCandidate[]): ModelCandidate | null {

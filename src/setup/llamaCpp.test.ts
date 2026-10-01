@@ -4,6 +4,8 @@ import {
   findLlamaServer,
   looksLikeUnsupportedModelFormat,
   probeModelCompatibility,
+  runtimeCandidatesNearModel,
+  MODEL_RUNTIME_SCAN_DEPTH,
 } from "./llamaCpp.js";
 
 // ── a binary that runs but cannot read the model is a different failure ─────
@@ -281,4 +283,131 @@ test("a binary rejected for the model is listed once however many layouts expose
     [bin],
     "one path that failed once must not appear three times in the user's report"
   );
+});
+
+// ── runtimes installed beside the models ─────────────────────────────────────
+//
+// A second real install shape, and the one that left the reported session dead
+// ended. llama.cpp publishes prebuilt release archives that get unpacked rather
+// than compiled, putting a complete runtime — its own `llama-server` and `.so`
+// files — wherever the user keeps their models. That is not a llama.cpp
+// *checkout*, so it was in neither PATH nor any searched root.
+//
+// Observed on this machine: the model is at
+// `<drive>/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf` and the only build
+// that can read it is `<drive>/bonsai2-runtime/llama-server` — same disk, two
+// directories away, invisible to every existing rule.
+
+test("a runtime beside the model directory is found", async () => {
+  const tree: Record<string, string[]> = {
+    "/m/models/bonsai2": [],
+    "/m/models": [],
+    "/m": ["models", "bonsai2-runtime", "llmwiki"],
+    "/": ["m", "home"],
+  };
+  const found = await runtimeCandidatesNearModel("/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf", {
+    listDirs: async (dir) => tree[dir] ?? [],
+    exists: async (p) => p === "/m/bonsai2-runtime/llama-server",
+  });
+  assert.deepEqual(found, ["/m/bonsai2-runtime/llama-server"]);
+});
+
+test("the scan is bounded and stops at the filesystem root", async () => {
+  // An unbounded walk up from /media/<user>/<volume> would reach the entire
+  // filesystem; without the root check, dirname("/") === "/" and it spins.
+  const asked: string[] = [];
+  const found = await runtimeCandidatesNearModel("/a/b/c/model.gguf", {
+    listDirs: async (dir) => {
+      asked.push(dir);
+      return [];
+    },
+    exists: async () => false,
+  });
+  assert.deepEqual(found, []);
+  assert.ok(asked.length <= MODEL_RUNTIME_SCAN_DEPTH + 1, `scanned ${asked.length} levels`);
+  assert.ok(!asked.includes("/"), "must not scan the filesystem root's children forever");
+});
+
+test("no model means no adjacent-runtime scan", async () => {
+  // With no model there is nothing to be adjacent to, and guessing at
+  // directories is precisely what this function exists to avoid.
+  let listed = false;
+  const found = await runtimeCandidatesNearModel(undefined, {
+    listDirs: async () => {
+      listed = true;
+      return [];
+    },
+    exists: async () => true,
+  });
+  assert.deepEqual(found, []);
+  assert.equal(listed, false, "the filesystem must not be touched");
+});
+
+test("llama-server is never treated as its own parent directory", async () => {
+  // Harmless but wrong: `<dir>/llama-server/llama-server` is not a candidate,
+  // and reporting it would put a nonexistent path in front of the user.
+  const found = await runtimeCandidatesNearModel("/m/models/m.gguf", {
+    listDirs: async () => ["llama-server", "runtime"],
+    exists: async (p) => p === "/m/runtime/llama-server",
+  });
+  assert.deepEqual(found, ["/m/runtime/llama-server"]);
+});
+
+test("the search prefers a declared location over an adjacent runtime", async () => {
+  // Ranking matters: a build the user put in PATH is a decision, whereas an
+  // adjacent runtime is a guess about where a tarball was unpacked. The guess
+  // may be tried, but must never outrank the decision.
+  const inPath = "/usr/local/bin/llama-server";
+  const adjacent = "/m/bonsai2-runtime/llama-server";
+  const result = await findLlamaServer({
+    home: "/home/jeano",
+    env: { PATH: "/usr/local/bin" },
+    exists: async (p) => p === inPath || p === adjacent,
+    listDirs: async (dir) => (dir === "/m" ? ["bonsai2-runtime"] : dir === "/home/jeano/llama.cpp" ? [] : []),
+    probe: async () => true,
+    modelPath: "/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    probeModel: async () => ({ ok: true }),
+  });
+  assert.equal(result.location?.binPath, inPath);
+  assert.equal(result.location?.source, "path");
+});
+
+test("an adjacent runtime is used when the declared builds cannot read the model", async () => {
+  // The case that was actually dead-ended: a stock build in PATH that runs fine
+  // and cannot read the model, and one working runtime beside the model files.
+  const inPath = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
+  const adjacent = "/m/bonsai2-runtime/llama-server";
+  const result = await findLlamaServer({
+    home: "/home/jeano",
+    env: {},
+    exists: async (p) => p === inPath || p === adjacent,
+    listDirs: async (dir) => (dir === "/m" ? ["bonsai2-runtime"] : ["build-opt"]),
+    probe: async () => true,
+    modelPath: "/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    probeModel: async (bin) =>
+      bin === adjacent ? { ok: true } : { ok: false, error: "invalid ggml type 143. should be in [0, 43)" },
+  });
+  assert.equal(result.location?.binPath, adjacent, "the one build that can read the model must win");
+  assert.equal(result.location?.source, "model-adjacent");
+  assert.deepEqual(result.rejectedForModel, [inPath]);
+});
+
+test("an unrelated sibling llama-server is probed and rejected, not launched", async () => {
+  // Widening WHERE we look is only safe because the probe still decides WHAT we
+  // accept. A sibling project that happens to contain a llama-server must not
+  // be able to talk its way in.
+  const stray = "/m/some-project/llama-server";
+  const good = "/m/bonsai2-runtime/llama-server";
+  const result = await findLlamaServer({
+    home: "/home/jeano",
+    env: {},
+    exists: async (p) => p === stray || p === good,
+    listDirs: async (dir) => (dir === "/m" ? ["some-project", "bonsai2-runtime"] : []),
+    probe: async () => true,
+    modelPath: "/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    probeModel: async (bin) =>
+      bin === good ? { ok: true } : { ok: false, error: "invalid ggml type 143. should be in [0, 43)" },
+  });
+  assert.equal(result.location?.binPath, good);
+  assert.deepEqual([...new Set(result.rejectedForModel ?? [])], [stray], "the stray build is reported, not used");
 });
