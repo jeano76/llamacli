@@ -10,6 +10,7 @@ import {
   DEFAULT_SUMMARY_MAX_TOKENS,
   splitSystemMessage,
   stripResumePrefix,
+  invalidateTokenEstimate,
   type CompactionDetail,
 } from "../compaction/compactor.js";
 import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/checkpoint.js";
@@ -423,6 +424,11 @@ export class AgentLoop {
     const lastMsg = this.messages[this.messages.length - 1];
     if (lastMsg && lastMsg.role === "user" && typeof lastMsg.content === "string" && lastMsg.content.startsWith("[resuming")) {
       lastMsg.content = resumeText;
+      // In-place edit: the token estimate memo keys on message count and the
+      // last message's length, and a replacement of the same length would
+      // otherwise look like an unchanged conversation and be served the old
+      // count. See invalidateTokenEstimate.
+      invalidateTokenEstimate();
     } else {
       this.messages.push({ role: "user", content: resumeText });
     }
@@ -1553,6 +1559,9 @@ export class AgentLoop {
           budget.summaryMaxTokens
         );
         this.messages = messages;
+        // The whole conversation was just replaced; the memoized count belongs
+        // to the one that was summarized away.
+        invalidateTokenEstimate();
         this.progress.onCompaction();
         this.opts.onStatus?.(
           `[compaction] ${((Date.now() - startedAt) / 1000).toFixed(1)}s ` +

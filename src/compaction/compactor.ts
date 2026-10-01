@@ -139,7 +139,77 @@ function charBasedEstimate(messages: ChatMessage[], extraText: string): number {
  *  request, and never counted here at all before this, silently
  *  undercounting every threshold check by that much. Callers that don't
  *  send tools (the compaction summary request itself) simply omit this. */
+/**
+ * Memo for the last exact token count, so an unchanged conversation is not
+ * re-measured.
+ *
+ * `estimateTokens` costs TWO HTTP round trips against the backend
+ * (`/apply-template` to render through the server's own chat template, then
+ * `/tokenize` on the result), and it is called from `maybeCompact()` — which
+ * runs once per turn AND once per individual tool call. On a single-slot
+ * llama-server (`-np 1`) those two requests contend with the very inference
+ * the turn is waiting on, so a repeated measurement of an identical history is
+ * latency paid for nothing.
+ *
+ * The cache is deliberately narrow: one entry, invalidated by a cheap identity
+ * check on the conversation (length + the last message's identity + the tool
+ * schema). It returns an exact number or nothing, so it cannot go stale — the
+ * identity check cannot miss a change in message CONTENT, only fail to notice
+ * one, and in that case the caller simply re-measures. Kept out of the exported
+ * surface and reset by `invalidateTokenEstimate()` for the paths that rewrite
+ * `this.messages` in place.
+ */
+let lastEstimate: { key: string; backend: unknown; tokens: number } | null = null;
+
+/** Identity of a conversation for cache purposes: cheap, and only ever a
+ *  shortcut for "probably the same" — never the basis for a wrong number. */
+function estimateKey(messages: ChatMessage[], extraText: string, tools?: ToolDef[]): string {
+  const last = messages[messages.length - 1];
+  // Identity of the TAIL, not its length alone. Length-only was wrong in a way
+  // the existing tests caught immediately: an assistant message with a
+  // 400-char `tool_calls` argument and one with no tool calls at all have the
+  // same `content` length (both null/empty), so the tool-call payload — the
+  // thing this whole function exists to count — was served from the memo as 0.
+  //
+  // So the key also carries the role and whether tool_calls are present, plus
+  // their argument bytes. Still no hashing of the full conversation: the point
+  // is to make a false HIT impossible for the shapes that differ, and every
+  // remaining risk is covered by the explicit invalidation on in-place edits.
+  const content = typeof last?.content === "string" ? last.content.length : 0;
+  const callChars = (last as any)?.tool_calls
+    ? (last as any).tool_calls.reduce(
+        (n: number, c: any) => n + (typeof c?.function?.arguments === "string" ? c.function.arguments.length : 0),
+        0
+      )
+    : 0;
+  return `${messages.length}:${last?.role ?? ""}:${content}:${callChars}:${extraText.length}:${tools?.length ?? 0}`;
+}
+
+/** Drops the memo. Called wherever `this.messages` is replaced or truncated. */
+export function invalidateTokenEstimate(): void {
+  lastEstimate = null;
+}
+
 export async function estimateTokens(
+  messages: ChatMessage[],
+  backend?: ModelBackend,
+  extraText = "",
+  tools?: ToolDef[]
+): Promise<number> {
+  const key = estimateKey(messages, extraText, tools);
+  // The backend is part of the identity, not an optional extra. Two different
+  // backends answer the same conversation with different numbers (an exact
+  // `/apply-template` count vs a char-based fallback), so a memo shared across
+  // them returns one backend's answer to the other.
+  if (lastEstimate && lastEstimate.key === key && lastEstimate.backend === backend) {
+    return lastEstimate.tokens;
+  }
+  const measured = await measureTokens(messages, backend, extraText, tools);
+  lastEstimate = { key, backend, tokens: measured };
+  return measured;
+}
+
+async function measureTokens(
   messages: ChatMessage[],
   backend?: ModelBackend,
   extraText = "",

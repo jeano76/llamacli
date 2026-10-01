@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens, CONTINUE_AFTER_COMPACTION } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens, CONTINUE_AFTER_COMPACTION, invalidateTokenEstimate } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -1131,4 +1131,94 @@ test("buildResumePrompt leaves the summary out when the live conversation alread
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// estimateTokens() costs two HTTP round trips (/apply-template then
+// /tokenize) and is called from maybeCompact() once per turn AND once per tool
+// call. On a single-slot llama-server those contend with the turn's own
+// inference. These pin the memo, and — more importantly — pin that it can
+// never serve a wrong number.
+
+test("an unchanged conversation is measured once, not once per call", async () => {
+  invalidateTokenEstimate();
+  let calls = 0;
+  const backend = {
+    async countPromptTokens() {
+      calls++;
+      return 1234;
+    },
+  } as any;
+  const messages = [{ role: "user" as const, content: "hello" }];
+  for (let i = 0; i < 5; i++) {
+    assert.equal(await estimateTokens(messages, backend, "", undefined), 1234);
+  }
+  assert.equal(calls, 1, `expected one measurement, got ${calls}`);
+});
+
+test("growing the conversation is measured again", async () => {
+  invalidateTokenEstimate();
+  let calls = 0;
+  const backend = {
+    async countPromptTokens(m: any) {
+      calls++;
+      return m.length * 100;
+    },
+  } as any;
+  const messages: any[] = [{ role: "user", content: "a" }];
+  await estimateTokens(messages, backend);
+  messages.push({ role: "assistant", content: "b" });
+  assert.equal(await estimateTokens(messages, backend), 200);
+  assert.equal(calls, 2);
+});
+
+test("a same-length content replacement is NOT served from the memo", async () => {
+  // The failure this guards: the key is (length, last-message-length), so an
+  // in-place edit of equal length looks unchanged. loop.ts calls
+  // invalidateTokenEstimate() on exactly that path; this proves the memo is not
+  // silently correct there.
+  invalidateTokenEstimate();
+  let calls = 0;
+  const backend = {
+    async countPromptTokens() {
+      calls++;
+      return 999;
+    },
+  } as any;
+  const messages: any[] = [{ role: "user", content: "aaaa" }];
+  await estimateTokens(messages, backend);
+  invalidateTokenEstimate();
+  messages[0].content = "bbbb";
+  await estimateTokens(messages, backend);
+  assert.equal(calls, 2, "an invalidated estimate must be re-measured");
+});
+
+test("invalidateTokenEstimate() forces a fresh measurement", async () => {
+  invalidateTokenEstimate();
+  let calls = 0;
+  const backend = {
+    async countPromptTokens() {
+      calls++;
+      return 7;
+    },
+  } as any;
+  const messages = [{ role: "user" as const, content: "x" }];
+  await estimateTokens(messages, backend);
+  invalidateTokenEstimate();
+  await estimateTokens(messages, backend);
+  assert.equal(calls, 2);
+});
+
+test("a different tool schema invalidates the memo", async () => {
+  invalidateTokenEstimate();
+  let calls = 0;
+  const backend = {
+    async countPromptTokens() {
+      calls++;
+      return 5;
+    },
+  } as any;
+  const messages = [{ role: "user" as const, content: "x" }];
+  await estimateTokens(messages, backend, "", []);
+  await estimateTokens(messages, backend, "", [{ type: "function", function: { name: "t", description: "d", parameters: {} } } as any]);
+  assert.equal(calls, 2, "a changed tool list changes the prompt and must be re-measured");
 });

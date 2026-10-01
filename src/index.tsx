@@ -9,7 +9,6 @@ import { resolveBackend } from "./backend/resolve.js";
 import type { Resolution } from "./backend/resolve.js";
 import { AgentLoop, summarizeErrorForDisplay } from "./agent/loop.js";
 import { configureBrowserTools, configureSkills } from "./tools/index.js";
-import { isBrowserAvailable } from "./tools/browser.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
 import { clearNotes } from "./compaction/notes.js";
@@ -468,12 +467,21 @@ async function main() {
   const { config, setupMessage } = await loadConfig(projectRoot);
   const rules = await loadRules(projectRoot);
   const skillIndex = await loadSkillIndex(projectRoot);
-  // Automatic by default: offer the browser tools only when a debuggable
-  // browser is actually reachable right now (see browser.ts
-  // isBrowserAvailable / config.ts browser.enabled). An explicit
-  // `enabled` in config.yaml forces it either way.
+  // Opt-IN, not automatic. This used to enable the browser tools whenever a
+  // debuggable Chrome happened to be listening, on the reasoning that a
+  // reachable browser is a browser the user wants to drive. That cost ~360
+  // tokens on EVERY request for the whole session — measured: the four browser
+  // tool schemas are 1,439 chars of the 4,691-char total — for four tools a
+  // coding session almost never calls.
+  //
+  // A stray `chrome --remote-debugging-port=9222` left running from something
+  // else was enough to switch them on permanently. Being wrong that way is
+  // silent and constant; being wrong the other way costs one line of config.
+  // `browser.enabled: true` in config.yaml turns them on, and the reachability
+  // probe still runs so a misconfigured port is reported honestly rather than
+  // offering tools that cannot work.
   const browserCfg = config.browser ?? { debugPort: 9222, host: "127.0.0.1" };
-  const browserEnabled = config.browser?.enabled ?? (await isBrowserAvailable(browserCfg));
+  const browserEnabled = config.browser?.enabled === true;
   const systemPrompt = injectSkillIndexIntoSystemPrompt(
     injectRulesIntoSystemPrompt(
       BASE_SYSTEM_PROMPT +
