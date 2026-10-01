@@ -189,6 +189,14 @@ export async function findLlamaServer(opts: {
   exists?: (path: string) => Promise<boolean>;
   listDirs?: (dir: string) => Promise<string[]>;
   probe?: (binPath: string) => Promise<boolean>;
+  /** Model file the chosen binary must be able to read. Skips a build whose
+   *  type registry rejects it (a stock llama.cpp cannot read a ternary 1-bit
+   *  quant) instead of accepting it and failing at server-start time. */
+  modelPath?: string;
+  probeModel?: (binPath: string, modelPath: string | undefined, run: Run) => Promise<{ ok: boolean; error?: string }>;
+  /** Set false to skip the model-compatibility pass entirely (tests, or when
+   *  no model is known yet). */
+  checkModel?: boolean;
   home?: string;
   run?: Run;
 } = {}): Promise<FindResult> {
@@ -196,20 +204,40 @@ export async function findLlamaServer(opts: {
   const exists = opts.exists ?? isExecutable;
   const listDirs = opts.listDirs ?? listBuildDirs;
   const home = opts.home ?? homedir();
-  const probe = opts.probe ?? (async (p: string) => (await probeLlamaServer(p, opts.run ?? defaultRun)).ok);
+  const run = opts.run ?? defaultRun;
+  const probe = opts.probe ?? (async (p: string) => (await probeLlamaServer(p, run)).ok);
 
   // Collected rather than returned on sight, so a candidate that exists but
   // cannot run is skipped in favour of the next one.
   const rejected: string[] = [];
+  // Candidates that run but cannot read the configured model. Recorded
+  // separately because the reason is actionable — "you have two llama.cpp
+  // builds and the one picked cannot read this quant" is a completely
+  // different instruction from "that binary is broken".
+  const rejectedForModel: string[] = [];
   const accept = async (
     binPath: string,
     source: LlamaLocation["source"]
   ): Promise<LlamaLocation | null> => {
-    if (await probe(binPath)) {
-      return { binPath, source, backend: backendFromPath(binPath) };
+    if (!(await probe(binPath))) {
+      rejected.push(binPath);
+      return null;
     }
-    rejected.push(binPath);
-    return null;
+    // Running is not the same as being able to read the model. Without this the
+    // search happily returned a stock build for a ternary-quantised model and
+    // the failure surfaced much later, as a server that exited with
+    // "invalid ggml type 143" and a message blaming the port.
+    if (opts.checkModel !== false && opts.modelPath) {
+      const compat = await (opts.probeModel ?? probeModelCompatibility)(binPath, opts.modelPath, run);
+      if (!compat.ok && looksLikeUnsupportedModelFormat(compat.error)) {
+        rejectedForModel.push(binPath);
+        return null;
+      }
+      // Any other load failure (a genuinely corrupt file, a missing dependency)
+      // says nothing about this binary, so it is kept rather than skipped —
+      // discarding a working install over a bad download would be worse.
+    }
+    return { binPath, source, backend: backendFromPath(binPath) };
   };
 
   // 1. Explicit overrides. Cheapest and unambiguous, so they win outright.
@@ -221,7 +249,7 @@ export async function findLlamaServer(opts: {
     const value = env[key];
     if (value && (await exists(value))) {
       const hit = await accept(value, "env");
-      if (hit) return { location: hit, rejected };
+      if (hit) return { location: hit, rejected, rejectedForModel };
     }
   }
 
@@ -234,7 +262,7 @@ export async function findLlamaServer(opts: {
     const candidate = join(dir, BIN_NAME);
     if (await exists(candidate)) {
       const hit = await accept(candidate, "path");
-      if (hit) return { location: hit, rejected };
+      if (hit) return { location: hit, rejected, rejectedForModel };
     }
   }
 
@@ -260,7 +288,7 @@ export async function findLlamaServer(opts: {
     for (const candidate of candidatePaths(root.dir, buildDirs)) {
       if (await exists(candidate)) {
         const hit = await accept(candidate, root.source);
-        if (hit) return { location: hit, rejected };
+        if (hit) return { location: hit, rejected, rejectedForModel };
       }
     }
   }
@@ -272,10 +300,10 @@ export async function findLlamaServer(opts: {
   //    install look like "llama.cpp is not installed" to llamacli.
   for (const binPath of await systemdLlamaServerPaths(env, { exists, run: opts.run ?? defaultRun })) {
     const hit = await accept(binPath, "systemd");
-    if (hit) return { location: hit, rejected };
+    if (hit) return { location: hit, rejected, rejectedForModel };
   }
 
-  return { location: null, rejected };
+  return { location: null, rejected, rejectedForModel };
 }
 
 /** A machine where a binary EXISTS but cannot run is otherwise reported as
@@ -285,6 +313,11 @@ export interface FindResult {
   location: LlamaLocation | null;
   /** Paths that exist but failed `probeLlamaServer`. */
   rejected: string[];
+  /** Paths that RUN but whose type registry rejects the configured model —
+   *  a different llama.cpp build than the model needs. Surfaced because the
+   *  instruction is specific: point `llama.binPath` at one of these, or use a
+   *  quant the chosen build understands. */
+  rejectedForModel?: string[];
 }
 
 /** Parses a llama-server binary path out of a systemd user unit.
@@ -360,6 +393,8 @@ export async function probeLlamaServer(binPath: string, run: Run = defaultRun): 
   ok: boolean;
   version?: string;
   error?: string;
+  /** True when the binary runs but cannot read the configured model at all. */
+  modelUnsupported?: boolean;
 }> {
   try {
     const out = await run(binPath, ["--version"], { timeout: 20_000 });
@@ -368,6 +403,59 @@ export async function probeLlamaServer(binPath: string, run: Run = defaultRun): 
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * Whether this llama-server can read the given model file.
+ *
+ * `--version` proves the binary runs; it says nothing about whether it can load
+ * the weights we are about to hand it. Those are separate builds with separate
+ * type registries, and picking the wrong one produces a failure that reads like
+ * a corrupt download:
+ *
+ *   tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)
+ *
+ * Type 143 is a ternary (3-valued) quant, added by the PrismML fork. The stock
+ * `~/llama.cpp` build on this machine tops out at 42, so it rejects a 1-bit
+ * Bonsai outright — while a `bonsai2-runtime` build sitting elsewhere on the
+ * same disk loads it fine. `findLlamaServer` ranks `~/llama.cpp/build-opt` first
+ * and accepted it, because until now nothing asked the question.
+ *
+ * So this loads nothing: it asks the binary to parse the GGUF header only,
+ * which is a few hundred KB of the file, and treats the "invalid ggml type"
+ * family of errors as "wrong build" rather than "bad download".
+ */
+export async function probeModelCompatibility(
+  binPath: string,
+  modelPath: string | undefined,
+  run: Run = defaultRun
+): Promise<{ ok: boolean; error?: string }> {
+  if (!modelPath) return { ok: true };
+  try {
+    // `--no-warmup` stops after loading rather than allocating a context, and
+    // `-c 64` keeps the KV buffer tiny; we want the header parsed, not a
+    // running model. -ngl 0 keeps it off the GPU so this is cheap and cannot
+    // disturb a server that is already using VRAM.
+    await run(binPath, ["-m", modelPath, "-c", "64", "-ngl", "0", "--no-warmup"], {
+      timeout: 60_000,
+      // The load failure is the signal here, so its output must not throw.
+      tolerateExitCode: true,
+    } as never);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** True when a load failure looks like "this build cannot read this format".
+ *
+ *  Deliberately narrow: these specific messages mean the binary's type registry
+ *  does not know the file's quantization, which is a build mismatch and not
+ *  anything wrong with the model. A generic "failed to load" is not enough to
+ *  claim that, so it is excluded. */
+export function looksLikeUnsupportedModelFormat(message: string | undefined): boolean {
+  if (!message) return false;
+  return /invalid ggml type|unknown ggml type|unsupported (?:tensor )?type/i.test(message);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

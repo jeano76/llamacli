@@ -51,12 +51,33 @@ export interface Hardware {
 /** Command runner seam. `run("nvidia-smi", [...])` resolves with stdout, or
  *  rejects if the binary is missing / exits nonzero — callers that treat a
  *  missing tool as "just CPU then" wrap it in try/catch. */
-export type Run = (file: string, args: string[]) => Promise<string>;
+/** Optional per-call settings for a `Run`. Third parameter so every existing
+ *  two-argument call site and test double keeps working unchanged. */
+export interface RunOptions {
+  timeout?: number;
+  maxBuffer?: number;
+  /** Resolve with the output instead of rejecting on a non-zero exit.
+   *
+   *  Needed wherever the exit code IS the signal — probing whether a
+   *  llama-server build can parse a model file fails precisely by exiting
+   *  non-zero, and treating that as a thrown error loses the message that says
+   *  why. */
+  tolerateExitCode?: boolean;
+  windowsHide?: boolean;
+}
 
-export const defaultRun: Run = async (file, args) => {
+export type Run = (file: string, args: string[], opts?: RunOptions) => Promise<string>;
+
+export const defaultRun: Run = async (file, args, opts = {}) => {
   const { stdout } = await execFileAsync(file, args, {
-    timeout: 10_000,
-    maxBuffer: 8 * 1024 * 1024,
+    timeout: opts.timeout ?? 10_000,
+    maxBuffer: opts.maxBuffer ?? 8 * 1024 * 1024,
+    windowsHide: opts.windowsHide,
+  }).catch((err: any) => {
+    if (!opts.tolerateExitCode) throw err;
+    // execFile puts both streams in the error's message on failure, which is
+    // where the "invalid ggml type" text lives.
+    return { stdout: `${err.stdout ?? ""}${err.stderr ?? ""}` };
   });
   return stdout;
 };

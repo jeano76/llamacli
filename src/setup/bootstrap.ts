@@ -23,7 +23,7 @@
  */
 
 import { mkdir, writeFile, readFile, rename } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { stringify, parse } from "yaml";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB, type Hardware } from "./hardware.js";
 import { getCapabilities } from "../tui/terminal.js";
@@ -141,17 +141,39 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   });
   log(steps[0].detail);
 
+  const existing = await readConfig(opts.projectRoot);
+
   // ── 2. llama-server binary ────────────────────────────────────────────────
-  const { location: found, rejected } = await findLlamaServer({ env, home: env.HOME });
+  // The model is chosen in step 3, but a config that already names one is
+  // enough to know whether the BINARY can read it — and that check has to
+  // happen here, because a build whose type registry rejects the quant looks
+  // exactly like a working install until the server starts. Two llama.cpp
+  // builds coexisted on this machine, one of which read a 1-bit model fine and
+  // the other rejecting it with "invalid ggml type 143".
+  const configuredModel =
+    typeof existing?.llama?.modelPath === "string" && existing.llama.modelPath
+      ? existing.llama.modelPath
+      : typeof existing?.model === "string" && existing.model
+      ? existing.model
+      : undefined;
+  const { location: found, rejected, rejectedForModel } = await findLlamaServer({
+    env,
+    home: env.HOME,
+    modelPath: configuredModel,
+  });
   let llama: LlamaLocation | undefined = found ?? undefined;
   if (!llama) {
     // A binary that exists but cannot run is a different problem from a binary
     // that is not installed, and reporting it as the latter sends the user
     // looking for an install that is sitting right there.
+    const modelRejectedNote =
+      rejectedForModel && rejectedForModel.length > 0
+        ? ` (실행은 되지만 이 모델의 양자화 형식(${basename(configuredModel ?? "")})을 읽지 못하는 빌드: ${rejectedForModel.join(", ")})`
+        : "";
     const rejectedNote =
       rejected.length > 0
-        ? ` (찾았지만 실행 불가: ${rejected.join(", ")})`
-        : "";
+        ? ` (찾았지만 실행 불가: ${rejected.join(", ")})${modelRejectedNote}`
+        : modelRejectedNote;
     if (opts.offline || opts.allowBuild === false) {
       steps.push({
         name: "llama.cpp",
@@ -203,7 +225,6 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // running, so narrowing them made the "keep the model in use" check below
   // fail every time and sent the bootstrap to the Hub for a model the machine
   // was serving. Read whole, or not at all.
-  const existing = await readConfig(opts.projectRoot);
 
   // This was found by running the real bootstrap on a machine that already had
   // a llama-server up: planPorts saw 8080 busy and moved us to 8081, which
