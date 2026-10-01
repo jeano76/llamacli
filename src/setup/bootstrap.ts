@@ -400,6 +400,22 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
         modelPath = dest;
         steps.push({ name: "모델 다운로드", ok: true, detail: `이미 있습니다: ${dest}` });
         log(`모델 이미 있음: ${dest}`);
+      } else if (alreadyInUse) {
+        // The model decision above found a real file on disk and deliberately
+        // declined to download, so this stage must not be entered at all.
+        //
+        // It used to be: only `dest` (under the models dir) and its equivalent
+        // were considered, so a model kept OUTSIDE that directory — which is the
+        // normal case, since `modelsDir` is only a default — fell through to
+        // `downloadFile` with the placeholder empty URL the "keep existing"
+        // branch assigns. That threw "Failed to parse URL from", the step was
+        // recorded as failed, and `modelPath` was left empty — so the run went
+        // on to start a server against an empty model path and died with
+        // "failed to open GGUF file", turning a working machine into a
+        // three-stage failure.
+        modelPath = alreadyInUse;
+        steps.push({ name: "모델 다운로드", ok: true, detail: `기존 경로에 있어 건너뜁니다: ${alreadyInUse}` });
+        log(`다운로드 단계 없이 기존 모델을 사용합니다: ${alreadyInUse}`);
       } else if ((equivalent = await findEquivalentModel(target.dir, model.candidate, opts))) {
         // The Hub's filename and the filename on disk routinely disagree, so an
         // existing correct model is reused instead of re-downloading 20 GB of

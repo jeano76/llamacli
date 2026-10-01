@@ -502,3 +502,91 @@ test("a healthy adopted server is not unresolved at all", async () => {
   });
   assert.equal(res.kind, "adopted");
 });
+
+// ── the recorded model path is found wherever the config kept it ────────────
+//
+// Seen live on a project whose config said `backend: openai-compatible`,
+// `llama.modelPath: ""`, and a real `model: /media/.../Ternary-Bonsai-2-27B...gguf`.
+// Requiring a non-empty `llama.modelPath` (and the `local-llama` backend) sent
+// it to the installer, which announced "llama.cpp is not installed", ran, failed,
+// and then spawned a server against an empty model path — so a machine with both
+// the binary and the weights reported a three-stage setup failure.
+
+test("a model recorded only in the top-level `model` key is still used, not reinstalled", async () => {
+  const root = await mkdtemp(join(tmpdir(), "resolve-model-key-"));
+  try {
+    const modelPath = join(root, "m.gguf");
+    await writeFile(modelPath, "weights");
+    let installerRan = false;
+    const res = await resolveBackend({
+      projectRoot: root,
+      config: localConfig({
+        // Exactly the reported shape: openai-compatible, empty llama.modelPath,
+        // the real model one level up.
+        backend: "openai-compatible" as any,
+        model: modelPath,
+        llama: { binPath: "/nonexistent/llama-server", modelPath: "", port: 8081 } as any,
+      }),
+      log: () => {},
+      discover: async () => none,
+      bootstrap: async () => {
+        installerRan = true;
+        return { ok: true, steps: [], errors: [] } as unknown as BootstrapReport;
+      },
+    });
+    assert.equal(installerRan, false, "a recorded model must not reach the installer");
+    // It got far enough to try the recorded binary, so this is a spawn failure
+    // rather than a setup failure.
+    assert.equal(res.kind, "unresolved");
+    assert.equal(res.kind === "unresolved" && res.usable, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an empty llama.modelPath does not mask a usable top-level model", async () => {
+  const root = await mkdtemp(join(tmpdir(), "resolve-model-key-2-"));
+  try {
+    const modelPath = join(root, "m.gguf");
+    await writeFile(modelPath, "weights");
+    let installerRan = false;
+    await resolveBackend({
+      projectRoot: root,
+      config: localConfig({ model: modelPath, llama: { binPath: "/nonexistent", modelPath: "", port: 8081 } as any }),
+      log: () => {},
+      discover: async () => none,
+      bootstrap: async () => {
+        installerRan = true;
+        return { ok: true, steps: [], errors: [] } as unknown as BootstrapReport;
+      },
+    });
+    assert.equal(installerRan, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the installer is still reached when no model path points at a real file", async () => {
+  // The fix must not over-reach: a config naming a model that is not on disk is
+  // genuinely missing, and case 3 is the correct place for that.
+  const root = await mkdtemp(join(tmpdir(), "resolve-model-key-3-"));
+  try {
+    let installerRan = false;
+    await resolveBackend({
+      projectRoot: root,
+      config: localConfig({
+        model: join(root, "does-not-exist.gguf"),
+        llama: { binPath: "/nonexistent", modelPath: join(root, "also-missing.gguf"), port: 8081 } as any,
+      }),
+      log: () => {},
+      discover: async () => none,
+      bootstrap: async () => {
+        installerRan = true;
+        return { ok: false, steps: [], errors: ["nothing to install"] } as unknown as BootstrapReport;
+      },
+    });
+    assert.equal(installerRan, true, "a genuinely missing model must reach the installer");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

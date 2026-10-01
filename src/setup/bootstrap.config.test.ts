@@ -156,3 +156,43 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
     assert.ok(after.llama?.port, "ports were still decided and recorded");
     assert.ok(report.ports?.llamaPort);
   }));
+
+// The "keep the model already in use" branch used to fall straight through into
+// the download step, which then called downloadFile with the placeholder empty
+// URL that branch assigns. Reproduced live: the step was reported as
+// "Failed to parse URL from ", modelPath was left empty, and the run went on to
+// spawn a server with an empty model path and die with "failed to open GGUF
+// file" — a working machine turned into a three-stage failure.
+
+test("a model kept from the existing config never enters the download step", async () =>
+  withTempDir(async (dir) => {
+    await mkdir(join(dir, ".llamacli"), { recursive: true });
+    // Outside any models dir, which is the normal case: modelsDir is only a default.
+    const modelPath = join(dir, "existing.gguf");
+    await writeFile(modelPath, Buffer.alloc(4096));
+    await writeFile(
+      join(dir, ".llamacli", "config.yaml"),
+      `backend: local-llama\nmodel: ${modelPath}\nllama:\n  binPath: /bin/true\n  modelPath: ${modelPath}\n  port: 8080\n`
+    );
+
+    const report = await ensureLocalStack({
+      projectRoot: dir,
+      hardware: {
+        cpuCount: 4, ramTotalBytes: 16 * 1024 ** 3, ramAvailableBytes: 12 * 1024 ** 3,
+        gpus: [], gpuBackend: "none", canBuildCuda: false, tools: {}, platform: "linux",
+      },
+      probe: async () => "free",
+      detectServer: async () => ({ kind: "none" }) as any,
+      listExistingModels: async () => [],
+    });
+
+    assert.deepEqual(report.errors, [], `expected no errors, got: ${report.errors.join(" | ")}`);
+    const download = report.steps.find((s) => s.name === "모델 다운로드");
+    assert.ok(download, "the download step should still be reported");
+    assert.equal(download!.ok, true, `download step failed: ${download!.detail}`);
+
+    // And the model must survive into the written config, since an empty
+    // modelPath is what made the subsequent server start fail.
+    const after = parse(await readFile(join(dir, ".llamacli", "config.yaml"), "utf8"));
+    assert.equal(after.llama.modelPath, modelPath);
+  }));

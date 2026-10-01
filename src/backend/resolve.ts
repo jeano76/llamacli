@@ -185,60 +185,90 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
   // Deliberately checked BEFORE the installer, so a machine that already has
   // both a binary and a model never reaches the Hub.
   const recorded = config.llama;
-  if (config.backend === "local-llama" && recorded?.modelPath && recorded.binPath) {
+  // The recorded model path is taken from EITHER `llama.modelPath` or the
+  // top-level `model`, whichever actually points at a file.
+  //
+  // Requiring `llama.modelPath` specifically sent configs to the installer
+  // unnecessarily. The bootstrap owns `llama.modelPath` and had left it as the
+  // empty string while the model the user was actually running lived in the
+  // top-level `model` key — a shape seen live on a project whose config said
+  // `backend: openai-compatible`, `llama.modelPath: ""` and a real
+  // `model: /media/.../Ternary-Bonsai-2-27B-PTQ1_0.gguf`. Because the gate also
+  // required `backend === "local-llama"`, neither the running server nor the
+  // recorded weights were consulted: it announced "llama.cpp is not installed",
+  // ran the installer, failed, and then spawned a server with an empty model
+  // path. `openai-compatible` is not a reason to ignore a model that is right
+  // there in the config.
+  const recordedModel =
+    typeof recorded?.modelPath === "string" && (await fileSize(recorded.modelPath)) > 0
+      ? recorded.modelPath
+      : typeof config.model === "string" && (await fileSize(config.model)) > 0
+      ? config.model
+      : undefined;
+  if (recorded?.binPath && recordedModel) {
     // Rebuilt as a full LlamaServerConfig rather than passed through: the config
     // type allows `host` to be absent, and the spawned process has to be told
-    // explicitly. 127.0.0.1, not 0.0.0.0 — the server is for this session.
-    const startCfg: LlamaServerConfig = { host: "127.0.0.1", ...recorded };
-    if (await fileSize(recorded.modelPath) > 0) {
-      const port = recorded.port;
-      log(`설치된 llama-server 를 ${port} 포트에서 시작합니다: ${recorded.binPath}`);
-      const started = await tryStart(startCfg, opts.registerCleanup);
-      if (started) {
-        const spawned = new OpenAICompatibleClient(started.baseUrl);
-        // Same check as case 1, and for the same reason: a config that points
-        // at a corrupt model file produces a server that loads and answers just
-        // as convincingly as a good one. This one is nearly free — the spawn
-        // path already waited out a multi-minute model load, so a single small
-        // request adds nothing to what the user is waiting for.
-        const health = await (opts.probe ?? probeBackendHealth)(spawned);
-        if (health.verdict === "garbage") {
-          const reason = describeUnhealthyBackend(`${started.baseUrl} (모델 ${recorded.modelPath})`, health);
-          log(reason);
-          // Same reasoning as case 1: the server is up and ours, so the session
-          // comes up with the reason visible rather than exiting on the user.
-          return { kind: "unresolved", backend: spawned, reason, usable: true };
-        }
-        return {
-          kind: "spawned",
-          backend: spawned,
-          stop: started.stop,
-          port,
-          modelPath: recorded.modelPath,
-        };
+    // explicitly. 127.0.0.1, not 0.0.0.0 - the server is for this session.
+    // `modelPath` is set explicitly rather than inherited, because this branch
+    // is exactly the case where the recorded one was unusable.
+    const startCfg: LlamaServerConfig = { ...recorded, host: "127.0.0.1", modelPath: recordedModel };
+    const port = recorded.port;
+    log(`설치된 llama-server 를 ${port} 포트에서 시작합니다: ${recorded.binPath}`);
+    const started = await tryStart(startCfg, opts.registerCleanup);
+    if (started) {
+      const spawned = new OpenAICompatibleClient(started.baseUrl);
+      // Same check as case 1, and for the same reason: a config that points
+      // at a corrupt model file produces a server that loads and answers just
+      // as convincingly as a good one. This one is nearly free - the spawn
+      // path already waited out a multi-minute model load, so a single small
+      // request adds nothing to what the user is waiting for.
+      const health = await (opts.probe ?? probeBackendHealth)(spawned);
+      if (health.verdict === "garbage") {
+        const reason = describeUnhealthyBackend(`${started.baseUrl} (모델 ${recordedModel})`, health);
+        log(reason);
+        // Same reasoning as case 1: the server is up and ours, so the session
+        // comes up with the reason visible rather than exiting on the user.
+        return { kind: "unresolved", backend: spawned, reason, usable: true };
       }
-      // A spawn failure is NOT fatal, and NOT a reason to fall through to the
-      // installer: the binary and the model are both on disk and known, so a
-      // rebuild would burn 10-40 minutes to fix a port that was busy or a card
-      // that was full. Returning here rather than falling through is the point —
-      // case 3 must be reached only when something is genuinely MISSING, never
-      // when something is present and merely refused to start.
       return {
-        kind: "unresolved",
-        backend: fallbackClient(config),
-        reason:
-          `${recorded.binPath} 를 ${port} 포트에서 시작하지 못했습니다. ` +
-          `llama.cpp 와 모델은 설치되어 있으므로 다시 설치하지 않았습니다 — 포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. ` +
-          `.llamacli/config.yaml 의 llama.port 를 비어 있는 포트로 바꾸거나, 서버를 직접 실행한 뒤 다시 시도하세요.`,
-        // Nothing is listening on that endpoint — the process refused to start —
-        // so there is no session to hand the user. This is one of the outcomes
-        // that must NOT come up as a ready-looking prompt.
-        usable: false,
+        kind: "spawned",
+        backend: spawned,
+        stop: started.stop,
+        port,
+        modelPath: recordedModel,
       };
-    } else {
-      log(`설정된 모델 파일이 없습니다: ${recorded.modelPath}`);
     }
+    // A spawn failure is NOT fatal, and NOT a reason to fall through to the
+    // installer: the binary and the model are both on disk and known, so a
+    // rebuild would burn 10-40 minutes to fix a port that was busy or a card
+    // that was full. Returning here rather than falling through is the point -
+    // case 3 must be reached only when something is genuinely MISSING, never
+    // when something is present and merely refused to start.
+    //
+    // The reason names the actual situation rather than assuming the common
+    // one. `binPath` is frequently a bare name like "llama-server", which only
+    // resolves through PATH, so the most frequent ENOENT here is "not on PATH"
+    // - and telling that user to change the port would send them to edit a
+    // setting that was never the problem.
+    const binIsBare = !recorded.binPath.includes("/");
+    return {
+      kind: "unresolved",
+      backend: fallbackClient(config),
+      reason:
+        `${recorded.binPath} 를 ${port} 포트에서 시작하지 못했습니다. ` +
+        `llama.cpp 와 모델은 설치되어 있으므로 다시 설치하지 않았습니다 - ` +
+        (binIsBare
+          ? `경로에 있는 이름이라 PATH에서 찾지 못한 것 같습니다. .llamacli/config.yaml 의 llama.binPath 에 전체 경로(예: /home/.../llama-server)를 적으세요. `
+          : `포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. `) +
+        `서버를 직접 실행한 뒤 다시 시도하세요.`,
+      // Nothing is listening on that endpoint - the process refused to start -
+      // so there is no session to hand the user. This is one of the outcomes
+      // that must NOT come up as a ready-looking prompt.
+      usable: false,
+    };
   }
+
+  if (recorded?.modelPath) log(`설정된 모델 파일이 없습니다: ${recorded.modelPath}`);
 
   // ── Case 3: not installed (or no model recorded) → install + configure ─────
   // The one case that may touch the network, and the only one that can take
