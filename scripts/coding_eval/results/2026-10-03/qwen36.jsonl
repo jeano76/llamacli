@@ -1,0 +1,52 @@
+{"suite": "humaneval", "id": "HumanEval/0", "passed": true, "why": "", "completion_tokens": 199, "reasoning_chars": 0, "wall_s": 5.1, "finish": "stop", "tg": 40.8}
+{"suite": "humaneval", "id": "HumanEval/4", "passed": true, "why": "", "completion_tokens": 174, "reasoning_chars": 0, "wall_s": 5.7, "finish": "stop", "tg": 41.1}
+{"suite": "humaneval", "id": "HumanEval/8", "passed": true, "why": "", "completion_tokens": 171, "reasoning_chars": 0, "wall_s": 6.0, "finish": "stop", "tg": 38.1}
+{"suite": "humaneval", "id": "HumanEval/12", "passed": true, "why": "", "completion_tokens": 165, "reasoning_chars": 0, "wall_s": 5.5, "finish": "stop", "tg": 40.9}
+{"suite": "humaneval", "id": "HumanEval/16", "passed": true, "why": "", "completion_tokens": 81, "reasoning_chars": 0, "wall_s": 3.3, "finish": "stop", "tg": 41.3}
+{"suite": "humaneval", "id": "HumanEval/20", "passed": true, "why": "", "completion_tokens": 310, "reasoning_chars": 0, "wall_s": 9.1, "finish": "stop", "tg": 41.4}
+{"suite": "humaneval", "id": "HumanEval/24", "passed": true, "why": "", "completion_tokens": 86, "reasoning_chars": 0, "wall_s": 3.3, "finish": "stop", "tg": 41.4}
+{"suite": "humaneval", "id": "HumanEval/28", "passed": true, "why": "", "completion_tokens": 70, "reasoning_chars": 0, "wall_s": 3.0, "finish": "stop", "tg": 40.9}
+{"suite": "humaneval", "id": "HumanEval/32", "passed": false, "why": "eback (most recent call last):\n  File \"/tmp/tmpa04dexmh/prog.py\", line 92, in <module>\n    check(find_zero)\n    ~~~~~^^^^^^^^^^^\n  File \"/tmp/tmpa04dexmh/prog.py\", line 88, in check\n    assert math.fabs(poly(coeffs, solution)) < 1e-4\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError", "completion_tokens": 578, "reasoning_chars": 0, "wall_s": 15.7, "finish": "stop", "tg": 41.4}
+{"suite": "humaneval", "id": "HumanEval/36", "passed": true, "why": "", "completion_tokens": 152, "reasoning_chars": 0, "wall_s": 5.1, "finish": "stop", "tg": 41.3}
+{"suite": "humaneval", "id": "HumanEval/40", "passed": true, "why": "", "completion_tokens": 361, "reasoning_chars": 0, "wall_s": 10.3, "finish": "stop", "tg": 41.5}
+{"suite": "humaneval", "id": "HumanEval/44", "passed": true, "why": "", "completion_tokens": 205, "reasoning_chars": 0, "wall_s": 6.4, "finish": "stop", "tg": 40.8}
+{"suite": "humaneval", "id": "HumanEval/48", "passed": true, "why": "", "completion_tokens": 87, "reasoning_chars": 0, "wall_s": 3.7, "finish": "stop", "tg": 39.4}
+{"suite": "humaneval", "id": "HumanEval/52", "passed": true, "why": "", "completion_tokens": 100, "reasoning_chars": 0, "wall_s": 3.9, "finish": "stop", "tg": 41.6}
+{"suite": "humaneval", "id": "HumanEval/56", "passed": true, "why": "", "completion_tokens": 186, "reasoning_chars": 0, "wall_s": 5.9, "finish": "stop", "tg": 41.4}
+{"suite": "humaneval", "id": "HumanEval/60", "passed": true, "why": "", "completion_tokens": 125, "reasoning_chars": 0, "wall_s": 4.5, "finish": "stop", "tg": 41.7}
+{"suite": "humaneval", "id": "HumanEval/64", "passed": true, "why": "", "completion_tokens": 230, "reasoning_chars": 0, "wall_s": 7.1, "finish": "stop", "tg": 41.0}
+{"suite": "humaneval", "id": "HumanEval/68", "passed": true, "why": "", "completion_tokens": 440, "reasoning_chars": 0, "wall_s": 12.5, "finish": "stop", "tg": 41.5}
+{"suite": "humaneval", "id": "HumanEval/72", "passed": true, "why": "", "completion_tokens": 269, "reasoning_chars": 0, "wall_s": 8.3, "finish": "stop", "tg": 41.2}
+{"suite": "humaneval", "id": "HumanEval/76", "passed": true, "why": "", "completion_tokens": 349, "reasoning_chars": 0, "wall_s": 10.0, "finish": "stop", "tg": 41.3}
+{"suite": "humaneval", "id": "HumanEval/80", "passed": true, "why": "", "completion_tokens": 183, "reasoning_chars": 0, "wall_s": 5.9, "finish": "stop", "tg": 41.3}
+{"suite": "humaneval", "id": "HumanEval/84", "passed": true, "why": "", "completion_tokens": 209, "reasoning_chars": 0, "wall_s": 7.0, "finish": "stop", "tg": 38.2}
+{"suite": "humaneval", "id": "HumanEval/88", "passed": true, "why": "", "completion_tokens": 327, "reasoning_chars": 0, "wall_s": 10.3, "finish": "stop", "tg": 39.8}
+{"suite": "humaneval", "id": "HumanEval/92", "passed": true, "why": "", "completion_tokens": 914, "reasoning_chars": 0, "wall_s": 25.3, "finish": "stop", "tg": 40.1}
+{"suite": "humaneval", "id": "HumanEval/96", "passed": true, "why": "", "completion_tokens": 298, "reasoning_chars": 0, "wall_s": 8.9, "finish": "stop", "tg": 41.1}
+{"suite": "humaneval", "id": "HumanEval/100", "passed": true, "why": "", "completion_tokens": 336, "reasoning_chars": 0, "wall_s": 10.4, "finish": "stop", "tg": 39.9}
+{"suite": "humaneval", "id": "HumanEval/104", "passed": true, "why": "", "completion_tokens": 186, "reasoning_chars": 0, "wall_s": 6.2, "finish": "stop", "tg": 39.4}
+{"suite": "humaneval", "id": "HumanEval/108", "passed": true, "why": "", "completion_tokens": 349, "reasoning_chars": 0, "wall_s": 10.4, "finish": "stop", "tg": 40.1}
+{"suite": "humaneval", "id": "HumanEval/112", "passed": true, "why": "", "completion_tokens": 263, "reasoning_chars": 0, "wall_s": 8.0, "finish": "stop", "tg": 40.9}
+{"suite": "humaneval", "id": "HumanEval/116", "passed": true, "why": "", "completion_tokens": 687, "reasoning_chars": 0, "wall_s": 18.7, "finish": "stop", "tg": 40.3}
+{"suite": "humaneval", "id": "HumanEval/120", "passed": true, "why": "", "completion_tokens": 303, "reasoning_chars": 0, "wall_s": 9.2, "finish": "stop", "tg": 41.1}
+{"suite": "humaneval", "id": "HumanEval/124", "passed": true, "why": "", "completion_tokens": 727, "reasoning_chars": 0, "wall_s": 19.6, "finish": "stop", "tg": 40.6}
+{"suite": "humaneval", "id": "HumanEval/128", "passed": true, "why": "", "completion_tokens": 235, "reasoning_chars": 0, "wall_s": 7.4, "finish": "stop", "tg": 40.7}
+{"suite": "humaneval", "id": "HumanEval/132", "passed": false, "why": "File \"/tmp/tmpgqjfzpqk/prog.py\", line 3\n    ```python\n    ^\nSyntaxError: invalid syntax", "completion_tokens": 1024, "reasoning_chars": 0, "wall_s": 26.8, "finish": "length", "tg": 40.5}
+{"suite": "humaneval", "id": "HumanEval/136", "passed": true, "why": "", "completion_tokens": 213, "reasoning_chars": 0, "wall_s": 6.7, "finish": "stop", "tg": 41.3}
+{"suite": "humaneval", "id": "HumanEval/140", "passed": true, "why": "", "completion_tokens": 177, "reasoning_chars": 0, "wall_s": 5.7, "finish": "stop", "tg": 41.1}
+{"suite": "humaneval", "id": "HumanEval/144", "passed": true, "why": "", "completion_tokens": 279, "reasoning_chars": 0, "wall_s": 8.3, "finish": "stop", "tg": 41.2}
+{"suite": "humaneval", "id": "HumanEval/148", "passed": true, "why": "", "completion_tokens": 364, "reasoning_chars": 0, "wall_s": 10.8, "finish": "stop", "tg": 40.0}
+{"suite": "humaneval", "id": "HumanEval/152", "passed": true, "why": "", "completion_tokens": 31, "reasoning_chars": 0, "wall_s": 2.6, "finish": "stop", "tg": 39.5}
+{"suite": "humaneval", "id": "HumanEval/156", "passed": true, "why": "", "completion_tokens": 288, "reasoning_chars": 0, "wall_s": 8.4, "finish": "stop", "tg": 41.4}
+{"suite": "humaneval", "id": "HumanEval/160", "passed": true, "why": "", "completion_tokens": 343, "reasoning_chars": 0, "wall_s": 10.0, "finish": "stop", "tg": 40.8}
+{"suite": "custom", "id": "lru_cache", "passed": true, "why": "PASS", "completion_tokens": 2544, "reasoning_chars": 9674, "wall_s": 63.9, "finish": "stop", "tg": 40.7}
+{"suite": "custom", "id": "calc", "passed": false, "why": "FAIL: '1 2' should raise ValueError", "completion_tokens": 10208, "reasoning_chars": 38601, "wall_s": 256.4, "finish": "stop", "tg": 40.0}
+{"suite": "custom", "id": "merge_intervals", "passed": true, "why": "PASS", "completion_tokens": 2237, "reasoning_chars": 8130, "wall_s": 56.6, "finish": "stop", "tg": 40.5}
+{"suite": "custom", "id": "toposort", "passed": true, "why": "PASS", "completion_tokens": 3688, "reasoning_chars": 12245, "wall_s": 91.7, "finish": "stop", "tg": 40.8}
+{"suite": "custom", "id": "fix_flatten", "passed": true, "why": "PASS", "completion_tokens": 1114, "reasoning_chars": 4064, "wall_s": 28.8, "finish": "stop", "tg": 40.8}
+{"suite": "custom", "id": "roman", "passed": true, "why": "PASS", "completion_tokens": 7941, "reasoning_chars": 22794, "wall_s": 197.2, "finish": "stop", "tg": 40.6}
+{"suite": "custom", "id": "wrap_text", "passed": true, "why": "PASS", "completion_tokens": 5167, "reasoning_chars": 19170, "wall_s": 128.5, "finish": "stop", "tg": 40.6}
+{"suite": "custom", "id": "dijkstra", "passed": false, "why": "FAIL: AttributeError module 'cand' has no attribute 'shortest_path'", "completion_tokens": 12000, "reasoning_chars": 41842, "wall_s": 301.6, "finish": "length", "tg": 40.0}
+{"suite": "custom", "id": "parse_nested", "passed": true, "why": "PASS", "completion_tokens": 7913, "reasoning_chars": 29436, "wall_s": 196.4, "finish": "stop", "tg": 40.6}
+{"suite": "custom", "id": "parse_csv_line", "passed": true, "why": "PASS", "completion_tokens": 5644, "reasoning_chars": 20759, "wall_s": 141.4, "finish": "stop", "tg": 40.3}
+{"suite": "custom", "id": "min_window", "passed": true, "why": "PASS", "completion_tokens": 5671, "reasoning_chars": 20944, "wall_s": 141.4, "finish": "stop", "tg": 40.5}

@@ -1,0 +1,52 @@
+{"suite": "humaneval", "id": "HumanEval/0", "passed": true, "why": "", "completion_tokens": 173, "reasoning_chars": 0, "wall_s": 7.9, "finish": "stop", "tg": 23.8}
+{"suite": "humaneval", "id": "HumanEval/4", "passed": true, "why": "", "completion_tokens": 184, "reasoning_chars": 0, "wall_s": 8.4, "finish": "stop", "tg": 23.9}
+{"suite": "humaneval", "id": "HumanEval/8", "passed": true, "why": "", "completion_tokens": 163, "reasoning_chars": 0, "wall_s": 7.5, "finish": "stop", "tg": 23.9}
+{"suite": "humaneval", "id": "HumanEval/12", "passed": true, "why": "", "completion_tokens": 128, "reasoning_chars": 0, "wall_s": 6.0, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/16", "passed": true, "why": "", "completion_tokens": 81, "reasoning_chars": 0, "wall_s": 4.0, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/20", "passed": true, "why": "", "completion_tokens": 273, "reasoning_chars": 0, "wall_s": 12.2, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/24", "passed": true, "why": "", "completion_tokens": 112, "reasoning_chars": 0, "wall_s": 5.2, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/28", "passed": true, "why": "", "completion_tokens": 70, "reasoning_chars": 0, "wall_s": 3.5, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/32", "passed": true, "why": "", "completion_tokens": 479, "reasoning_chars": 0, "wall_s": 21.2, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/36", "passed": true, "why": "", "completion_tokens": 139, "reasoning_chars": 0, "wall_s": 6.4, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/40", "passed": true, "why": "", "completion_tokens": 235, "reasoning_chars": 0, "wall_s": 10.6, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/44", "passed": true, "why": "", "completion_tokens": 158, "reasoning_chars": 0, "wall_s": 7.3, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/48", "passed": true, "why": "", "completion_tokens": 87, "reasoning_chars": 0, "wall_s": 4.2, "finish": "stop", "tg": 23.8}
+{"suite": "humaneval", "id": "HumanEval/52", "passed": true, "why": "", "completion_tokens": 100, "reasoning_chars": 0, "wall_s": 4.8, "finish": "stop", "tg": 23.8}
+{"suite": "humaneval", "id": "HumanEval/56", "passed": true, "why": "", "completion_tokens": 157, "reasoning_chars": 0, "wall_s": 7.3, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/60", "passed": true, "why": "", "completion_tokens": 125, "reasoning_chars": 0, "wall_s": 5.9, "finish": "stop", "tg": 23.7}
+{"suite": "humaneval", "id": "HumanEval/64", "passed": true, "why": "", "completion_tokens": 192, "reasoning_chars": 0, "wall_s": 10.0, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/68", "passed": true, "why": "", "completion_tokens": 430, "reasoning_chars": 0, "wall_s": 19.3, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/72", "passed": true, "why": "", "completion_tokens": 30, "reasoning_chars": 0, "wall_s": 2.2, "finish": "stop", "tg": 23.4}
+{"suite": "humaneval", "id": "HumanEval/76", "passed": true, "why": "", "completion_tokens": 319, "reasoning_chars": 0, "wall_s": 14.2, "finish": "stop", "tg": 23.6}
+{"suite": "humaneval", "id": "HumanEval/80", "passed": true, "why": "", "completion_tokens": 81, "reasoning_chars": 0, "wall_s": 4.1, "finish": "stop", "tg": 23.6}
+{"suite": "humaneval", "id": "HumanEval/84", "passed": true, "why": "", "completion_tokens": 180, "reasoning_chars": 0, "wall_s": 8.3, "finish": "stop", "tg": 23.6}
+{"suite": "humaneval", "id": "HumanEval/88", "passed": true, "why": "", "completion_tokens": 73, "reasoning_chars": 0, "wall_s": 3.9, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/92", "passed": true, "why": "", "completion_tokens": 59, "reasoning_chars": 0, "wall_s": 3.2, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/96", "passed": true, "why": "", "completion_tokens": 298, "reasoning_chars": 0, "wall_s": 13.4, "finish": "stop", "tg": 23.6}
+{"suite": "humaneval", "id": "HumanEval/100", "passed": true, "why": "", "completion_tokens": 198, "reasoning_chars": 0, "wall_s": 9.1, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/104", "passed": true, "why": "", "completion_tokens": 185, "reasoning_chars": 0, "wall_s": 8.5, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/108", "passed": false, "why": "k (most recent call last):\n  File \"/tmp/tmpm2syinnv/prog.py\", line 42, in <module>\n    check(count_nums)\n    ~~~~~^^^^^^^^^^^^\n  File \"/tmp/tmpm2syinnv/prog.py\", line 33, in check\n    assert candidate([12, 23, 34, -45, -56, 0]) == 5\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError", "completion_tokens": 249, "reasoning_chars": 0, "wall_s": 11.3, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/112", "passed": true, "why": "", "completion_tokens": 239, "reasoning_chars": 0, "wall_s": 10.9, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/116", "passed": true, "why": "", "completion_tokens": 234, "reasoning_chars": 0, "wall_s": 10.7, "finish": "stop", "tg": 23.6}
+{"suite": "humaneval", "id": "HumanEval/120", "passed": true, "why": "", "completion_tokens": 96, "reasoning_chars": 0, "wall_s": 5.0, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/124", "passed": true, "why": "", "completion_tokens": 287, "reasoning_chars": 0, "wall_s": 13.2, "finish": "stop", "tg": 23.6}
+{"suite": "humaneval", "id": "HumanEval/128", "passed": true, "why": "", "completion_tokens": 110, "reasoning_chars": 0, "wall_s": 5.4, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/132", "passed": false, "why": "Traceback (most recent call last):\n  File \"/tmp/tmp_946krri/prog.py\", line 38, in <module>\n    check(is_nested)\n    ~~~~~^^^^^^^^^^^\n  File \"/tmp/tmp_946krri/prog.py\", line 26, in check\n    assert candidate('[[]') == False\n           ^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError", "completion_tokens": 88, "reasoning_chars": 0, "wall_s": 4.4, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/136", "passed": true, "why": "", "completion_tokens": 81, "reasoning_chars": 0, "wall_s": 4.1, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/140", "passed": true, "why": "", "completion_tokens": 79, "reasoning_chars": 0, "wall_s": 4.0, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/144", "passed": true, "why": "", "completion_tokens": 74, "reasoning_chars": 0, "wall_s": 3.9, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/148", "passed": true, "why": "", "completion_tokens": 127, "reasoning_chars": 0, "wall_s": 6.2, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/152", "passed": true, "why": "", "completion_tokens": 31, "reasoning_chars": 0, "wall_s": 2.2, "finish": "stop", "tg": 23.5}
+{"suite": "humaneval", "id": "HumanEval/156", "passed": true, "why": "", "completion_tokens": 299, "reasoning_chars": 0, "wall_s": 13.3, "finish": "stop", "tg": 23.6}
+{"suite": "humaneval", "id": "HumanEval/160", "passed": true, "why": "", "completion_tokens": 262, "reasoning_chars": 0, "wall_s": 12.0, "finish": "stop", "tg": 23.5}
+{"suite": "custom", "id": "lru_cache", "passed": true, "why": "PASS", "completion_tokens": 806, "reasoning_chars": 2655, "wall_s": 35.2, "finish": "stop", "tg": 23.5}
+{"suite": "custom", "id": "calc", "passed": false, "why": "FAIL: AttributeError module 'cand' has no attribute 'evaluate'", "completion_tokens": 12000, "reasoning_chars": 48891, "wall_s": 531.8, "finish": "length", "tg": 22.6}
+{"suite": "custom", "id": "merge_intervals", "passed": true, "why": "PASS", "completion_tokens": 835, "reasoning_chars": 2858, "wall_s": 36.6, "finish": "stop", "tg": 23.4}
+{"suite": "custom", "id": "toposort", "passed": true, "why": "PASS", "completion_tokens": 812, "reasoning_chars": 2412, "wall_s": 35.2, "finish": "stop", "tg": 23.6}
+{"suite": "custom", "id": "fix_flatten", "passed": true, "why": "PASS", "completion_tokens": 292, "reasoning_chars": 1065, "wall_s": 13.4, "finish": "stop", "tg": 23.4}
+{"suite": "custom", "id": "roman", "passed": false, "why": "FAIL: AttributeError module 'cand' has no attribute 'to_roman'", "completion_tokens": 12000, "reasoning_chars": 41498, "wall_s": 533.7, "finish": "length", "tg": 22.5}
+{"suite": "custom", "id": "wrap_text", "passed": true, "why": "PASS", "completion_tokens": 2920, "reasoning_chars": 10937, "wall_s": 125.9, "finish": "stop", "tg": 23.4}
+{"suite": "custom", "id": "dijkstra", "passed": true, "why": "PASS", "completion_tokens": 799, "reasoning_chars": 2197, "wall_s": 34.9, "finish": "stop", "tg": 23.5}
+{"suite": "custom", "id": "parse_nested", "passed": false, "why": "FAIL: AttributeError module 'cand' has no attribute 'parse_nested'", "completion_tokens": 12000, "reasoning_chars": 46861, "wall_s": 531.8, "finish": "length", "tg": 22.6}
+{"suite": "custom", "id": "parse_csv_line", "passed": false, "why": "FAIL: AttributeError module 'cand' has no attribute 'parse_csv_line'", "completion_tokens": 12000, "reasoning_chars": 48499, "wall_s": 532.1, "finish": "length", "tg": 22.6}
+{"suite": "custom", "id": "min_window", "passed": true, "why": "PASS", "completion_tokens": 4709, "reasoning_chars": 16385, "wall_s": 203.7, "finish": "stop", "tg": 23.2}

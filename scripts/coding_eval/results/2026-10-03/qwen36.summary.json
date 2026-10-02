@@ -1,0 +1,1 @@
+{"name": "qwen36", "humaneval": {"n": 41, "passed": 39, "tokens": 12074, "secs": 361}, "custom": {"n": 11, "passed": 9, "think": true, "tokens": 64127, "secs": 1604}}
