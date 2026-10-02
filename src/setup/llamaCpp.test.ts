@@ -545,3 +545,45 @@ test("output that already decided the verdict wins over a later exit", async () 
   const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
   assert.equal(r.verdict, "unsupported");
 });
+
+// The round-trip that was broken: llamacli INSTALLS a ternary-capable runtime, then
+// has to FIND it on the next launch. It installed into
+// ~/.llamacli/prism-llama.cpp/<subdir>/ (a downloaded prebuilt) or
+// ~/.llamacli/llama.cpp-fork/<build>/ (a fork build), and searched neither — so
+// every launch re-downloaded or re-compiled the whole thing.
+test("a runtime llamacli installed for ternary models is found again", async () => {
+  const home = "/h";
+  const seen: string[] = [];
+  const prebuilt = "/h/.llamacli/prism-llama.cpp/cuda-12.8/llama-server";
+  const found = await findLlamaServer({
+    env: { HOME: home } as never,
+    home,
+    // Only the runtime llamacli itself would have installed exists, and it runs.
+    exists: async (p: string) => {
+      seen.push(p);
+      return p === prebuilt;
+    },
+    // The real code lists the subdirectories of each root; the installed runtime
+    // lives in one, and without it there is nothing for the layout to match.
+    listDirs: async (dir: string) => (dir.includes("prism-llama.cpp") ? ["cuda-12.8"] : []),
+    probe: async () => ({ ok: true, backend: "cuda" }),
+  } as never);
+  assert.equal(found.location?.binPath, prebuilt, `the installed runtime was not discovered; probed ${seen.length} paths`);
+  assert.ok(
+    seen.includes(prebuilt),
+    "the unpacked-release layout — binary directly in a subdir, no bin/ — must be one of the probed paths"
+  );
+});
+
+test("a fork build under ~/.llamacli/llama.cpp-fork is found again", async () => {
+  const home = "/h";
+  const built = "/h/.llamacli/llama.cpp-fork/build-cuda/bin/llama-server";
+  const found = await findLlamaServer({
+    env: { HOME: home } as never,
+    home,
+    exists: async (p: string) => p === built,
+    listDirs: async (dir: string) => (dir.includes("llama.cpp-fork") ? ["build-cuda"] : []),
+    probe: async () => ({ ok: true, backend: "cuda" }),
+  } as never);
+  assert.equal(found.location?.binPath, built);
+});

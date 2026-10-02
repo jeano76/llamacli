@@ -165,6 +165,12 @@ export function candidatePaths(root: string, buildDirs: string[]): string[] {
   for (const dir of ranked) {
     out.push(join(root, dir, "bin", BIN_NAME));
     out.push(join(root, dir, "bin", "Release", BIN_NAME));
+    // The UNPACKED shape, which is what every published release archive is: the
+    // binary and its .so files sit directly in the directory, with no `bin/`. A
+    // cmake build is never laid out this way, so this cannot shadow one — but
+    // omitting it makes an installed runtime invisible to the very search meant
+    // to find it, and the machine then re-downloads or re-builds on every launch.
+    out.push(join(root, dir, BIN_NAME));
   }
   out.push(join(root, "bin", BIN_NAME));
   out.push(join(root, BIN_NAME));
@@ -392,6 +398,15 @@ export async function findLlamaServer(opts: {
     // the other cannot be tested, and on a machine where HOME differs from
     // what `homedir()` reports it would look in two different places.
     { dir: join(home, ".llamacli", "llama.cpp"), source: "llamacli-build" as const },
+    // The two roots a TERNARY-capable runtime lands in (see ternaryRuntime.ts and
+    // buildLlamaCpp's `repo` option). They were missing, and that is not a
+    // cosmetic omission: llamacli downloaded its pinned PrismML prebuilt to
+    // ~/.llamacli/prism-llama.cpp/<subdir>/, or built the fork into
+    // ~/.llamacli/llama.cpp-fork/, and then never searched either — so the very
+    // next launch could not see what it had just installed and would fetch or
+    // compile the whole thing again. Every launch, forever.
+    { dir: join(home, ".llamacli", "prism-llama.cpp"), source: "llamacli-build" as const },
+    { dir: join(home, ".llamacli", "llama.cpp-fork"), source: "llamacli-build" as const },
   ];
   for (const root of roots) {
     const buildDirs = await listDirs(root.dir);
