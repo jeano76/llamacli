@@ -590,6 +590,47 @@ which reported the 21.9 GiB 35B-A3B as a full VRAM fit on a 7 GiB card:
    the **whole file** fits, and so cannot distinguish "fully resident" from
    "streaming".
 
+### `/server` — the other half, and deliberately a separate command
+
+`/models <n>` **changes which model is served.** `/server` answers a different
+question that had no route except reading `config.yaml` by hand — *what is
+running right now, on which port, with which build, and can that build read my
+model?* — which comes up on its own after a crash or after something else took
+the port.
+
+```
+[server] 포트 8084 (실행 중인 서버에서 확인) · 실행 중 (pid 128976, 이 설치 소유) · 빌드 bonsai2-runtime/llama-server
+[server] 재시작 시: 기존 서버를 종료하고 같은 포트(8084)에서 …로 다시 올립니다.
+  · 지금 재시작하려면  /server restart
+```
+
+`/server restart` re-serves the model **already in config**. It is not a second
+spelling of `/models <n>`: collapsing them would make "restart my server"
+silently switch models. So the restart path **reuses the recorded tuning rather
+than re-deriving it** — a restart that quietly changed the flags you are running
+with would not be a restart. Only the model-switch path re-tunes, because only
+there the model changed.
+
+The report is held to the same honesty rules as the action:
+
+| Situation | Reported as | Never as |
+|---|---|---|
+| port not in config | resolved from the **running server**, marked `(실행 중인 서버에서 확인)` | defaulted to 8080 and called free |
+| port occupied by an unidentifiable process | `확인 불가` | `비어 있음` |
+| no build can read the quant | names the **rejecting** builds | silence |
+| a build exists but was never confirmed | flagged as unconfirmed | `읽을 수 있습니다` |
+
+The first row was a live bug. This config has no `llama` block, so the first
+version reported `포트 8080 · 서버 없음` on a machine with a live server on 8084
+— confidently wrong, and worse than saying nothing, because a user who believed
+it would conclude their server had died.
+
+**The restart plan is computed from the same report the user just read**, so what
+they are told will happen and what is attempted cannot diverge. And it refuses up
+front — before touching anything — when a systemd unit holds the port (restarting
+it re-runs *its own* model), when the port cannot be inspected, or when no
+compatible build exists.
+
 ### Selection REPLACES
 
 `.llamacli/config.yaml` names exactly one model, so choosing a rung overwrites
@@ -844,7 +885,7 @@ which is what made the four bugs findable at all.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 831 unit tests
+npm test                                              # 843 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -852,7 +893,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **831** | pass |
+| Unit / regression | `npm test` | **843** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |

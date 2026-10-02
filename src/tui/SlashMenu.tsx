@@ -35,6 +35,11 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   // /models lists what THIS machine can actually run — file size alone does not
   // decide that — and `/models <n>` replaces the model currently in use.
   { key: "models", label: "/models", description: "이 PC에서 구동 가능한 로컬 모델 메트릭스 · 선택" },
+  // /server is the other half of /models. `/models <n>` CHANGES which model is
+  // served; `/server` reports what is running right now and `/server restart`
+  // re-serves the model already in config. They are deliberately separate -- one
+  // command that did both would make "restart my server" silently switch models.
+  { key: "server", label: "/server", description: "모델 제공 서버 상태 확인 · /server restart 로 같은 포트에서 재시작" },
   { key: "skills", label: "/skills", description: "List loaded skills" },
   { key: "rules", label: "/rules", description: "List loaded rules" },
   // Label and key must agree. This one didn't: the key is "plan-clear"

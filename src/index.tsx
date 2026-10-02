@@ -31,8 +31,34 @@ import { selectModel } from "./setup/modelSelect.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
 import { switchModelAndServer } from "./setup/modelSwitch.js";
+import { reportServer } from "./setup/serverReport.js";
 import { formatProgress } from "./setup/download.js";
 import { totalmem } from "node:os";
+/** The tuning flags the config already records, for a restart that must NOT
+ *  re-derive them.
+ *
+ *  Deliberately different from the model-switch path, which re-tunes. A restart
+ *  re-serves the SAME model, so re-tuning would silently change flags the user
+ *  is already running with — a restart that quietly alters the configuration is
+ *  not a restart. */
+function recordedTuning(config: unknown) {
+  const llama = ((config as any)?.llama ?? {}) as Record<string, any>;
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  return {
+    contextSize: num(llama.contextSize) ?? 8192,
+    threads: num(llama.threads) ?? 4,
+    gpuLayers: num(llama.gpuLayers) ?? 0,
+    threadsBatch: num(llama.threadsBatch),
+    batchSize: num(llama.batchSize),
+    ubatchSize: num(llama.ubatchSize),
+    cpuMoeLayers: num(llama.cpuMoeLayers),
+    parallel: num(llama.parallel),
+    flashAttn: typeof llama.flashAttn === "boolean" ? llama.flashAttn : undefined,
+    cacheTypeK: typeof llama.cacheTypeK === "string" ? llama.cacheTypeK : undefined,
+    cacheTypeV: typeof llama.cacheTypeV === "string" ? llama.cacheTypeV : undefined,
+  };
+}
+
 import { join } from "node:path";
 
 
@@ -1052,6 +1078,67 @@ async function main() {
             } finally {
               ui?.setBusy(false);
             }
+            break;
+          }
+          // /server — what is running RIGHT NOW, and `/server restart` to
+          // re-serve the configured model on the configured port.
+          //
+          // Distinct from `/models <n>`, which CHANGES which model is served.
+          // This re-serves the model already in config, and the distinction is
+          // the point: collapsing them would make "restart my server" silently
+          // switch models. It answers the question that has no other route —
+          // after a crash, or after something else took the port.
+          case "server": {
+            const arg = (argument ?? "").trim().toLowerCase();
+            const report = await reportServer({ config: config as unknown as Record<string, any>, projectRoot });
+
+            if (arg === "restart") {
+              // The restart plan is computed from the SAME report, so what the
+              // user is told will happen and what is attempted cannot diverge.
+              const blocked = /읽지 못|systemd|확인 불가/.test(report.restartPlan);
+              if (blocked) {
+                ui?.pushStatus(`[server] 재시작하지 않습니다 — ${report.restartPlan}`);
+                break;
+              }
+              ui?.setBusy(true);
+              try {
+                ui?.pushStatus(`[server] ${report.restartPlan}`);
+                const binPath = report.build?.binPath ?? (config as any)?.llama?.binPath;
+                if (!binPath) {
+                  ui?.pushStatus("[server] llama-server 실행 파일을 찾지 못했습니다. /models 로 모델을 다시 선택하세요.");
+                  break;
+                }
+                const sw = await switchModelAndServer({
+                  modelPath: report.configuredModel!,
+                  // Reused verbatim; never re-planned. A restart that moves the
+                  // port is an install nobody can predict.
+                  port: report.configuredPort ?? 8080,
+                  binPath,
+                  tuning: recordedTuning(config),
+                });
+                ui?.pushStatus(`[server] ${sw.lines.join("\n")}`);
+              } catch (err) {
+                ui?.pushStatus(`[server 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
+              } finally {
+                ui?.setBusy(false);
+              }
+              break;
+            }
+
+            ui?.pushStatus(
+              [
+                `[server] ${report.summary}`,
+                report.configuredModel ? "" : "  · config 에 모델이 없습니다 — /models 로 선택하세요.",
+                report.build && !report.build.canReadModel
+                  ? `  · ${report.build.rejectedForModel.join(", ")} 는 이 양자화를 읽지 못합니다.`
+                  : "",
+                "",
+                `[server] 재시작 시: ${report.restartPlan}`,
+                "  · 지금 재시작하려면  /server restart",
+              ]
+                .filter(Boolean)
+                .join("\n")
+            );
             break;
           }
           case "reset": {
