@@ -28,7 +28,9 @@ import { ensureLocalStack } from "./setup/bootstrap.js";
 import { describeReset, describeInForce } from "./setup/resetDiff.js";
 import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } from "./setup/modelMetrics.js";
 import { selectModel } from "./setup/modelSelect.js";
-import { detectHardware } from "./setup/hardware.js";
+import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
+import { tuneForHardware } from "./setup/tuning.js";
+import { switchModelAndServer } from "./setup/modelSwitch.js";
 import { totalmem } from "node:os";
 import { join } from "node:path";
 
@@ -987,24 +989,72 @@ async function main() {
 
             ui?.setBusy(true);
             try {
-              const result = await selectModel({ projectRoot, rung, modelsDir: modelsDirFor(projectRoot) });
-              ui?.pushStatus(
-                [
-                  `[models] ${rung.label} (${rung.quant}) 로 교체했습니다.`,
-                  result.previousModel && result.previousModel !== result.modelPath
-                    ? `  · 이전 모델: ${result.previousModel}`
-                    : "",
-                  `  · 기록된 경로: ${result.modelPath}`,
-                  report.fit === "stream" ? `  · ${report.verdict}` : "",
-                  result.presentOnDisk
-                    ? ""
-                    : "  · 파일이 아직 없습니다 — 다음 실행 시 내려받습니다 (진행 상태는 저장되어 재개됩니다).",
-                  `  · ${result.llama.detail}`,
-                  result.requiresRestart ? "  · 새 모델은 재시작 후 적용됩니다." : "",
-                ]
-                  .filter(Boolean)
-                  .join("\n")
-              );
+              // The flags in config were sized for the model that is loaded NOW.
+              // Re-derived for the new one before anything is written, because
+              // `--n-cpu-moe` sized for a 35B MoE is not a harmless leftover on a
+              // dense model -- it is an OOM at load.
+              //
+              // The old server's VRAM is added back to the budget: the free-VRAM
+              // reading is taken while it is still running, and we are about to
+              // stop it, so counting its memory as unavailable would collapse the
+              // context for a server that is about to release it.
+              const binDir = (config as any)?.llama?.binPath
+                ? dirname(String((config as any).llama.binPath))
+                : undefined;
+              const oldServerVramGiB = await ownLlamaServerVramGiB(await findOwnLlamaServerPids(binDir));
+              const tuning = tuneForHardware(hw, {
+                modelBytes: rung.sizeBytes,
+                ownServerVramGiB: oldServerVramGiB,
+              });
+
+              const result = await selectModel({
+                projectRoot,
+                rung,
+                modelsDir: modelsDirFor(projectRoot),
+                tuning,
+              });
+
+              const head = [
+                `[models] ${rung.label} (${rung.quant}) 로 교체했습니다.`,
+                result.previousModel && result.previousModel !== result.modelPath
+                  ? `  · 이전 모델: ${result.previousModel}`
+                  : "",
+                `  · 기록된 경로: ${result.modelPath}`,
+                report.fit === "stream" ? `  · ${report.verdict}` : "",
+                `  · ${result.llama.detail}`,
+              ];
+
+              // The server switch needs both a binary that can read the model and
+              // the model itself. Either missing, the config still records the
+              // choice -- refusing would make the selection silently not happen
+              // -- but nothing is restarted, and the reason is stated rather than
+              // left to be discovered as a load error on the next launch.
+              if (!result.llama.ok || !result.llama.binPath) {
+                ui?.pushStatus(
+                  [...head, `  · 서버는 그대로 둡니다 — ${result.llama.detail}`].join("\n")
+                );
+                break;
+              }
+              if (!result.presentOnDisk) {
+                ui?.pushStatus(
+                  [
+                    ...head,
+                    "  · 모델 파일이 아직 없어 서버는 교체하지 않습니다. 다음 실행 시 내려받은 뒤",
+                    `    같은 포트(${result.port})로 새 모델로 서버가 올라갑니다.`,
+                  ].join("\n")
+                );
+                break;
+              }
+
+              const sw = await switchModelAndServer({
+                modelPath: result.modelPath,
+                // Reused verbatim. Never re-planned: a model switch that quietly
+                // moves the port is the failure this exists to prevent.
+                port: result.port,
+                binPath: result.llama.binPath,
+                tuning,
+              });
+              ui?.pushStatus([...head, ...sw.lines.map((l) => `  · ${l}`)].join("\n"));
             } catch (err) {
               ui?.pushStatus(`[models 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
             } finally {

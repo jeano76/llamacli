@@ -33,6 +33,8 @@ import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import { mkdir, writeFile } from "node:fs/promises";
 import { findLlamaServer } from "./llamaCpp.js";
+import { tuningToConfigKeys } from "./bootstrap.js";
+import type { LlamaTuning } from "./tuning.js";
 import type { ModelRung } from "./modelMetrics.js";
 
 export interface SelectResult {
@@ -56,6 +58,11 @@ export interface SelectResult {
   };
   /** True when the switch takes effect only after a restart. */
   requiresRestart: boolean;
+  /** The port already in force. Carried through so the server switch reuses it
+   *  instead of re-planning one. */
+  port: number;
+  /** The tuning now recorded for the new model. */
+  tuning?: LlamaTuning;
 }
 
 export interface SelectOptions {
@@ -66,6 +73,14 @@ export interface SelectOptions {
   /** Injected for tests. */
   readConfigFile?: (projectRoot: string) => Promise<Record<string, any> | undefined>;
   writeConfigFile?: (projectRoot: string, config: Record<string, unknown>) => Promise<void>;
+  /** Tuning RE-DERIVED for the new model.
+   *
+   *  Not optional in practice: the flags in the config were sized for whatever
+   *  model was loaded before, and `--n-cpu-moe` in particular is meaningless
+   *  (or harmful) on a dense model. Carrying them across a switch is how a
+   *  5 GiB dense model gets launched with a 35B MoE's CPU-expert count and
+   *  dies at load. */
+  tuning?: LlamaTuning;
   /** Injected for tests; defaults to the real discovery. */
   findServer?: typeof findLlamaServer;
 }
@@ -163,6 +178,10 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
     llama: {
       ...((existing?.llama ?? {}) as Record<string, any>),
       modelPath,
+      // Re-derived per model. The port is deliberately NOT included here --
+      // it is carried over untouched, and a model switch must never relocate
+      // the server.
+      ...(opts.tuning ? tuningToConfigKeys(opts.tuning) : {}),
     },
   };
   await writeConfig(opts.projectRoot, next);
@@ -180,6 +199,10 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
     // The running server has the OLD model loaded; nothing can change that
     // without a restart, and saying so is the whole point of this field.
     requiresRestart: previousModel !== modelPath,
+    // 8080 is llama.cpp's own default and what an uninstalled config implies;
+    // anything else recorded is a deliberate choice and is reused verbatim.
+    port: typeof existing?.llama?.port === "number" ? existing.llama.port : 8080,
+    tuning: opts.tuning,
   };
 }
 

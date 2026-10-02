@@ -122,3 +122,27 @@ test("the model path lands under the configured models directory", async () => {
   const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/mnt/nvme/models", ...h.deps });
   assert.ok(r.modelPath.startsWith("/mnt/nvme/models/"), `path should be under modelsDir: ${r.modelPath}`);
 });
+test("re-tuning for the new model does NOT move the port", async () => {
+  // The regression this guards: the tuning write and the port live in the same
+  // `llama` block, so a re-tune that re-derives the port would relocate the
+  // server on every model switch -- and a port that moves on every switch is a
+  // port nobody can predict. The port is carried over untouched.
+  const h = harness({ model: "/models/old.gguf", llama: { modelPath: "/models/old.gguf", port: 8084 } }, COMPATIBLE);
+  const r = await selectModel({
+    projectRoot: "/p",
+    rung: bonsai,
+    modelsDir: "/models",
+    tuning: { contextSize: 16384, threads: 10, cpuMoeLayers: 4 } as any,
+    ...h.deps,
+  });
+  assert.equal(r.port, 8084, "the port must be reported for the server switch to reuse");
+  assert.equal(h.written[0].llama.port, 8084, "and must survive into the config untouched");
+  assert.equal(h.written[0].llama.contextSize, 16384, "while the model-specific flags ARE re-derived");
+  assert.equal(h.written[0].llama.cpuMoeLayers, 4);
+});
+
+test("a config with no port defaults to llama.cpp's own 8080", async () => {
+  const h = harness(undefined, COMPATIBLE);
+  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  assert.equal(r.port, 8080);
+});

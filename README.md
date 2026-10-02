@@ -600,6 +600,48 @@ with; writing only one is how a config ends up naming a model that is not being
 served. The running server still holds the old model, so the status line says a
 restart is required rather than implying the switch is already live.
 
+### The server switches too — on the SAME port
+
+Choosing a model also replaces the **server** serving it, and the port does not
+move. Both halves of that are load-bearing, and both have been violated here:
+
+| Failure | Consequence |
+|---|---|
+| **Two servers** — `planPorts` used to see 8080 busy and move llamacli to 8081, spawning a *second* llama-server | On an 8 GB card whose first server already holds 7.2 GB, that is an **OOM at load**, not a slowdown. |
+| **A moved port** — re-planning the port on each launch | An install nobody can predict. The port is recorded once and kept. |
+
+So the port is read from config and reused verbatim. There is **no code path in
+`modelSwitch.ts` that chooses a different one** — and that is asserted twice,
+including with a non-default port, because a test covering only 8080 would pass
+even if the value were hardcoded.
+
+The flags are **re-derived for the new model** before anything is written.
+`--n-cpu-moe` sized for a 35B MoE is not a harmless leftover on a dense model;
+it is an OOM at load. The old server's VRAM is also added back to the budget —
+the free-VRAM reading is taken while it is still running and is about to release
+that memory, so counting it as unavailable would collapse the context.
+
+The tuning→config key mapping is now shared (`tuningToConfigKeys`) between the
+bootstrap and this switch. Two writers is one too many: a key added to one and
+forgotten in the other does not fail loudly, it just leaves the previous model's
+value in place, so the replacement server launches with flags sized for a model
+that is no longer loaded.
+
+#### Who owns the port decides what happens
+
+Something is usually already listening, and whether llamacli may stop it depends
+entirely on what it is:
+
+| Owner | Action |
+|---|---|
+| **ours** — a llama-server llamacli can attribute | Stopped (SIGTERM, confirmed released, then SIGKILL at 10 s), then replaced |
+| **none** — port free | Started directly |
+| **systemd unit** holding the port | **Reported, not fought.** The unit owns the port and will keep holding it, so a bare kill races the unit's own restart — and "restart the unit" does **not** load a new model, because the unit names its own. Proceeding would leave the new model unused while looking like success. |
+| **foreign** — anything not confidently a llama-server | **Refused.** The port is not ours and the holder is not ours. Failing closed is the point: misclassifying a stranger as ours would let a model switch kill it. |
+
+Verified live on this machine: port 8084 (the running `llama-server`) → `ours`;
+8080 and 9999 → `none`; a real `node` process on 7317 → `foreign`, refused.
+
 ### The llama.cpp half — and why Bonsai is the case that matters
 
 Some quantizations need a build that can read them. `PTQ1_0` and `PQ2_0` are
@@ -629,7 +671,7 @@ thrown.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 789 unit tests
+npm test                                              # 801 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -637,7 +679,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **789** | pass |
+| Unit / regression | `npm test` | **801** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |

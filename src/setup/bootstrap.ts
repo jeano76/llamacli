@@ -684,6 +684,29 @@ export const REMOVED_CONFIG_BLOCKS = ["laya"] as const;
  *  bootstrap runs on every launch, so a config that a user has hand-tuned
  *  (apiKey, verify commands, browser settings) must survive it. Only the fields
  *  the bootstrap owns are written, and only when it actually determined them. */
+/** The `llama.*` keys a tuning produces.
+ *
+ *  Shared rather than written twice because two writers exist — the bootstrap
+ *  and the `/models` switch — and a key added to one and forgotten in the other
+ *  does not fail loudly: the config simply keeps the previous model's value for
+ *  it, so the replacement server silently launches with flags sized for a
+ *  model that is no longer loaded. */
+export function tuningToConfigKeys(tuning: LlamaTuning): Record<string, unknown> {
+  return {
+    contextSize: tuning.contextSize,
+    threads: tuning.threads,
+    threadsBatch: tuning.threadsBatch,
+    gpuLayers: tuning.gpuLayers,
+    cpuMoeLayers: tuning.cpuMoeLayers,
+    batchSize: tuning.batchSize,
+    ubatchSize: tuning.ubatchSize,
+    parallel: tuning.parallel,
+    flashAttn: tuning.flashAttn,
+    cacheTypeK: tuning.cacheTypeK,
+    cacheTypeV: tuning.cacheTypeV,
+  };
+}
+
 export function buildConfig(opts: {
   existing?: Record<string, any>;
   llama?: LlamaLocation;
@@ -716,17 +739,7 @@ export function buildConfig(opts: {
       binPath: opts.llama.binPath,
       ...(opts.modelPath ? { modelPath: opts.modelPath } : {}),
       port: opts.plan.llamaPort,
-      contextSize: opts.tuning.contextSize,
-      threads: opts.tuning.threads,
-      threadsBatch: opts.tuning.threadsBatch,
-      gpuLayers: opts.tuning.gpuLayers,
-      cpuMoeLayers: opts.tuning.cpuMoeLayers,
-      batchSize: opts.tuning.batchSize,
-      ubatchSize: opts.tuning.ubatchSize,
-      parallel: opts.tuning.parallel,
-      flashAttn: opts.tuning.flashAttn,
-      cacheTypeK: opts.tuning.cacheTypeK,
-      cacheTypeV: opts.tuning.cacheTypeV,
+      ...tuningToConfigKeys(opts.tuning),
     };
   }
   return next;
