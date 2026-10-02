@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from "node:child_process";
 import { stat } from "node:fs/promises";
+import { GPU_LOG_LINE } from "../setup/gpuReport.js";
 import { OpenAICompatibleClient } from "./openaiClient.js";
 
 /** Size of a file, or 0 when it cannot be read. */
@@ -207,6 +208,10 @@ export class LlamaServerManager {
   private spawnError: Error | null = null;
   /** Set when this manager owns the child, so an exit handler can reap it. */
   private installedExitHook = false;
+  /** Load-time lines about the accelerator, kept separately from `log`: the rolling tail
+   *  drops the early part of a long model load, which is where llama.cpp says how many
+   *  layers went to the GPU. */
+  private gpuLines: string[] = [];
 
   constructor(private config: LlamaServerConfig) {}
 
@@ -219,6 +224,7 @@ export class LlamaServerManager {
     this.exited = null;
     this.spawnError = null;
     this.log = [];
+    this.gpuLines = [];
 
     this.proc = spawn(this.config.binPath, buildServerArgs(this.config), {
       stdio: ["ignore", "pipe", "pipe"],
@@ -276,7 +282,15 @@ export class LlamaServerManager {
     return this.log.slice(-lines).join("").trim();
   }
 
+  /** What the server said about the GPU while loading (offload count, device, OOM). */
+  gpuLog(): string {
+    return this.gpuLines.join("\n");
+  }
+
   private appendLog(text: string): void {
+    for (const line of text.split(/\r?\n/)) {
+      if (GPU_LOG_LINE.test(line) && this.gpuLines.length < 40) this.gpuLines.push(line.trim());
+    }
     // Bounded: a long-running server logs for hours, and this buffer exists to
     // explain a failure, not to archive a session.
     if (this.log.length > 200) this.log.splice(0, this.log.length - 200);

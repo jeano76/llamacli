@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises";
-import { formatBytes, type TransferProgress } from "../setup/download.js";
+import { formatBytes, formatProgress, type TransferProgress } from "../setup/download.js";
 import { LlamaServerManager, type LlamaServerConfig } from "./llamaServer.js";
 import { OpenAICompatibleClient } from "./openaiClient.js";
 import { discoverRunningServer, COMMON_PORTS, type Discovery } from "./detect.js";
@@ -77,6 +77,10 @@ export interface ResolveOptions {
    *  was found or done — this is the only feedback a multi-minute first run
    *  gives, and it renders inside the alt screen (see index.tsx). */
   log: (line: string) => void;
+  /** Redraws ONE terminal row for a transfer (`text`), and releases it with `null`. When
+   *  absent (output is piped, or the terminal takes no escapes) progress is logged as
+   *  throttled lines instead. */
+  progressLine?: (text: string | null) => void;
   /** Called with the process to release when the session ends, if any. */
   registerCleanup?: (fn: () => void) => void;
   /** Injected so tests do not depend on what is actually running on this
@@ -166,10 +170,15 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
   let lastPercent = -1;
   let lastBytes = 0;
   const progress = (_default: (p: TransferProgress) => void) => (p: TransferProgress) => {
-    // Whole percents only: a 20 GB transfer calls this several times a second,
-    // and an unthrottled status line would push every earlier line out of the
-    // TUI's log. `percent` is -1 until the total size is known, so that case
-    // falls back to a fixed 1 GiB interval rather than emitting -1 forever.
+    // One redrawn row when the terminal can do it: a 20 GB transfer reports several times
+    // a second, and a line per update (or even per percent) scrolls the whole setup output
+    // away. `formatProgress` already carries the bar, bytes, speed and ETA.
+    if (opts.progressLine) {
+      opts.progressLine(formatProgress(p));
+      return;
+    }
+    // No redraw available: whole percents only, and a fixed 1 GiB step when the total size
+    // is unknown (`percent` is -1 then), so the log is not flooded.
     if (p.percent >= 0) {
       const percent = Math.floor(p.percent);
       if (percent === lastPercent) return;
@@ -396,6 +405,7 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     return { kind: "unresolved", backend: fallbackClient(config), reason, usable: false };
   }
 
+  opts.progressLine?.(null); // release the redrawn row before anything else is printed
   for (const error of report.errors) log(`[설정 경고] ${error}`);
 
   // The bootstrap may have found a server of its own (case 1 all over again, in

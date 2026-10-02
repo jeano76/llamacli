@@ -104,7 +104,7 @@ test("ladder: the first rung that verifies wins and nothing is compiled", async 
   const installed: string[] = [];
   let built = false;
   const got = await acquireStockLlamaServer({
-    hardware: hw(), run: (async () => "") as never,
+    hardware: hw(), installedRoot: "/nonexistent-llamacli", run: (async () => "") as never,
     releases: async () => [release],
     install: async (r) => { installed.push(r.backend); return `/x/${r.subdir}/llama-server`; },
     verify: async () => ({ ok: true }),
@@ -119,7 +119,7 @@ test("ladder: the first rung that verifies wins and nothing is compiled", async 
 test("ladder: a CUDA prebuilt that will not initialise falls to Vulkan, then CPU", async () => {
   const verified: string[] = [];
   const got = await acquireStockLlamaServer({
-    hardware: hw({ gpuBackend: "cuda" }), run: (async (f: string) => (f === "nvidia-smi" ? "CUDA Version: 12.9" : "")) as never,
+    hardware: hw({ gpuBackend: "cuda" }), installedRoot: "/nonexistent-llamacli", run: (async (f: string) => (f === "nvidia-smi" ? "CUDA Version: 12.9" : "")) as never,
     releases: async () => [release],
     install: async (r) => `/x/${r.subdir}/llama-server`,
     verify: async (bin) => { verified.push(bin); return bin.includes("cpu") ? { ok: true } : { ok: false, detail: "cannot init" }; },
@@ -133,7 +133,7 @@ test("ladder: a CUDA prebuilt that will not initialise falls to Vulkan, then CPU
 test("ladder: offline (release lookup fails) goes straight to a source build", async () => {
   let built = 0;
   const got = await acquireStockLlamaServer({
-    hardware: hw(), run: (async () => "") as never,
+    hardware: hw(), installedRoot: "/nonexistent-llamacli", run: (async () => "") as never,
     releases: async () => { throw new Error("ENOTFOUND api.github.com"); },
     install: async () => { throw new Error("must not download"); },
     verify: async () => ({ ok: true }),
@@ -146,7 +146,7 @@ test("ladder: offline (release lookup fails) goes straight to a source build", a
 
 test("ladder: allowBuild=false never compiles", async () => {
   const got = await acquireStockLlamaServer({
-    hardware: hw(), run: (async () => "") as never, allowBuild: false,
+    hardware: hw(), installedRoot: "/nonexistent-llamacli", run: (async () => "") as never, allowBuild: false,
     releases: async () => [],
     build: (async () => { throw new Error("must not build"); }) as never,
   });
@@ -156,7 +156,7 @@ test("ladder: allowBuild=false never compiles", async () => {
 test("ladder: an accelerated source build that will not run is rebuilt as CPU once", async () => {
   const forcedArgs: (string | undefined)[] = [];
   const got = await acquireStockLlamaServer({
-    hardware: hw({ gpuBackend: "vulkan", canBuildVulkan: true }), run: (async () => "") as never,
+    hardware: hw({ gpuBackend: "vulkan", canBuildVulkan: true }), installedRoot: "/nonexistent-llamacli", run: (async () => "") as never,
     releases: async () => [],
     verify: async (bin) => (bin.includes("build-vulkan") ? { ok: false, detail: "no device" } : { ok: true }),
     build: (async (o: { backend?: string }) => {
@@ -171,10 +171,74 @@ test("ladder: an accelerated source build that will not run is rebuilt as CPU on
 test("ladder: if the newest release lacks the asset, an older one is used", async () => {
   const empty: Release = { tag: "b99999", assets: [] };
   const got = await acquireStockLlamaServer({
-    hardware: hw(), run: (async () => "") as never,
+    hardware: hw(), installedRoot: "/nonexistent-llamacli", run: (async () => "") as never,
     releases: async () => [empty, release],
     install: async (r) => { assert.equal(r.tag, TAG); return "/x/cpu/llama-server"; },
     verify: async () => ({ ok: true }),
   });
   assert.equal(got?.binPath, "/x/cpu/llama-server");
+});
+
+// ── already installed means NOT downloaded again ────────────────────────────
+
+import { mkdtemp, mkdir, writeFile, chmod, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { listInstalledStock, acceptableStockBackends } from "./stockRuntime.js";
+
+async function installed(...subdirs: string[]) {
+  const root = await mkdtemp(join(tmpdir(), "stockroot-"));
+  for (const d of subdirs) {
+    await mkdir(join(root, d), { recursive: true });
+    await writeFile(join(root, d, "llama-server"), "#!/bin/sh\n");
+    await chmod(join(root, d, "llama-server"), 0o755);
+  }
+  return root;
+}
+
+test("an installed prebuilt that still runs is used with ZERO network and ZERO downloads", async () => {
+  const root = await installed("cuda-12.8");
+  try {
+    let fetched = 0, downloaded = 0, built = 0;
+    const got = await acquireStockLlamaServer({
+      hardware: hw({ gpuBackend: "cuda" }), run: (async () => "") as never, installedRoot: root,
+      releases: async () => { fetched++; return []; },
+      install: async () => { downloaded++; return "/x"; },
+      verify: async () => ({ ok: true }),
+      build: (async () => { built++; return "/b"; }) as never,
+    });
+    assert.equal(got?.binPath, join(root, "cuda-12.8", "llama-server"));
+    assert.equal(got?.backend, "cuda");
+    assert.deepEqual([fetched, downloaded, built], [0, 0, 0]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("an installed prebuilt that no longer runs is skipped, and the ladder carries on to the next rung", async () => {
+  const root = await installed("cuda-12.8");
+  try {
+    const got = await acquireStockLlamaServer({
+      hardware: hw({ gpuBackend: "cuda" }), run: (async () => "") as never, installedRoot: root,
+      releases: async () => [release],
+      install: async (r) => `/x/${r.subdir}/llama-server`,
+      verify: async (bin) => (bin.startsWith(root) ? { ok: false, detail: "driver changed" } : { ok: true }),
+    });
+    assert.notEqual(got?.binPath.startsWith(root), true);
+    assert.ok(got!.attempts.some((a) => /설치됨/.test(a.label) && !a.ok && /driver changed/.test(a.detail ?? "")));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("only backends that suit this machine count as 'installed': a cuda build is no use on a CPU box", async () => {
+  const root = await installed("cuda-12.8", "cpu");
+  try {
+    const cpuBox = await listInstalledStock({ gpuBackend: "none", platform: "linux", arch: "x64" }, root);
+    assert.deepEqual(cpuBox.map((x) => x.backend), ["cpu"]);
+    const nvidia = await listInstalledStock({ gpuBackend: "cuda", platform: "linux", arch: "x64" }, root);
+    assert.deepEqual(nvidia.map((x) => x.backend), ["cuda", "cpu"], "best first");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("acceptableStockBackends: the machine's own accelerator, then its fallbacks", () => {
+  assert.deepEqual(acceptableStockBackends("cuda", "linux", "x64"), ["cuda", "vulkan", "cpu"]);
+  assert.deepEqual(acceptableStockBackends("none", "linux", "x64"), ["cpu"]);
+  assert.deepEqual(acceptableStockBackends("metal", "darwin", "arm64"), ["metal"]);
 });

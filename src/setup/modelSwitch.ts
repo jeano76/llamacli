@@ -34,6 +34,7 @@
  */
 
 import { LlamaServerManager, type LlamaServerConfig } from "../backend/llamaServer.js";
+import { summarizeGpuOffload, waitForGpuRelease } from "./gpuReport.js";
 import { hasSystemd, listeningPortsCommand, PORT_FIELD_SEPARATOR, type HostPlatform } from "./hostEnv.js";
 
 export type PortOwner =
@@ -71,7 +72,15 @@ export interface SwitchOptions {
   /** Who holds the port. Injected for tests. */
   detectOwner?: () => Promise<PortOwner>;
   /** Injected for tests; defaults to a real manager. */
-  makeServer?: (cfg: LlamaServerConfig) => { start(): Promise<void>; stop(): void; logTail(lines?: number): string };
+  makeServer?: (cfg: LlamaServerConfig) => { start(): Promise<void>; stop(): void; logTail(lines?: number): string; gpuLog?(): string };
+  /** Called after the old server is gone and its VRAM released, BEFORE the new one is
+   *  started: re-measure the hardware, re-derive the tuning for the new model against the
+   *  memory that is really free now, and say whether the GPU will be used. Returns the
+   *  tuning to launch with. The /models flow sizes the model while the old server still
+   *  holds its VRAM, so without this the plan it printed was made on stale numbers. */
+  retune?: () => Promise<{ tuning?: SwitchOptions["tuning"]; lines: string[] }>;
+  /** Injected for tests; defaults to polling nvidia-smi. */
+  waitGpuRelease?: (pid: number) => Promise<{ released: boolean; waitedMs: number }>;
   /** Injected for tests; defaults to signalling the real process.
    *
    *  A seam rather than a mock: "stopped before it started" is the load-bearing
@@ -164,8 +173,26 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
     stopped = owner;
     say(`${port} 포트의 기존 llama-server (pid ${owner.pid}) 를 종료합니다.`);
     await (opts.stopProcess ?? stopPid)(owner.pid, say);
+    const rel = await (opts.waitGpuRelease ?? ((pid) => waitForGpuRelease(pid, opts.runCommand ?? defaultRunCommand)))(owner.pid);
+    say(
+      rel.released
+        ? "기존 서버가 사용하던 GPU 메모리를 반환했습니다."
+        : "기존 서버가 종료됐지만 GPU 메모리 반환이 아직 확인되지 않습니다 — 새 서버가 메모리 부족으로 실패할 수 있습니다."
+    );
   } else {
     say(`${port} 포트가 비어 있습니다. 그대로 시작합니다.`);
+  }
+
+  // The plan, on numbers taken now that the old server's VRAM is free.
+  let launchTuning = opts.tuning;
+  if (opts.retune) {
+    try {
+      const r = await opts.retune();
+      if (r.tuning) launchTuning = r.tuning;
+      for (const l of r.lines) say(l);
+    } catch (err) {
+      say(`GPU 재측정에 실패해 이전 계산값으로 진행합니다: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   const cfg: LlamaServerConfig = {
@@ -176,10 +203,10 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
     // a model switch that quietly relocates the server is the failure this
     // whole module exists to prevent.
     port,
-    contextSize: opts.tuning.contextSize ?? 8192,
-    threads: opts.tuning.threads ?? 4,
-    gpuLayers: opts.tuning.gpuLayers ?? 0,
-    ...opts.tuning,
+    contextSize: launchTuning.contextSize ?? 8192,
+    threads: launchTuning.threads ?? 4,
+    gpuLayers: launchTuning.gpuLayers ?? 0,
+    ...launchTuning,
   };
 
   const make = opts.makeServer ?? ((c: LlamaServerConfig) => new LlamaServerManager(c));
@@ -203,6 +230,8 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
   }
 
   say(`${port} 포트에서 새 모델이 응답합니다.`);
+  // The result, from the server's own load log — the plan above is what was asked for.
+  say(summarizeGpuOffload(server.gpuLog?.() ?? server.logTail?.(200) ?? "", { gpuLayers: cfg.gpuLayers ?? 0 }));
   return { ok: true, port, stopped, ready: true, lines };
 }
 
@@ -432,6 +461,80 @@ export async function detectRunningServerPorts(
     readCmdline?: (pid: number, platform: HostPlatform) => Promise<string | null>;
   } = {}
 ): Promise<number[]> {
+  return (await listLlamaServers(opts)).map((s) => s.port);
+}
+
+export interface LiveLlamaServer {
+  pid: number;
+  port: number;
+  cmdline: string;
+  /** Absolute path of the executable (procfs `exe`), when readable. The command line's
+   *  argv[0] is often relative (`./llama-server`), which names nothing on its own. */
+  exe?: string;
+}
+
+/** What a running llama-server was started with, read back from its command line. Lets
+ *  `/server restart` and `/models` act on a server that llamacli did not start and whose
+ *  settings are in no config — the user started it by hand, and its own arguments are the
+ *  only record of its model, build and tuning. */
+export interface ParsedServerArgs {
+  modelPath?: string;
+  port?: number;
+  /** PER-SLOT context: llama.cpp's `-c` is the total across slots, divided by `-np`. */
+  contextSize?: number;
+  gpuLayers?: number;
+  threads?: number;
+  threadsBatch?: number;
+  batchSize?: number;
+  ubatchSize?: number;
+  parallel?: number;
+  cpuMoeLayers?: number;
+  flashAttn?: boolean;
+  cacheTypeK?: string;
+  cacheTypeV?: string;
+}
+
+export function parseLlamaServerArgs(cmdline: string): ParsedServerArgs {
+  const t = cmdline.trim().split(/\s+/);
+  const val = (...names: string[]): string | undefined => {
+    for (let i = 0; i < t.length - 1; i++) if (names.includes(t[i])) return t[i + 1];
+    return undefined;
+  };
+  const num = (...names: string[]): number | undefined => {
+    const v = val(...names);
+    return v !== undefined && /^-?\d+$/.test(v) ? Number(v) : undefined;
+  };
+  const parallel = num("-np", "--parallel");
+  const totalCtx = num("-c", "--ctx-size");
+  const fa = val("-fa", "--flash-attn");
+  return {
+    modelPath: val("-m", "--model"),
+    port: num("--port"),
+    parallel,
+    contextSize: totalCtx !== undefined ? Math.floor(totalCtx / Math.max(1, parallel ?? 1)) : undefined,
+    gpuLayers: num("-ngl", "--n-gpu-layers", "--gpu-layers"),
+    threads: num("-t", "--threads"),
+    threadsBatch: num("-tb", "--threads-batch"),
+    batchSize: num("-b", "--batch-size"),
+    ubatchSize: num("-ub", "--ubatch-size"),
+    cpuMoeLayers: num("--n-cpu-moe"),
+    flashAttn: fa === undefined ? (t.includes("-fa") ? true : undefined) : !/^(off|0|false)$/i.test(fa),
+    cacheTypeK: val("-ctk", "--cache-type-k"),
+    cacheTypeV: val("-ctv", "--cache-type-v"),
+  };
+}
+
+/** Every llama-server process that is listening, with its pid and command line. The
+ *  pid is what lets a model switch stop the right process even when the config's
+ *  recorded port is stale. */
+export async function listLlamaServers(
+  opts: {
+    platform?: HostPlatform;
+    run?: (file: string, args: string[], timeoutMs: number) => Promise<string>;
+    readCmdline?: (pid: number, platform: HostPlatform) => Promise<string | null>;
+    readExe?: (pid: number) => Promise<string | null>;
+  } = {}
+): Promise<LiveLlamaServer[]> {
   const run = opts.run ?? defaultRunCommand;
   const platform = opts.platform ?? process.platform;
   const { file, args } = listeningPortsCommand(platform);
@@ -441,7 +544,7 @@ export async function detectRunningServerPorts(
   } catch {
     return [];
   }
-  const ports: number[] = [];
+  const out: LiveLlamaServer[] = [];
   for (const line of stdout.split("\n")) {
     const pid = platform === "win32" ? netstatPid(line) : line.match(/pid=(\d+)/)?.[1];
     if (!pid) continue;
@@ -449,14 +552,54 @@ export async function detectRunningServerPorts(
     // The binary may be relative (`./llama-server`) when started by hand, so the
     // test is on the name anywhere in the command line, not on the argv[0] path.
     if (!cmdline || !/llama-server/i.test(cmdline)) continue;
-    // The port the socket is actually bound to is authoritative, and it is read
-    // from the platform's own format rather than from `--port` on the command
-    // line: a server whose flag disagrees with its socket is rare, and trusting
+    // The port the socket is actually bound to is authoritative, not `--port` on the
+    // command line: a server whose flag disagrees with its socket is rare, and trusting
     // the flag would hand the switch a port nothing is listening on.
     const port = platform === "win32" ? netstatLocalPort(line) : line.match(/:(\d+)\s/)?.[1];
-    if (port && !ports.includes(Number(port))) ports.push(Number(port));
+    if (port && !out.some((o) => o.pid === Number(pid) && o.port === Number(port))) {
+      const exe = await (opts.readExe ?? readExe)(Number(pid));
+      out.push({ pid: Number(pid), port: Number(port), cmdline, ...(exe ? { exe } : {}) });
+    }
   }
-  return ports;
+  return out;
+}
+
+async function readExe(pid: number): Promise<string | null> {
+  if (process.platform === "win32") return null;
+  const { readlink } = await import("node:fs/promises");
+  return readlink(`/proc/${pid}/exe`).catch(() => null);
+}
+
+export interface ResolvedServerPort {
+  port: number;
+  /** "recorded": the config's port has a llama-server on it. "live": the config's port
+   *  is stale or absent and a llama-server is listening elsewhere — that one wins.
+   *  "recorded-idle": nothing is listening; the config's port is reused. "default":
+   *  nothing is listening and nothing is recorded. */
+  source: "recorded" | "live" | "recorded-idle" | "default";
+  servers: LiveLlamaServer[];
+}
+
+/**
+ * The port a model switch / restart must act on.
+ *
+ * The config's `llama.port` is a RECORD of where a server once was. When the user (or a
+ * script) started the server by hand on another port it goes stale — here the config said
+ * 8080 while the server held 7.3 GB of an 8 GB card on 8084 — and trusting it meant the
+ * switch saw "8080 is free", stopped nothing, and started a SECOND server on a full card.
+ * What is actually listening is a fact, so it outranks the record.
+ */
+export async function resolveLiveServerPort(
+  recorded: number | undefined,
+  opts: Parameters<typeof listLlamaServers>[0] & { servers?: LiveLlamaServer[] } = {}
+): Promise<ResolvedServerPort> {
+  const servers = opts.servers ?? (await listLlamaServers(opts));
+  if (recorded !== undefined && servers.some((s) => s.port === recorded)) {
+    return { port: recorded, source: "recorded", servers };
+  }
+  if (servers.length > 0) return { port: servers[0].port, source: "live", servers };
+  if (recorded !== undefined) return { port: recorded, source: "recorded-idle", servers };
+  return { port: 8080, source: "default", servers };
 }
 
 /** The pid column of a `netstat -ano` LISTENING line, or null. */

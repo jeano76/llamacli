@@ -17,6 +17,9 @@ function harness(existing: Record<string, any> | undefined, findResult: any) {
         written.push(cfg as Record<string, any>);
       },
       findServer: async () => findResult,
+      // Machine-independent by default: otherwise the port is taken from whatever
+      // llama-server happens to be running on the box the suite runs on.
+      detectRunningPort: async () => null as number | null,
     },
   };
 }
@@ -133,8 +136,8 @@ test("when nothing is on disk, the path lands under the configured models direct
     projectRoot: "/p",
     rung: findRung("ornith-9b")!,
     modelsDir: dir,
-    detectRunningPort: async () => null,
     ...h.deps,
+    detectRunningPort: async () => null,
   });
   assert.ok(r.modelPath.startsWith(dir + "/"), `should be under modelsDir: ${r.modelPath}`);
   assert.equal(r.presentOnDisk, false, "nothing there means a download, which must be reported as such");
@@ -197,23 +200,37 @@ test("an unrecorded port asks the RUNNING server, never defaults to 8080", async
   const r = await selectModel({
     projectRoot: "/p",
     rung: bonsai,
-    detectRunningPort: async () => 8084,
     ...h.deps,
+    detectRunningPort: async () => 8084,
   });
   assert.equal(r.port, 8084, "the running server's port must win over the 8080 default");
 });
 
-test("a port already in the config still wins over the running server", async () => {
-  // Otherwise every model switch would silently adopt whatever port some other
-  // process happened to be on, moving an install that was deliberately placed.
+test("a recorded port yields to the llama-server that is really running elsewhere", async () => {
+  // The field failure: config said 8080, the server was started by hand on 8084. Trusting
+  // the record sent the switch to a port with nothing on it, so nothing was stopped and a
+  // second server was started beside a full card. The detector only reports llama-server
+  // processes, so "whatever some other process is on" cannot move the install.
   const h = harness({ llama: { modelPath: "/m.gguf", port: 9090 } }, COMPATIBLE);
   const r = await selectModel({
     projectRoot: "/p",
     rung: bonsai,
-    detectRunningPort: async () => 8084,
     ...h.deps,
+    detectRunningPort: async () => 8084,
   });
+  assert.equal(r.port, 8084);
+});
+
+test("a recorded port is kept when no llama-server is running", async () => {
+  const h = harness({ llama: { modelPath: "/m.gguf", port: 9090 } }, COMPATIBLE);
+  const r = await selectModel({ projectRoot: "/p", rung: bonsai, ...h.deps, detectRunningPort: async () => null });
   assert.equal(r.port, 9090);
+});
+
+test("the port the server is really on is written back to the config", async () => {
+  const h = harness({ llama: { modelPath: "/m.gguf", port: 8080 } }, COMPATIBLE);
+  await selectModel({ projectRoot: "/p", rung: bonsai, ...h.deps, detectRunningPort: async () => 8084 });
+  assert.equal(h.written[0].llama.port, 8084, "the stale 8080 must not be written back");
 });
 
 test("with nothing running, an unrecorded port falls back to 8080", async () => {
@@ -223,8 +240,8 @@ test("with nothing running, an unrecorded port falls back to 8080", async () => 
   const r = await selectModel({
     projectRoot: "/p",
     rung: bonsai,
-    detectRunningPort: async () => null,
     ...h.deps,
+    detectRunningPort: async () => null,
   });
   assert.equal(r.port, 8080);
 });

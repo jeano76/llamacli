@@ -155,6 +155,40 @@ export function stockRungsFor(release: Release, m: StockMachine): StockRung[] {
   return rungs;
 }
 
+
+/** Backends whose installed prebuilt is acceptable for this machine, best first. */
+export function acceptableStockBackends(gpuBackend: GpuBackend, platform: string, arch: string): StockBackend[] {
+  if (platform === "darwin") return [arch === "arm64" ? "metal" : "cpu"];
+  switch (gpuBackend) {
+    case "cuda": return ["cuda", "vulkan", "cpu"];
+    case "rocm": return ["rocm", "vulkan", "cpu"];
+    case "vulkan": return ["vulkan", "cpu"];
+    default: return ["cpu"];
+  }
+}
+
+/** Prebuilts this installer already put on disk, as `{subdir, binPath, backend}`, best first.
+ *  Nothing is downloaded when one of these still runs: "already installed" must mean
+ *  "not fetched again" — the release tag moves on every merged commit, so asking the
+ *  network what is newest would re-download hundreds of MB for no reason. */
+export async function listInstalledStock(
+  machine: { gpuBackend: GpuBackend; platform: string; arch: string },
+  root: string = STOCK_RUNTIME_HOME
+): Promise<{ subdir: string; binPath: string; backend: StockBackend }[]> {
+  const names = await readdir(root).catch(() => [] as string[]);
+  const order = acceptableStockBackends(machine.gpuBackend, machine.platform, machine.arch);
+  const backendOf = (n: string): StockBackend | null =>
+    n.startsWith("cuda") ? "cuda" : n === "rocm" ? "rocm" : n === "vulkan" ? "vulkan" : n === "metal" ? "metal" : n === "cpu" ? "cpu" : null;
+  const found: { subdir: string; binPath: string; backend: StockBackend }[] = [];
+  for (const n of names) {
+    const backend = backendOf(n);
+    if (!backend || !order.includes(backend)) continue;
+    const binPath = join(root, n, binNameFor());
+    if (await executableExists(binPath)) found.push({ subdir: n, binPath, backend });
+  }
+  return found.sort((a, b) => order.indexOf(a.backend) - order.indexOf(b.backend));
+}
+
 const stampPath = (dir: string) => join(dir, ".llama_release");
 
 export interface InstallRungOptions {
@@ -220,6 +254,8 @@ export interface AcquireStockOptions {
   build?: typeof buildLlamaCpp;
   /** Skip the from-source rung (the caller is forbidden to compile). */
   allowBuild?: boolean;
+  /** Where prebuilts live. Defaults to STOCK_RUNTIME_HOME; injected by tests. */
+  installedRoot?: string;
 }
 
 export interface AcquireStockResult {
@@ -248,6 +284,20 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
   const hw = opts.hardware;
   const verify = opts.verify ?? ((bin, gpu) => verifyLlamaServer(bin, opts.run, opts.modelPath, gpu));
   const install = opts.install ?? ((r) => installStockRung(r, { destRoot: opts.destRoot, fetchImpl: opts.fetchImpl, onProgress: opts.onProgress, log }));
+
+  // 0. Already installed → verify and use; no network, no download.
+  for (const have of await listInstalledStock(
+    { gpuBackend: hw.gpuBackend, platform: hw.platform, arch: hw.arch ?? process.arch },
+    opts.installedRoot
+  )) {
+    const verdict = await verify(have.binPath, have.backend !== "cpu");
+    if (verdict.ok) {
+      log(`이미 설치된 llama-server 를 사용합니다 (다시 받지 않음): ${have.binPath}`);
+      attempts.push({ label: `설치됨 (${have.subdir})`, ok: true, binPath: have.binPath });
+      return { binPath: have.binPath, backend: have.backend, source: "downloaded", attempts };
+    }
+    attempts.push({ label: `설치됨 (${have.subdir})`, ok: false, binPath: have.binPath, detail: `실행되지 않음: ${verdict.detail ?? "알 수 없음"}` });
+  }
 
   // 1. Published prebuilts.
   let releases: Release[] = [];

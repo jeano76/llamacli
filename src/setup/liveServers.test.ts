@@ -16,7 +16,7 @@ const cmdlines: Record<number, string> = {
   4242: "node server.js",
   777: "/opt/llama-server --port 9090",
 };
-const deps = { platform: "linux" as const, run: async () => ss, readCmdline: async (pid: number) => cmdlines[pid] ?? null };
+const deps = { platform: "linux" as const, run: async () => ss, readCmdline: async (pid: number) => cmdlines[pid] ?? null, readExe: async () => null };
 
 test("a hand-started llama-server on an unlisted port is found, and unrelated listeners are not", async () => {
   assert.deepEqual(await detectRunningServerPorts(deps), [8084, 9090]);

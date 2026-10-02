@@ -188,12 +188,15 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
 
   const previousModel = typeof existing?.model === "string" ? existing.model : undefined;
 
+  const port = await resolvePort(existing, opts.detectRunningPort);
   const next: Record<string, any> = {
     ...(existing ?? {}),
     model: modelPath,
     llama: {
       ...((existing?.llama ?? {}) as Record<string, any>),
       modelPath,
+      // The port the server is REALLY on (see resolvePort), not a stale record.
+      port,
       // Re-derived per model. The port is deliberately NOT included here --
       // it is carried over untouched, and a model switch must never relocate
       // the server.
@@ -215,7 +218,7 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
     // The running server has the OLD model loaded; nothing can change that
     // without a restart, and saying so is the whole point of this field.
     requiresRestart: previousModel !== modelPath,
-    port: await resolvePort(existing, opts.detectRunningPort),
+    port,
     tuning: opts.tuning,
   };
 }
@@ -281,11 +284,46 @@ async function resolvePort(
   existing: Record<string, any> | undefined,
   detect: (() => Promise<number | null>) | undefined
 ): Promise<number> {
-  if (typeof existing?.llama?.port === "number") return existing.llama.port;
-  const running = await (detect ?? (() => import("./modelSwitch.js").then((m) => m.detectRunningServerPort())))();
-  // 8080 is llama.cpp's own default, and the correct last resort -- it is only
-  // reached when nothing is running, so binding it cannot collide.
-  return running ?? 8080;
+  const recorded = typeof existing?.llama?.port === "number" ? existing.llama.port : undefined;
+  if (detect) {
+    // A test (or caller) that supplies its own probe answers "which port is a server on".
+    const running = await detect();
+    return recorded !== undefined && running === null ? recorded : running ?? recorded ?? 8080;
+  }
+  // What is actually listening outranks the record: a config that says 8080 while the
+  // server was started by hand on 8084 sent the switch to a port with nothing on it, it
+  // stopped nothing, and the replacement server was started beside a full card.
+  const { resolveLiveServerPort } = await import("./modelSwitch.js");
+  return (await resolveLiveServerPort(recorded)).port;
+}
+
+/** Records the port the server is really on, so the config stops being stale. Only
+ *  touches `llama.port` (and a `baseUrl` that names a different local port); everything
+ *  else in the file is preserved. */
+export async function recordServerPort(
+  projectRoot: string,
+  port: number,
+  io: { read?: SelectOptions["readConfigFile"]; write?: SelectOptions["writeConfigFile"] } = {}
+): Promise<boolean> {
+  const read = io.read ?? defaultRead;
+  const write = io.write ?? defaultWrite;
+  const cfg = await read(projectRoot);
+  if (!cfg) return false;
+  let changed = false;
+  const next: Record<string, any> = { ...cfg, llama: { ...(cfg.llama ?? {}) } };
+  if (next.llama.port !== port) { next.llama.port = port; changed = true; }
+  if (typeof next.baseUrl === "string") {
+    try {
+      const u = new URL(next.baseUrl);
+      if (["127.0.0.1", "localhost"].includes(u.hostname) && Number(u.port) !== port) {
+        u.port = String(port);
+        next.baseUrl = u.toString().replace(/\/$/, "");
+        changed = true;
+      }
+    } catch { /* not a URL: leave it */ }
+  }
+  if (changed) await write(projectRoot, next);
+  return changed;
 }
 
 /** A path the config already uses for exactly this filename.

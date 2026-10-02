@@ -27,13 +27,14 @@ import { installCrashHandlers } from "./crashHandler.js";
 import { ensureLocalStack } from "./setup/bootstrap.js";
 import { describeReset, describeInForce } from "./setup/resetDiff.js";
 import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } from "./setup/modelMetrics.js";
-import { selectModel } from "./setup/modelSelect.js";
+import { selectModel, recordServerPort } from "./setup/modelSelect.js";
+import { describeGpuPlan } from "./setup/gpuReport.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
 import { switchModelAndServer } from "./setup/modelSwitch.js";
 import { reportServer } from "./setup/serverReport.js";
 import { provisionForSwitch } from "./setup/provision.js";
-import { formatProgress } from "./setup/download.js";
+import { transientProgress } from "./tui/transientProgress.js";
 import { totalmem } from "node:os";
 /** The tuning flags the config already records, for a restart that must NOT
  *  re-derive them.
@@ -698,12 +699,30 @@ async function main() {
   const log = (line: string) => {
     process.stdout.write(`${line}\n`);
   };
+  // One terminal line, rewritten in place, for a transfer. Only on a real terminal that
+  // takes escapes: piped output gets the throttled per-decile lines instead.
+  let progressOpen = false;
+  const progressLine = (text: string | null) => {
+    if (text === null) {
+      if (progressOpen) process.stdout.write("\n");
+      progressOpen = false;
+      return;
+    }
+    progressOpen = true;
+    process.stdout.write(`\r\x1b[2K${text}`);
+  };
+  const canRewrite = Boolean(process.stdout.isTTY) && getCapabilities().ansi !== false;
   if (setupMessage) log(setupMessage);
 
   const resolution = await resolveBackend({
     projectRoot,
     config,
-    log,
+    log: (line) => {
+      // A message arriving while a progress line is open would be glued onto it.
+      progressLine(null);
+      log(line);
+    },
+    progressLine: canRewrite ? progressLine : undefined,
     // Explicit, in addition to the manager's own exit hook, and a server left
     // running holds the model in VRAM for the rest of the machine's uptime.
     registerCleanup: (fn) => cleanupRegistry.push(fn),
@@ -1163,10 +1182,8 @@ async function main() {
                   // Same seam /reset uses: the TUI owns the screen, so the bar is
                   // ONE row redrawn in place rather than escapes painted into an
                   // Ink-rendered region.
-                  onProgress: (defaultReporter) => (progress) => {
-                    ui?.endTransient?.();
-                    ui?.setTransient?.(formatProgress(progress));
-                  },
+                  // One redrawn row — see transientProgress for why it never releases it.
+                  onProgress: transientProgress(() => ui),
                 });
                 ui?.endTransient?.();
 
@@ -1189,14 +1206,27 @@ async function main() {
                 switchTuning = provisioned.tuning ?? tuning;
               }
 
+              ui?.pushStatus(`  · 새 모델을 올리기 위해 기존 서버를 종료하고 VRAM 을 비웁니다 (포트 ${result.port}).`);
               const sw = await switchModelAndServer({
                 modelPath,
-                // Reused verbatim. Never re-planned: a model switch that quietly
-                // moves the port is the failure this exists to prevent.
+                // The port the server is REALLY on (selectModel resolved it from the
+                // running llama-server, not from a possibly stale record). Never
+                // re-planned beyond that: a switch that quietly moves the port is the
+                // failure this exists to prevent.
                 port: result.port,
                 binPath,
                 tuning: switchTuning,
+                // Once the old server has released its VRAM: re-measure, re-size for the
+                // new model against the memory that is free NOW, and say whether the GPU
+                // will be used. The sizing above was done while the old server still held
+                // its memory.
+                retune: async () => {
+                  const hw2 = await detectHardware();
+                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes });
+                  return { tuning: t2, lines: describeGpuPlan(hw2, t2) };
+                },
               });
+              if (sw.ok) await recordServerPort(projectRoot, sw.port).catch(() => false);
               ui?.pushStatus([...head, ...sw.lines.map((l) => `  · ${l}`)].join("\n"));
             } catch (err) {
               ui?.pushStatus(`[models 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
@@ -1233,14 +1263,36 @@ async function main() {
                   ui?.pushStatus("[server] llama-server 실행 파일을 찾지 못했습니다. /models 로 모델을 다시 선택하세요.");
                   break;
                 }
+                // Tuning: the config's when it has any; otherwise what the running server was
+                // started with (a hand-started server has no llama block, and the defaults
+                // here — 8192 context, -ngl 0 — would silently downgrade it to CPU).
+                const sa = report.serverArgs;
+                const configHasTuning = typeof (config as any)?.llama?.contextSize === "number";
+                const recorded = configHasTuning || !sa
+                  ? recordedTuning(config)
+                  : {
+                      ...recordedTuning(config),
+                      ...Object.fromEntries(Object.entries(sa).filter(([k, v]) => v !== undefined && k !== "modelPath" && k !== "port")),
+                    } as ReturnType<typeof recordedTuning>;
                 const sw = await switchModelAndServer({
                   modelPath: report.configuredModel!,
-                  // Reused verbatim; never re-planned. A restart that moves the
-                  // port is an install nobody can predict.
-                  port: report.configuredPort ?? 8080,
+                  // The port the server is on (report.port: where a llama-server is
+                  // actually listening, else the record). Never re-planned — but NOT the
+                  // record alone, which is stale when the server was started by hand.
+                  port: report.port,
                   binPath,
-                  tuning: recordedTuning(config),
+                  tuning: recorded,
+                  // The recorded tuning is re-applied as is; this only reports whether the
+                  // GPU will be used, on a reading taken after the old server released it.
+                  retune: async () => ({
+                    lines: describeGpuPlan(await detectHardware(), {
+                      gpuLayers: recorded.gpuLayers,
+                      contextSize: recorded.contextSize,
+                      cpuMoeLayers: recorded.cpuMoeLayers ?? 0,
+                    }),
+                  }),
                 });
+                if (sw.ok) await recordServerPort(projectRoot, sw.port).catch(() => false);
                 ui?.pushStatus(`[server] ${sw.lines.join("\n")}`);
               } catch (err) {
                 ui?.pushStatus(`[server 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
@@ -1301,10 +1353,7 @@ async function main() {
                 //
                 // So the bar is ONE row, redrawn in place, and committed to the
                 // scrollback when the transfer ends.
-                onProgress: (defaultReporter) => (p) => {
-                  ui?.endTransient?.();
-                  ui?.setTransient?.(formatProgress(p));
-                },
+                onProgress: transientProgress(() => ui),
               });
               const changed = describeReset(config as unknown as Record<string, unknown>, report.config);
               const inForce = describeInForce(report.config);

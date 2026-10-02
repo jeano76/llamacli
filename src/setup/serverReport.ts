@@ -18,7 +18,7 @@
  * my server" silently switch models.
  */
 
-import { detectPortOwner, detectRunningServerPort, type PortOwner } from "./modelSwitch.js";
+import { detectPortOwner, resolveLiveServerPort, parseLlamaServerArgs, type ParsedServerArgs, type LiveLlamaServer, type PortOwner } from "./modelSwitch.js";
 import { findLlamaServer } from "./llamaCpp.js";
 
 export interface ServerReport {
@@ -31,12 +31,20 @@ export interface ServerReport {
   port: number;
   /** True when `port` came from the running server rather than the config. */
   portDiscovered: boolean;
+  /** Set when the config records a port that has NO llama-server on it while one is
+   *  listening elsewhere: the record is stale. */
+  stalePort?: { recorded: number; actual: number };
   /** The model the config names. */
   configuredModel?: string;
   /** The binary the config names. */
   configuredBin?: string;
   /** Who holds the port right now, if anyone. */
   owner: PortOwner;
+  /** Set when the model/binary in this report came from the RUNNING server's own command
+   *  line because the config records none (a server started by hand). */
+  fromRunningServer?: boolean;
+  /** The running server's own settings, parsed from its command line. */
+  serverArgs?: ParsedServerArgs;
   /** What discovery found for the configured model, and whether it can read it. */
   build?: {
     binPath: string;
@@ -56,7 +64,10 @@ export interface ReportOptions {
   projectRoot: string;
   /** Injected for tests. */
   detectOwner?: (port: number) => Promise<PortOwner>;
-  /** Injected for tests. Used ONLY when the config records no port. */
+  /** Injected for tests: replaces the process scan that finds where llama-server listens. */
+  resolvePort?: (recorded: number | undefined) => Promise<{ port: number; source: "recorded" | "live" | "recorded-idle" | "default"; servers?: LiveLlamaServer[] }>;
+  /** Injected for tests: the port a llama-server is listening on, or null. Treated as the
+   *  one live server when `resolvePort` is not given. */
   detectRunningPort?: () => Promise<number | null>;
   /** Injected for tests. */
   findServer?: typeof findLlamaServer;
@@ -67,20 +78,38 @@ const DEFAULT_PORT = 8080;
 export async function reportServer(opts: ReportOptions): Promise<ServerReport> {
   const llama = (opts.config?.llama ?? {}) as Record<string, any>;
   const configuredPort = typeof llama.port === "number" ? llama.port : undefined;
-  const configuredModel = typeof llama.modelPath === "string" ? llama.modelPath : undefined;
-  const configuredBin = typeof llama.binPath === "string" ? llama.binPath : undefined;
+  let configuredModel = typeof llama.modelPath === "string" ? llama.modelPath : undefined;
+  let configuredBin = typeof llama.binPath === "string" ? llama.binPath : undefined;
 
-  // The port to inspect. NOT re-planned — the same rule the switch follows, so
-  // the report and the action can never disagree about which port is "the" port.
-  //
-  // An unrecorded port is resolved by ASKING THE RUNNING SERVER, and that is not
-  // a refinement. This config has no `llama` block at all, so the first version
-  // reported "포트 8080 · 서버 없음" on a machine with a live server on 8084 —
-  // confidently wrong, and worse than saying nothing, because a user who believed
-  // it would conclude their server had died. `8080` is correct only when nothing
-  // is listening, which is the one case where binding it cannot collide.
-  const port = configuredPort ?? (await (opts.detectRunningPort ?? detectRunningServerPort)()) ?? DEFAULT_PORT;
+  // The port to inspect: where a llama-server is ACTUALLY listening, falling back to the
+  // record only when nothing is. Reporting the record while a server sits on another port
+  // said "포트 8080 · 서버 없음" about a live server on 8084 — confidently wrong, and a
+  // user who believed it would conclude the server had died (and start a second one).
+  const resolvePort =
+    opts.resolvePort ??
+    (opts.detectRunningPort
+      ? async (r: number | undefined) => {
+          const live = await opts.detectRunningPort!();
+          return resolveLiveServerPort(r, { servers: live === null ? [] : [{ pid: 0, port: live, cmdline: "llama-server" }] });
+        }
+      : (r: number | undefined) => resolveLiveServerPort(r));
+  const resolved = await resolvePort(configuredPort);
+  const port = resolved.port;
+  const stalePort =
+    configuredPort !== undefined && resolved.source === "live" && resolved.port !== configuredPort
+      ? { recorded: configuredPort, actual: resolved.port }
+      : undefined;
   const owner = await (opts.detectOwner ?? ((p) => detectPortOwner(p)))(port);
+
+  // A server the user started by hand has no `llama` block in any config — the adopted
+  // config only records a URL — so "config 에 모델이 없습니다" would be the whole answer
+  // about a server that is plainly running a model. Its own command line has the model,
+  // the binary and the tuning; use them for whatever the config does not say.
+  const live = resolved.servers?.find((x) => x.port === port);
+  const serverArgs = live ? parseLlamaServerArgs(live.cmdline) : undefined;
+  let fromRunningServer = false;
+  if (live && !configuredModel && serverArgs?.modelPath) { configuredModel = serverArgs.modelPath; fromRunningServer = true; }
+  if (live && !configuredBin && live.exe) { configuredBin = live.exe; fromRunningServer = true; }
 
   let build: ServerReport["build"];
   try {
@@ -116,12 +145,15 @@ export async function reportServer(opts: ReportOptions): Promise<ServerReport> {
   return {
     configuredPort,
     port,
-    portDiscovered: configuredPort === undefined,
+    portDiscovered: configuredPort === undefined || resolved.source === "live",
+    stalePort,
+    fromRunningServer,
+    serverArgs,
     configuredModel,
     configuredBin,
     owner,
     build,
-    summary: summarize({ port, portDiscovered: configuredPort === undefined, configuredModel, owner, build }),
+    summary: summarize({ port, portDiscovered: configuredPort === undefined || resolved.source === "live", stalePort, configuredModel, owner, build }),
     restartPlan: restartPlan({ configuredModel, configuredBin, port, owner, build }),
   };
 }
@@ -129,6 +161,7 @@ export async function reportServer(opts: ReportOptions): Promise<ServerReport> {
 function summarize(r: {
   port: number;
   portDiscovered: boolean;
+  stalePort?: { recorded: number; actual: number };
   configuredModel?: string;
   owner: PortOwner;
   build?: ServerReport["build"];
@@ -136,7 +169,10 @@ function summarize(r: {
   // The RESOLVED port, and marked as discovered when the config did not record
   // it — so "8084 (실행 중인 서버에서 확인)" is visibly a different kind of
   // claim from a recorded "8084".
-  const parts: string[] = [`포트 ${r.port}${r.portDiscovered ? " (실행 중인 서버에서 확인)" : ""}`];
+  const parts: string[] = [
+    `포트 ${r.port}${r.portDiscovered ? " (실행 중인 서버에서 확인)" : ""}` +
+      (r.stalePort ? ` — config 에는 ${r.stalePort.recorded} 로 기록돼 있어 실제와 다릅니다` : ""),
+  ];
   if (r.configuredModel) parts.push(`모델 ${r.configuredModel.split("/").pop()}`);
   switch (r.owner.kind) {
     case "none":

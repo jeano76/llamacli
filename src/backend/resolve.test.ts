@@ -1014,3 +1014,48 @@ test("discovery probes the recorded port before the heuristic list", async () =>
     globalThis.fetch = realFetch;
   }
 });
+
+// ── download progress is one redrawn line, not a scrolling log ──────────────
+
+test("with a redraw channel, a transfer is reported there and NOT as a log line per percent", async () => {
+  const { resolveBackend } = await import("./resolve.js");
+  const logs: string[] = [];
+  const drawn: (string | null)[] = [];
+  await resolveBackend({
+    projectRoot: "/p",
+    config: { backend: "local-llama" } as any,
+    log: (l: string) => logs.push(l),
+    progressLine: (t: string | null) => drawn.push(t),
+    discover: async () => ({ kind: "none" }) as any,
+    bootstrap: (async (o: any) => {
+      const report = o.onProgress(() => {});
+      for (let i = 1; i <= 100; i++) {
+        report({ label: "m", receivedBytes: i * 1e7, totalBytes: 1e9, bytesPerSecond: 1e7, etaSeconds: 5, percent: i });
+      }
+      return { ok: false, steps: [], errors: [] };
+    }) as any,
+  } as any).catch(() => {});
+  assert.equal(drawn.filter((d) => d !== null).length, 100);
+  assert.equal(drawn[drawn.length - 1], null, "the row is released once the transfer is over");
+  assert.ok(!logs.some((l: string) => /모델 다운로드 중/.test(l)), "no per-percent log lines");
+});
+
+test("without a redraw channel (piped output) progress is throttled to whole percents", async () => {
+  const { resolveBackend } = await import("./resolve.js");
+  const logs: string[] = [];
+  await resolveBackend({
+    projectRoot: "/p",
+    config: { backend: "local-llama" } as any,
+    log: (l: string) => logs.push(l),
+    discover: async () => ({ kind: "none" }) as any,
+    bootstrap: (async (o: any) => {
+      const report = o.onProgress(() => {});
+      for (let i = 0; i < 400; i++) {
+        report({ label: "m", receivedBytes: i, totalBytes: 400, bytesPerSecond: 1, etaSeconds: 1, percent: (i * 100) / 400 });
+      }
+      return { ok: false, steps: [], errors: [] };
+    }) as any,
+  } as any).catch(() => {});
+  const lines = logs.filter((l: string) => /모델 다운로드 중/.test(l));
+  assert.ok(lines.length > 0 && lines.length <= 100, `got ${lines.length}`);
+});
