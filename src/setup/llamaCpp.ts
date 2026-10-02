@@ -34,6 +34,9 @@ import { delimiter, dirname, join } from "node:path";
 import { execFile, spawn as spawnProc } from "node:child_process";
 import { promisify } from "node:util";
 import type { Hardware } from "./hardware.js";
+import { chooseBuildTarget, detectCudaArch, buildJobs, buildDiskBytes, type BuildBackend, type BuildTarget } from "./buildTarget.js";
+import { planBuildEnv, applyBuildEnv } from "./buildEnv.js";
+import { diskInfoFor, type Statfs } from "./disk.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -107,7 +110,7 @@ export interface LlamaLocation {
  * `candidatePaths` instead, and listing them here produced paths like
  * `~/llama.cpp/bin/bin/llama-server` that exist nowhere.
  */
-const BUILD_DIR_PREFERENCE = ["build-opt", "build-cuda", "build-cpu", "build", "build-release"];
+const BUILD_DIR_PREFERENCE = ["build-opt", "build-cuda", "build-metal", "build-vulkan", "build-cpu", "build", "build-release"];
 
 /** Score for a build directory name; lower is better, and `undefined` means
  *  "not a recognised build dir at all" (still searched, just last). */
@@ -831,14 +834,23 @@ export interface BuildOptions {
   /** Where to keep the checkout. Separate per repo, so building the fork does not
    *  clobber a stock tree (or vice versa) and the two can coexist. */
   home?: string;
+  /** Force a backend instead of choosing the best one the toolchain allows. The
+   *  engine ladder uses this to retry as CPU when an accelerated build was unusable. */
+  backend?: BuildBackend;
+  /** Injected for tests. */
+  statfs?: Statfs;
+  /** Injected for tests; defaults to a TTY check. */
+  interactive?: boolean;
 }
 
 /** Clones (or updates) and builds llama.cpp, returning the built binary path.
  *
- * The CUDA decision comes from `hw.canBuildCuda` — a machine can have a GPU
- * with no `nvcc`, and asking cmake for `-DGGML_CUDA=ON` in that state produces
- * a configure error rather than a CPU fallback. Threads are capped at the core
- * count because a `-j` larger than the machine only thrashes.
+ * What is built comes from `chooseBuildTarget`, which only returns a backend whose
+ * toolchain was measured present — a machine can have a GPU with no `nvcc`, and
+ * asking cmake for `-DGGML_CUDA=ON` in that state is a configure error rather than a
+ * CPU fallback. Build tools are installed by `planBuildEnv` (only what is missing,
+ * for the package manager that is there), and the job count is capped by free RAM as
+ * well as cores.
  */
 export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
   const { hw, run, log = () => {} } = opts;
@@ -848,13 +860,36 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
   // for a model only one of them can read.
   const dir = opts.home ?? (repo === LLAMA_CPP_REPO ? LLAMA_CPP_HOME : join(LLAMA_CPP_HOME + "-fork"));
 
+  const cudaArch = hw.canBuildCuda ? await detectCudaArch(run as never) : null;
+  const target: BuildTarget = chooseBuildTarget(hw, cudaArch, opts.backend);
+
+  // ── Preflight: refuse early, with the reason, instead of failing at minute 30 ──
+  const need = buildDiskBytes(target.backend);
+  const disk = await diskInfoFor(dir, opts.statfs);
+  if (disk.freeBytes < need) {
+    throw new Error(
+      `빌드에 약 ${(need / 1024 ** 3).toFixed(0)} GiB 의 디스크가 필요하지만 ${dir} 이 있는 파일시스템의 여유는 ` +
+        `${(disk.freeBytes / 1024 ** 3).toFixed(1)} GiB 입니다.`
+    );
+  }
+
   if (opts.installDeps !== false) {
-    log(`빌드 패키지를 설치합니다 (CUDA: ${hw.canBuildCuda ? "예" : "아니오"})…`);
-    const deps = await installBuildPackages({ cuda: hw.canBuildCuda, run });
-    if (!deps.ok) {
-      // Not fatal on its own: the machine may already have everything (which is
-      // the common case on a dev box, and is why we try the build regardless).
-      log(`패키지 자동 설치에 실패했지만 이미 설치되어 있을 수 있어 계속합니다: ${deps.output.split("\n").slice(-1)[0]}`);
+    const plan = planBuildEnv(hw, { needs: { vulkan: target.backend === "vulkan" } });
+    log(plan.summary);
+    if (plan.commands.length > 0) {
+      const res = await applyBuildEnv(plan, {
+        run: run as never,
+        log,
+        interactive: opts.interactive ?? Boolean(process.stdin.isTTY),
+      });
+      if (!res.ok) {
+        // Not fatal on its own: the tools may be usable anyway (a fresh shell is
+        // sometimes all that is missing), and the configure step will say precisely
+        // what is absent if they are not.
+        log(`빌드 도구 설치가 확인되지 않았지만 계속합니다: ${res.output.split("\n").filter(Boolean).slice(-1)[0] ?? ""}`);
+      }
+    } else if (plan.manual) {
+      throw new Error(plan.manual);
     }
   }
 
@@ -877,7 +912,7 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
     }
   }
 
-  const buildDir = hw.canBuildCuda ? "build-cuda" : "build-cpu";
+  const buildDir = target.dir;
   const cmakeFlags = [
     "-B", buildDir,
     "-DCMAKE_BUILD_TYPE=Release",
@@ -885,25 +920,40 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
     // GGML_NATIVE lets the build target this exact CPU, which on a modern
     // desktop CPU is a large prefill/decode win over a generic build.
     "-DGGML_NATIVE=ON",
-    ...(hw.canBuildCuda ? ["-DGGML_CUDA=ON"] : []),
+    ...target.flags,
   ];
-  log(`cmake 설정 중… (${hw.canBuildCuda ? "CUDA" : "CPU"})`);
+  log(`cmake 설정 중… (${target.label})`);
   await run("cmake", cmakeFlags, { cwd: dir, timeout: 20 * 60_000 });
 
-  const jobs = String(Math.max(1, Math.min(hw.cpuCount, 16)));
-  log(`빌드 중… (-j${jobs})`);
-  await run("cmake", ["--build", buildDir, "--config", "Release", "-j", jobs], {
-    cwd: dir,
-    // A CUDA build of llama.cpp is genuinely long; the generic 20 min default
-    // is not enough on a slow CPU and would abort a build that was working.
-    timeout: 120 * 60_000,
-  });
+  const buildCmd = (jobs: number) =>
+    run("cmake", ["--build", buildDir, "--config", "Release", "-j", String(jobs)], {
+      cwd: dir,
+      // A CUDA build of llama.cpp is genuinely long; the generic 20 min default
+      // is not enough on a slow CPU and would abort a build that was working.
+      timeout: 120 * 60_000,
+    });
+  const jobs = buildJobs(hw, target.backend);
+  log(`빌드 중… (-j${jobs}${jobs < Math.min(hw.cpuCount, 16) ? ", 여유 메모리에 맞춰 코어 수보다 줄임" : ""})`);
+  try {
+    await buildCmd(jobs);
+  } catch (err) {
+    if (jobs === 1) throw err;
+    // The usual cause of a mid-build failure on a small box is the kernel killing a
+    // compiler for memory. One serial retry costs time and removes that cause.
+    log("빌드가 실패해 -j1 로 한 번 더 시도합니다 (메모리 부족일 수 있습니다).");
+    await buildCmd(1);
+  }
 
-  const bin = join(dir, buildDir, "bin", "llama-server");
-  if (!(await isExecutable(bin))) {
-    throw new Error(`빌드가 끝났지만 ${bin} 을 찾을 수 없습니다.`);
+  const bin = (await firstExecutable(candidatePaths(dir, [buildDir])));
+  if (!bin) {
+    throw new Error(`빌드가 끝났지만 ${dir}/${buildDir} 아래에서 ${binNameFor()} 를 찾을 수 없습니다.`);
   }
   return bin;
+}
+
+async function firstExecutable(paths: string[]): Promise<string | null> {
+  for (const p of paths) if (await isExecutable(p)) return p;
+  return null;
 }
 
 async function dirExists(path: string): Promise<boolean> {

@@ -264,6 +264,7 @@ export async function ownLlamaServerVramGiB(
  *  its absence is a very different failure than a missing compiler, so it's
  *  reported here too. */
 const PROBE_TOOLS = [
+  "c++", "clang++",
   "git", "cmake", "make", "ninja", "g++", "cc", "nvcc", "curl", "pkg-config",
   // Accelerator toolchains: decide whether a GPU-targeted source build can work.
   "hipcc", "glslc", "vulkaninfo",
