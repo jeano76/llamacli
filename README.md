@@ -827,6 +827,39 @@ file, so it would have passed no matter what the app did; the second stamped the
 allocated id onto the created row, which it had not, and the bar grew the log
 anyway — caught immediately by the test that exists to catch exactly that.
 
+## Self-update reports every stage, with elapsed time
+
+Startup self-update printed **one banner and then went silent** for the whole
+download-verify-install. Nothing said which stage was running, so a slow step was
+indistinguishable from a hang.
+
+Worse, the window **before the manifest resolved printed nothing at all**. That
+is the worst case: a slow or unreachable GitHub looked exactly like a frozen
+startup.
+
+```
+[manifest  ] 원격 매니페스트 확인 중… (0.0초 경과)
+[download  ] 아카이브 다운로드 중… (0.03초 경과)
+[verify    ] 해시 검증 중… (0.18초 경과)
+[extract   ] 압축 푸는 중… (0.18초 경과)
+```
+
+Each stage is announced **when it begins**, not when it ends, and the `manifest`
+stage fires **before the request** — the only ordering that closes the silent
+window. On a TTY the four stages rewrite one line rather than adding four; a
+non-ANSI sink gets plain lines.
+
+The elapsed number is what does the work: a stage with no clock reads as stalled
+whether or not it is, while `(7초)` reads as progress.
+
+**A normal launch leaves the terminal untouched.** "Already up to date" is the
+overwhelmingly common case, and the manifest stage must fire before the fetch to
+close the silent window — so it flashes on every startup. It is therefore
+*erased* rather than newline-terminated when there is no update, and only a real
+update leaves a trace. Tests assert that up-to-date reports the manifest stage
+and nothing else, because a full stage list there would mean downloading an
+update that does not exist.
+
 ## Validation on a bare machine and on Windows `cmd`
 
 The other three harnesses all assume a machine that already has things: a home
@@ -885,7 +918,7 @@ which is what made the four bugs findable at all.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 843 unit tests
+npm test                                              # 850 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -893,7 +926,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **843** | pass |
+| Unit / regression | `npm test` | **850** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |

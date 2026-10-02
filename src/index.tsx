@@ -16,7 +16,7 @@ import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
 import { buildVersionString } from "./tui/banner.js";
-import { checkAndApplyUpdate, spawnRestart } from "./selfUpdate.js";
+import { checkAndApplyUpdate, spawnRestart, UPDATE_STAGE_LABEL, type UpdateStage } from "./selfUpdate.js";
 import { checkBuildFreshness, stalenessMessage } from "./buildStamp.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth, stripAnsi } from "./tui/terminal.js";
 import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
@@ -409,7 +409,30 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
   // two explicit, unmistakable stages instead of one terse line printed
   // only after everything already finished:
   let announcedUpdateFound = false;
+  // Every stage, as it begins, with elapsed time. One banner followed by silence
+  // made a slow download indistinguishable from a hang — and the very first
+  // window (resolving the remote manifest) printed NOTHING at all, so a slow or
+  // unreachable GitHub looked exactly like a frozen startup.
+  //
+  // The elapsed time is the part that does the work: a stage with no number
+  // reads as stalled whether or not it is, while "(7초)" reads as progress.
+  // Rewritten in place on a TTY so this is a status line rather than a second
+  // scroll of output.
+  const canRewrite = Boolean(process.stdout.isTTY);
+  let wroteStage = false;
+  const onStage = (name: UpdateStage, elapsedMs: number) => {
+    const secs = (elapsedMs / 1000).toFixed(1);
+    const line = `[self-update] ${UPDATE_STAGE_LABEL[name]}… (${secs}초 경과)`;
+    if (canRewrite) {
+      // `\r` + erase-line, so four stages cost one line instead of four.
+      process.stdout.write(`\r\x1b[2K${line}`);
+      wroteStage = true;
+    } else {
+      process.stdout.write(`${line}\n`);
+    }
+  };
   const result = await checkAndApplyUpdate(distDir, {
+    onStage,
     onUpdateFound: (manifest) => {
       announcedUpdateFound = true;
       process.stdout.write(
@@ -423,7 +446,21 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
       );
     },
   }).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
+  if (wroteStage && canRewrite && result.updated) {
+    // Close the transient line, or the next write lands on the same row and the
+    // two messages overprint each other — which is how a progress line turns
+    // into an unreadable smear on the way out.
+    process.stdout.write("\n");
+  }
   if (!result.updated) {
+    if (wroteStage && canRewrite) {
+      // ALREADY UP TO DATE is the overwhelmingly common case, and the manifest
+      // stage has to be announced before the fetch to close the silent window —
+      // which means it flashes on every single startup. Erased rather than
+      // newline-terminated, so a normal launch leaves the terminal exactly as
+      // it found it and only a real update leaves a trace.
+      process.stdout.write("\r\x1b[2K");
+    }
     // Said out loud rather than swallowed. A silent no-op is indistinguishable
     // from "up to date", which is how a developer ends up believing they ran
     // the published build when in fact they ran something else — or, worse,

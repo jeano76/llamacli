@@ -151,6 +151,19 @@ export function updateRefusedForCheckout(
   };
 }
 
+export type UpdateStage =
+  | "manifest"
+  | "download"
+  | "verify"
+  | "extract";
+
+export const UPDATE_STAGE_LABEL: Record<UpdateStage, string> = {
+  manifest: "원격 매니페스트 확인 중",
+  download: "아카이브 다운로드 중",
+  verify: "해시 검증 중",
+  extract: "압축 푸는 중",
+};
+
 export interface SelfUpdateResult {
   updated: boolean;
   reason: string;
@@ -179,6 +192,21 @@ export async function checkAndApplyUpdate(
     // the caller can announce it clearly BEFORE the download/verify/install
     // work starts, not only after everything already succeeded.
     onUpdateFound?: (manifest: UpdateManifest) => void;
+    /**
+     * Reports each stage as it BEGINS, with the elapsed time since startup.
+     *
+     *  The update banner used to be one block of text printed once, after which
+     *  the process went silent for the whole download-and-install. Nothing said
+     *  which stage was running, so a slow step was indistinguishable from a
+     *  hang — and before the manifest resolves there was no output AT ALL, so
+     *  the worst case (a slow or unreachable GitHub) looked exactly like a
+     *  frozen startup.
+     *
+     *  `elapsedMs` is there so the caller can show that time is passing. A stage
+     *  with no elapsed time looks stalled whether or not it is; the same stage
+     *  with "(7초)" reads as working.
+     */
+    onStage?: (stage: UpdateStage, elapsedMs: number) => void;
     /** Injected so the opt-out and URL overrides are testable without
      *  mutating the real process environment. */
     env?: NodeJS.ProcessEnv;
@@ -187,6 +215,11 @@ export async function checkAndApplyUpdate(
   // Checked first so the opt-out is absolute: no manifest fetch, no archive
   // download, and above all no write to dist/. See selfUpdateDisabled's
   // comment for why this matters when working on the tool itself.
+  // Every stage is timed from here, and announced when it BEGINS rather than
+  // when it ends -- so the user is told what is happening while it happens.
+  const startedAt = Date.now();
+  const stage = (name: UpdateStage) => opts.onStage?.(name, Date.now() - startedAt);
+
   if (selfUpdateDisabled(opts.env)) {
     return { updated: false, reason: "self-update disabled via LLAMACLI_NO_UPDATE=1" };
   }
@@ -202,6 +235,10 @@ export async function checkAndApplyUpdate(
   const manifestUrl = opts.manifestUrl ?? opts.env?.LLAMACLI_UPDATE_MANIFEST_URL ?? DEFAULT_MANIFEST_URL;
   const archiveUrl = opts.archiveUrl ?? opts.env?.LLAMACLI_UPDATE_ARCHIVE_URL ?? DEFAULT_ARCHIVE_URL;
 
+  // Announced BEFORE the request, not after it succeeds. This window is where a
+  // slow or unreachable GitHub used to produce total silence: the process had
+  // started, printed nothing, and looked frozen until the timeout fired.
+  stage("manifest");
   let manifest: UpdateManifest;
   try {
     const res = await fetchImpl(manifestUrl, { signal: AbortSignal.timeout(opts.manifestTimeoutMs ?? 5000) });
@@ -248,6 +285,7 @@ export async function checkAndApplyUpdate(
   }
 
   opts.onUpdateFound?.(manifest);
+  stage("download");
 
   let downloaded: Buffer;
   try {
@@ -258,6 +296,7 @@ export async function checkAndApplyUpdate(
     return { updated: false, reason: `archive fetch failed: ${err.message ?? err}` };
   }
 
+  stage("verify");
   // Verify #1: the downloaded bytes, before anything touches disk.
   if (sha256Hex(downloaded) !== manifest.sha256) {
     return { updated: false, reason: "downloaded archive's hash doesn't match the manifest — refusing to install it" };
@@ -280,6 +319,7 @@ export async function checkAndApplyUpdate(
     // default — the exact bug this fix targets — fall back to a pure-Node
     // gzip+tar extractor below (zero new dependencies), so Windows installs
     // don't silently throw and leave dist/ untouched.
+    stage("extract");
     if (process.platform === "win32") {
       await extractTarGz(tmpArchivePath, distDir);
     } else {
