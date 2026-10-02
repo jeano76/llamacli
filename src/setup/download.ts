@@ -38,6 +38,17 @@
  */
 
 import { open, rename, stat } from "node:fs/promises";
+import {
+  loadProgress,
+  saveProgress,
+  clearProgress,
+  withRange,
+  isComplete,
+  partitionRanges,
+  progressPathOf,
+  type DownloadProgress,
+  type RangeSpan,
+} from "./downloadProgress.js";
 import type { FileHandle } from "node:fs/promises";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -346,13 +357,31 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
   // last byte and the rename. In the second case the bytes are all there and
   // re-downloading them is pure waste — so the .part is PROMOTED (renamed) and
   // reported complete, rather than being treated as a download that never
-  // happened. Without this, a machine that lost power at 99% re-fetched the
-  // whole model on every subsequent launch.
+  // happened.
+  //
+  // SIZE IS NOT THE COMPLETION SIGNAL, and treating it as one was a data
+  // corruption bug. `downloadRanges` pre-truncates the .part to the FINAL
+  // length so every segment's pwrite lands in allocated space, so the file is
+  // full length from the first second; an interrupted run's next attempt saw
+  // `atPart >= total`, promoted it, and llamacli ended up with a model of
+  // exactly the right size whose unwritten regions are zero bytes. Silent, and
+  // discovered much later inside llama-server.
+  //
+  // The durable range list in the sidecar is what says "this is finished".
+  // Where there is no usable state (an older .part, a corrupt sidecar) the
+  // answer is to re-fetch, because promoting bytes of unknown provenance is the
+  // failure this exists to prevent.
   const completeAt = probe.totalBytes > 0 ? probe.totalBytes : 0;
   const atFinal = await existingSize(path);
   const atPart = await existingSize(partPath);
-  const already = Math.max(opts.resumeFrom ?? 0, atFinal, atPart);
-  if (completeAt > 0 && already >= completeAt) {
+  const state = await loadProgress(partPath, probe.finalUrl, completeAt);
+  const finished = state !== null && isComplete(state) && atPart >= completeAt;
+  // A file at the FINAL name is only trustworthy when this run's own state says
+  // the same url/size completed, or when the caller vouches for it explicitly
+  // (resumeFrom) -- which is how an install that predates the sidecar keeps
+  // working without silently re-fetching 22 GB.
+  const finalIsDone = atFinal >= completeAt && (state === null || isComplete(state) || (opts.resumeFrom ?? 0) >= completeAt);
+  if (completeAt > 0 && (finished || finalIsDone)) {
     transfer.setTotal(completeAt);
     transfer.add(completeAt);
     onProgress?.(transfer.progress());
@@ -360,6 +389,10 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
     // a usable file, which is the whole point of noticing it was complete.
     if (atPart >= completeAt && atFinal < completeAt) {
       try { await rename(partPath, path); } catch { /* best effort */ }
+      // The .part is gone, so its state must go too — a stale sidecar at the
+      // same path would let a later, DIFFERENT download inherit a "complete"
+      // verdict from this one.
+      await clearProgress(partPath);
     }
     return { path, bytes: completeAt, parallel: false };
   }
@@ -443,11 +476,36 @@ async function downloadRanges(
   transfer: Transfer,
   ctx: RangeCtx
 ): Promise<void> {
-  const ranges = planRanges(probe.totalBytes, ctx.connections, ctx.maxPartBytes);
-  if (ranges.length === 0) {
+  const planned = planRanges(probe.totalBytes, ctx.connections, ctx.maxPartBytes);
+  if (planned.length === 0) {
     await downloadSingle(probe.finalUrl, partPath, handle, transfer, ctx);
     return;
   }
+
+  // Resume: ranges a previous run recorded as finished are skipped, and their
+  // bytes are added to the progress total so the bar starts where it left off
+  // instead of at zero. Without this a 22 GB model at ~3 h restarts from byte 0
+  // on every retry, which is the whole complaint.
+  const prior = await loadProgress(partPath, probe.finalUrl, probe.totalBytes);
+  const { skip, todo: ranges } = partitionRanges(planned, prior?.ranges ?? []);
+  if (skip.length > 0) {
+    transfer.add(skip.reduce((n, r) => n + (r.end - r.start + 1), 0));
+  }
+
+  // Shared, mutable, and written after each segment: the state has to outlive
+  // the process for a resume to be possible at all. Serialised through a chain
+  // so two segments finishing at once cannot interleave a read-modify-write.
+  let progress: DownloadProgress = prior ?? { url: probe.finalUrl, totalBytes: probe.totalBytes, ranges: [], updatedAt: 0 };
+  let writeChain: Promise<void> = Promise.resolve();
+  const recordRange = (span: RangeSpan): Promise<void> => {
+    writeChain = writeChain
+      .then(async () => {
+        progress = withRange(progress, span);
+        await saveProgress(partPath, progress);
+      })
+      .catch(() => {});
+    return writeChain;
+  };
   // Start the file at its full length so every segment's pwrite at its own
   // offset lands in already-allocated space. Without this the first segment
   // (offset 0) would extend the file only as far as it writes, and a later
@@ -510,6 +568,10 @@ async function downloadRanges(
         transfer.add(buf.length);
         report();
       }
+      // The segment's bytes are on disk: record it durably BEFORE moving on, so
+      // a crash costs at most this one segment rather than everything since the
+      // last checkpoint.
+      await recordRange(range);
   }
   report(true);
   const failure = settled.find((r) => r.status === "rejected");
