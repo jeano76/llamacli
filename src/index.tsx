@@ -781,6 +781,7 @@ async function main() {
       (globalThis as any).__llamacli_ui?.finalizeReasoning();
     },
     onReasoningDelta: (t) => (globalThis as any).__llamacli_ui?.pushReasoningDelta(t),
+    onDecodeRate: (tps) => (globalThis as any).__llamacli_ui?.setDecodeRate(tps),
     onQueueChange: (q) => (globalThis as any).__llamacli_ui?.setQueue(q),
     onToolCall: (name, args) => {
       let preview = "";

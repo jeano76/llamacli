@@ -1,3 +1,4 @@
+import { formatDecodeRate } from "../agent/decodeRate.js";
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput, useStdout } from "ink";
 import stringWidth from "string-width";
@@ -98,6 +99,10 @@ interface LogLine {
    *  full expanded body). Unused for "reasoning", which derives its own via
    *  foldedReasoningSummary(text). */
   foldLabel?: string;
+  /** Decode speed of the response this "assistant" line came from, tokens/second.
+   *  Display-only: drawn after the last word, never part of `text`, so copying, the
+   *  sanitiser and the markdown renderer never see it. */
+  tps?: number;
 }
 
 let logIdCounter = 0;
@@ -117,6 +122,32 @@ interface RenderedRow {
     | "user-paste-expanded"
     | "status-folded";
   lineId: number;
+}
+
+/** Appends " (40 t/s)" after the last word of an assistant block.
+ *
+ *  Applied to the rows AFTER they come out of the wrap cache, on a copy: the cache is
+ *  keyed on (text, width) and the rate changes several times a second, so putting it
+ *  in the cached rows would re-wrap and re-render markdown on every update. If the
+ *  last row has no room left, the rate goes on a row of its own rather than being cut. */
+export function withDecodeRate(rows: string[], tps: number | undefined, width: number, ansi = true): string[] {
+  if (tps === undefined || rows.length === 0) return rows;
+  const tag = formatDecodeRate(tps);
+  // The streaming path draws rows through the shimmer, which slices by character
+  // index and would tear an escape sequence in half, so it gets the bare tag.
+  const styled = ansi ? `\x1b[2m${tag}\x1b[22m` : tag;
+  // Trailing blank rows (markdown paragraph spacing) are skipped so the tag sits on
+  // the last row that actually has text.
+  let last = rows.length - 1;
+  while (last > 0 && stringWidth(stripAnsi(rows[last])) === 0) last--;
+  const out = rows.slice();
+  const used = stringWidth(stripAnsi(out[last]));
+  if (used + 1 + tag.length <= width) {
+    out[last] = `${out[last]} ${styled}`;
+  } else {
+    out.splice(last + 1, 0, styled);
+  }
+  return out;
 }
 
 /** The single-line summary shown for a finished reasoning block once
@@ -1192,6 +1223,22 @@ export function App({
     setStreamingAssistantId(null);
   }
 
+  /** Attaches the current decode speed to the newest assistant line. The loop only
+   *  reports a rate once this response has produced assistant text, and `setLog`
+   *  updaters run in order, so "the newest assistant line" is this response's. */
+  function setDecodeRate(tps: number) {
+    setLog((prev) => {
+      for (let i = prev.length - 1; i >= 0; i--) {
+        if (prev[i].kind !== "assistant") continue;
+        if (prev[i].tps === tps) return prev;
+        const next = prev.slice();
+        next[i] = { ...prev[i], tps };
+        return next;
+      }
+      return prev;
+    });
+  }
+
   function pushReasoningDelta(text: string) {
     setLog((prev) => {
       if (reasoningStreamingIdRef.current !== null) {
@@ -1348,6 +1395,31 @@ export function App({
     // result from parseMouseWheel already returned before the click parser
     // ever ran, so clicks did nothing. Verified against the real binary
     // (pty + a real terminal emulator) that this was the actual cause.
+    // Toggles the fold (if any) on terminal row `row`. Diffs track their FOLDED ids
+    // (default expanded); paste chips and everything else track their EXPANDED ids
+    // (default folded) — see collapsedDiffIds/expandedPasteLineIds/expandedReasoningIds's
+    // own doc comments. Gate lines are the sole exception: they expand the moment they
+    // first appear, then fold until clicked, tracked by which ids have been seen (firstSeen).
+    const toggleFoldAtRow = (row: number) => {
+      if (menuOpen || quittingSince !== null) return;
+      const { firstRow, entries } = clickMapRef.current;
+      const idx = row - firstRow;
+      const entry = idx >= 0 && idx < entries.length ? entries[idx] : undefined;
+      if (!entry?.foldable) return;
+      const setFn = entry.isDiff
+        ? setCollapsedDiffIds
+        : entry.isGate
+          ? setFirstSeen
+          : entry.isPaste
+            ? setExpandedPasteLineIds
+            : setExpandedReasoningIds;
+      setFn((prev) => {
+        const next = new Set(prev);
+        if (next.has(entry.lineId)) next.delete(entry.lineId);
+        else next.add(entry.lineId);
+        return next;
+      });
+    };
     if (/\[<\d+;\d+;\d+[Mm]/.test(char)) {
       const wheel = parseMouseWheel(char);
       if (wheel !== null && wheel !== 0 && !menuOpen && quittingSince === null) {
@@ -1374,8 +1446,13 @@ export function App({
           setDrag(null);
           if (!current) continue;
           if (!current.moved) {
-            // A click, not a drag: fall through to the fold toggle below.
+            // A click, not a drag: toggle the fold under the pointer. This is where it
+            // has to happen. The toggle used to live after this loop and read PRESS
+            // coordinates, but a press over the log always starts a selection (so
+            // `dragRef` is non-null and that code was skipped) and the release branch
+            // only did `continue` — so no click ever toggled anything, on any block.
             setStickySelection(null);
+            toggleFoldAtRow(row);
             continue;
           }
           setStickySelection(current.sel);
@@ -1445,45 +1522,6 @@ export function App({
         }
       }
 
-      // A plain click: toggle a folded/expanded reasoning block if it
-      // landed on one of its rows. Ignored while the menu is open or
-      // saving (the map wasn't built for those layouts).
-      //
-      // Only reached for a press that did NOT become a drag: the release
-      // branch above already consumed that case by clearing dragRef, and
-      // `dragRef.current` is non-null only while a gesture is in flight.
-      if (!menuOpen && quittingSince === null && dragRef.current === null) {
-        const { firstRow, entries } = clickMapRef.current;
-        for (const { row } of parseMouseClicks(char)) {
-          const idx = row - firstRow;
-          const entry = idx >= 0 && idx < entries.length ? entries[idx] : undefined;
-          if (!entry?.foldable) continue;
-          // Diffs track their FOLDED ids (default expanded); paste chips
-          // and everything else track their EXPANDED ids (default folded)
-          // — see collapsedDiffIds/expandedPasteLineIds/expandedReasoningIds's
-          // own doc comments. Gate lines are the sole exception: they expand
-          // the moment they first appear, then fold until clicked, tracked by
-          // which ids have been seen at least once (firstSeen).
-          const setFn = entry.isDiff
-            ? setCollapsedDiffIds
-            : entry.isGate
-              ? setFirstSeen
-              : entry.isPaste
-                ? setExpandedPasteLineIds
-                : setExpandedReasoningIds;
-          setFn((prev) => {
-            const next = new Set(prev);
-            if (next.has(entry.lineId)) next.delete(entry.lineId);
-            else next.add(entry.lineId);
-            return next;
-          });
-          // A press that reaches here also started a selection above; drop it
-          // so a click doesn't leave a stray one-row highlight behind.
-          dragRef.current = null;
-          setDrag(null);
-          setStickySelection(null);
-        }
-      }
       return;
     }
 
@@ -1879,6 +1917,7 @@ export function App({
   // agent loop is wired to real streaming; global is a placeholder only.
   (globalThis as any).__llamacli_ui = {
     pushAssistantDelta,
+    setDecodeRate,
     finalizeAssistant,
     pushReasoningDelta,
     finalizeReasoning,
@@ -2345,7 +2384,7 @@ export function App({
         cached = { text: line.text, width, rows: wrapToWidth(line.text, width).map(asRow) };
         rowCache.set(line.id, cached);
       }
-      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      withDecodeRate(cached.rows, line.tps, width, false).forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
       continue;
     }
     let cached = rowCache.get(line.id);
@@ -2353,7 +2392,8 @@ export function App({
       cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
       rowCache.set(line.id, cached);
     }
-    cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+    const shown = line.kind === "assistant" ? withDecodeRate(cached.rows, line.tps, width) : cached.rows;
+    shown.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
   }
   if (rowCache.size > liveIds.size) {
     for (const id of rowCache.keys()) if (!liveIds.has(id)) rowCache.delete(id);

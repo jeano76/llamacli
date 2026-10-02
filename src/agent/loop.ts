@@ -1,6 +1,7 @@
 import type { ChatMessage, ModelBackend } from "../backend/types.js";
 import { AGENT_STATE_TOOLS, FILE_TOOLS, activeToolDefs, executeTool } from "../tools/index.js";
 import { CircuitBreaker } from "../hermes/selfHeal.js";
+import { DecodeRateTracker } from "./decodeRate.js";
 import {
   runCompaction,
   estimateTokens,
@@ -293,6 +294,10 @@ export interface AgentLoopOptions {
   repeatPenalty?: number;
   /** Clock, injectable for tests. */
   now?: () => number;
+  /** Clock for the decode-speed readout only (see `onDecodeRate`). Defaults to the real
+   *  wall clock; separate from `now` so reading it per chunk cannot move the loop's
+   *  own notion of time. */
+  rateClock?: () => number;
   /** Called for each incremental token/chunk of assistant text as it streams in. */
   onAssistantDelta?: (text: string) => void;
   /** Streamed chain-of-thought (`reasoning_content`), separate from
@@ -303,6 +308,11 @@ export interface AgentLoopOptions {
    *  it within the SAME generation by construction; re-feeding it as input
    *  on a LATER turn would only cost tokens for no benefit. */
   onReasoningDelta?: (text: string) => void;
+  /** Decode speed of the response being streamed, in tokens per second. Called a few
+   *  times a second while it streams (`final: false`) and once more when it finishes
+   *  with the exact figure (`final: true`). Only called after the response has produced
+   *  visible assistant text, so the UI always has an assistant line to attach it to. */
+  onDecodeRate?: (tokensPerSecond: number, final: boolean) => void;
   /** Fires whenever the queued-message list changes (see queueMessage), so
    *  the UI's own display of it (the /queue command) stays in sync with
    *  the authoritative copy this class now owns. */
@@ -797,6 +807,12 @@ export class AgentLoop {
         this.opts.onTurnStart?.();
       };
 
+      // Its own clock, deliberately NOT `this.opts.now`: that one is the loop's logical
+      // time (the progress guard's minutes), tests drive it with a stepping fake, and a
+      // second reader per streamed chunk would advance it and skew the guard. Speed is a
+      // property of real elapsed time, so the real clock is also the correct one.
+      const rate = new DecodeRateTracker(this.opts.rateClock);
+      let sawAssistantText = false;
       let res;
       try {
         res = await this.opts.backend.chat(
@@ -850,8 +866,18 @@ export class AgentLoop {
             if (delta?.content || (delta as any)?.reasoning_content || delta?.tool_calls?.length) {
               maybeFireTurnStart();
             }
-            if (delta?.content) this.opts.onAssistantDelta?.(delta.content);
+            if (delta?.content) {
+              this.opts.onAssistantDelta?.(delta.content);
+              sawAssistantText = true;
+            }
             const reasoning = (delta as any)?.reasoning_content;
+            if (delta?.content || reasoning || delta?.tool_calls?.length) {
+              rate.chunk();
+              if (sawAssistantText) {
+                const live = rate.live();
+                if (live !== null) this.opts.onDecodeRate?.(live, false);
+              }
+            }
             // Surface reasoning whenever the backend sends it, INCLUDING when
             // `enableThinking` is off — because a server can emit reasoning on
             // its own regardless of what we ask for. llama-server defaults
@@ -868,6 +894,10 @@ export class AgentLoop {
             if (typeof reasoning === "string" && reasoning) this.opts.onReasoningDelta?.(reasoning);
           }
         );
+        if (sawAssistantText) {
+          const done = rate.final(res?.usage?.completion_tokens);
+          if (done !== null) this.opts.onDecodeRate?.(done, true);
+        }
       } catch (err: any) {
         // cancelCurrentTurn() already wrote a resumable checkpoint and
         // called backend.cancel() before this throw ever happens — this is
