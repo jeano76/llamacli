@@ -11,6 +11,8 @@ import {
   checkBuildFreshness,
   stalenessMessage,
   BUILD_STAMP_FILE,
+  LOCAL_VERSION_FILE,
+  readLocalVersion,
 } from "./buildStamp.js";
 
 /**
@@ -302,5 +304,56 @@ test("a no-stamp checkout is told to build once, and not that it is out of date"
     const msg = stalenessMessage(checkBuildFreshness(join(dir, "dist"))) ?? "";
     assert.match(msg, /npm run build/);
     assert.doesNotMatch(msg, /오래되었/);
+  });
+});
+// The version a build reports used to come from dist/index.js's mtime, which
+// cannot tell two builds from the same day apart: this project published one at
+// 03:21 and another at 03:53 and both said `v20261002`. The sha suffix is what
+// makes a rebuild distinguishable from the one it replaced.
+test("readLocalVersion reports the version the build recorded, sha and all", async () => {
+  await tmp(async (dir) => {
+    await mkdir(join(dir, "dist"), { recursive: true });
+    await writeFile(join(dir, "dist", LOCAL_VERSION_FILE), "v20261002-55461f7\n");
+    assert.equal(readLocalVersion(join(dir, "dist")), "v20261002-55461f7");
+  });
+});
+
+test("readLocalVersion accepts a bare date for a build with no git sha", async () => {
+  // A build outside a checkout has no sha. The date is still true, just not
+  // unique, so it is shown rather than hidden.
+  await tmp(async (dir) => {
+    await mkdir(join(dir, "dist"), { recursive: true });
+    await writeFile(join(dir, "dist", LOCAL_VERSION_FILE), "v20261002");
+    assert.equal(readLocalVersion(join(dir, "dist")), "v20261002");
+  });
+});
+
+test("readLocalVersion returns null when absent or unrecognisable", async () => {
+  await tmp(async (dir) => {
+    await mkdir(join(dir, "dist"), { recursive: true });
+    // No file — a dist/ built before this change, or a tsx dev run.
+    assert.equal(readLocalVersion(join(dir, "dist")), null);
+    // Present but not a version string: the banner falls back rather than
+    // printing arbitrary file contents into the UI.
+    await writeFile(join(dir, "dist", LOCAL_VERSION_FILE), "rm -rf /\n");
+    assert.equal(readLocalVersion(join(dir, "dist")), null);
+    await writeFile(join(dir, "dist", LOCAL_VERSION_FILE), "v2026\n");
+    assert.equal(readLocalVersion(join(dir, "dist")), null);
+  });
+});
+
+test("two same-day builds are distinguishable only by the sha", async () => {
+  // The concrete regression: these two builds were an hour apart and produced
+  // byte-identical version strings under the old mtime scheme.
+  await tmp(async (dir) => {
+    await mkdir(join(dir, "dist"), { recursive: true });
+    const path = join(dir, "dist", LOCAL_VERSION_FILE);
+    await writeFile(path, "v20261002-55461f7");
+    const first = readLocalVersion(join(dir, "dist"));
+    await writeFile(path, "v20261002-6bb0635");
+    const second = readLocalVersion(join(dir, "dist"));
+    assert.equal(first, "v20261002-55461f7");
+    assert.equal(second, "v20261002-6bb0635");
+    assert.notEqual(first, second);
   });
 });

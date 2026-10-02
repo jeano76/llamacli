@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
 import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart, UPDATE_STAGE_LABEL, type UpdateStage } from "./selfUpdate.js";
-import { checkBuildFreshness, stalenessMessage } from "./buildStamp.js";
+import { checkBuildFreshness, stalenessMessage, readLocalVersion } from "./buildStamp.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth, stripAnsi } from "./tui/terminal.js";
 import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
 import { execFileSync } from "node:child_process";
@@ -367,13 +367,27 @@ function restoreTerminalModes(): void {
   }
 }
 
-/** "vYYYYMMDD" — dist/index.js's own mtime (no separate build-info step
- *  exists to read a date from). Computed here (needs fs access) and handed
- *  to App, which renders the "HARNESS" wordmark itself as ASCII art plus
- *  this version line — see AppProps.startupBanner's doc comment for why
- *  it's not a raw pre-alt-screen stdout write (that was invisible in
- *  practice: reported directly, "최초 구동 로그가 나오지 않았어"). */
+/** This build's version, e.g. "v20261002-55461f7".
+ *
+ *  Read from the file the build wrote (dist/.llamacli-version), because the
+ *  previous source — dist/index.js's own mtime — cannot distinguish two builds
+ *  from the same day: this project published one at 03:21 and another at 03:53
+ *  and both reported `v20261002`, so nothing on screen said which commit was
+ *  live or that a newer build existed at all. The sha makes each build
+ *  identifiable and names its provenance.
+ *
+ *  Falls back to the old mtime guess when the file is absent, which is the case
+ *  for a dist/ built before this change and for a `tsx src/index.tsx` dev run.
+ *  That fallback is coarser by design: it is still true, and it is better than
+ *  an empty banner for a tree that has no recorded version.
+ *
+ *  Needs fs access, so it is computed here and handed to App — see
+ *  AppProps.startupBanner's doc comment for why the banner is not a raw
+ *  pre-alt-screen stdout write (that was invisible in practice: reported
+ *  directly, "최초 구동 로그가 나오지 않았어"). */
 function startupVersion(): string {
+  const recorded = readLocalVersion(dirname(fileURLToPath(import.meta.url)));
+  if (recorded) return recorded;
   try {
     return buildVersionString(statSync(fileURLToPath(import.meta.url)).mtimeMs);
   } catch {

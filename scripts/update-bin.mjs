@@ -23,6 +23,10 @@ const binDir = join(root, "bin");
 const archivePath = join(binDir, "llamacli-dist.tar.gz");
 const manifestPath = join(binDir, "manifest.json");
 
+/** Shipped inside dist/ so an installed copy can name the build it is running.
+ *  Kept in step with src/buildStamp.ts's LOCAL_VERSION_FILE. */
+const VERSION_FILE = ".llamacli-version";
+
 mkdirSync(binDir, { recursive: true });
 
 // ── build provenance ─────────────────────────────────────────────────────────
@@ -52,6 +56,37 @@ const gitSha = (() => {
   }
 })();
 const srcHash = hashTree(join(root, "src"));
+
+// `vYYYYMMDD-<sha>`: the build date, then the commit it was built from.
+//
+// The date used to stand alone, taken from dist/index.js's mtime, and that made
+// two builds on the same day indistinguishable: this repo shipped one at 03:21
+// and another at 03:53 and both were `v20261002`. Nothing about the artifact
+// said which was newer, so a rebuild looked like it had never been published.
+// The sha is what actually distinguishes one build from another, and it doubles
+// as provenance — the archive can name the commit it came from.
+//
+// Falls back to the bare date when git is unavailable or the tree is not a
+// checkout (an exported tarball, a shallow copy with no .git): the date is still
+// true, just not unique. `unknown` likewise — never a hash, because a bogus
+// "sha" in a version string reads as a real provenance claim.
+const mtime = statSync(join(distDir, "index.js")).mtime;
+const pad = (n) => String(n).padStart(2, "0");
+const date = `${mtime.getFullYear()}${pad(mtime.getMonth() + 1)}${pad(mtime.getDate())}`;
+const shortSha = /^[0-9a-f]{7,40}$/.test(gitSha) ? gitSha.slice(0, 7) : null;
+const version = shortSha ? `v${date}-${shortSha}` : `v${date}`;
+
+// Written BEFORE the archive is taken, so it ships inside it. The banner reads
+// this to show the same string the manifest carries; without it in the archive an
+// installed copy could not know its own sha and would fall back to guessing the
+// version from its file mtime, which is exactly the ambiguity this removes.
+//
+// Deliberately NOT the build stamp (dist/.build-stamp.json). That one claims a
+// srcHash for the tree on disk, so overwriting a developer's with the published
+// tree's would make their checkout look fresh when it is not. This file claims
+// only which build these bytes are, which stays true after an overwrite.
+writeFileSync(join(distDir, VERSION_FILE), version + "\n");
+
 // Tar from INSIDE dist/ (-C distDir .) so archive entries are relative
 // ("index.js", "tui/App.js", ...) — matches how src/selfUpdate.ts extracts
 // it back over an existing dist/ directory.
@@ -59,13 +94,6 @@ execFileSync("tar", ["-czf", archivePath, "-C", distDir, "."]);
 
 const archiveContent = readFileSync(archivePath);
 const sha256 = createHash("sha256").update(archiveContent).digest("hex");
-
-// Same vYYYYMMDD shape as banner.ts's buildVersionString, computed the same
-// way (dist/index.js's own mtime) — so the manifest's version always
-// matches what the running CLI's own startup banner would show.
-const mtime = statSync(join(distDir, "index.js")).mtime;
-const pad = (n) => String(n).padStart(2, "0");
-const version = `v${mtime.getFullYear()}${pad(mtime.getMonth() + 1)}${pad(mtime.getDate())}`;
 
 writeFileSync(manifestPath, JSON.stringify({ version, sha256, builtAt: new Date().toISOString() }, null, 2) + "\n");
 // The LOCAL side of the comparison selfUpdate.ts's checkAndApplyUpdate()
