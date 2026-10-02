@@ -39,6 +39,7 @@ import { acquireStockLlamaServer } from "./stockRuntime.js";
 import { chooseModel, resolveModel, pickPinnedCandidate, type ModelChoice } from "./modelCatalog.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
+import { scanModels, pickReusable } from "./existingModel.js";
 import { discoverRunningServer, modelLoadBudgetMs, type Discovery } from "../backend/detect.js";
 import { rm } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
@@ -704,6 +705,18 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
           detail: `동일한 모델이 다른 이름으로 이미 있습니다: ${equivalent}`,
         });
         log(`이미 있는 동일 모델을 사용합니다: ${equivalent}`);
+      } else if (
+        (equivalent = await findModelAnywhere(model.candidate, [target.dir, modelsDir], env, opts.listExistingModels))
+      ) {
+        // The same model on ANOTHER disk or directory (models are not kept in one place):
+        // used where it is. No download, no copy, and the config will point at it.
+        modelPath = equivalent;
+        steps.push({
+          name: "모델 다운로드",
+          ok: true,
+          detail: `동일한 모델이 이미 있어 다시 받지 않고 재사용합니다: ${equivalent}`,
+        });
+        log(`이미 있는 동일 모델을 재사용합니다 (다운로드 안 함): ${equivalent}`);
       } else if (opts.offline) {
         steps.push({ name: "모델 다운로드", ok: false, detail: "오프라인이라 건너뜁니다." });
       } else {
@@ -719,6 +732,12 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
             signal: downloadAbort.signal,
             // The Hub's own hash for this file: the result is hashed before it is trusted.
             expectedSha256: model!.candidate.sha256,
+            // Downloaded, resumed and VERIFIED in a temporary folder; only a file whose hash
+            // checks out is moved into the models directory. Beside the target by default so
+            // the move is an instant rename (a RAM-backed /tmp would need the whole model in
+            // memory, and another filesystem turns the move into a 20 GB copy);
+            // LLAMACLI_TMP_DIR overrides it.
+            stagingDir: env.LLAMACLI_TMP_DIR ? join(env.LLAMACLI_TMP_DIR, "llamacli-downloads") : join(target.dir, ".llamacli-tmp"),
           });
           } catch (err) {
             if (downloadAbort.signal.aborted) {
@@ -1013,6 +1032,24 @@ export async function findEquivalentModel(
     return f.path;
   }
   return null;
+}
+
+/** The candidate's model if it is anywhere this machine keeps models: the target and models
+ *  directories, the conventional ones, and mounted disks' `models` folders. */
+export async function findModelAnywhere(
+  candidate: { filename: string; sizeBytes: number },
+  dirs: string[],
+  env: NodeJS.ProcessEnv,
+  listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>
+): Promise<string | null> {
+  const { candidateDirs, discoverMounts } = await import("./disk.js");
+  const all = [...new Set([...dirs, ...candidateDirs(env), ...(listExistingModels ? [] : await discoverMounts().catch(() => []))])];
+  // An injected lister stands in for the filesystem (tests, and callers that already know
+  // what is on disk), so the real disks are never consulted behind its back.
+  const local = listExistingModels
+    ? (await Promise.all(all.map((d) => listExistingModels(d).catch(() => [])))).flat()
+    : await scanModels(all);
+  return pickReusable(candidate, local)?.path ?? null;
 }
 
 async function listGgufsIn(dir: string): Promise<{ path: string; sizeBytes: number }[]> {

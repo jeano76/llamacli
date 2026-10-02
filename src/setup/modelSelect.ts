@@ -85,6 +85,10 @@ export interface SelectOptions {
   tuning?: LlamaTuning;
   /** Injected for tests; defaults to the real discovery. */
   findServer?: typeof findLlamaServer;
+  /** Injected for tests: the .gguf files on disk, instead of walking the real filesystem. */
+  listLocalModels?: (dirs: string[]) => Promise<{ path: string; sizeBytes: number }[]>;
+  /** Do not treat a same-family file in another quant as "already downloaded". */
+  noFamilyReuse?: boolean;
   /** Injected for tests; defaults to asking the running server. */
   detectRunningPort?: () => Promise<number | null>;
 }
@@ -254,9 +258,20 @@ async function resolveModelPath(
   const configured = configuredModelPath(existing, filename);
   if (configured && (await isFile(configured))) return configured;
 
-  for (const dir of await searchDirs(opts.modelsDir)) {
+  const dirs = await searchDirs(opts.modelsDir);
+  for (const dir of dirs) {
     const hit = await findByName(dir, filename, isFile);
     if (hit) return hit;
+  }
+
+  // The table's quant is an estimate (the 8B has no PTQ1_0 on the Hub; PQ2_0 is what a
+  // download would fetch), so the exact name can be absent while the same MODEL is on disk
+  // in the quant the downloader would have chosen. That copy is reused rather than fetched.
+  if (!opts.noFamilyReuse) {
+    const { scanModels, pickFamilyMatch } = await import("./existingModel.js");
+    const local = opts.listLocalModels ? await opts.listLocalModels(dirs) : await scanModels(dirs);
+    const family = pickFamilyMatch(filename, local);
+    if (family) return family.path;
   }
 
   // 2. Somewhere with room, for the download.

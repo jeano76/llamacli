@@ -37,7 +37,8 @@
  * local `http.Server` with no network and no real multi-gigabyte files.
  */
 
-import { open, rename, rm, stat, writeFile } from "node:fs/promises";
+import { open, rename, rm, stat, writeFile, mkdir, copyFile, rmdir } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { sha256File, normalizeSha256, ChecksumMismatchError } from "./checksum.js";
 import {
   loadProgress,
@@ -320,6 +321,12 @@ export interface DownloadOptions {
    *  call started: that one was not produced here, may legitimately differ from what the
    *  Hub serves today, and deleting a model that works would be worse than not checking. */
   expectedSha256?: string;
+  /** A temporary folder to download into. The file is fetched, resumed and hash-verified
+   *  THERE and only moved to `path` once it checks out, so the model directory never
+   *  holds a half-written or unverified file. Should be on the same filesystem as `path`
+   *  for an instant move (the default the callers use is a hidden folder beside it);
+   *  across filesystems the move is a verified copy. */
+  stagingDir?: string;
   /** Internal: this call is the single clean retry after a mismatch. */
   _verifyRetry?: boolean;
 }
@@ -333,6 +340,8 @@ export interface DownloadResult {
   sha256Verified?: boolean;
   /** Connections actually used (1 for a single stream). */
   connections?: number;
+  /** True when the final move had to copy (the staging folder was on another filesystem). */
+  copiedAcrossFilesystems?: boolean;
 }
 
 /** Where an in-progress download is staged. Kept as a function rather than an
@@ -341,6 +350,41 @@ export interface DownloadResult {
  *  exactly the bug that made a completed download look incomplete. */
 export function partPathOf(path: string): string {
   return `${path}.part`;
+}
+
+/** Where the in-progress copy of `path` lives. With a `stagingDir` it is a temporary folder
+ *  (kept by name, so a restart resumes the same file); without one it is the `.part`
+ *  beside the final name, as before. */
+export function partPathFor(path: string, stagingDir?: string): string {
+  return stagingDir ? join(stagingDir, `${basename(path)}.part`) : partPathOf(path);
+}
+
+/**
+ * Puts a finished, verified file at its final path.
+ *
+ * `rename` when the staging folder is on the same filesystem (instant and atomic — a
+ * reader never sees a half-written model). Across filesystems `rename` fails with EXDEV;
+ * then the bytes are copied to a temporary name NEXT TO the destination and renamed from
+ * there, so even that path never exposes a partial file under the final name.
+ */
+export async function moveIntoPlace(src: string, dest: string): Promise<{ copied: boolean }> {
+  await mkdir(dirname(dest), { recursive: true });
+  try {
+    await rename(src, dest);
+    return { copied: false };
+  } catch (err: any) {
+    if (err?.code !== "EXDEV") throw err;
+  }
+  const tmp = `${dest}.copying`;
+  try {
+    await copyFile(src, tmp);
+    await rename(tmp, dest);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
+  await rm(src, { force: true });
+  return { copied: true };
 }
 
 /** Everything already on disk at `path`, or 0. Used to skip a completed
@@ -381,7 +425,8 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
   const probe = opts.preProbed ?? (await probeUrl(url, fetchImpl, signal));
   const transfer = new Transfer(label, probe.totalBytes, now);
 
-  const partPath = partPathOf(path);
+  const partPath = partPathFor(path, opts.stagingDir);
+  if (opts.stagingDir) await mkdir(opts.stagingDir, { recursive: true });
   // A fully-downloaded file from a previous run: nothing to do.
   //
   // Both names are checked, because there are two ways a previous run can have
@@ -417,27 +462,24 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
     transfer.setTotal(completeAt);
     transfer.add(completeAt);
     onProgress?.(transfer.progress());
-    // Promote a complete .part into its final name so the caller ends up with
-    // a usable file, which is the whole point of noticing it was complete.
-    let promoted = false;
+    // A complete .part from an interrupted run: check it (it was produced by THIS downloader),
+    // and only then move it into place. One already complete under its final name is left
+    // alone (see `expectedSha256`).
     if (atPart >= completeAt && atFinal < completeAt) {
-      try { await rename(partPath, path); promoted = true; } catch { /* best effort */ }
-      // The .part is gone, so its state must go too — a stale sidecar at the
-      // same path would let a later, DIFFERENT download inherit a "complete"
-      // verdict from this one.
-      await clearProgress(partPath);
-    }
-    // A file we just promoted was produced by an earlier run of THIS downloader, so it is
-    // checked. One that was already complete under its final name is left alone (see
-    // `expectedSha256`).
-    if (promoted && expected) {
-      const v = await verifyOrDiscard(path, expected, label, onProgress, signal);
-      if (!v.ok) {
-        if (!opts._verifyRetry) return downloadFile(url, path, { ...opts, _verifyRetry: true });
-        throw new ChecksumMismatchError(path, expected, v.actual);
+      if (expected) {
+        const v = await verifyOrDiscard(partPath, expected, label, onProgress, signal);
+        if (!v.ok) {
+          if (!opts._verifyRetry) return downloadFile(url, path, { ...opts, _verifyRetry: true });
+          throw new ChecksumMismatchError(path, expected, v.actual);
+        }
       }
-      await recordVerified(path, expected);
-      return { path, bytes: completeAt, parallel: false, sha256Verified: true, connections: 0 };
+      const moved = await moveIntoPlace(partPath, path);
+      // The .part is gone, so its state must go too — a stale sidecar at the same path would
+      // let a later, DIFFERENT download inherit a "complete" verdict from this one.
+      await clearProgress(partPath);
+      await cleanStaging(opts.stagingDir);
+      if (expected) await recordVerified(path, expected);
+      return { path, bytes: completeAt, parallel: false, sha256Verified: expected ? true : undefined, connections: 0, copiedAcrossFilesystems: moved.copied };
     }
     return { path, bytes: completeAt, parallel: false };
   }
@@ -474,23 +516,31 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
       });
     }
     await handle.close();
-    // Only now is the file whole: rename is atomic on the same filesystem, so
-    // a reader never observes a half-written model at `path`.
-    await rename(partPath, path);
-    await clearProgress(partPath);
     const finalTotal = transfer.progress().totalBytes;
     onProgress?.(transfer.progress());
     const used = probe.supportsRanges && probe.totalBytes > 0 ? connections : 1;
+    // VERIFY FIRST, in the staging area: nothing reaches the model directory until the hash
+    // says the bytes are the publisher's. A mismatch is discarded where it lies.
     if (expected) {
-      const v = await verifyOrDiscard(path, expected, label, onProgress, signal);
+      const v = await verifyOrDiscard(partPath, expected, label, onProgress, signal);
       if (!v.ok) {
         if (!opts._verifyRetry) return downloadFile(url, path, { ...opts, _verifyRetry: true });
         throw new ChecksumMismatchError(path, expected, v.actual);
       }
-      await recordVerified(path, expected);
-      return { path, bytes: finalTotal > 0 ? finalTotal : (await existingSize(path)), parallel: probe.supportsRanges, sha256Verified: true, connections: used };
     }
-    return { path, bytes: finalTotal > 0 ? finalTotal : (await existingSize(path)), parallel: probe.supportsRanges, connections: used };
+    // Only now is the file whole and checked: move it into place (atomic on one filesystem).
+    const moved = await moveIntoPlace(partPath, path);
+    await clearProgress(partPath);
+    await cleanStaging(opts.stagingDir);
+    if (expected) await recordVerified(path, expected);
+    return {
+      path,
+      bytes: finalTotal > 0 ? finalTotal : await existingSize(path),
+      parallel: probe.supportsRanges,
+      connections: used,
+      copiedAcrossFilesystems: moved.copied,
+      ...(expected ? { sha256Verified: true } : {}),
+    };
   } catch (err) {
     try { await handle.close(); } catch { /* already closed */ }
     throw err;
@@ -505,14 +555,14 @@ async function recordVerified(path: string, sha: string): Promise<void> {
 /** Hashes `path` and compares it with `expected`. On a match returns true. On a mismatch
  *  removes the file and every piece of resume state so the next attempt starts clean. */
 async function verifyOrDiscard(
-  path: string,
+  file: string,
   expected: string,
   label: string,
   onProgress: ((p: TransferProgress) => void) | undefined,
   signal: AbortSignal | undefined
 ): Promise<{ ok: true } | { ok: false; actual: string }> {
   const started = Date.now();
-  const actual = await sha256File(path, {
+  const actual = await sha256File(file, {
     signal,
     onProgress: ({ hashedBytes, totalBytes }) =>
       onProgress?.({
@@ -521,10 +571,18 @@ async function verifyOrDiscard(
       }),
   });
   if (actual === expected) return { ok: true };
-  await rm(path, { force: true });
-  await rm(partPathOf(path), { force: true });
-  await clearProgress(partPathOf(path));
+  // The file under test is the staged .part (or, for a legacy caller, the final name): remove
+  // it with its resume state so the next attempt starts from zero.
+  await rm(file, { force: true });
+  await clearProgress(file);
+  await clearProgress(`${file}`);
   return { ok: false, actual };
+}
+
+/** Removes the staging folder once it is empty (best effort — a sibling download may still
+ *  be using it, in which case `rmdir` refuses and nothing is lost). */
+async function cleanStaging(dir: string | undefined): Promise<void> {
+  if (dir) await rmdir(dir).catch(() => {});
 }
 
 async function probeUrl(url: string, fetchImpl: typeof fetch, signal?: AbortSignal): Promise<ProbeResult> {
@@ -834,7 +892,7 @@ export async function downloadFiles(
         // the user with no file at all.
         const known = sizes.get(f.path) ?? -1;
         const atFinal = await existingSize(f.path);
-        const atPart = await existingSize(partPathOf(f.path));
+        const atPart = await existingSize(partPathFor(f.path, rest.stagingDir));
         if (known > 0 && atFinal >= known) {
           skippedComplete++;
           aggregate.add(known);
@@ -847,7 +905,7 @@ export async function downloadFiles(
           // the rename. Still a "skipped" download — no byte is transferred —
           // but the file must be PROMOTED here rather than skipped outright, or
           // the user is left with no model at their expected path.
-          try { await rename(partPathOf(f.path), f.path); } catch { /* falls through to a real download */ }
+          try { await moveIntoPlace(partPathFor(f.path, rest.stagingDir), f.path); } catch { /* falls through to a real download */ }
           if (await existingSize(f.path) >= known) {
             skippedComplete++;
             aggregate.add(known);

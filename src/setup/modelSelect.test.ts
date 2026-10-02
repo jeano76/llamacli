@@ -20,6 +20,9 @@ function harness(existing: Record<string, any> | undefined, findResult: any) {
       // Machine-independent by default: otherwise the port is taken from whatever
       // llama-server happens to be running on the box the suite runs on.
       detectRunningPort: async () => null as number | null,
+      // And disk-independent: the family-reuse scan would otherwise find the models that
+      // really are on the machine running the suite.
+      listLocalModels: async () => [] as { path: string; sizeBytes: number }[],
     },
   };
 }
@@ -269,4 +272,28 @@ test("a model already on disk is recorded at its REAL path, not a guessed one", 
   });
   assert.equal(r.modelPath, real, "the existing on-disk copy must be recorded, not re-downloaded");
   assert.equal(r.presentOnDisk, true);
+});
+
+test("/models: the same model on disk in the quant a download would fetch counts as already downloaded", async () => {
+  // The table says 8B PTQ1_0, but the Hub's 8B is PQ2_0. A user who has the PQ2_0 file
+  // already has this model; asking them to download it again (and to type `confirm`) was
+  // the bug.
+  const eight = findRung("bonsai-8b")!;
+  const h = harness(undefined, COMPATIBLE);
+  const r = await selectModel({
+    projectRoot: "/p", rung: eight, modelsDir: "/models", ...h.deps,
+    listLocalModels: async () => [{ path: "/media/disk2/models/Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 2_000_000_000 }],
+  });
+  assert.equal(r.modelPath, "/media/disk2/models/Ternary-Bonsai-8B-PQ2_0.gguf");
+  assert.equal(h.written[0].llama.modelPath, r.modelPath, "and the config records where it really is");
+});
+
+test("/models: a file of another FAMILY is never taken for the chosen model", async () => {
+  const eight = findRung("bonsai-8b")!;
+  const h = harness(undefined, COMPATIBLE);
+  const r = await selectModel({
+    projectRoot: "/p", rung: eight, modelsDir: "/models", ...h.deps,
+    listLocalModels: async () => [{ path: "/media/disk2/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf", sizeBytes: 5_500_000_000 }],
+  });
+  assert.doesNotMatch(r.modelPath, /27B/);
 });

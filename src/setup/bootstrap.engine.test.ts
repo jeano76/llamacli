@@ -149,3 +149,47 @@ test("pinModelFilename: a family the Hub does not have FAILS the step instead of
     assert.equal(step?.ok, false);
     assert.match(step?.detail ?? "", /다른 모델로 바꿔 받지 않습니다/);
   }));
+
+function hub8b(resolved: string[]) {
+  return (async (url: any) => {
+    const u = String(url);
+    if (u.includes("/resolve/")) { resolved.push(u); return { ok: false, status: 500, json: async () => ({}), headers: new Headers() } as any; }
+    if (u.includes("Ternary-Bonsai-8B-gguf")) {
+      return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-8B-PQ2_0.gguf", size: 2_000_000_000 }] }) } as any;
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as any;
+  }) as unknown as typeof fetch;
+}
+
+test("the same model already on ANOTHER disk is reused: no download request is made, and the config points at it", () =>
+  withTempDir(async (dir) => {
+    const resolved: string[] = [];
+    const s = spies();
+    const elsewhere = "/mnt/disk2/models/Ternary-Bonsai-8B-PQ2_0.gguf";
+    const report = await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
+      detectServer: async () => ({ kind: "none" as const }),
+      // The lister is asked about every model directory; the model is in one of them.
+      listExistingModels: async (d) => (d.endsWith("/models") ? [{ path: elsewhere, sizeBytes: 2_000_000_000 }] : []),
+      modelsDir: join(dir, "models"), fetchImpl: hub8b(resolved), acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+    });
+    assert.deepEqual(resolved, [], "nothing was fetched");
+    assert.equal(report.modelPath, elsewhere);
+    const step = report.steps.find((x) => x.name === "모델 다운로드");
+    assert.equal(step?.ok, true);
+    assert.match(step?.detail ?? "", /재사용/);
+  }));
+
+test("when the model is NOT anywhere, the download is attempted (control for the test above)", () =>
+  withTempDir(async (dir) => {
+    const resolved: string[] = [];
+    const s = spies();
+    await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
+      detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
+      modelsDir: join(dir, "models"), fetchImpl: hub8b(resolved), acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+    });
+    assert.ok(resolved.length > 0, "the control must reach the download, or the test above proves nothing");
+  }));
