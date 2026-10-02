@@ -17,7 +17,13 @@
 # "invalid ggml type 143", so it is not a fallback, it is the original bug.
 #
 # Usage:
-#   scripts/ternary-runtime.sh [--dest DIR] [--model FILE] [--force] [--no-build]
+#   scripts/ternary-runtime.sh [--dest DIR] [--model FILE] [--gpu auto|cuda|vulkan|cpu]
+#                              [--force] [--no-build]
+#
+# WSL: detected automatically. The CUDA runtime arrives from the Windows driver, so
+# a GPU prebuilt can unpack and pass a --version check and still fail to initialise
+# the device — the binary is asked for its devices, and --gpu cpu is the escape
+# hatch when passthrough is not cooperating.
 #
 # Exit codes: 0 a verified runtime is in place · 1 nothing worked (see the summary)
 set -uo pipefail
@@ -29,6 +35,7 @@ DEST="${HOME}/.llamacli/prism-llama.cpp"
 MODEL=""
 FORCE=0
 ALLOW_BUILD=1
+GPU_OVERRIDE=auto
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,6 +43,7 @@ while [ $# -gt 0 ]; do
     --model) MODEL="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --no-build) ALLOW_BUILD=0; shift ;;
+    --gpu) GPU_OVERRIDE="$2"; shift 2 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1" >&2; exit 2 ;;
   esac
@@ -55,6 +63,17 @@ case "$ARCH_RAW" in
   arm64|aarch64) ARCH=arm64 ;;
   *) fail "지원하지 않는 아키텍처: $ARCH_RAW"; exit 1 ;;
 esac
+
+# ── WSL ───────────────────────────────────────────────────────────────────────
+# WSL reports itself as plain Linux, so nothing here can notice it by uname. It has
+# to be asked, and it matters: under WSL the CUDA runtime is provided by the Windows
+# driver through /usr/lib/wsl/lib, so a Linux CUDA prebuilt can unpack fine, pass a
+# naive `--version` check, and still fail to initialise the device — which is the
+# usual WSL symptom and is invisible without asking the binary for its devices.
+IS_WSL=0
+if [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+  IS_WSL=1
+fi
 
 GPU_KIND="cpu"
 CUDA_TAG=""
@@ -77,6 +96,14 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 [ "$GPU_KIND" = cpu ] && { command -v vulkaninfo >/dev/null 2>&1 && GPU_KIND=vulkan; }
+
+case "$GPU_OVERRIDE" in
+  cpu) GPU_KIND=cpu; CUDA_TAG="" ;;
+  cuda) GPU_KIND=cuda ;;
+  vulkan) GPU_KIND=vulkan; CUDA_TAG="" ;;
+  auto) ;;
+  *) fail "--gpu 는 auto|cuda|vulkan|cpu 중 하나여야 합니다: $GPU_OVERRIDE"; exit 2 ;;
+esac
 
 HAVE_NVCC=0
 command -v nvcc >/dev/null 2>&1 && HAVE_NVCC=1
@@ -140,6 +167,23 @@ verify() { # $1 binPath
     echo "실행되지 않음: $( { $T "$1" --version; } 2>&1 | head -1)"
     return 1
   fi
+  # `--version` does NOT initialise CUDA, and the model check below runs at -ngl 0,
+  # so neither proves the accelerator loads. Under WSL that is exactly the thing
+  # that fails — the runtime comes from the Windows driver, and a binary that cannot
+  # find it still passes every other check and then dies on the first real request.
+  # Asking for the device list is what actually exercises it.
+  if [ "$WANT_GPU" -eq 1 ]; then
+    local devs
+    devs="$({ $T "$1" --list-devices; } 2>&1)"
+    if [ $? -ne 0 ] || ! printf '%s' "$devs" | grep -qiE 'CUDA[0-9]|Vulkan|ROCm'; then
+      echo "가속기를 초기화할 수 없음: $(printf '%s' "$devs" | grep -viE '^$' | head -1)"
+      if [ "$IS_WSL" -eq 1 ]; then
+        echo "(WSL: Windows NVIDIA 드라이버가 /usr/lib/wsl/lib 에 CUDA 런타임을 제공합니다 — 없으면 --gpu cpu 로 다시 시도하세요)"
+      fi
+      return 1
+    fi
+  fi
+
   if [ -n "$MODEL" ] && [ -f "$MODEL" ]; then
     # `--no-warmup` stops after LOADING, but the server then binds and serves — it
     # does NOT exit. Without `timeout` this blocks forever, which is exactly what an
@@ -164,6 +208,7 @@ verify() { # $1 binPath
 
 record() { ATTEMPTS="${ATTEMPTS}  $2 $1\n"; }
 RESULT=""
+WANT_GPU=0
 
 try_prebuilt() { # $1 kind, $2 label
   local asset subdir strip
@@ -178,7 +223,8 @@ try_prebuilt() { # $1 kind, $2 label
 
   if [ "$FORCE" -eq 0 ] && [ -f "$root/.llama_release" ] && [ "$(cat "$root/.llama_release")" = "$RELEASE_TAG" ]; then
     if [ -f "$bin" ]; then
-      local why; why="$(verify "$bin")"
+      local why; WANT_GPU=0; [ "$1" = cuda ] || [ "$1" = vulkan ] && WANT_GPU=1
+      why="$(verify "$bin")"
       if [ "$why" = "ok" ]; then
         say "이미 설치됨: $bin"; record OK "$2"; RESULT="$bin"; return 0
       fi
@@ -202,7 +248,8 @@ try_prebuilt() { # $1 kind, $2 label
   unpack "$DEST/$asset" "$root" "$strip" || { rm -f "$DEST/$asset"; record FAIL "$2 (압축 해제 실패)"; return 1; }
   rm -f "$DEST/$asset"
 
-  local why; why="$(verify "$bin")"
+  local why; WANT_GPU=0; [ "$1" = cuda ] || [ "$1" = vulkan ] && WANT_GPU=1
+  why="$(verify "$bin")"
   if [ "$why" != "ok" ]; then
     fail "검증 실패: $why"; record FAIL "$2 ($why)"; rm -rf "$root"; return 1
   fi
@@ -232,6 +279,19 @@ build_fork() {
 
 # ── the ladder ──────────────────────────────────────────────────────────────
 step "플랫폼: $OS/$ARCH · GPU: $GPU_KIND${CUDA_TAG:+ (CUDA $CUDA_TAG)} · nvcc: $([ $HAVE_NVCC -eq 1 ] && echo 있음 || echo 없음)"
+if [ "$IS_WSL" -eq 1 ]; then
+  say "WSL 로 감지되었습니다."
+  if [ -d /usr/lib/wsl/lib ]; then
+    say "Windows 드라이버의 CUDA 런타임(/usr/lib/wsl/lib) 을 찾았습니다."
+  else
+    fail "WSL CUDA 런타임(/usr/lib/wsl/lib) 이 없습니다 — Windows 쪽 NVIDIA 드라이버가 필요합니다."
+    say "GPU 없이도 쓸 수 있습니다: --gpu cpu"
+  fi
+  say "GPU 오프로딩이 불안정하면  --gpu cpu 로 CPU 빌드로 고정할 수 있습니다."
+fi
+for t in curl tar cmake git; do
+  command -v "$t" >/dev/null 2>&1 || say "참고: $t 이 없어 해당 경로는 건너뜁니다"
+done
 
 # Each rung runs in THIS shell, not a subshell: a subshell would discard both the
 # attempt log and the RESULT variable, and the ladder would silently report nothing.

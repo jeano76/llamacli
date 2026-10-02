@@ -324,3 +324,30 @@ test("Windows CUDA brings its runtime bundle, because the server will not load w
   assert.equal(cpu?.companions, undefined, "a CPU build needs no runtime bundle");
 });
 
+
+test("a GPU build whose device will not initialise falls back to CPU", async () => {
+  // The WSL case, and the reason `--version` is not a sufficient check. Under WSL the
+  // CUDA runtime comes from the Windows driver; a binary that cannot find it runs
+  // fine, passes `--version`, and even loads a model at -ngl 0 — and then fails on
+  // the first request that actually offloads. So the device list is asked for.
+  const verified: string[] = [];
+  const res = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: true },
+    run: withCuda(),
+    verify: async (bin, expectGpu) => {
+      verified.push(`${bin}:gpu=${expectGpu}`);
+      return bin.includes("cuda") ? { ok: false, detail: "가속기를 초기화할 수 없음" } : { ok: true };
+    },
+    download: async ({ machine }) => ({
+      ok: true,
+      binPath: machine.gpuBackend === "cuda" ? "/p/cuda/llama-server" : "/p/cpu/llama-server",
+      asset: "a",
+      lines: [],
+    }),
+  });
+  assert.equal(res?.binPath, "/p/cpu/llama-server");
+  // The accelerator is only demanded of an accelerator build. Asking the CPU one for
+  // CUDA devices would fail every CPU install on the planet.
+  assert.match(verified[0], /cuda\/llama-server:gpu=true/);
+  assert.match(verified[verified.length - 1], /cpu\/llama-server:gpu=false/);
+});

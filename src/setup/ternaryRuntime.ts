@@ -448,7 +448,7 @@ export async function acquireTernaryLlamaServer(opts: {
   /** Injected for tests. Defaults to the real build. */
   build?: (o: { hw: never; run: Run; log?: (l: string) => void; repo: string }) => Promise<string>;
   /** Injected for tests. Defaults to running the binary. */
-  verify?: (binPath: string) => Promise<{ ok: boolean; detail?: string }>;
+  verify?: (binPath: string, expectGpu: boolean) => Promise<{ ok: boolean; detail?: string }>;
 }): Promise<AcquireResult | null> {
   const log = opts.log ?? (() => {});
   const attempts: AcquireAttempt[] = [];
@@ -458,7 +458,10 @@ export async function acquireTernaryLlamaServer(opts: {
     arch: process.arch,
     cudaVersion,
   };
-  const verify = opts.verify ?? ((binPath: string) => verifyLlamaServer(binPath, opts.run, opts.modelPath));
+  const verify =
+    opts.verify ??
+    ((binPath: string, expectGpu: boolean) =>
+      verifyLlamaServer(binPath, opts.run, opts.modelPath, expectGpu));
 
   /** Try one published asset. */
   const tryAsset = async (gpuBackend: PrismMachine["gpuBackend"], label: string): Promise<AcquireResult | null> => {
@@ -479,9 +482,10 @@ export async function acquireTernaryLlamaServer(opts: {
       attempts.push({ label, ok: false, detail: res.lines[res.lines.length - 1] });
       return null;
     }
-    const verdict = await verify(res.binPath);
+    const verdict = await verify(res.binPath, gpuBackend !== "none");
     if (!verdict.ok) {
-      // A prebuilt that unpacks and then will not start is the failure this ladder
+      // A prebuilt that unpacks and then will not start — or starts but cannot
+      // initialise its accelerator — is the failure this ladder
       // exists for. Say so plainly rather than reporting a broken install.
       attempts.push({ label, ok: false, detail: `다운로드는 되었지만 실행되지 않음: ${verdict.detail ?? "알 수 없음"}` });
       return null;
@@ -507,7 +511,7 @@ export async function acquireTernaryLlamaServer(opts: {
   const build = opts.build ?? ((o) => import("./llamaCpp.js").then((m) => m.buildLlamaCpp(o as never)));
   try {
     const binPath = await build({ hw: opts.hardware as never, run: opts.run, log, repo: PRISM_LLAMA_CPP_REPO } as never);
-    const verdict = await verify(binPath);
+    const verdict = await verify(binPath, cuda);
     const label = `${cuda ? "CUDA" : "CPU"} 소스 빌드 (fork)`;
     if (!verdict.ok) {
       attempts.push({ label, ok: false, binPath, detail: verdict.detail });
@@ -523,20 +527,42 @@ export async function acquireTernaryLlamaServer(opts: {
   }
 }
 
-/** Does this binary actually RUN, and can it read the model if we have one?
+/** Does this binary actually RUN, actually INITIALISE its accelerator, and can it
+ *  read the model if we have one?
  *
- *  "Runs" is the load-bearing test. A prebuilt that unpacks cleanly and then dies on
- *  a missing CUDA runtime looks identical to a working install until something tries
- *  to execute it, and the previous version of this code never executed anything. */
+ *  Three separate questions, and the middle one is the WSL case. `--version` does
+ *  not touch CUDA, and the model probe below runs at `-ngl 0` precisely so it cannot
+ *  disturb a live server — so neither of those proves the device loads. Under WSL the
+ *  CUDA runtime comes from the Windows driver, and a binary that cannot find it
+ *  passes every other check and then fails on the first real request. `--list-devices`
+ *  is what actually exercises backend initialisation.
+ *
+ *  Every one of these has a failure that looks like a working install from the
+ *  outside, and the previous version of this code ran nothing at all. */
 async function verifyLlamaServer(
   binPath: string,
   run: Run,
-  modelPath?: string
+  modelPath?: string,
+  expectGpu = false
 ): Promise<{ ok: boolean; detail?: string }> {
   const { probeLlamaServer, probeModelCompatibility, looksLikeUnsupportedModelFormat } = await import("./llamaCpp.js");
-  const runIt = probeLlamaServer(binPath, run);
-  const probe = await runIt;
+  const probe = await probeLlamaServer(binPath, run);
   if (!probe.ok) return { ok: false, detail: probe.error ?? "실행 실패" };
+
+  if (expectGpu) {
+    try {
+      await run(binPath, ["--list-devices"], { timeout: 30_000 });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        detail:
+          `가속기를 초기화할 수 없음: ${detail.split("\n")[0]}` +
+          ` (WSL 이라면 Windows NVIDIA 드라이버의 CUDA 런타임이 필요합니다 — CPU 폴백은 자동으로 시도합니다)`,
+      };
+    }
+  }
+
   if (!modelPath) return { ok: true };
   const compat = await probeModelCompatibility(binPath, modelPath, { run });
   if (!compat.ok && looksLikeUnsupportedModelFormat(compat.error)) {
