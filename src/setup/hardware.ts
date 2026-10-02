@@ -340,6 +340,18 @@ export async function detectAmdGpus(host: HostProbe): Promise<Gpu[]> {
   return gpus;
 }
 
+/** Windows adapter names (one per line) that mean a real GPU with a Vulkan driver.
+ *  Excludes the software/remote adapters Windows always lists ("Microsoft Basic
+ *  Render Driver", "Microsoft Remote Display Adapter", Hyper-V), which would
+ *  otherwise make every virtual machine look accelerated. */
+export function windowsAdapterHasVulkanGpu(namesText: string): boolean {
+  return namesText
+    .split(/\r?\n/)
+    .map((n) => n.trim())
+    .filter((n) => n && !/microsoft|basic|remote|hyper-v|virtual|vmware|parsec/i.test(n))
+    .some((n) => /radeon|\bamd\b|\barc\b|iris|uhd|intel/i.test(n));
+}
+
 /** True when `vulkaninfo --summary` lists a real (non-software) device. */
 export function vulkanSummaryHasGpu(summary: string): boolean {
   return /PHYSICAL_DEVICE_TYPE_(DISCRETE|INTEGRATED|VIRTUAL)_GPU/.test(summary);
@@ -396,6 +408,16 @@ export async function detectHardware(
       gpus = await detectAmdGpus(host);
       if (gpus.length > 0) gpuBackend = tools.hipcc ? "rocm" : "vulkan";
     }
+  }
+  if (gpuBackend === "none" && isWin) {
+    // No sysfs and no vulkaninfo on a stock Windows box; the adapter list is what is
+    // there. Memory is not read (`AdapterRAM` is a 32-bit field that caps at 4 GiB and
+    // would mis-size every modern card), so the model is sized as for a CPU machine
+    // while the engine still gets the Vulkan build.
+    try {
+      const names = await run("powershell", ["-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"], { timeout: 15_000 });
+      if (windowsAdapterHasVulkanGpu(names)) gpuBackend = "vulkan";
+    } catch { /* no PowerShell: stay CPU */ }
   }
   if (gpuBackend === "none" && tools.vulkaninfo) {
     // Intel, or any device with no VRAM figure we can read. The backend is known

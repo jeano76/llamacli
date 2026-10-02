@@ -444,10 +444,12 @@ export async function acquireTernaryLlamaServer(opts: {
    *  ladder silently consults and writes the real install, which makes it impossible
    *  to exercise a failure path at all. */
   destRoot?: string;
+  /** One-line progress for the download and the compile. */
+  onProgress?: (p: TransferProgress) => void;
   /** Injected for tests. */
   download?: typeof downloadPrismRuntime;
   /** Injected for tests. Defaults to the real build. */
-  build?: (o: { hw: never; run: Run; log?: (l: string) => void; repo: string }) => Promise<string>;
+  build?: (o: { hw: never; run: Run; log?: (l: string) => void; repo: string; onProgress?: (p: TransferProgress) => void }) => Promise<string>;
   /** Injected for tests. Defaults to running the binary. */
   verify?: (binPath: string, expectGpu: boolean) => Promise<{ ok: boolean; detail?: string }>;
 }): Promise<AcquireResult | null> {
@@ -474,7 +476,7 @@ export async function acquireTernaryLlamaServer(opts: {
     const dl = opts.download ?? downloadPrismRuntime;
     let res;
     try {
-      res = await dl({ machine, log, destRoot: opts.destRoot });
+      res = await dl({ machine, log, destRoot: opts.destRoot, onProgress: opts.onProgress });
     } catch (err) {
       attempts.push({ label, ok: false, detail: err instanceof Error ? err.message : String(err) });
       return null;
@@ -517,7 +519,7 @@ export async function acquireTernaryLlamaServer(opts: {
   log(`사전 빌드가 동작하지 않아 fork(${PRISM_LLAMA_CPP_REPO})에서 직접 빌드합니다 (${cuda ? "CUDA" : "CPU"}). 10~40분 걸릴 수 있습니다.`);
   const build = opts.build ?? ((o) => import("./llamaCpp.js").then((m) => m.buildLlamaCpp(o as never)));
   try {
-    const binPath = await build({ hw: opts.hardware as never, run: opts.run, log, repo: PRISM_LLAMA_CPP_REPO } as never);
+    const binPath = await build({ hw: opts.hardware as never, run: opts.run, log, repo: PRISM_LLAMA_CPP_REPO, onProgress: opts.onProgress } as never);
     const verdict = await verify(binPath, cuda);
     const label = `${cuda ? "CUDA" : "CPU"} 소스 빌드 (fork)`;
     if (!verdict.ok) {

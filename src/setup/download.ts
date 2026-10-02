@@ -71,6 +71,11 @@ export interface TransferProgress {
   etaSeconds: number;
   /** 0..100, or -1 when the total size is unknown. */
   percent: number;
+  /** "build" for a compile reported through the same one-line channel as a download,
+   *  so the TUI redraws it in place with no change of its own. Absent = a transfer. */
+  phase?: "build";
+  /** Seconds since the compile started; only meaningful for phase "build". */
+  elapsedSeconds?: number;
 }
 
 /** Mutable shared state behind {@link TransferProgress}. One instance is shared
@@ -181,6 +186,11 @@ export function progressBar(percent: number, width = 24): string {
  *  successive updates overwrite cleanly on a single terminal row — the reason
  *  a caller can print this in a loop without flooding the scrollback. */
 export function formatProgress(p: TransferProgress, barWidth = 24): string {
+  if (p.phase === "build") {
+    const pct = p.percent >= 0 ? `${p.percent.toFixed(0)}%` : "?%";
+    const mins = Math.floor((p.elapsedSeconds ?? 0) / 60);
+    return `[${progressBar(p.percent, barWidth)}] ${pct}  ${p.label} 빌드 ${mins}분 경과`;
+  }
   const total = p.totalBytes > 0 ? `${formatBytes(p.receivedBytes)} / ${formatBytes(p.totalBytes)}` : formatBytes(p.receivedBytes);
   const pct = p.percent >= 0 ? `${p.percent.toFixed(0)}%` : "?%";
   return (

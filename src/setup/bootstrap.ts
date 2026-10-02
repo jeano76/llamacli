@@ -207,6 +207,11 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
    *  choice, so a machine that already had a server up still compiled one, and a
    *  first launch compiled stock llama.cpp and then discovered the chosen Bonsai
    *  model needed the fork — 10-40 minutes spent on a binary that was thrown away. */
+  let engineFailed = false;
+  /** Progress sink for the engine's download/compile. Set before `acquireEngine`
+   *  runs: a redrawn line normally, but nothing when a model download is running
+   *  beside it (two writers on one transient line just flicker). */
+  let engineProgress: ((p: TransferProgress) => void) | undefined;
   const acquireEngine = async (chosen?: ModelChoice): Promise<void> => {
     if (llama) return;
     // A binary that exists but cannot run is a different problem from a binary
@@ -249,7 +254,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
         // Download the fork's pinned prebuilt; build the fork only if the release
         // has nothing for this platform.
         const binPath = await step("PrismML llama-server 준비", async () => {
-          const got = await (opts.acquireTernary ?? acquireTernaryLlamaServer)({ hardware, run, log });
+          const got = await (opts.acquireTernary ?? acquireTernaryLlamaServer)({ hardware, run, log, onProgress: engineProgress });
           if (!got) throw new Error("PrismML llama-server 를 받을 수도, 빌드할 수도 없었습니다.");
           return got.binPath;
         });
@@ -268,13 +273,14 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
         await step("llama.cpp 준비", async () => {
           const r = await (opts.acquireStock ?? acquireStockLlamaServer)({
             hardware, run: run as never, log, modelPath: configuredModel,
-            onProgress: opts.onProgress ? opts.onProgress(() => renderProgressLine(log)) : undefined,
+            onProgress: engineProgress,
           });
           if (!r) throw new Error("llama-server 를 받을 수도, 빌드할 수도 없었습니다.");
           llama = { binPath: r.binPath, source: r.source, backend: r.backend };
           return `${r.binPath} (${r.source === "downloaded" ? "사전 빌드" : "소스 빌드"}, ${r.backend})`;
         });
       }
+      if (!llama) engineFailed = true;
     }
   };
   if (llama) {
@@ -518,7 +524,18 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // ── 3.2 The engine, now that the model is known ───────────────────────────
   // Not earlier: see `acquireEngine`. An already-running server ended the bootstrap
   // above, so a machine with a working server never reaches a download or a compile.
+  // Runs BESIDE the download below (see the Promise.all). The two are independent — the
+  // compatibility check needs only the model's filename — and a first launch otherwise
+  // waits for a compile and THEN for a 20 GB transfer. If the engine cannot be had at
+  // all the transfer is aborted: its .part file is kept, so the bytes already fetched
+  // are not lost when the user fixes the engine and relaunches.
+  const needDownload = Boolean(model) && !alreadyInUse && !opts.offline;
+  const reportDefault = opts.onProgress ? opts.onProgress(() => renderProgressLine(log)) : renderProgressLine(log);
+  engineProgress = needDownload ? undefined : reportDefault;
+  const downloadAbort = new AbortController();
+  const enginePart = (async () => {
   await acquireEngine(model);
+  if (engineFailed && needDownload) downloadAbort.abort();
 
   // ── 3.5 Does the chosen binary plausibly read the chosen model? ────────────
   // The binary is settled in step 2 and the model in step 3, so a fresh install
@@ -601,7 +618,9 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       );
     }
   }
+  })();
 
+  const downloadPart = (async () => {
   // ── 4. Download ───────────────────────────────────────────────────────────
   // Disk space is checked BEFORE the transfer, never during it. A download that
   // runs the filesystem out doesn't fail at the start: it fills the disk, and
@@ -660,18 +679,30 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       } else {
         await step("모델 다운로드", async () => {
           await mkdir(dirname(dest), { recursive: true });
-          const result = await downloadFile(model!.candidate.url, dest, {
+          let result;
+          try {
+            result = await downloadFile(model!.candidate.url, dest, {
             connections: 8,
             label: model!.candidate.filename,
             fetchImpl: opts.fetchImpl,
-            onProgress: opts.onProgress ? opts.onProgress(() => renderProgressLine(log)) : renderProgressLine(log),
+            onProgress: reportDefault,
+            signal: downloadAbort.signal,
           });
+          } catch (err) {
+            if (downloadAbort.signal.aborted) {
+              throw new Error("llama-server 를 확보하지 못해 다운로드를 중단했습니다. 받은 부분은 보존되어 다시 실행하면 이어받습니다.");
+            }
+            throw err;
+          }
           return `${result.bytes} 바이트 다운로드 완료 (${result.parallel ? "병렬 range" : "단일 스트림"})`;
         });
         modelPath = dest;
       }
     }
   }
+  })();
+
+  await Promise.all([enginePart, downloadPart]);
 
   const plan = await planPorts({
     probe: opts.probe ?? tcpPortProbe,

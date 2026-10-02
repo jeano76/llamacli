@@ -34,9 +34,10 @@ import { delimiter, dirname, join } from "node:path";
 import { execFile, spawn as spawnProc } from "node:child_process";
 import { promisify } from "node:util";
 import type { Hardware } from "./hardware.js";
-import { chooseBuildTarget, detectCudaArch, buildJobs, buildDiskBytes, type BuildBackend, type BuildTarget } from "./buildTarget.js";
+import { chooseBuildTarget, detectCudaArch, detectHipInfo, buildJobs, buildDiskBytes, type BuildBackend, type BuildTarget } from "./buildTarget.js";
 import { planBuildEnv, applyBuildEnv } from "./buildEnv.js";
 import { diskInfoFor, type Statfs } from "./disk.js";
+import type { TransferProgress } from "./download.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -154,7 +155,7 @@ export interface LlamaLocation {
  * `candidatePaths` instead, and listing them here produced paths like
  * `~/llama.cpp/bin/bin/llama-server` that exist nowhere.
  */
-const BUILD_DIR_PREFERENCE = ["build-opt", "build-cuda", "build-metal", "build-vulkan", "build-cpu", "build", "build-release"];
+const BUILD_DIR_PREFERENCE = ["build-opt", "build-cuda", "build-metal", "build-rocm", "build-vulkan", "build-cpu", "build", "build-release"];
 
 /** Score for a build directory name; lower is better, and `undefined` means
  *  "not a recognised build dir at all" (still searched, just last). */
@@ -883,6 +884,8 @@ export interface BuildOptions {
   /** Force a backend instead of choosing the best one the toolchain allows. The
    *  engine ladder uses this to retry as CPU when an accelerated build was unusable. */
   backend?: BuildBackend;
+  /** Where build progress goes as a redrawn line. Absent: periodic `log` lines. */
+  onProgress?: (p: TransferProgress) => void;
   /** Injected for tests. */
   statfs?: Statfs;
   /** Injected for tests; defaults to a TTY check. */
@@ -907,7 +910,8 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
   const dir = opts.home ?? (repo === LLAMA_CPP_REPO ? LLAMA_CPP_HOME : join(LLAMA_CPP_HOME + "-fork"));
 
   const cudaArch = hw.canBuildCuda ? await detectCudaArch(run as never) : null;
-  const target: BuildTarget = chooseBuildTarget(hw, cudaArch, opts.backend);
+  const hip = hw.canBuildRocm && opts.backend !== "cpu" ? await detectHipInfo(run as never) : undefined;
+  const target: BuildTarget = chooseBuildTarget(hw, cudaArch, opts.backend, hip);
 
   // ── Preflight: refuse early, with the reason, instead of failing at minute 30 ──
   const need = buildDiskBytes(target.backend);
@@ -919,8 +923,10 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
     );
   }
 
+  let cmake = "cmake";
   if (opts.installDeps !== false) {
     const plan = planBuildEnv(hw, { needs: { vulkan: target.backend === "vulkan" } });
+    if (plan.cmakeBin) cmake = plan.cmakeBin;
     log(plan.summary);
     if (plan.commands.length > 0) {
       const res = await applyBuildEnv(plan, {
@@ -940,6 +946,15 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
   }
 
   if (!(await dirExists(join(dir, ".git")))) {
+    // Reachability first, with git itself: it is the tool that will do the clone, so it
+    // honours proxies and credentials exactly as the clone will, and a dead network
+    // is reported now instead of as a clone error after the build tools were installed.
+    await run("git", ["ls-remote", "--exit-code", repo, "HEAD"], { timeout: 30_000 }).catch((err) => {
+      throw new Error(
+        `${repo} 에 연결할 수 없어 소스를 받을 수 없습니다 (네트워크/프록시를 확인하세요): ` +
+          `${(err instanceof Error ? err.message : String(err)).split("\n")[0]}`
+      );
+    });
     log(`llama.cpp 소스를 받습니다 → ${dir}`);
     await run("git", ["clone", "--depth", "1", repo, dir], { timeout: 20 * 60_000 });
   } else {
@@ -969,11 +984,11 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
     ...target.flags,
   ];
   log(`cmake 설정 중… (${target.label})`);
-  await run("cmake", cmakeFlags, { cwd: dir, timeout: 20 * 60_000 });
+  await run(cmake, cmakeFlags, { cwd: dir, timeout: 20 * 60_000 });
 
-  const progress = makeBuildProgress(log, target.label);
+  const progress = makeBuildProgress(log, target.label, Date.now, 60_000, opts.onProgress);
   const buildCmd = (jobs: number) =>
-    run("cmake", ["--build", buildDir, "--config", "Release", "-j", String(jobs)], {
+    run(cmake, ["--build", buildDir, "--config", "Release", "-j", String(jobs)], {
       cwd: dir,
       onLine: progress,
       // A CUDA build of llama.cpp is genuinely long; the generic 20 min default
@@ -1020,13 +1035,22 @@ export function makeBuildProgress(
   log: (line: string) => void,
   label: string,
   now: () => number = Date.now,
-  heartbeatMs = 60_000
+  heartbeatMs = 60_000,
+  /** When given, progress goes here (the TUI's one-line redraw) instead of `log`. */
+  report?: (p: TransferProgress) => void
 ): (line: string) => void {
   const t0 = now();
   let lastDecile = -1;
   let lastEmit = t0;
   let lastPct: number | null = null;
   const mins = () => Math.max(0, Math.floor((now() - t0) / 60_000));
+  const emit = (percent: number, text: string) => {
+    if (!report) return log(text);
+    report({
+      label, receivedBytes: 0, totalBytes: -1, bytesPerSecond: 0, etaSeconds: -1,
+      percent, phase: "build", elapsedSeconds: Math.floor((now() - t0) / 1000),
+    });
+  };
   return (line) => {
     const pct = parseBuildPercent(line);
     if (pct !== null) lastPct = pct;
@@ -1034,10 +1058,10 @@ export function makeBuildProgress(
     if (pct !== null && Math.floor(pct / 10) > lastDecile) {
       lastDecile = Math.floor(pct / 10);
       lastEmit = t;
-      log(`${label} 빌드 ${pct}% (${mins()}분 경과)`);
+      emit(pct, `${label} 빌드 ${pct}% (${mins()}분 경과)`);
     } else if (t - lastEmit >= heartbeatMs) {
       lastEmit = t;
-      log(`${label} 빌드 중… ${lastPct !== null ? `${lastPct}%, ` : ""}${mins()}분 경과`);
+      emit(lastPct ?? -1, `${label} 빌드 중… ${lastPct !== null ? `${lastPct}%, ` : ""}${mins()}분 경과`);
     }
   };
 }

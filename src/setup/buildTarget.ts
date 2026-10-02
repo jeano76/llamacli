@@ -9,7 +9,7 @@
 
 import type { Hardware, Run } from "./hardware.js";
 
-export type BuildBackend = "cuda" | "vulkan" | "metal" | "cpu";
+export type BuildBackend = "cuda" | "rocm" | "vulkan" | "metal" | "cpu";
 
 export interface BuildTarget {
   backend: BuildBackend;
@@ -20,21 +20,46 @@ export interface BuildTarget {
   label: string;
 }
 
+export interface HipInfo {
+  /** Full path of the ROCm clang, from `hipconfig -l`. */
+  compiler?: string;
+  /** GPU architectures present ("gfx1100;gfx1030"), from `rocminfo`. */
+  targets?: string | null;
+}
+
+/** What a ROCm/HIP build needs to be told. llama.cpp's HIP build does not find the
+ *  ROCm compiler on its own the way the CUDA one finds nvcc, and compiling for every
+ *  AMD architecture is most of its build time, so both are read from the machine. */
+export async function detectHipInfo(run: Run): Promise<HipInfo> {
+  const info: HipInfo = {};
+  try {
+    const dir = (await run("hipconfig", ["-l"], { timeout: 5000 })).trim();
+    if (dir) info.compiler = `${dir.replace(/\/$/, "")}/clang`;
+  } catch { /* no hipconfig */ }
+  try {
+    const out = await run("rocminfo", [], { timeout: 10_000 });
+    const gfx = [...new Set([...out.matchAll(/\bgfx[0-9a-f]{3,5}\b/g)].map((m) => m[0]))];
+    info.targets = gfx.length > 0 ? gfx.join(";") : null;
+  } catch { info.targets = null; }
+  return info;
+}
+
 /**
  * Best backend a from-source build can actually produce here.
  *
  * Only backends whose toolchain was MEASURED present are returned: CUDA needs
  * `nvcc` (a GPU without a toolkit makes `-DGGML_CUDA=ON` a configure error, not a
- * fallback), Vulkan needs `glslc`. ROCm is intentionally absent: the HIP build needs
- * compiler environment wiring this installer has not been able to verify, and the
- * release publishes a ROCm prebuilt, which the engine ladder tries first.
+ * fallback), Vulkan needs `glslc`. ROCm needs `hipcc` AND an AMD GPU (canBuildRocm). That
+ * path has NOT been run on AMD hardware; if the result will not start, the engine
+ * ladder rebuilds for CPU, so an error here costs time rather than a working install.
  */
 export function chooseBuildTarget(
-  hw: Pick<Hardware, "gpuBackend" | "canBuildCuda" | "canBuildVulkan" | "platform" | "arch">,
+  hw: Pick<Hardware, "gpuBackend" | "canBuildCuda" | "canBuildVulkan" | "platform" | "arch"> & { canBuildRocm?: boolean },
   cudaArch?: string | null,
   /** "cpu" skips accelerators — the ladder's last resort when an accelerated build
    *  compiled but would not run. Any other value is the same as not forcing. */
-  forced?: BuildBackend
+  forced?: BuildBackend,
+  hip?: HipInfo
 ): BuildTarget {
   if (forced === "cpu") return { backend: "cpu", dir: "build-cpu", label: "CPU", flags: [] };
   if (hw.canBuildCuda) {
@@ -44,6 +69,16 @@ export function chooseBuildTarget(
       // card actually present cuts it several-fold; it is omitted, not guessed, when
       // the capability could not be read.
       flags: ["-DGGML_CUDA=ON", ...(cudaArch ? [`-DCMAKE_CUDA_ARCHITECTURES=${cudaArch}`] : [])],
+    };
+  }
+  if (hw.canBuildRocm && hw.platform === "linux") {
+    return {
+      backend: "rocm", dir: "build-rocm", label: "ROCm",
+      flags: [
+        "-DGGML_HIP=ON",
+        ...(hip?.compiler ? [`-DCMAKE_HIP_COMPILER=${hip.compiler}`] : []),
+        ...(hip?.targets ? [`-DAMDGPU_TARGETS=${hip.targets}`] : []),
+      ],
     };
   }
   if (hw.platform === "darwin" && hw.arch === "arm64") {
@@ -76,7 +111,7 @@ export async function detectCudaArch(run: Run): Promise<string | null> {
  * of swap, and a build a little slower than possible still finishes.
  */
 export function buildJobs(hw: Pick<Hardware, "cpuCount" | "ramAvailableBytes">, backend: BuildBackend): number {
-  const perJobGiB = backend === "cuda" ? 3 : 1.5;
+  const perJobGiB = backend === "cuda" || backend === "rocm" ? 3 : 1.5;
   const byRam = Math.floor(hw.ramAvailableBytes / 1024 ** 3 / perJobGiB);
   return Math.max(1, Math.min(hw.cpuCount, 16, byRam));
 }
@@ -86,5 +121,5 @@ export function buildJobs(hw: Pick<Hardware, "cpuCount" | "ramAvailableBytes">, 
  *  is cheap, a build that dies at 90% is not. */
 export function buildDiskBytes(backend: BuildBackend): number {
   const GiB = 1024 ** 3;
-  return backend === "cuda" ? 6 * GiB : backend === "vulkan" ? 3 * GiB : 2 * GiB;
+  return backend === "cuda" ? 6 * GiB : backend === "rocm" ? 6 * GiB : backend === "vulkan" ? 3 * GiB : 2 * GiB;
 }

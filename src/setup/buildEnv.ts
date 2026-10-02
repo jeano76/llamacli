@@ -29,6 +29,8 @@
  * toolkit at all. A source build only targets CUDA when `nvcc` is already present.
  */
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { Hardware, Run } from "./hardware.js";
 
 export type PackageManager = "apt" | "dnf" | "pacman" | "apk" | "zypper" | "brew" | "winget";
@@ -53,6 +55,9 @@ export interface BuildEnvPlan {
   needsPrivilege: boolean;
   /** Set when the plan cannot be carried out automatically, with what to tell the user. */
   manual?: string;
+  /** Absolute path of a cmake installed into the user's own directory (no root), for
+   *  callers to invoke by path: a fresh `pip --user` install is not on this process's PATH. */
+  cmakeBin?: string;
   /** Human-readable, for the log. */
   summary: string;
 }
@@ -177,6 +182,16 @@ export function planBuildEnv(
   }
 
   if (needsPrivilege && !hw.tools.sudo) {
+    // No root, but cmake alone is installable without it: PyPI ships a complete cmake.
+    // Git and a compiler are not, so this only applies when cmake is all that is missing.
+    if (missing.length === 1 && missing[0] === "cmake" && hw.tools.pip3) {
+      return {
+        manager, missing, packages: ["cmake"], needsPrivilege: false,
+        commands: [{ file: "pip3", args: ["install", "--user", "cmake"], privileged: false }],
+        cmakeBin: join(homedir(), ".local", "bin", "cmake"),
+        summary: "root 권한이 없어 cmake 를 사용자 영역에 설치합니다 (pip3 install --user cmake).",
+      };
+    }
     return {
       manager, missing, packages, commands: [], needsPrivilege,
       manual: `root 권한이 필요한데 sudo 가 없습니다. 루트로 다음을 실행하세요: ${INSTALL_ARGS[manager](packages).file} ${INSTALL_ARGS[manager](packages).args.join(" ")}`,
@@ -248,7 +263,8 @@ export async function applyBuildEnv(plan: BuildEnvPlan, opts: ApplyOptions): Pro
   for (const v of VERIFY) {
     if (!needsVerify.has(v.tool)) continue;
     let ok = false;
-    for (const c of v.candidates) {
+    const candidates = v.tool === "cmake" && plan.cmakeBin ? [plan.cmakeBin, ...v.candidates] : v.candidates;
+    for (const c of candidates) {
       try { await opts.run(c, v.args, { timeout: 10_000 }); ok = true; break; } catch { /* next */ }
     }
     verified[v.tool] = ok;

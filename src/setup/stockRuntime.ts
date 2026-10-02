@@ -98,7 +98,10 @@ export function stockRungsFor(release: Release, m: StockMachine): StockRung[] {
   if (m.platform === "darwin") {
     // The macOS build ships Metal; there is no separate CPU asset to fall back to.
     const asset = byName.get(`llama-${tag}-bin-macos-${a}.tar.gz`);
-    if (asset) add({ backend: "metal", label: "Metal 사전 빌드", subdir: "metal", asset, companions: [], format: "tar.gz", strip: 1 });
+    // Apple Silicon runs it on Metal. An Intel Mac gets the same archive but is not
+    // claimed to be accelerated, so it is not required to initialise a GPU.
+    const metal = a === "arm64";
+    if (asset) add({ backend: metal ? "metal" : "cpu", label: metal ? "Metal 사전 빌드" : "macOS x64 사전 빌드", subdir: metal ? "metal" : "cpu", asset, companions: [], format: "tar.gz", strip: 1 });
     return rungs;
   }
 
@@ -295,11 +298,11 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
     return null;
   }
   const build = opts.build ?? buildLlamaCpp;
-  const mkBackend = (forced?: "cpu") => build({ hw, run: opts.run as never, log, backend: forced });
+  const mkBackend = (forced?: "cpu") => build({ hw, run: opts.run as never, log, backend: forced, onProgress: opts.onProgress });
   for (const forced of [undefined, "cpu"] as const) {
     try {
       const binPath = await mkBackend(forced);
-      const accelerated = forced === undefined && /build-(cuda|vulkan|metal)/.test(binPath);
+      const accelerated = forced === undefined && /build-(cuda|rocm|vulkan|metal)/.test(binPath);
       const verdict = await verify(binPath, accelerated);
       const label = `소스 빌드 (${forced ?? "자동"})`;
       if (!verdict.ok) {
@@ -309,7 +312,7 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
         continue;
       }
       attempts.push({ label, ok: true, binPath });
-      const backend = (/build-(cuda|vulkan|metal)/.exec(binPath)?.[1] ?? "cpu") as LlamaLocation["backend"];
+      const backend = (/build-(cuda|rocm|vulkan|metal)/.exec(binPath)?.[1] ?? "cpu") as LlamaLocation["backend"];
       return { binPath, backend, source: "built", attempts };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
