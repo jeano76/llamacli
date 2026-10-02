@@ -84,3 +84,12 @@ test("styled form wraps the tag in dim, bare form does not (shimmer slices by in
   assert.match(withDecodeRate(["a"], 40, 80, true)[0], /\x1b\[2m\(40 t\/s\)\x1b\[22m$/);
   assert.ok(!withDecodeRate(["a"], 40, 80, false)[0].includes("\x1b"));
 });
+
+import { foldedWithRate, foldedReasoningSummary } from "../tui/App.js";
+
+test("a folded reasoning row gets the rate only when it still fits on one row", () => {
+  const base = foldedReasoningSummary("x".repeat(162));
+  assert.equal(foldedWithRate(base, 22, 100), `${base} (22 t/s)`);
+  assert.equal(foldedWithRate(base, 22, 40), base, "narrow terminal: the summary stays one whole row");
+  assert.equal(foldedWithRate(base, undefined, 100), base);
+});

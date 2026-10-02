@@ -80,3 +80,42 @@ test("reasoning tokens count toward the speed once text appears (they are decode
     await loop.send("hi");
     assert.ok(rates.length > 0 && rates.every((r) => r >= 38 && r <= 42), JSON.stringify(rates));
   }));
+
+test("reasoning gets its own rate, final as soon as the answer starts", () =>
+  withProject(async (dir) => {
+    const clock = { t: 0 };
+    const events: Array<["r" | "a", number, boolean]> = [];
+    const loop = new AgentLoop({
+      projectRoot: dir, model: "m", systemPrompt: "s", backend: streamingBackend(40, clock, { reasoningFirst: 80 }),
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100_000 }, rateClock: () => clock.t,
+      onReasoningRate: (tps, final) => events.push(["r", Math.round(tps), final]),
+      onDecodeRate: (tps, final) => events.push(["a", Math.round(tps), final]),
+    });
+    await loop.send("hi");
+    const r = events.filter((e) => e[0] === "r");
+    assert.ok(r.length >= 2, JSON.stringify(events));
+    assert.equal(r.filter((e) => e[2]).length, 1, "exactly one final reasoning rate");
+    assert.ok(r.every(([, v]) => v >= 38 && v <= 42), JSON.stringify(r));
+    assert.ok(events.some((e) => e[0] === "a" && e[2]), "and the answer still gets its own");
+  }));
+
+test("reasoning followed by a tool call (no answer text) still gets its final rate", () =>
+  withProject(async (dir) => {
+    const clock = { t: 0 };
+    const backend: ModelBackend = {
+      async chat(_r, onDelta) {
+        clock.t += 3000;
+        for (let i = 0; i < 60; i++) { onDelta?.({ choices: [{ delta: { reasoning_content: "t " } as never, finish_reason: null }] }); clock.t += 25; }
+        return { choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] };
+      },
+      async listModels() { return ["m"]; }, async tokenize() { return 5; },
+    };
+    const got: Array<[number, boolean]> = [];
+    const loop = new AgentLoop({
+      projectRoot: dir, model: "m", systemPrompt: "s", backend,
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100_000 }, rateClock: () => clock.t,
+      onReasoningRate: (tps, final) => got.push([Math.round(tps), final]),
+    });
+    await loop.send("hi");
+    assert.deepEqual(got.filter(([, f]) => f).map(([v]) => v), [40]);
+  }));

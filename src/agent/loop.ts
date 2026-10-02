@@ -313,6 +313,11 @@ export interface AgentLoopOptions {
    *  with the exact figure (`final: true`). Only called after the response has produced
    *  visible assistant text, so the UI always has an assistant line to attach it to. */
   onDecodeRate?: (tokensPerSecond: number, final: boolean) => void;
+  /** Same, for the reasoning (`reasoning_content`) part of the response, measured over
+   *  its own tokens only. `final: true` fires as soon as reasoning ends — when the answer
+   *  or a tool call starts, or the response ends — so a folded reasoning block shows its
+   *  speed while the answer is still streaming. */
+  onReasoningRate?: (tokensPerSecond: number, final: boolean) => void;
   /** Fires whenever the queued-message list changes (see queueMessage), so
    *  the UI's own display of it (the /queue command) stays in sync with
    *  the authoritative copy this class now owns. */
@@ -812,6 +817,18 @@ export class AgentLoop {
       // second reader per streamed chunk would advance it and skew the guard. Speed is a
       // property of real elapsed time, so the real clock is also the correct one.
       const rate = new DecodeRateTracker(this.opts.rateClock);
+      // Reasoning is timed on its own: its tokens are decoded at the same speed, but
+      // folding them into the answer's figure would make the answer's number depend
+      // on how long the model thought, and the two blocks show different lines.
+      const reasoningRate = new DecodeRateTracker(this.opts.rateClock);
+      let reasoningChunks = 0;
+      let reasoningDone = false;
+      const finishReasoning = () => {
+        if (reasoningChunks === 0 || reasoningDone) return;
+        reasoningDone = true;
+        const r = reasoningRate.final();
+        if (r !== null) this.opts.onReasoningRate?.(r, true);
+      };
       let sawAssistantText = false;
       let res;
       try {
@@ -871,6 +888,15 @@ export class AgentLoop {
               sawAssistantText = true;
             }
             const reasoning = (delta as any)?.reasoning_content;
+            if (typeof reasoning === "string" && reasoning) {
+              reasoningChunks++;
+              reasoningRate.chunk();
+              const liveReasoning = reasoningRate.live();
+              if (liveReasoning !== null) this.opts.onReasoningRate?.(liveReasoning, false);
+            } else if (delta?.content || delta?.tool_calls?.length) {
+              // The first non-reasoning chunk after reasoning is the end of thinking.
+              finishReasoning();
+            }
             if (delta?.content || reasoning || delta?.tool_calls?.length) {
               rate.chunk();
               if (sawAssistantText) {
@@ -894,6 +920,7 @@ export class AgentLoop {
             if (typeof reasoning === "string" && reasoning) this.opts.onReasoningDelta?.(reasoning);
           }
         );
+        finishReasoning();
         if (sawAssistantText) {
           const done = rate.final(res?.usage?.completion_tokens);
           if (done !== null) this.opts.onDecodeRate?.(done, true);

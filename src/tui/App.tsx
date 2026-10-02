@@ -124,6 +124,15 @@ interface RenderedRow {
   lineId: number;
 }
 
+/** A folded summary row is exactly ONE row (the click map is one entry per row), so the
+ *  rate is added only when it fits; on a narrow terminal the summary stays whole and the
+ *  rate shows once the block is expanded. */
+export function foldedWithRate(summary: string, tps: number | undefined, width: number): string {
+  if (tps === undefined) return summary;
+  const withTag = `${summary} ${formatDecodeRate(tps)}`;
+  return stringWidth(withTag) <= width ? withTag : summary;
+}
+
 /** Appends " (40 t/s)" after the last word of an assistant block.
  *
  *  Applied to the rows AFTER they come out of the wrap cache, on a copy: the cache is
@@ -1223,13 +1232,14 @@ export function App({
     setStreamingAssistantId(null);
   }
 
-  /** Attaches the current decode speed to the newest assistant line. The loop only
+  /** Attaches the current decode speed to the newest line of `kind` (the answer, or its
+   *  reasoning block). The loop only
    *  reports a rate once this response has produced assistant text, and `setLog`
    *  updaters run in order, so "the newest assistant line" is this response's. */
-  function setDecodeRate(tps: number) {
+  function setDecodeRate(tps: number, kind: "assistant" | "reasoning" = "assistant") {
     setLog((prev) => {
       for (let i = prev.length - 1; i >= 0; i--) {
-        if (prev[i].kind !== "assistant") continue;
+        if (prev[i].kind !== kind) continue;
         if (prev[i].tps === tps) return prev;
         const next = prev.slice();
         next[i] = { ...prev[i], tps };
@@ -2205,7 +2215,12 @@ export function App({
     // folded case).
     if (line.kind === "reasoning" && line.id !== thinkingLineId) {
       if (!expandedReasoningIds.has(line.id)) {
-        allRows.push({ key: `${line.id}-fold`, text: foldedReasoningSummary(line.text), kind: "reasoning-folded", lineId: line.id });
+        allRows.push({
+          key: `${line.id}-fold`,
+          text: foldedWithRate(foldedReasoningSummary(line.text), line.tps, width),
+          kind: "reasoning-folded",
+          lineId: line.id,
+        });
         continue;
       }
       let cached = rowCache.get(line.id);
@@ -2213,7 +2228,7 @@ export function App({
         cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
         rowCache.set(line.id, cached);
       }
-      cached.rows.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
+      withDecodeRate(cached.rows, line.tps, width).forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
       allRows.push({ key: `${line.id}-fold-hint`, text: foldToggleHintExpanded, kind: "reasoning-folded", lineId: line.id });
       continue;
     }
@@ -2392,7 +2407,12 @@ export function App({
       cached = { text: line.text, width, rows: wrapLogLine(line, width).map(asRow) };
       rowCache.set(line.id, cached);
     }
-    const shown = line.kind === "assistant" ? withDecodeRate(cached.rows, line.tps, width) : cached.rows;
+    // A reasoning line only reaches here while it is still streaming (finalized ones
+    // fold above), and streaming rows go through the shimmer: bare tag, no escapes.
+    const shown =
+      line.kind === "assistant" ? withDecodeRate(cached.rows, line.tps, width)
+      : line.kind === "reasoning" ? withDecodeRate(cached.rows, line.tps, width, false)
+      : cached.rows;
     shown.forEach((text, i) => allRows.push({ key: `${line.id}-${i}`, text, kind: line.kind, lineId: line.id }));
   }
   if (rowCache.size > liveIds.size) {
