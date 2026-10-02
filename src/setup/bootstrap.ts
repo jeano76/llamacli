@@ -36,7 +36,8 @@ import {
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
 import { acquireTernaryLlamaServer, PRISM_LLAMA_CPP_REPO } from "./ternaryRuntime.js";
 import { acquireStockLlamaServer } from "./stockRuntime.js";
-import { chooseModel, resolveModel, pickPinnedCandidate, type ModelChoice } from "./modelCatalog.js";
+import { chooseModel, resolveModel, pickPinnedCandidate, isKnownDenseFamily, type ModelChoice } from "./modelCatalog.js";
+import { isMoeModel } from "./ggufMeta.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
 import { scanModels, pickReusable } from "./existingModel.js";
@@ -813,10 +814,17 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   const serverPids =
     opts.serverPids ?? (await findOwnLlamaServerPids(llama ? dirname(llama.binPath) : undefined, run));
   const ownServerVramGiB = await ownLlamaServerVramGiB(serverPids, run);
+  // Dense or MoE? From the file's own header when it is on disk, else the catalogue/name.
+  const moe = await isMoeModel({
+    path: modelPath || undefined,
+    filename: model?.candidate.filename ?? (modelPath ? basename(modelPath) : undefined),
+    dense: isKnownDenseFamily(model?.candidate.filename ?? basename(modelPath || "")),
+  });
   const tuning = tuneForHardware(hardware, {
     modelBytes: model?.candidate.sizeBytes,
     cpuMoeLayers: measuredCpuMoe,
     ownServerVramGiB,
+    moe,
   });
   for (const r of tuning.rationale) log(r);
 

@@ -126,6 +126,13 @@ export function tuneForHardware(
      * budgetVramGiB for why this is load-bearing rather than cosmetic.
      */
     ownServerVramGiB?: number;
+    /**
+     * Is the model a Mixture-of-Experts? `false` means DENSE: there are no expert tensors, so
+     * `--n-cpu-moe` does nothing — and neither a measured value carried over from a previous
+     * (MoE) model nor the VRAM-shortfall formula may produce one. `undefined` (unknown, e.g. a
+     * model not yet downloaded and not in the catalogue) keeps the previous behaviour.
+     */
+    moe?: boolean;
   }
 ): LlamaTuning {
   const rationale: string[] = [];
@@ -285,7 +292,15 @@ export function tuneForHardware(
   // number. A guess must not silently outrank a measurement on every launch.
   let cpuMoeLayers = 0;
   const measuredCpuMoe = opts?.cpuMoeLayers;
-  if (measuredCpuMoe !== undefined && measuredCpuMoe > 0) {
+  if (opts?.moe === false) {
+    // Dense: no experts to move. A value recorded for a previous MoE model (the config of a
+    // machine that ran Ornith keeps `cpuMoeLayers: 32`) is dropped for the same reason.
+    rationale.push(
+      measuredCpuMoe && measuredCpuMoe > 0
+        ? `밀집(dense) 모델이라 expert 가 없어 이전 모델의 --n-cpu-moe ${measuredCpuMoe} 을(를) 쓰지 않습니다.`
+        : "밀집(dense) 모델이라 MoE expert 가 없어 --n-cpu-moe 를 쓰지 않습니다."
+    );
+  } else if (measuredCpuMoe !== undefined && measuredCpuMoe > 0) {
     cpuMoeLayers = measuredCpuMoe;
     rationale.push(
       `--n-cpu-moe ${cpuMoeLayers} 은(는) 이 머신에서 실측된 값이라 그대로 유지합니다 (자동 계산값으로 덮지 않습니다).`

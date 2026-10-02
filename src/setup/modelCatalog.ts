@@ -182,6 +182,11 @@ const GiB = 1024 ** 3;
  *  request named; the others are only reached if it is absent from a repo. */
 const QUANT_PREFERENCE = ["Q4_K_M", "Q5_K_M", "Q6_K", "Q4_K_S", "Q3_K_XL", "Q3_K_M", "Q2_K"];
 
+/** Families this project ships that are DENSE (no experts): the Bonsai ladder and the 9B. */
+export function isKnownDenseFamily(filename: string): boolean {
+  return /Ternary-Bonsai/i.test(filename) || /Ornith-1\.5-9B/i.test(filename);
+}
+
 /** `Ternary-Bonsai-8B-PTQ1_0.gguf` → `Ternary-Bonsai-8B`; the model family without its quant. */
 export function modelFamilyOf(filename: string): string {
   const base = filename.replace(/\.gguf$/i, "").replace(/-\d{5}-of-\d{5}$/, "");

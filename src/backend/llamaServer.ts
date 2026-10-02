@@ -1,6 +1,7 @@
 import { spawn, ChildProcess } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { GPU_LOG_LINE } from "../setup/gpuReport.js";
+import { isMoeModelFile } from "../setup/ggufMeta.js";
 import { OpenAICompatibleClient } from "./openaiClient.js";
 
 /** Size of a file, or 0 when it cannot be read. */
@@ -225,6 +226,15 @@ export class LlamaServerManager {
     this.spawnError = null;
     this.log = [];
     this.gpuLines = [];
+
+    // A recorded `cpuMoeLayers` outlives the model it was measured for: the config of a machine
+    // that once ran a MoE model keeps it, and every later launch passed --n-cpu-moe to whatever
+    // model came next. On a dense model the flag has nothing to act on, so it is dropped here —
+    // the one place every launch path (startup, /models, /server restart) goes through — whenever
+    // the model's own header says it has no experts. Unknown means "leave it as configured".
+    if (this.config.cpuMoeLayers && (await isMoeModelFile(this.config.modelPath)) === false) {
+      this.config = { ...this.config, cpuMoeLayers: 0 };
+    }
 
     this.proc = spawn(this.config.binPath, buildServerArgs(this.config), {
       stdio: ["ignore", "pipe", "pipe"],

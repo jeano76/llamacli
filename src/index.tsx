@@ -29,6 +29,7 @@ import { describeReset, describeInForce } from "./setup/resetDiff.js";
 import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } from "./setup/modelMetrics.js";
 import { selectModel, recordServerPort, recordServerState } from "./setup/modelSelect.js";
 import { describeGpuPlan } from "./setup/gpuReport.js";
+import { isMoeModel } from "./setup/ggufMeta.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
 import { switchModelAndServer } from "./setup/modelSwitch.js";
@@ -1154,9 +1155,13 @@ async function main() {
                 ? dirname(String((config as any).llama.binPath))
                 : undefined;
               const oldServerVramGiB = await ownLlamaServerVramGiB(await findOwnLlamaServerPids(binDir));
+              // Dense (no experts) vs MoE: `activeParamB` is set only on the MoE rungs. A dense
+              // model gets no --n-cpu-moe — it has no experts to move.
+              const moe = await isMoeModel({ activeParamB: rung.activeParamB, dense: rung.activeParamB === undefined });
               const tuning = tuneForHardware(hw, {
                 modelBytes: rung.sizeBytes,
                 ownServerVramGiB: oldServerVramGiB,
+                moe,
               });
 
               const result = await selectModel({
@@ -1257,7 +1262,7 @@ async function main() {
                 // its memory.
                 retune: async () => {
                   const hw2 = await detectHardware();
-                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes });
+                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes, moe });
                   return { tuning: t2, lines: describeGpuPlan(hw2, t2) };
                 },
               });
