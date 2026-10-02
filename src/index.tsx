@@ -34,14 +34,6 @@ import { switchModelAndServer } from "./setup/modelSwitch.js";
 import { totalmem } from "node:os";
 import { join } from "node:path";
 
-/** Where models live for this install. `modelsDir` is only a default — models on
- *  an external drive are the normal case here, and `LLAMACLI_MODELS_DIR` is how
- *  bootstrap learns about one — so the recorded value is preferred over a guess. */
-function modelsDirFor(projectRoot: string): string {
-  const fromEnv = process.env.LLAMACLI_MODELS_DIR;
-  if (fromEnv) return fromEnv;
-  return join(process.env.HOME ?? "/root", "models");
-}
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -1010,7 +1002,6 @@ async function main() {
               const result = await selectModel({
                 projectRoot,
                 rung,
-                modelsDir: modelsDirFor(projectRoot),
                 tuning,
               });
 

@@ -117,11 +117,59 @@ test("a discovery error is reported, not thrown", async () => {
   assert.match(r.llama.detail, /오류/);
 });
 
-test("the model path lands under the configured models directory", async () => {
+test("when nothing is on disk, the path lands under the configured models directory", async () => {
+  // Only reached when the search comes up empty, which cannot be arranged from a
+  // test on a machine that really has these models on an external drive — so
+  // `modelsDir` is pointed at a temp dir AND the rung is one that genuinely does
+  // not exist here. The earlier version of this test asserted the path lands
+  // under modelsDir for a model that WAS on disk elsewhere, i.e. it asserted the
+  // bug: that a real existing copy is ignored in favour of the requested dir.
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "msel3-"));
   const h = harness(undefined, COMPATIBLE);
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/mnt/nvme/models", ...h.deps });
-  assert.ok(r.modelPath.startsWith("/mnt/nvme/models/"), `path should be under modelsDir: ${r.modelPath}`);
+  const r = await selectModel({
+    projectRoot: "/p",
+    rung: findRung("ornith-9b")!,
+    modelsDir: dir,
+    detectRunningPort: async () => null,
+    ...h.deps,
+  });
+  assert.ok(r.modelPath.startsWith(dir + "/"), `should be under modelsDir: ${r.modelPath}`);
+  assert.equal(r.presentOnDisk, false, "nothing there means a download, which must be reported as such");
 });
+
+test("an existing model in a SUBDIRECTORY is found, not re-downloaded", async () => {
+  // The real layout on this machine splits the two cases: some models sit at the
+  // top of the models dir and some in a per-family subdirectory. A flat check
+  // found the first and proposed re-downloading the second — several GiB the
+  // user already had.
+  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const root = await mkdtemp(join(tmpdir(), "msel2-"));
+  const sub = join(root, "models", "bonsai2");
+  await mkdir(sub, { recursive: true });
+  const real = join(sub, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+  await writeFile(real, "x");
+
+  const r = await selectModel({
+    projectRoot: root,
+    rung: bonsai,
+    detectRunningPort: async () => null,
+    readConfigFile: async () => ({}),
+    writeConfigFile: async () => {},
+    findServer: async () => COMPATIBLE as any,
+    // The models dir is not the default, so the search is pointed at it.
+    modelsDir: join(root, "models"),
+  });
+  assert.equal(r.modelPath, real, "a model in a subdirectory must be found, not re-downloaded");
+  assert.equal(r.presentOnDisk, true);
+});
+
+// ── Tuning, port, and the two defects found by checking the real config ──────
+
 test("re-tuning for the new model does NOT move the port", async () => {
   // The regression this guards: the tuning write and the port live in the same
   // `llama` block, so a re-tune that re-derives the port would relocate the
@@ -131,7 +179,6 @@ test("re-tuning for the new model does NOT move the port", async () => {
   const r = await selectModel({
     projectRoot: "/p",
     rung: bonsai,
-    modelsDir: "/models",
     tuning: { contextSize: 16384, threads: 10, cpuMoeLayers: 4 } as any,
     ...h.deps,
   });
@@ -141,8 +188,68 @@ test("re-tuning for the new model does NOT move the port", async () => {
   assert.equal(h.written[0].llama.cpuMoeLayers, 4);
 });
 
-test("a config with no port defaults to llama.cpp's own 8080", async () => {
+test("an unrecorded port asks the RUNNING server, never defaults to 8080", async () => {
+  // The config here has no `llama.port` at all while a real server listens on
+  // 8084. Defaulting to 8080 there would start a SECOND server -- the exact
+  // two-server OOM the switch exists to prevent -- so the running process is
+  // asked where it actually is.
+  const h = harness({ model: "/models/old.gguf", llama: { modelPath: "/models/old.gguf" } }, COMPATIBLE);
+  const r = await selectModel({
+    projectRoot: "/p",
+    rung: bonsai,
+    detectRunningPort: async () => 8084,
+    ...h.deps,
+  });
+  assert.equal(r.port, 8084, "the running server's port must win over the 8080 default");
+});
+
+test("a port already in the config still wins over the running server", async () => {
+  // Otherwise every model switch would silently adopt whatever port some other
+  // process happened to be on, moving an install that was deliberately placed.
+  const h = harness({ llama: { modelPath: "/m.gguf", port: 9090 } }, COMPATIBLE);
+  const r = await selectModel({
+    projectRoot: "/p",
+    rung: bonsai,
+    detectRunningPort: async () => 8084,
+    ...h.deps,
+  });
+  assert.equal(r.port, 9090);
+});
+
+test("with nothing running, an unrecorded port falls back to 8080", async () => {
+  // It is correct as a fallback precisely because nothing is listening, so
+  // binding it cannot collide.
   const h = harness(undefined, COMPATIBLE);
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  const r = await selectModel({
+    projectRoot: "/p",
+    rung: bonsai,
+    detectRunningPort: async () => null,
+    ...h.deps,
+  });
   assert.equal(r.port, 8080);
+});
+
+test("a model already on disk is recorded at its REAL path, not a guessed one", async () => {
+  // The regression: guessing `$HOME/models` recorded a path that does not exist
+  // for a model the user already had on an external drive, which reports
+  // "not downloaded yet" and then re-downloads GiB they already have. The
+  // config's own path wins when the file is really there.
+  const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const root = await mkdtemp(join(tmpdir(), "msel4-"));
+  const real = join(root, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+  await mkdir(join(root, ".llamacli"), { recursive: true });
+  await writeFile(real, "x");
+
+  const r = await selectModel({
+    projectRoot: root,
+    rung: bonsai,
+    detectRunningPort: async () => null,
+    readConfigFile: async () => ({ llama: { modelPath: real } }),
+    writeConfigFile: async () => {},
+    findServer: async () => COMPATIBLE as any,
+  });
+  assert.equal(r.modelPath, real, "the existing on-disk copy must be recorded, not re-downloaded");
+  assert.equal(r.presentOnDisk, true);
 });

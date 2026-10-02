@@ -282,3 +282,38 @@ async function stopPid(pid: number, say: (l: string) => void): Promise<void> {
   }
   await new Promise((r) => setTimeout(r, 500));
 }
+/** The port an already-running llama-server is listening on.
+ *
+ *  Needed because a config can legitimately have no `llama.port` at all — the
+ *  file on this machine was exactly that — and the fallback for "no port
+ *  recorded" must NOT be 8080. A server actually running on 8084 plus a default
+ *  of 8080 means the switch starts a SECOND server on 8080, which is the exact
+ *  two-server OOM this module exists to prevent. Asking the running process is
+ *  the only source that cannot be wrong about where it is.
+ *
+ *  Returns null when nothing of ours is listening; the caller then falls back. */
+export async function detectRunningServerPort(): Promise<number | null> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  let stdout = "";
+  try {
+    ({ stdout } = await run("ss", ["-ltnp"], { timeout: 5000 }));
+  } catch {
+    return null;
+  }
+  for (const line of stdout.split("\n")) {
+    const pid = line.match(/pid=(\d+)/)?.[1];
+    if (!pid) continue;
+    const cmdline = await readCmdline(Number(pid));
+    // The binary may be relative (`./llama-server`) when started by hand, so the
+    // test is on the name anywhere in the command line, not on the argv[0] path.
+    if (!cmdline || !/llama-server/i.test(cmdline)) continue;
+    // The listening port off the ss line, cross-checked against the process's own
+    // --port when it gave one. The ss port is authoritative: it is what the
+    // socket is actually bound to.
+    const port = line.match(/:(\d+)\s/) ? line.match(/:(\d+)\s/)![1] : null;
+    if (port) return Number(port);
+  }
+  return null;
+}

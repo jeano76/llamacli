@@ -627,6 +627,39 @@ forgotten in the other does not fail loudly, it just leaves the previous model's
 value in place, so the replacement server launches with flags sized for a model
 that is no longer loaded.
 
+#### Where the port comes from — and where the model already is
+
+Both of these were wrong until the **real** config on this machine was read
+rather than assumed. That config has no `llama` block at all: no port, no
+`binPath`, no `modelPath` — while a real `llama-server` listens on **8084**.
+
+| | First version | Correct version |
+|---|---|---|
+| **Port** | fell back to `8080` when the config recorded none | asks the **running server** where it is; `8080` is the last resort, reached only when nothing is listening |
+| **Model path** | guessed `$HOME/models` | searches for the file that is **already on disk** |
+
+The port bug is the same failure the module exists to prevent, arriving by a
+different door: a server on 8084 plus a default of 8080 means the switch starts
+a **second** server. `8080` is only a safe default when nothing is listening, so
+that is exactly where it now sits.
+
+The path bug proposed re-downloading GiB the user already had. `discoverMounts`
+finds `/media/$USER/<label>/models` — which no fixed candidate list matches, and
+which is where this machine's models are — and the search **recurses**, because
+the real layout has some models at the top of that directory
+(`Ornith-1.5-35B-A3B-Q4_K_M.gguf`) and some in per-family subdirectories
+(`bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf`). A flat check found one and missed
+the other. Bounded on depth and directories visited, because this runs inside a
+slash command on a real filesystem.
+
+Verified live against this machine's actual disk:
+
+```
+bonsai-27b    86ms  port=8084  5.5 GiB   /media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+ornith-35b    30ms  port=8084  20.4 GiB  /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+ornith-9b     32ms  port=8084  not on disk → would download
+```
+
 #### Who owns the port decides what happens
 
 Something is usually already listening, and whether llamacli may stop it depends
@@ -671,7 +704,7 @@ thrown.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 801 unit tests
+npm test                                              # 805 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -679,7 +712,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **801** | pass |
+| Unit / regression | `npm test` | **805** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
