@@ -292,6 +292,28 @@ export function chooseModel(opts: {
   if (!ramOk) why.push(`RAM ${ramGiB.toFixed(1)} GiB < 모델의 ${(size35 * MIN_RAM_MULTIPLE / GiB).toFixed(1)} GiB`);
   reasons.push(`35B 대신 9B 선택: ${why.join(", ")}`);
 
+  // ── A box too small even for the 9B ───────────────────────────────────────
+  // The 9B was returned unconditionally, so a 4 GB machine was handed a 5.4 GiB file
+  // that cannot be resident. The same 1.4x rule the 35B uses applies here: below it
+  // the model pages from disk and the box becomes unusable. A dense Bonsai is sized
+  // by RAM alone on such a machine (no VRAM is involved), and its 1-bit files are a
+  // fraction of the 9B's.
+  const size9 = pick9?.sizeBytes || APPROX_SIZES["9b"];
+  if (pick9 && ramGiB * GiB < size9 * MIN_RAM_MULTIPLE) {
+    for (const { size, pick } of bonsaiPicks) {
+      if (!pick) continue;
+      if (ramGiB * GiB < pick.sizeBytes * MIN_RAM_MULTIPLE) continue;
+      return {
+        candidate: pick,
+        reason:
+          `Ternary-Bonsai-${size} ${pick.filename} 을 선택했습니다. ${reasons.join(". ")}. ` +
+          `RAM ${ramGiB.toFixed(1)} GiB 로는 9B(${(size9 / GiB).toFixed(1)} GiB × ${MIN_RAM_MULTIPLE})가 상주할 수 없어, ` +
+          `파일이 ${(pick.sizeBytes / GiB).toFixed(1)} GiB 인 1-bit 모델로 CPU 실행합니다.`,
+        alternatives: [pick9],
+      };
+    }
+  }
+
   if (pick9) {
     return {
       candidate: pick9,

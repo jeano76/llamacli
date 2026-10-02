@@ -208,3 +208,30 @@ test("an empty Bonsai map does not change the Ornith outcome", () => {
   });
   assert.equal(r.candidate.filename, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
 });
+
+// ── A box too small for the 9B must not be handed it ───────────────────────
+
+test("chooseModel: a 4 GB CPU-only machine gets a 1-bit Bonsai, not the 5.4 GiB 9B", () => {
+  const GiB = 1024 ** 3;
+  const c9 = [{ repo: "r", filename: "Ornith-1.5-9B-Q4_K_M.gguf", sizeBytes: 5.4 * GiB, url: "u" }];
+  const bonsai = {
+    "27B": [{ repo: "r", filename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", sizeBytes: 5.5 * GiB, url: "u" }],
+    "8B": [{ repo: "r", filename: "Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 2.0 * GiB, url: "u" }],
+    "4B": [{ repo: "r", filename: "Ternary-Bonsai-4B-PQ2_0.gguf", sizeBytes: 1.0 * GiB, url: "u" }],
+  };
+  const pick = (ramGiB: number) => chooseModel({
+    vramTotalBytes: 0, vramFreeBytes: 0, ramTotalBytes: ramGiB * GiB, candidates35b: [], candidates9b: c9, bonsai,
+  }).candidate.filename;
+  assert.equal(pick(4), "Ternary-Bonsai-8B-PQ2_0.gguf");
+  assert.equal(pick(2), "Ternary-Bonsai-4B-PQ2_0.gguf");
+  // Enough RAM for the 9B (5.4 * 1.4 = 7.6) keeps the existing choice.
+  assert.equal(pick(8), "Ornith-1.5-9B-Q4_K_M.gguf");
+  assert.equal(pick(16), "Ornith-1.5-9B-Q4_K_M.gguf");
+});
+
+test("chooseModel: with no Bonsai available, a small box still gets the 9B rather than an error", () => {
+  const GiB = 1024 ** 3;
+  const c9 = [{ repo: "r", filename: "Ornith-1.5-9B-Q4_K_M.gguf", sizeBytes: 5.4 * GiB, url: "u" }];
+  const c = chooseModel({ vramTotalBytes: 0, vramFreeBytes: 0, ramTotalBytes: 4 * GiB, candidates35b: [], candidates9b: c9 });
+  assert.equal(c.candidate.filename, "Ornith-1.5-9B-Q4_K_M.gguf");
+});
