@@ -413,6 +413,25 @@ async function stopPid(pid: number, say: (l: string) => void): Promise<void> {
 export async function detectRunningServerPort(
   opts: { platform?: HostPlatform; run?: (file: string, args: string[], timeoutMs: number) => Promise<string> } = {}
 ): Promise<number | null> {
+  return (await detectRunningServerPorts(opts))[0] ?? null;
+}
+
+/** EVERY port a llama-server process of this machine is listening on, in the order
+ *  the OS lists them.
+ *
+ *  Plural because the first-found answer is not enough for discovery: with a manual
+ *  server on 8084 and a stray one elsewhere, "the first" may be the wrong one, and
+ *  discovery wants to probe them all. The list is the ground truth that the fixed
+ *  `COMMON_PORTS` guess can never be — a server started by hand (`--port 8084`) is
+ *  in no list anyone wrote down, which is how a healthy server holding 7.3 GB of an
+ *  8 GB card went unseen and a second one was spawned beside it. */
+export async function detectRunningServerPorts(
+  opts: {
+    platform?: HostPlatform;
+    run?: (file: string, args: string[], timeoutMs: number) => Promise<string>;
+    readCmdline?: (pid: number, platform: HostPlatform) => Promise<string | null>;
+  } = {}
+): Promise<number[]> {
   const run = opts.run ?? defaultRunCommand;
   const platform = opts.platform ?? process.platform;
   const { file, args } = listeningPortsCommand(platform);
@@ -420,12 +439,13 @@ export async function detectRunningServerPort(
   try {
     stdout = await run(file, args, 5000);
   } catch {
-    return null;
+    return [];
   }
+  const ports: number[] = [];
   for (const line of stdout.split("\n")) {
     const pid = platform === "win32" ? netstatPid(line) : line.match(/pid=(\d+)/)?.[1];
     if (!pid) continue;
-    const cmdline = await readCmdline(Number(pid), platform);
+    const cmdline = await (opts.readCmdline ?? readCmdline)(Number(pid), platform);
     // The binary may be relative (`./llama-server`) when started by hand, so the
     // test is on the name anywhere in the command line, not on the argv[0] path.
     if (!cmdline || !/llama-server/i.test(cmdline)) continue;
@@ -434,9 +454,9 @@ export async function detectRunningServerPort(
     // line: a server whose flag disagrees with its socket is rare, and trusting
     // the flag would hand the switch a port nothing is listening on.
     const port = platform === "win32" ? netstatLocalPort(line) : line.match(/:(\d+)\s/)?.[1];
-    if (port) return Number(port);
+    if (port && !ports.includes(Number(port))) ports.push(Number(port));
   }
-  return null;
+  return ports;
 }
 
 /** The pid column of a `netstat -ano` LISTENING line, or null. */

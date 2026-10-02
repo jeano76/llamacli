@@ -347,7 +347,10 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
         onWait: (port, waited) =>
           log(`${port} 포트 서버가 모델을 불러오는 중입니다 (${Math.round(waited / 1000)}초 경과)…`),
       }));
-  const discovery = await detect("127.0.0.1", COMMON_PORTS);
+  // The fixed list is a guess; the processes are the fact. A llama-server started by
+  // hand on 8084 is in no list, and missing it spawns a second server on a full card.
+  const livePorts = opts.detectServer ? [] : await (await import("./modelSwitch.js")).detectRunningServerPorts();
+  const discovery = await detect("127.0.0.1", [...new Set([...livePorts, ...COMMON_PORTS])]);
 
   // ── A port that is held but still loading is NOT ours to take ─────────────
   // The budget ran out while a server was mid-load. Binding a different port

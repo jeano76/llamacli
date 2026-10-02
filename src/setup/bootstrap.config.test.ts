@@ -102,6 +102,9 @@ test("an existing config is read back and merged, not discarded", async () =>
       projectRoot: dir,
       offline: true,
       allowBuild: false,
+      // Injected: without it the bootstrap scans the machine's real listeners, and on a
+      // box with a llama-server up it adopts that one — testing the machine, not the code.
+      detectServer: async () => ({ kind: "none" as const }),
       hardware: {
         cpuCount: 4, ramTotalBytes: 16 * 1024 ** 3, ramAvailableBytes: 12 * 1024 ** 3,
         gpus: [], gpuBackend: "none", canBuildCuda: false, tools: {}, platform: "linux",

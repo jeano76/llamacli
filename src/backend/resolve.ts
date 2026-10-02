@@ -3,6 +3,7 @@ import { formatBytes, type TransferProgress } from "../setup/download.js";
 import { LlamaServerManager, type LlamaServerConfig } from "./llamaServer.js";
 import { OpenAICompatibleClient } from "./openaiClient.js";
 import { discoverRunningServer, COMMON_PORTS, type Discovery } from "./detect.js";
+import { detectRunningServerPorts } from "../setup/modelSwitch.js";
 import { probeBackendHealth, describeUnhealthyBackend, type BackendHealth } from "./healthCheck.js";
 import type { LlamacliConfig } from "../config.js";
 import {
@@ -147,8 +148,14 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     opts.discover ??
     (() => {
       const recorded = configuredPort(config);
-      const ports = recorded === null ? COMMON_PORTS : [recorded, ...COMMON_PORTS.filter((p) => p !== recorded)];
-      return discoverRunningServer("127.0.0.1", ports);
+      // Order: the recorded port, then wherever a llama-server process is ACTUALLY
+      // listening, then the heuristic list. The middle one is what finds a server
+      // started by hand on a port nobody wrote down (8084 here), which neither the
+      // record nor the guess contains.
+      return detectRunningServerPorts().then((live) => {
+        const ordered = [...(recorded === null ? [] : [recorded]), ...live, ...COMMON_PORTS];
+        return discoverRunningServer("127.0.0.1", [...new Set(ordered)]);
+      });
     });
   // A download that reported progress by rewriting one terminal line would
   // corrupt the TUI rendering into the same screen — Ink owns those bytes here,
