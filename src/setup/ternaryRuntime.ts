@@ -546,7 +546,7 @@ export async function acquireTernaryLlamaServer(opts: {
  *
  *  Every one of these has a failure that looks like a working install from the
  *  outside, and the previous version of this code ran nothing at all. */
-async function verifyLlamaServer(
+export async function verifyLlamaServer(
   binPath: string,
   run: Run,
   modelPath?: string,

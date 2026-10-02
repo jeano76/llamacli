@@ -29,12 +29,13 @@ import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB, type Har
 import { getCapabilities } from "../tui/terminal.js";
 import { tuneForHardware, type LlamaTuning } from "./tuning.js";
 import {
-  findLlamaServer, buildLlamaCpp, defaultRun,
+  findLlamaServer, defaultRun,
   probeModelCompatibility, looksLikeUnsupportedModelFormat,
   type LlamaLocation, type Run,
 } from "./llamaCpp.js";
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
 import { acquireTernaryLlamaServer, PRISM_LLAMA_CPP_REPO } from "./ternaryRuntime.js";
+import { acquireStockLlamaServer } from "./stockRuntime.js";
 import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
@@ -110,6 +111,8 @@ export interface BootstrapOptions {
    *  cannot assert that without standing in for it. Reaching the network or a
    *  30-minute compile from a test is not an option. */
   acquireTernary?: typeof acquireTernaryLlamaServer;
+  /** Same seam for the stock llama.cpp ladder (prebuilt → Vulkan → CPU → compile). */
+  acquireStock?: typeof acquireStockLlamaServer;
   /** PIDs of llama-server processes belonging to THIS install, whose VRAM is
    *  discounted when sizing the context (see budgetVramGiB). Injected because
    *  attributing a pid to our own server is a question about which binary we
@@ -199,7 +202,13 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     modelPath: configuredModel,
   });
   let llama: LlamaLocation | undefined = found ?? undefined;
-  if (!llama) {
+  /** Gets a llama-server when none was found. DEFERRED until the model is known:
+   *  this used to run here, before the running-server check and before the model
+   *  choice, so a machine that already had a server up still compiled one, and a
+   *  first launch compiled stock llama.cpp and then discovered the chosen Bonsai
+   *  model needed the fork — 10-40 minutes spent on a binary that was thrown away. */
+  const acquireEngine = async (chosen?: ModelChoice): Promise<void> => {
+    if (llama) return;
     // A binary that exists but cannot run is a different problem from a binary
     // that is not installed, and reporting it as the latter sends the user
     // looking for an install that is sitting right there.
@@ -232,6 +241,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       // binary that fails on the very model it was built for.
       const wantsTernary =
         needsTernaryBuild(basename(configuredModel ?? "")) ||
+        (chosen ? needsTernaryBuild(chosen.candidate.filename) : false) ||
         (rejectedForModel?.length ?? 0) > 0 ||
         (rejected ?? []).length > 0;
 
@@ -253,14 +263,21 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
           };
         }
       } else {
-        const binPath = await step("llama.cpp 빌드", async () => {
-          log("llama-server 를 찾지 못해 빌드합니다. CUDA 빌드는 10~40분 걸릴 수 있습니다.");
-          return buildLlamaCpp({ hw: hardware, run, log });
+        // Prebuilt first, compile last, every rung run before it is believed — see
+        // stockRuntime.ts. This used to be an unconditional 10-40 minute compile.
+        await step("llama.cpp 준비", async () => {
+          const r = await (opts.acquireStock ?? acquireStockLlamaServer)({
+            hardware, run: run as never, log, modelPath: configuredModel,
+            onProgress: opts.onProgress ? opts.onProgress(() => renderProgressLine(log)) : undefined,
+          });
+          if (!r) throw new Error("llama-server 를 받을 수도, 빌드할 수도 없었습니다.");
+          llama = { binPath: r.binPath, source: r.source, backend: r.backend };
+          return `${r.binPath} (${r.source === "downloaded" ? "사전 빌드" : "소스 빌드"}, ${r.backend})`;
         });
-        if (binPath) llama = { binPath, source: "built", backend: hardware.canBuildCuda ? "cuda" : "cpu" };
       }
     }
-  } else {
+  };
+  if (llama) {
     steps.push({
       name: "llama-server 확인",
       ok: true,
@@ -497,6 +514,11 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       return model.reason;
     });
   }
+
+  // ── 3.2 The engine, now that the model is known ───────────────────────────
+  // Not earlier: see `acquireEngine`. An already-running server ended the bootstrap
+  // above, so a machine with a working server never reaches a download or a compile.
+  await acquireEngine(model);
 
   // ── 3.5 Does the chosen binary plausibly read the chosen model? ────────────
   // The binary is settled in step 2 and the model in step 3, so a fresh install

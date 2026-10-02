@@ -412,6 +412,8 @@ export async function findLlamaServer(opts: {
     // compile the whole thing again. Every launch, forever.
     { dir: join(home, ".llamacli", "prism-llama.cpp"), source: "llamacli-build" as const },
     { dir: join(home, ".llamacli", "llama.cpp-fork"), source: "llamacli-build" as const },
+    // Stock prebuilts installed by stockRuntime.ts, one subdirectory per backend.
+    { dir: join(home, ".llamacli", "llama.cpp-prebuilt"), source: "llamacli-build" as const },
   ];
   for (const root of roots) {
     const buildDirs = await listDirs(root.dir);
