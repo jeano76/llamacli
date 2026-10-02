@@ -40,6 +40,7 @@ import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
 import { discoverRunningServer, modelLoadBudgetMs, type Discovery } from "../backend/detect.js";
 import { rm } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
+import { defaultModelsDir } from "./hostEnv.js";
 
 export interface BootstrapStep {
   name: string;
@@ -109,7 +110,15 @@ export interface BootstrapOptions {
   serverPids?: readonly number[];
 }
 
-export const DEFAULT_MODELS_DIR = pathJoin(process.env.HOME ?? "/root", "models");
+/**
+ * Kept as a value for existing callers, but it is a POSIX guess and is WRONG on
+ * Windows, where `HOME` is normally unset. It is now derived from `homedir()`,
+ * which resolves `USERPROFILE` there, instead of `process.env.HOME ?? "/root"` —
+ * a hardcoded root that produced a plausible, impossible path rather than an
+ * error. Anything that has the caller's `env` in hand must prefer
+ * `defaultModelsDir(env)`, which honours an injected HOME.
+ */
+export const DEFAULT_MODELS_DIR = defaultModelsDir();
 
 /** Idempotency marker. Without it there is no way to tell "never bootstrapped"
  *  from "bootstrapped and everything was already present", and the expensive
@@ -401,7 +410,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   //   1. an already-running server (above), which ends the bootstrap outright;
   //   2. the model this install is ALREADY using, below.
   //
-  const modelsDir = opts.modelsDir ?? env.LLAMACLI_MODELS_DIR ?? DEFAULT_MODELS_DIR;
+  const modelsDir = opts.modelsDir ?? env.LLAMACLI_MODELS_DIR ?? defaultModelsDir(env);
   let equivalent: string | null = null;
   //
   // (2) exists because the Hub republishes filenames: this box's working model

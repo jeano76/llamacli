@@ -34,9 +34,21 @@
  */
 
 import { LlamaServerManager, type LlamaServerConfig } from "../backend/llamaServer.js";
+import { hasSystemd, listeningPortsCommand, PORT_FIELD_SEPARATOR, type HostPlatform } from "./hostEnv.js";
 
 export type PortOwner =
   | { kind: "none" }
+  /**
+   * The lookup itself failed — the platform's tool is missing or its output
+   * could not be parsed. NOT the same as "free".
+   *
+   * This state exists because the previous version shelled out to `ss`, caught
+   * the "command not found" on Windows, and reported the port as free. A model
+   * switch on an occupied port would then start a second server, which is the
+   * exact failure the module exists to prevent — reached by believing a tool's
+   * absence instead of by ignoring it.
+   */
+  | { kind: "unknown"; reason: string }
   /** A llama-server this install is allowed to stop. */
   | { kind: "ours"; pid: number; binPath?: string }
   /** A systemd user unit holding the port. Restarting it re-runs the unit's own
@@ -69,6 +81,10 @@ export interface SwitchOptions {
   stopProcess?: (pid: number, say: (line: string) => void) => Promise<void>;
   /** Injected for tests. */
   onProgress?: (line: string) => void;
+  /** Injected for tests; defaults to the host platform. */
+  platform?: HostPlatform;
+  /** Injected for tests; defaults to a real child-process exec. */
+  runCommand?: (file: string, args: string[], timeoutMs: number) => Promise<string>;
 }
 
 export interface SwitchResult {
@@ -92,8 +108,25 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
     opts.onProgress?.(l);
   };
 
-  const detectOwner = opts.detectOwner ?? (async () => detectPortOwner(port));
+  const detectOwner =
+    opts.detectOwner ??
+    (async () => detectPortOwner(port, { platform: opts.platform, run: opts.runCommand }));
   const owner = await detectOwner();
+
+  if (owner.kind === "unknown") {
+    // Refusing is the whole point: acting on a port we could not inspect risks a
+    // second server, and a second server on a small card is an OOM at load.
+    return {
+      ok: false,
+      port,
+      ready: false,
+      lines: [
+        `${port} 포트가 사용 중인지 확인할 수 없습니다 (${owner.reason}).`,
+        "확인되지 않은 포트에 서버를 새로 띄우면 기존 서버와 충돌합니다.",
+        "모델은 config 에 기록했습니다 — 서버 교체는 건너뜁니다.",
+      ],
+    };
+  }
 
   if (owner.kind === "foreign") {
     // The one case we refuse to act on. Binding the port ourselves would fail,
@@ -179,49 +212,110 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
  * llama-server becomes "foreign", which the caller then declines to touch.
  * Failing closed matters here — mis-classifying a stranger's process as ours
  * would let a model switch kill it. */
-export async function detectPortOwner(port: number): Promise<PortOwner> {
-  const pid = await pidOnPort(port);
+export async function detectPortOwner(
+  port: number,
+  opts: {
+    platform?: HostPlatform;
+    run?: (file: string, args: string[], timeoutMs: number) => Promise<string>;
+    /** Injected for tests. The real one reads procfs or shells out to wmic, and
+     *  `wmic` is absent on current Windows -- so without a seam the ONLY
+     *  reachable answer on a Windows box is `unknown`, and the positive
+     *  attribution could not be exercised anywhere. */
+    readCmdline?: (pid: number, platform: HostPlatform) => Promise<string | null>;
+  } = {}
+): Promise<PortOwner> {
+  const run = opts.run ?? defaultRunCommand;
+  const probeCmd = listeningPortsCommand(opts.platform);
+  const { pid, known } = await pidOnPort(port, run, opts.platform);
+  // `known: false` means the LISTENING-PORT LOOKUP ITSELF FAILED — the tool is
+  // missing, or the output could not be parsed. That is NOT the same as "the
+  // port is free", and treating it as free is how a model switch starts a SECOND
+  // server on an occupied port: the command is absent on Windows, the throw was
+  // caught, and the empty answer was believed.
+  if (!known) return { kind: "unknown", reason: `listening-port 조회 실패 (${probeCmd.file})` };
   if (!pid) return { kind: "none" };
 
   // A systemd unit that names this port wins over everything: it is the thing
-  // that will keep holding it, so it decides what happens.
-  const unit = await systemdUnitForPort(port);
-  if (unit) return { kind: "systemd", unit };
+  // that will keep holding it, so it decides what happens. Skipped outright on
+  // platforms that have no systemd, rather than run and caught.
+  if (hasSystemd(opts.platform)) {
+    const unit = await systemdUnitForPort(port, run);
+    if (unit) return { kind: "systemd", unit };
+  }
 
-  const cmdline = await readCmdline(pid);
+  const cmdline = await (opts.readCmdline ?? readCmdline)(pid, opts.platform ?? process.platform);
   if (cmdline && /llama-server/i.test(cmdline)) {
     return { kind: "ours", pid, binPath: cmdline.split(/\s+/)[0] };
+  }
+  // A cmdline we could NOT read is not the same as one that does not mention
+  // llama-server. Collapsing the two calls a real server `foreign` — which
+  // refuses the switch with a message about a process "llamacli does not
+  // recognise", when the truth is that it simply could not look. `wmic` is
+  // absent on current Windows, so this is the normal case there, not an edge
+  // one. Both refuse to act, so the safety outcome is identical; the difference
+  // is that only one of them tells the truth about why.
+  if (!cmdline) {
+    return { kind: "unknown", reason: `pid ${pid} 의 명령줄을 읽을 수 없음 (읽지 못함 ≠ llama-server 아님)` };
   }
   return { kind: "foreign", pid };
 }
 
-async function pidOnPort(port: number): Promise<number | null> {
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const run = promisify(execFile);
+async function pidOnPort(
+  port: number,
+  run: (file: string, args: string[], timeoutMs: number) => Promise<string>,
+  platform: HostPlatform = process.platform
+): Promise<{ pid: number | null; known: boolean }> {
+  const { file, args } = listeningPortsCommand(platform);
+  let stdout: string;
   try {
-    // `ss -ltnp` prints `users:(("llama-server",pid=123,fd=3))`.
-    const { stdout } = await run("ss", ["-ltnp"], { timeout: 5000 });
-    for (const line of stdout.split("\n")) {
-      if (!new RegExp(`:${port}\\s`).test(line)) continue;
-      const m = line.match(/pid=(\d+)/);
-      if (m) return Number(m[1]);
-    }
-    return null;
+    stdout = await run(file, args, 5000);
   } catch {
-    return null;
+    return { pid: null, known: false };
   }
+  for (const line of stdout.split("\n")) {
+    if (platform === "win32") {
+      // `continue` on a non-match, NOT an early return: the first line of
+      // netstat output is a header, so returning on it reported every port as
+      // free. An early return here is the same class of bug as treating a
+      // failed lookup as an empty one — a wrong answer instead of no answer.
+      const pid = parseNetstatLine(line, port);
+      if (pid) return { pid, known: true };
+      continue;
+    }
+    if (!new RegExp(`${PORT_FIELD_SEPARATOR}${port}\\s`).test(line)) continue;
+    const m = line.match(/pid=(\d+)/);
+    if (m) return { pid: Number(m[1]), known: true };
+  }
+  return { pid: null, known: true };
 }
 
-async function systemdUnitForPort(port: number): Promise<string | null> {
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const run = promisify(execFile);
+/** `netstat -ano` line → pid, or null when the line is not our port.
+ *
+ *  Windows prints `TCP  127.0.0.1:8084  0.0.0.0:0  LISTENING  1234`, with the
+ *  port in the LOCAL address column. The foreign-address column also contains a
+ *  colon, so the port is matched against the local column specifically —
+ *  matching anywhere in the line would read `0.0.0.0:0` and every line as a
+ *  candidate. */
+function parseNetstatLine(line: string, port: number): number | null {
+  const cols = line.trim().split(/\s+/);
+  if (cols.length < 5) return null;
+  if (cols[0].toUpperCase() !== "TCP") return null;
+  if (cols[3].toUpperCase() !== "LISTENING") return null;
+  const local = cols[1];
+  if (!local.endsWith(`${PORT_FIELD_SEPARATOR}${port}`)) return null;
+  const pid = Number(cols[4]);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+async function systemdUnitForPort(
+  port: number,
+  run: (file: string, args: string[], timeoutMs: number) => Promise<string>
+): Promise<string | null> {
   try {
-    const { stdout } = await run(
+    const stdout = await run(
       "systemctl",
       ["--user", "list-units", "--type=service", "--state=running", "--no-pager", "--plain", "--no-legend"],
-      { timeout: 8000 }
+      8000
     );
     for (const line of stdout.split("\n")) {
       const unit = line.trim().split(/\s+/)[0];
@@ -229,8 +323,8 @@ async function systemdUnitForPort(port: number): Promise<string | null> {
       if (!/llama|llamacli/i.test(unit)) continue;
       // Confirm the unit actually binds this port before claiming it does --
       // otherwise any llama unit would be attributed whatever port is asked.
-      const { stdout: show } = await run("systemctl", ["--user", "show", unit, "-p", "ExecStart"], { timeout: 5000 }).catch(() => ({ stdout: "" }));
-      if (show.includes(`:${port}`) || show.includes(`--port ${port}`)) return unit;
+      const show = await run("systemctl", ["--user", "show", unit, "-p", "ExecStart"], 5000).catch(() => "");
+      if (show.includes(`${PORT_FIELD_SEPARATOR}${port}`) || show.includes(`--port ${port}`)) return unit;
     }
     return null;
   } catch {
@@ -238,13 +332,37 @@ async function systemdUnitForPort(port: number): Promise<string | null> {
   }
 }
 
-async function readCmdline(pid: number): Promise<string | null> {
+/** The command line of `pid`, or null when the platform cannot supply one.
+ *
+ *  null must be read as UNKNOWN, not as empty. An empty string would fail the
+ *  `/llama-server/i` test below and classify a real server as `foreign`, which
+ *  makes the switch refuse to act on the very server it was asked to replace. */
+async function readCmdline(pid: number, platform: HostPlatform = process.platform): Promise<string | null> {
+  if (platform === "win32") {
+    try {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const out = await promisify(execFile)("wmic",
+        ["process", "where", `ProcessId=${pid}`, "get", "CommandLine", "/value"],
+        { timeout: 5000, windowsHide: true } as never);
+      return (String(out.stdout) || "").split("=").slice(1).join("=").trim() || null;
+    } catch {
+      return null;
+    }
+  }
   const { readFile } = await import("node:fs/promises");
   try {
-    return (await readFile(`/proc/${pid}/cmdline`, "utf8")).replace(/\0/g, " ").trim();
+    return (await readFile(`/proc/${pid}/cmdline`, "utf8")).replace(/\0/g, " ").trim() || null;
   } catch {
     return null;
   }
+}
+
+async function defaultRunCommand(file: string, args: string[], timeoutMs: number): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const { stdout } = await promisify(execFile)(file, args, { timeout: timeoutMs });
+  return String(stdout);
 }
 
 /** SIGTERM, then confirm it actually let go of the port.
@@ -292,28 +410,46 @@ async function stopPid(pid: number, say: (l: string) => void): Promise<void> {
  *  the only source that cannot be wrong about where it is.
  *
  *  Returns null when nothing of ours is listening; the caller then falls back. */
-export async function detectRunningServerPort(): Promise<number | null> {
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const run = promisify(execFile);
-  let stdout = "";
+export async function detectRunningServerPort(
+  opts: { platform?: HostPlatform; run?: (file: string, args: string[], timeoutMs: number) => Promise<string> } = {}
+): Promise<number | null> {
+  const run = opts.run ?? defaultRunCommand;
+  const platform = opts.platform ?? process.platform;
+  const { file, args } = listeningPortsCommand(platform);
+  let stdout: string;
   try {
-    ({ stdout } = await run("ss", ["-ltnp"], { timeout: 5000 }));
+    stdout = await run(file, args, 5000);
   } catch {
     return null;
   }
   for (const line of stdout.split("\n")) {
-    const pid = line.match(/pid=(\d+)/)?.[1];
+    const pid = platform === "win32" ? netstatPid(line) : line.match(/pid=(\d+)/)?.[1];
     if (!pid) continue;
-    const cmdline = await readCmdline(Number(pid));
+    const cmdline = await readCmdline(Number(pid), platform);
     // The binary may be relative (`./llama-server`) when started by hand, so the
     // test is on the name anywhere in the command line, not on the argv[0] path.
     if (!cmdline || !/llama-server/i.test(cmdline)) continue;
-    // The listening port off the ss line, cross-checked against the process's own
-    // --port when it gave one. The ss port is authoritative: it is what the
-    // socket is actually bound to.
-    const port = line.match(/:(\d+)\s/) ? line.match(/:(\d+)\s/)![1] : null;
+    // The port the socket is actually bound to is authoritative, and it is read
+    // from the platform's own format rather than from `--port` on the command
+    // line: a server whose flag disagrees with its socket is rare, and trusting
+    // the flag would hand the switch a port nothing is listening on.
+    const port = platform === "win32" ? netstatLocalPort(line) : line.match(/:(\d+)\s/)?.[1];
     if (port) return Number(port);
   }
   return null;
+}
+
+/** The pid column of a `netstat -ano` LISTENING line, or null. */
+function netstatPid(line: string): string | null {
+  const cols = line.trim().split(/\s+/);
+  if (cols.length < 5 || cols[0].toUpperCase() !== "TCP" || cols[3].toUpperCase() !== "LISTENING") return null;
+  return /^[0-9]+$/.test(cols[4]) ? cols[4] : null;
+}
+
+/** The local port of a `netstat -ano` LISTENING line, or null. */
+function netstatLocalPort(line: string): string | null {
+  const cols = line.trim().split(/\s+/);
+  if (cols.length < 5 || cols[0].toUpperCase() !== "TCP" || cols[3].toUpperCase() !== "LISTENING") return null;
+  const m = cols[1].match(/:(\d+)$/);
+  return m ? m[1] : null;
 }

@@ -13,7 +13,9 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test \"src/**/*.test.ts\"",
-    "verify-build": "node scripts/verify-build.mjs"
+    "verify-build": "node scripts/verify-build.mjs",
+    "check:harnesses": "tsx scripts/persona_usability_check.ts && tsx scripts/project_persona_check.ts && tsx scripts/tui_simulation_check.ts && tsx scripts/bare_env_check.ts",
+    "check": "npm run typecheck && npm test && npm run check:harnesses"
   },
   "dependencies": {
     "ink": "^4.4.1",

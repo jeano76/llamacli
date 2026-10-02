@@ -57,7 +57,27 @@ async function isExecutable(path: string): Promise<boolean> {
 
 /** The binary name for this platform. llama.cpp ships `llama-server.exe` on
  *  Windows and nothing anywhere else. */
-const BIN_NAME = process.platform === "win32" ? "llama-server.exe" : "llama-server";
+/**
+ * The binary's filename on this platform.
+ *
+ * A FUNCTION, not a module-level const. As a const it was frozen from
+ * `process.platform` at import time, which meant the Windows `.exe` name could
+ * not be exercised by any test on a Linux box -- the platform-specific naming
+ * was real code that nothing could reach. Same mistake as reading `HOME` once
+ * at module load: a value decided before anything could ask the question.
+ */
+export function binNameFor(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? "llama-server.exe" : "llama-server";
+}
+
+/** The name for the host platform.
+ *
+ *  Only the PATH lookup consults `binNameFor(opts.platform)`; the build
+ *  directory layouts below use this, because llama.cpp's own layout
+ *  (`build/bin`, `build/Release/bin`) is the same on every platform it ships
+ *  for, and threading a platform parameter through every one of those helpers
+ *  would be a large refactor to make an unchanged behaviour injectable. */
+const BIN_NAME = binNameFor();
 
 export interface LlamaLocation {
   binPath: string;
@@ -254,6 +274,9 @@ export async function findLlamaServer(opts: {
   probeModel?: typeof probeModelCompatibility;
   /** Injected for tests; defaults to a real spawn. */
   spawnProbe?: ProbeSpawn;
+  /** Overrides the host platform. Injectable because the binary's NAME depends on
+   *  it, and a name frozen at import time is untestable. */
+  platform?: NodeJS.Platform;
   /** Set false to skip the model-compatibility pass entirely (tests, or when
    *  no model is known yet). */
   checkModel?: boolean;
@@ -346,7 +369,7 @@ export async function findLlamaServer(opts: {
   //    the same injectable `exists` seam covers every candidate.
   const pathEntries = (env.PATH ?? "").split(delimiter).filter(Boolean);
   for (const dir of pathEntries) {
-    const candidate = join(dir, BIN_NAME);
+    const candidate = join(dir, binNameFor(opts.platform));
     if (await exists(candidate)) {
       const hit = await accept(candidate, "path");
       if (hit) return { location: hit, rejected, rejectedForModel, unverified };

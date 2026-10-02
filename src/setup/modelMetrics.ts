@@ -134,6 +134,25 @@ const KV_GIB_PER_TOKEN = 0.3 / (1024 * 1024); // ~0.3 MB/token at q8_0
 /** How much VRAM is actually spendable on this machine right now. */
 export function usableVramGiB(hw: Hardware): number {
   const gpu = pickPrimaryGpu(hw);
+  // ZERO when there is no GPU — deliberately, and this is the fix for a bug the
+  // bare-environment harness found.
+  //
+  // `budgetVramGiB` falls back to `RAM * 0.6` when no GPU is present. That
+  // fallback is CORRECT for its caller: the tuner needs a non-zero number to
+  // size a CPU-only launch sanely, and returning 0 there collapses the context
+  // to nothing on exactly the machines that need it sized most conservatively.
+  //
+  // It is wrong HERE. This function answers "how much VRAM may I spend", and the
+  // table then labels the answer "✅ GPU에 완전히 올라갑니다" — fully resident on
+  // the GPU. On a machine with no GPU at all that reported 4.8 GiB and told the
+  // user a 1.9 GiB model loads entirely onto a GPU that does not exist. A
+  // fallback meant for one caller was silently inherited by another, and the
+  // headline verdict of `/models` was false.
+  //
+  // So the two are deliberately different numbers, and only the tuner gets the
+  // RAM fallback. With 0 here, every rung correctly falls through to the RAM or
+  // CPU tiers, which is the truth on a machine without a GPU.
+  if (!gpu) return 0;
   return budgetVramGiB(hw, gpu);
 }
 

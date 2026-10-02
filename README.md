@@ -751,12 +751,65 @@ sitting **beside the models** (`runtimeCandidatesNearModel`). `/models` only
 turns that result into something actionable. A discovery error is reported, never
 thrown.
 
+## Validation on a bare machine and on Windows `cmd`
+
+The other three harnesses all assume a machine that already has things: a home
+directory with content, a shell, `PATH`, a GPU tool, a working `llama-server`.
+`scripts/bare_env_check.ts` removes those assumptions, because "works on my
+machine" is exactly the claim that breaks for someone who has none of them.
+
+| Family | What is removed |
+|---|---|
+| **A · bare** | no config, no model, no llama.cpp, no `PATH`, no `nvidia-smi`, no `ss`, no `systemctl`, no network |
+| **B · Windows cmd** | no `HOME` (it is `USERPROFILE`), no procfs, no `systemctl`; listening ports from `netstat -ano` in a different column layout |
+
+Windows is **simulated by injecting the platform and the real command output**,
+not by mocking the code under test — the point is to exercise the real parsing.
+`netstat` fixtures are real `netstat -ano` lines, CRLF and all.
+
+### It found four real bugs, all the same mistake
+
+A platform-specific default that degrades into a **wrong answer** instead of an
+error.
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| `env.HOME` with a hardcoded `/root` fallback | `HOME` is normally **unset** on Windows, so every default became `/root/...` — a path that cannot exist there, produced with no error | `USERPROFILE` is honoured; no POSIX fallback |
+| `ss -ltnp` for the listening port | absent on Windows; the throw was caught and the port reported **FREE** → a model switch starts a **second** server on an occupied port | `netstat -ano` on Windows; a missing tool is `unknown`, and `unknown` refuses to act |
+| `usableVramGiB` inherited the tuner's `RAM * 0.6` no-GPU fallback | a machine with **no GPU** was told `4.8 GiB` of VRAM, and `/models` printed `✅ GPU에 완전히 올라갑니다` for it | the two are deliberately different numbers; only the tuner gets the RAM fallback. The tuner still sizes a CPU-only box sanely (`-c 32768`, not 0) |
+| an unreadable `/proc` cmdline read as "not a llama-server" | `wmic` is gone from current Windows, so a real server was classified `foreign` and the switch refused with a message about a process "llamacli does not recognise" — when the truth is it could not look | unreadable ⇒ `unknown`, which says so |
+
+The third is the one worth dwelling on: the two numbers are *deliberately*
+different, and the comment in `usableVramGiB` says why. A fallback that is
+correct for one caller is not correct for another, and nothing in the types
+stopped it being inherited.
+
+### Every bug was verified by reverting it
+
+A harness that passes on its first full run is a harness that may be asserting
+nothing. Each was reintroduced and the failure watched:
+
+```
+reintroduce no-GPU VRAM bug        -> ✗ with no GPU nothing may be reported as fitting in VRAM
+reintroduce USERPROFILE bug        -> ✗ HOME is unset on Windows, so USERPROFILE must be used
+                                     ✗ must not fall back to /root when HOME is absent
+reintroduce "missing tool = free"  -> ✗ believing a tool's absence starts a second server
+```
+
+### What it does NOT prove
+
+Simulated is not native. `netstat` output is **parsed** here on Linux; it has not
+been run against a real `cmd.exe`, and `wmic`'s absence is assumed rather than
+observed. A real Windows box is still the only thing that settles those. What is
+verified is that the platform-specific code paths are *reachable and correct*,
+which is what made the four bugs findable at all.
+
 ## Validation — what is actually checked, and what is not
 
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 814 unit tests
+npm test                                              # 823 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -764,7 +817,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **814** | pass |
+| Unit / regression | `npm test` | **823** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
