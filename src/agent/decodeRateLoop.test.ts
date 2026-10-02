@@ -119,3 +119,22 @@ test("reasoning followed by a tool call (no answer text) still gets its final ra
     await loop.send("hi");
     assert.deepEqual(got.filter(([, f]) => f).map(([v]) => v), [40]);
   }));
+
+test("setModel changes the id every later request carries", () =>
+  withProject(async (dir) => {
+    const clock = { t: 0 };
+    const seen: string[] = [];
+    const backend: ModelBackend = {
+      async chat(req) {
+        seen.push(req.model);
+        clock.t += 100;
+        return { choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] };
+      },
+      async listModels() { return ["m"]; }, async tokenize() { return 5; },
+    };
+    const loop = new AgentLoop({ projectRoot: dir, model: "old-27B.gguf", systemPrompt: "s", backend, thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100_000 }, rateClock: () => clock.t });
+    await loop.send("one");
+    loop.setModel("new-8B.gguf");
+    await loop.send("two");
+    assert.deepEqual(seen, ["old-27B.gguf", "new-8B.gguf"]);
+  }));

@@ -193,6 +193,10 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
   const previousModel = typeof existing?.model === "string" ? existing.model : undefined;
 
   const port = await resolvePort(existing, opts.detectRunningPort);
+  // The build that can read THIS model is recorded alongside it. Leaving the previous
+  // `binPath` in place meant the config named a binary that rejects the new quant, and every
+  // launch paid a failed probe (or a fallback search) before finding the right one.
+  const llamaCheck = await checkLlama(modelPath, opts.rung.label, findServer);
   const next: Record<string, any> = {
     ...(existing ?? {}),
     model: modelPath,
@@ -201,6 +205,7 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
       modelPath,
       // The port the server is REALLY on (see resolvePort), not a stale record.
       port,
+      ...(llamaCheck.ok && llamaCheck.binPath ? { binPath: llamaCheck.binPath } : {}),
       // Re-derived per model. The port is deliberately NOT included here --
       // it is carried over untouched, and a model switch must never relocate
       // the server.
@@ -211,7 +216,7 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
 
   const { stat } = await import("node:fs/promises");
   const presentOnDisk = await stat(modelPath).then((s) => s.isFile(), () => false);
-  const llama = await checkLlama(modelPath, opts.rung.label, findServer);
+  const llama = llamaCheck;
 
   return {
     rung: opts.rung,
@@ -312,33 +317,55 @@ async function resolvePort(
   return (await resolveLiveServerPort(recorded)).port;
 }
 
-/** Records the port the server is really on, so the config stops being stale. Only
- *  touches `llama.port` (and a `baseUrl` that names a different local port); everything
- *  else in the file is preserved. */
-export async function recordServerPort(
+/** Records what the server is REALLY running, so the config stops describing the previous
+ *  one: the port, the binary that read this model, the model file, and the tuning it was
+ *  launched with. Only these keys are touched (and a local `baseUrl` that names another
+ *  port); everything else in the file is preserved. */
+export async function recordServerState(
   projectRoot: string,
-  port: number,
+  state: { port?: number; binPath?: string; modelPath?: string; tuning?: Record<string, unknown> },
   io: { read?: SelectOptions["readConfigFile"]; write?: SelectOptions["writeConfigFile"] } = {}
 ): Promise<boolean> {
   const read = io.read ?? defaultRead;
   const write = io.write ?? defaultWrite;
   const cfg = await read(projectRoot);
   if (!cfg) return false;
-  let changed = false;
+  const before = JSON.stringify(cfg);
   const next: Record<string, any> = { ...cfg, llama: { ...(cfg.llama ?? {}) } };
-  if (next.llama.port !== port) { next.llama.port = port; changed = true; }
-  if (typeof next.baseUrl === "string") {
+  if (state.port !== undefined) next.llama.port = state.port;
+  if (state.binPath) next.llama.binPath = state.binPath;
+  if (state.modelPath) {
+    next.llama.modelPath = state.modelPath;
+    next.model = state.modelPath;
+  }
+  if (state.tuning) {
+    // An undefined tuning field means "not decided", not "clear it": assigning it would
+    // delete the user's existing key (YAML drops undefined values on write).
+    for (const [k, v] of Object.entries(tuningToConfigKeys(state.tuning as never))) {
+      if (v !== undefined) next.llama[k] = v;
+    }
+  }
+  if (state.port !== undefined && typeof next.baseUrl === "string") {
     try {
       const u = new URL(next.baseUrl);
-      if (["127.0.0.1", "localhost"].includes(u.hostname) && Number(u.port) !== port) {
-        u.port = String(port);
+      if (["127.0.0.1", "localhost"].includes(u.hostname) && Number(u.port) !== state.port) {
+        u.port = String(state.port);
         next.baseUrl = u.toString().replace(/\/$/, "");
-        changed = true;
       }
     } catch { /* not a URL: leave it */ }
   }
-  if (changed) await write(projectRoot, next);
-  return changed;
+  if (JSON.stringify(next) === before) return false;
+  await write(projectRoot, next);
+  return true;
+}
+
+/** Port-only form, kept for callers that have nothing else to record. */
+export async function recordServerPort(
+  projectRoot: string,
+  port: number,
+  io: Parameters<typeof recordServerState>[2] = {}
+): Promise<boolean> {
+  return recordServerState(projectRoot, { port }, io);
 }
 
 /** A path the config already uses for exactly this filename.

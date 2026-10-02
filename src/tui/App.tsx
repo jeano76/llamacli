@@ -831,6 +831,9 @@ export function App({
   startupBanner,
 }: AppProps) {
   const { stdout } = useStdout();
+  // The model named in the status bar. A prop alone would stay on the model the session
+  // started with after `/models` swaps the server underneath it.
+  const [modelLabel, setModelLabel] = useState(model);
   const [input, setInput] = useState("");
   // Character offset into `input` where the next typed/deleted char lands.
   // Reported directly: 화살표 키로 단어 사이 이동이 안 됨 — editing used to be
@@ -1927,6 +1930,7 @@ export function App({
   // agent loop is wired to real streaming; global is a placeholder only.
   (globalThis as any).__llamacli_ui = {
     pushAssistantDelta,
+    setModelName: setModelLabel,
     setDecodeRate,
     finalizeAssistant,
     pushReasoningDelta,
@@ -2611,7 +2615,7 @@ export function App({
 
       <StatusBar
         cwd={cwd}
-        model={model}
+        model={modelLabel}
         contextUsedRatio={contextUsedRatio}
         planProgress={planProgress}
         compactionStatus={compactionStatus}

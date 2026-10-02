@@ -82,8 +82,15 @@ export interface ProvisionResult {
   port: number;
   /** Tuning derived for this model; the switch must use these, not the old ones. */
   tuning?: LlamaTuning;
+  /** Non-fatal problems the bootstrap reported. Shown, but they do not stop the switch. */
+  warnings?: string[];
   /** User-facing lines. */
   lines: string[];
+}
+
+async function fileBytes(path: string): Promise<number> {
+  const { stat } = await import("node:fs/promises");
+  return stat(path).then((s) => (s.isFile() ? s.size : 0), () => 0);
 }
 
 /** A probe that treats `port` as bindable and everything else as real.
@@ -165,13 +172,32 @@ export async function provisionForSwitch(opts: ProvisionOptions): Promise<Provis
     return { ok: false, port, lines };
   }
 
-  const ok = Boolean(binPath && modelPath) && report.ok;
+  // READY means what the switch actually needs, checked directly: a binary that exists and a
+  // model file that is really on disk. It used to also require `report.ok`, which is "no step
+  // reported any error at all" — so a harmless warning (a compatibility note, a config
+  // remark) discarded a downloaded model and a working binary, and the server was never
+  // switched. Warnings are still shown; they just do not veto the switch.
+  const modelOnDisk = modelPath ? (await fileBytes(modelPath)) > 0 : false;
+  const binOnDisk = binPath ? (await fileBytes(binPath)) > 0 : false;
+  const ok = binOnDisk && modelOnDisk;
+  if (binPath && !binOnDisk) lines.push(`llama-server 실행 파일이 없습니다: ${binPath}`);
+  if (modelPath && !modelOnDisk) lines.push(`모델 파일이 디스크에 없습니다: ${modelPath}`);
+  const warnings = report.ok ? [] : report.errors;
   return {
     ok,
     binPath,
-    modelPath,
+    modelPath: modelOnDisk ? modelPath : undefined,
     port,
     tuning,
-    lines: [...lines, ...(ok ? [`준비 완료: ${binPath} · ${modelPath} (포트 ${port} 그대로)`] : [])],
+    warnings,
+    lines: [
+      ...lines,
+      ...(ok
+        ? [
+            `준비 완료: ${binPath} · ${modelPath} (포트 ${port} 그대로)`,
+            ...(warnings.length > 0 ? [`참고(진행에는 영향 없음): ${warnings.join(" / ")}`] : []),
+          ]
+        : []),
+    ],
   };
 }

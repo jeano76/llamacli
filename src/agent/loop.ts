@@ -561,6 +561,13 @@ export class AgentLoop {
     });
   }
 
+  /** Points the loop at the model id the server now reports. A model switch (`/models`,
+   *  `/server restart`) replaces what is being served while this loop keeps running, and
+   *  requests carry this id. */
+  setModel(id: string): void {
+    this.opts.model = id;
+  }
+
   /** Compaction triggered by IDLE time rather than by the context threshold.
    *
    *  The distinction is the whole point. `maybeCompact()` (used at the top of

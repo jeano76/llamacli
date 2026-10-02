@@ -193,3 +193,25 @@ test("when the model is NOT anywhere, the download is attempted (control for the
     });
     assert.ok(resolved.length > 0, "the control must reach the download, or the test above proves nothing");
   }));
+
+test("a FAILED download leaves modelPath unset — it must not point at a file that was never written", () =>
+  withTempDir(async (dir) => {
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.includes("/resolve/")) throw new Error("connection reset");
+      if (u.includes("Ternary-Bonsai-8B-gguf")) {
+        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-8B-PQ2_0.gguf", size: 2_000_000_000 }] }) } as any;
+      }
+      return { ok: false, status: 404, json: async () => ({}) } as any;
+    }) as unknown as typeof fetch;
+    const s = spies();
+    const report = await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
+      detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
+      modelsDir: join(dir, "models"), fetchImpl, acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+    });
+    const step = report.steps.find((x) => x.name === "모델 다운로드");
+    assert.equal(step?.ok, false);
+    assert.equal(report.modelPath ?? "", "", `modelPath must stay empty, got ${report.modelPath}`);
+  }));

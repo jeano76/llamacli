@@ -720,7 +720,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       } else if (opts.offline) {
         steps.push({ name: "모델 다운로드", ok: false, detail: "오프라인이라 건너뜁니다." });
       } else {
-        await step("모델 다운로드", async () => {
+        const downloaded = await step("모델 다운로드", async () => {
           await mkdir(dirname(dest), { recursive: true });
           let result;
           try {
@@ -751,7 +751,10 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
             `${result.sha256Verified ? ", SHA-256 검증 완료" : model!.candidate.sha256 ? "" : ", 해시 미제공 — 검증 안 함"})`
           );
         });
-        modelPath = dest;
+        // Only when the step SUCCEEDED. `step` swallows a failure and returns null, and this
+        // line used to run regardless — recording a path that does not exist, which the
+        // rest of the run (and the caller) then treated as "the model is ready".
+        if (downloaded !== null && (await fileSize(dest)) > 0) modelPath = dest;
       }
     }
   }

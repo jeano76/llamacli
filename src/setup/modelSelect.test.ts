@@ -297,3 +297,48 @@ test("/models: a file of another FAMILY is never taken for the chosen model", as
   });
   assert.doesNotMatch(r.modelPath, /27B/);
 });
+
+import { recordServerState } from "./modelSelect.js";
+
+test("selecting a model records the build that can READ it, not the one that cannot", async () => {
+  const h = harness({ llama: { modelPath: "/m/old.gguf", binPath: "/home/u/llama.cpp/build-opt/bin/llama-server", port: 8084 } },
+    { location: { binPath: "/home/u/.llamacli/prism-llama.cpp/cuda-12.8/llama-server", source: "x", backend: "cuda" }, rejected: [] });
+  await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  assert.equal(h.written[0].llama.binPath, "/home/u/.llamacli/prism-llama.cpp/cuda-12.8/llama-server");
+});
+
+test("no compatible build found: the existing binPath is left alone rather than blanked", async () => {
+  const h = harness({ llama: { modelPath: "/m/old.gguf", binPath: "/keep/llama-server" } }, NONE);
+  await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  assert.equal(h.written[0].llama.binPath, "/keep/llama-server");
+});
+
+test("recordServerState writes port, binary, model and the tuning actually launched — and keeps the rest", async () => {
+  let saved: any;
+  const changed = await recordServerState(
+    "/p",
+    { port: 8084, binPath: "/b/llama-server", modelPath: "/m/new.gguf", tuning: { gpuLayers: 999, contextSize: 16384, threads: 6, cpuMoeLayers: 0 } },
+    {
+      read: async () => ({ apiKey: "keep", backend: "openai-compatible", baseUrl: "http://127.0.0.1:8080", model: "/m/old.gguf", llama: { port: 8080, modelPath: "/m/old.gguf", flashAttn: true } }),
+      write: async (_r, c) => { saved = c; },
+    }
+  );
+  assert.equal(changed, true);
+  assert.equal(saved.apiKey, "keep");
+  assert.equal(saved.model, "/m/new.gguf");
+  assert.equal(saved.llama.modelPath, "/m/new.gguf");
+  assert.equal(saved.llama.binPath, "/b/llama-server");
+  assert.equal(saved.llama.port, 8084);
+  assert.equal(saved.llama.contextSize, 16384);
+  assert.equal(saved.llama.gpuLayers, 999);
+  assert.equal(saved.baseUrl, "http://127.0.0.1:8084", "a local baseUrl follows the real port");
+  assert.equal(saved.llama.flashAttn, true, "unrelated llama keys survive");
+});
+
+test("recordServerState is a no-op (no write) when the config already says it", async () => {
+  let writes = 0;
+  const cfg = { model: "/m/a.gguf", llama: { port: 8084, modelPath: "/m/a.gguf", binPath: "/b" } };
+  const changed = await recordServerState("/p", { port: 8084, binPath: "/b", modelPath: "/m/a.gguf" }, { read: async () => cfg, write: async () => { writes++; } });
+  assert.equal(changed, false);
+  assert.equal(writes, 0);
+});

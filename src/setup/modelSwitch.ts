@@ -104,6 +104,9 @@ export interface SwitchResult {
   stopped?: PortOwner;
   /** True when the new server answered a health probe. */
   ready: boolean;
+  /** What the new server was actually launched with (after the post-stop re-tune), so the
+   *  config can record the real thing rather than the pre-stop estimate. */
+  launched?: { binPath: string; modelPath: string; tuning: SwitchOptions["tuning"] };
   /** User-facing lines. */
   lines: string[];
 }
@@ -230,9 +233,10 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
   }
 
   say(`${port} 포트에서 새 모델이 응답합니다.`);
+  const launched = { binPath: opts.binPath, modelPath: opts.modelPath, tuning: launchTuning };
   // The result, from the server's own load log — the plan above is what was asked for.
   say(summarizeGpuOffload(server.gpuLog?.() ?? server.logTail?.(200) ?? "", { gpuLayers: cfg.gpuLayers ?? 0 }));
-  return { ok: true, port, stopped, ready: true, lines };
+  return { ok: true, port, stopped, ready: true, lines, launched };
 }
 
 /** Who is listening on `port`.

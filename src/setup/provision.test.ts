@@ -2,6 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { provisionForSwitch, pinnedPortProbe, type ProvisionOptions } from "./provision.js";
 import { tcpPortProbe, type PortState } from "./ports.js";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/** Real files: "ready" is now judged by what is on disk, not by what a report claims. */
+async function realFiles() {
+  const dir = await mkdtemp(join(tmpdir(), "prov-"));
+  const bin = join(dir, "llama-server");
+  const model = join(dir, "m.gguf");
+  await writeFile(bin, "#!/bin/sh\n");
+  await writeFile(model, Buffer.alloc(2048));
+  return { dir, bin, model, cleanup: () => rm(dir, { recursive: true, force: true }) };
+}
 import type { Hardware } from "./hardware.js";
 
 /** The minimum a fake bootstrap must look like for provisioning to read a result
@@ -35,16 +48,57 @@ const base = (over: Partial<ProvisionOptions> = {}): ProvisionOptions => ({
 });
 
 test("provisions and hands back what the switch needs", async () => {
-  const res = await provisionForSwitch(
-    base({ ensureLocalStack: fakeEnsure({}) })
-  );
-  assert.equal(res.ok, true);
-  assert.equal(res.binPath, "/opt/llama-server");
-  assert.equal(res.modelPath, "/models/m.gguf");
-  // The port is a decision, not a re-derivation.
-  assert.equal(res.port, 8084);
-  // Tuning must travel with it: the old model's flags are sized for the old model.
-  assert.equal(res.tuning?.contextSize, 32768);
+  const f = await realFiles();
+  try {
+    const res = await provisionForSwitch(
+      base({ ensureLocalStack: fakeEnsure({ llama: { binPath: f.bin, backend: "test" }, modelPath: f.model }) })
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.binPath, f.bin);
+    assert.equal(res.modelPath, f.model);
+    // The port is a decision, not a re-derivation.
+    assert.equal(res.port, 8084);
+    // Tuning must travel with it: the old model's flags are sized for the old model.
+    assert.equal(res.tuning?.contextSize, 32768);
+  } finally { await f.cleanup(); }
+});
+
+test("a harmless warning does NOT veto a model and binary that are really there", async () => {
+  // The bootstrap's `ok` means "no step reported any error", so a compatibility remark or a
+  // config note used to discard a finished download and leave the server unswitched.
+  const f = await realFiles();
+  try {
+    const res = await provisionForSwitch(
+      base({ ensureLocalStack: fakeEnsure({ ok: false, errors: ["모델/빌드 호환성: 확인되지 않음"], llama: { binPath: f.bin, backend: "t" }, modelPath: f.model }) })
+    );
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.warnings, ["모델/빌드 호환성: 확인되지 않음"]);
+    assert.ok(res.lines.some((l) => /참고\(진행에는 영향 없음\)/.test(l)));
+  } finally { await f.cleanup(); }
+});
+
+test("a model path that is NOT on disk is never reported ready, whatever the report says", async () => {
+  // A failed download used to leave `modelPath` set to where the file WOULD have been.
+  const f = await realFiles();
+  try {
+    const res = await provisionForSwitch(
+      base({ ensureLocalStack: fakeEnsure({ llama: { binPath: f.bin, backend: "t" }, modelPath: join(f.dir, "never-downloaded.gguf") }) })
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.modelPath, undefined);
+    assert.ok(res.lines.some((l) => /모델 파일이 디스크에 없습니다/.test(l)));
+  } finally { await f.cleanup(); }
+});
+
+test("a binary that is not on disk is not ready either", async () => {
+  const f = await realFiles();
+  try {
+    const res = await provisionForSwitch(
+      base({ ensureLocalStack: fakeEnsure({ llama: { binPath: "/nonexistent/llama-server", backend: "t" }, modelPath: f.model }) })
+    );
+    assert.equal(res.ok, false);
+    assert.ok(res.lines.some((l) => /실행 파일이 없습니다/.test(l)));
+  } finally { await f.cleanup(); }
 });
 
 test("does NOT adopt the server it is about to replace", async () => {

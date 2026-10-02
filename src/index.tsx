@@ -27,7 +27,7 @@ import { installCrashHandlers } from "./crashHandler.js";
 import { ensureLocalStack } from "./setup/bootstrap.js";
 import { describeReset, describeInForce } from "./setup/resetDiff.js";
 import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } from "./setup/modelMetrics.js";
-import { selectModel, recordServerPort } from "./setup/modelSelect.js";
+import { selectModel, recordServerPort, recordServerState } from "./setup/modelSelect.js";
 import { describeGpuPlan } from "./setup/gpuReport.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
@@ -828,6 +828,40 @@ async function main() {
     onTurnStart: () => (globalThis as any).__llamacli_ui?.collapseDiffs(),
   });
 
+  /**
+   * Brings the RUNNING session in line with the server that was just switched.
+   *
+   * The server swap happens underneath a live loop. Everything the loop captured at start
+   * is now about the OLD model: the id its requests carry, the status bar's model name, the
+   * in-memory config, and — the one that does real damage — the context window compaction
+   * is measured against (the documented drift bug: a window of 40960 against a server now
+   * running 16384 means compaction never fires and the next turn overflows).
+   * Returns lines to show; every step is best-effort and reported rather than thrown.
+   */
+  async function syncSessionToServer(modelPath: string, recorded: { contextSize?: number } = {}): Promise<string[]> {
+    const out: string[] = [];
+    const ui = (globalThis as any).__llamacli_ui;
+    let id: string | undefined;
+    try {
+      id = (await backend.listModels?.())?.[0];
+    } catch { /* the id is cosmetic for llama-server; the path stands in */ }
+    const modelId = id ?? modelPath;
+    loop.setModel(modelId);
+    ui?.setModelName?.(modelId);
+    (config as any).model = modelId;
+    (config as any).llama = { ...((config as any).llama ?? {}), modelPath };
+    try {
+      const reported = await backend.getContextSize?.();
+      const window = reported || recorded.contextSize;
+      if (window && window !== thresholds.contextWindowTokens) {
+        out.push(`컨텍스트 창을 ${thresholds.contextWindowTokens.toLocaleString()} → ${window.toLocaleString()} 토큰으로 맞췄습니다 (컴팩션 기준).`);
+        thresholds.contextWindowTokens = window;
+      }
+    } catch { /* /props unavailable: the previous window stands, and that is said nothing about */ }
+    out.push(`세션이 새 서버에 연결되었습니다 — 모델 ${modelId.split("/").pop()}`);
+    return out;
+  }
+
   // Every quit path ends here: show the save-in-progress animation (App's
   // quitting state), save, then ALWAYS exit — on success, on failure, or
   // after QUIT_SAVE_TIMEOUT_MS at the latest. Reported live: saving could
@@ -1227,8 +1261,16 @@ async function main() {
                   return { tuning: t2, lines: describeGpuPlan(hw2, t2) };
                 },
               });
-              if (sw.ok) await recordServerPort(projectRoot, sw.port).catch(() => false);
-              ui?.pushStatus([...head, ...sw.lines.map((l) => `  · ${l}`)].join("\n"));
+              // Record what is REALLY running now — port, binary, model and the tuning it was
+              // launched with after the post-stop re-measure — so the config matches it.
+              if (sw.ok && sw.launched) {
+                await recordServerState(projectRoot, {
+                  port: sw.port, binPath: sw.launched.binPath, modelPath: sw.launched.modelPath,
+                  tuning: sw.launched.tuning as Record<string, unknown>,
+                }).catch(() => false);
+              }
+              const synced = sw.ok ? await syncSessionToServer(modelPath, { contextSize: switchTuning.contextSize }) : [];
+              ui?.pushStatus([...head, ...sw.lines.map((l) => `  · ${l}`), ...synced.map((l) => `  · ${l}`)].join("\n"));
             } catch (err) {
               ui?.pushStatus(`[models 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
             } finally {
@@ -1293,8 +1335,11 @@ async function main() {
                     }),
                   }),
                 });
-                if (sw.ok) await recordServerPort(projectRoot, sw.port).catch(() => false);
-                ui?.pushStatus(`[server] ${sw.lines.join("\n")}`);
+                if (sw.ok && sw.launched) {
+                  await recordServerState(projectRoot, { port: sw.port, binPath: sw.launched.binPath, modelPath: sw.launched.modelPath }).catch(() => false);
+                }
+                const synced = sw.ok ? await syncSessionToServer(report.configuredModel!, { contextSize: recorded.contextSize }) : [];
+                ui?.pushStatus(`[server] ${[...sw.lines, ...synced].join("\n")}`);
               } catch (err) {
                 ui?.pushStatus(`[server 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
               } finally {
