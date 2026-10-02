@@ -78,6 +78,7 @@ export const KEY_BINDINGS: KeyBindingGroup[] = [
     bindings: [
       { keys: "/compact", description: "지금 컨텍스트 압축 실행" },
       { keys: "/reset", description: "현재 GPU·VRAM·RAM 기준으로 모델/설정 재계산 (파괴적)" },
+      { keys: "/models [번호]", description: "구동 가능한 로컬 모델 메트릭스 보기·교체" },
       { keys: "/queue", description: "큐에 메시지 추가" },
       { keys: "/skills, /rules", description: "불러온 스킬 / 룰 목록" },
       { keys: "/plan-clear", description: "멈춘 계획 표시 초기화" },

@@ -32,6 +32,9 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   // and the ask lives in the command rather than a separate screen, so this menu
   // item is the whole affordance.
   { key: "reset", label: "/reset", description: "현재 GPU·VRAM·RAM에 맞는 모델/설정으로 다시 초기화" },
+  // /models lists what THIS machine can actually run — file size alone does not
+  // decide that — and `/models <n>` replaces the model currently in use.
+  { key: "models", label: "/models", description: "이 PC에서 구동 가능한 로컬 모델 메트릭스 · 선택" },
   { key: "skills", label: "/skills", description: "List loaded skills" },
   { key: "rules", label: "/rules", description: "List loaded rules" },
   // Label and key must agree. This one didn't: the key is "plan-clear"

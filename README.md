@@ -552,12 +552,84 @@ path left to re-enable it.
 
 `/reset`, local model search and tuning are **present and implemented**.
 
+## `/models` — pick a model that runs on THIS machine
+
+`/models` lists the candidate local models with the metrics that decide whether
+they actually run here, and `/models <번호|이름>` selects one.
+
+```
+[models] 이 머신 기준 — 사용 가능 VRAM 6.2 GiB, RAM 30 GiB
+
+#  모델                  파라미터       양자화  크기         판정
+─  ────────────────────  ─────────────  ──────  ──────────  ──────────────
+1  Ornith-1.5-35B-A3B    3B 활성 (MoE)  Q4_K_M   20.4 GiB    ⚠️ RAM 스트리밍
+2  Ternary-Bonsai-2-27B  27B (밀집)     PTQ1_0  5.5 GiB     ✅ VRAM
+3  Ornith-1.5-9B         9B             Q4_K_M   5.1 GiB     ✅ VRAM
+```
+
+**"Will it run" is not a size question.** Three things decide it, and the table
+answers all three:
+
+| Verdict | Meaning |
+|---|---|
+| `✅ VRAM` | The whole file fits the spendable VRAM. GPU does everything. |
+| `⚠️ RAM 스트리밍` | Too big for VRAM, but the **active** parameters stay on the GPU and the rest streams from RAM (`--n-cpu-moe`). Slower, but it runs. |
+| `⚠️ CPU 전용` | Only fits in RAM. `-ngl 0`; very slow. |
+| `❌ 불가` | Fits nowhere. Refused at selection rather than written into config. |
+
+The VRAM budget is the same `budgetVramGiB` the tuner launches with, including
+its 1 GiB reserve — not a second copy of the arithmetic, which would be free to
+drift and would then promise a fit the launch does not honour.
+
+MoE residency is derived from each model's own **active-parameter count**, not a
+percentage guess. Two wrong answers were corrected while building this, both of
+which reported the 21.9 GiB 35B-A3B as a full VRAM fit on a 7 GiB card:
+
+1. a flat "15% of the file" residency estimate, then
+2. testing only the *active* size against the budget — which never asks whether
+   the **whole file** fits, and so cannot distinguish "fully resident" from
+   "streaming".
+
+### Selection REPLACES
+
+`.llamacli/config.yaml` names exactly one model, so choosing a rung overwrites
+it — it does not accumulate a list. Both `model` and `llama.modelPath` are
+written together, because `loadConfig` treats the top-level one as a live cache
+refreshed from the server while `llama.modelPath` is what the binary is launched
+with; writing only one is how a config ends up naming a model that is not being
+served. The running server still holds the old model, so the status line says a
+restart is required rather than implying the switch is already live.
+
+### The llama.cpp half — and why Bonsai is the case that matters
+
+Some quantizations need a build that can read them. `PTQ1_0` and `PQ2_0` are
+the two a stock llama.cpp cannot, and **`PTQ1_0` is exactly the quant the Bonsai
+family is chosen for** — so picking Bonsai is the common case for hitting this,
+not an edge case.
+
+Selecting reports it at the moment you decide, rather than letting it surface on
+the next launch as a load error:
+
+```
+[models] Ternary-Bonsai-2-27B (PTQ1_0) 로 교체했습니다.
+  · 기록된 경로: /mnt/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+  · llama-server 가 이 모델을 읽을 수 있습니다 (…/bonsai2-runtime/llama-server, cuda 빌드).
+  · 새 모델은 재시작 후 적용됩니다.
+```
+
+The arbitration itself is not duplicated: `findLlamaServer` already *executes*
+each candidate binary against the configured model and collects the ones whose
+type registry rejects it into `rejectedForModel`, and it looks for a build
+sitting **beside the models** (`runtimeCandidatesNearModel`). `/models` only
+turns that result into something actionable. A discovery error is reported, never
+thrown.
+
 ## Validation — what is actually checked, and what is not
 
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 764 unit tests
+npm test                                              # 789 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -565,7 +637,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **764** | pass |
+| Unit / regression | `npm test` | **789** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |

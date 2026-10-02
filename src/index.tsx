@@ -26,6 +26,20 @@ import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
 import { ensureLocalStack } from "./setup/bootstrap.js";
 import { describeReset, describeInForce } from "./setup/resetDiff.js";
+import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } from "./setup/modelMetrics.js";
+import { selectModel } from "./setup/modelSelect.js";
+import { detectHardware } from "./setup/hardware.js";
+import { totalmem } from "node:os";
+import { join } from "node:path";
+
+/** Where models live for this install. `modelsDir` is only a default — models on
+ *  an external drive are the normal case here, and `LLAMACLI_MODELS_DIR` is how
+ *  bootstrap learns about one — so the recorded value is preferred over a guess. */
+function modelsDirFor(projectRoot: string): string {
+  const fromEnv = process.env.LLAMACLI_MODELS_DIR;
+  if (fromEnv) return fromEnv;
+  return join(process.env.HOME ?? "/root", "models");
+}
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -918,6 +932,86 @@ async function main() {
           // `/reset confirm` cannot be triggered by a stray Enter and needs no
           // new UI surface — a strictly stronger guarantee than a Y/N that
           // defaults either way.
+// /models — local-model metrics for THIS machine, and the selection.
+          //
+          // Bare `/models` lists the rungs with a fit verdict each, so what
+          // actually runs is visible before anything is chosen.
+          // `/models <번호|이름>` REPLACES the model in config.yaml — it does
+          // not add to a list, because the config names exactly one model and
+          // picking one means "run this one".
+          case "models": {
+            const arg = (argument ?? "").trim();
+            // One detection, used for both the listing and the verdict on a
+            // selection — otherwise `/models` and `/models 3` could disagree
+            // about whether a model fits.
+            const hw = await detectHardware();
+            const reports = evaluateAll(hw);
+
+            if (!arg) {
+              const { lines } = formatModelTable(reports);
+              ui?.pushStatus(
+                [
+                  `[models] 이 머신 기준 — 사용 가능 VRAM ${usableVramGiB(hw).toFixed(1)} GiB, RAM ${(totalmem() / 1024 ** 3).toFixed(0)} GiB`,
+                  "",
+                  ...lines,
+                  "",
+                  "선택하려면  /models <번호>  를 입력하세요. 현재 사용 중인 모델이 교체됩니다.",
+                ].join("\n")
+              );
+              break;
+            }
+
+            // A number picks a row; anything else is treated as a name, so
+            // `/models bonsai-27b` works without looking up an index first.
+            const n = Number(arg);
+            const byIndex = Number.isInteger(n) && n >= 1 && n <= reports.length ? reports[n - 1] : null;
+            const byName = byIndex ? null : findRung(arg);
+            const report = byIndex ?? (byName ? evaluateFit(byName, hw) : null);
+            if (!report) {
+              ui?.pushStatus(
+                `[models] '${arg}' 를 찾지 못했습니다. /models 로 목록을 보고 번호나 이름을 입력하세요.`
+              );
+              break;
+            }
+            const rung = report.rung;
+
+            if (report.fit === "no") {
+              // Refuse rather than record a selection that cannot run: the config
+              // would name a model this machine cannot load, and the failure
+              // would surface later as a load error with no trace back to here.
+              ui?.pushStatus(
+                `[models] 선택하지 않습니다 — ${rung.label} 은(는) 이 머신에서 실행되지 않습니다.\n  ${report.verdict}`
+              );
+              break;
+            }
+
+            ui?.setBusy(true);
+            try {
+              const result = await selectModel({ projectRoot, rung, modelsDir: modelsDirFor(projectRoot) });
+              ui?.pushStatus(
+                [
+                  `[models] ${rung.label} (${rung.quant}) 로 교체했습니다.`,
+                  result.previousModel && result.previousModel !== result.modelPath
+                    ? `  · 이전 모델: ${result.previousModel}`
+                    : "",
+                  `  · 기록된 경로: ${result.modelPath}`,
+                  report.fit === "stream" ? `  · ${report.verdict}` : "",
+                  result.presentOnDisk
+                    ? ""
+                    : "  · 파일이 아직 없습니다 — 다음 실행 시 내려받습니다 (진행 상태는 저장되어 재개됩니다).",
+                  `  · ${result.llama.detail}`,
+                  result.requiresRestart ? "  · 새 모델은 재시작 후 적용됩니다." : "",
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+              );
+            } catch (err) {
+              ui?.pushStatus(`[models 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
+            } finally {
+              ui?.setBusy(false);
+            }
+            break;
+          }
           case "reset": {
             const arg = (argument ?? "").trim().toLowerCase();
             if (arg !== "confirm") {
