@@ -130,3 +130,96 @@ test("loadConfig survives a read-only project directory instead of throwing", as
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// `compaction.summaryMaxTokens` was declared in the schema and documented as
+// the single biggest lever on compaction latency in three places — and read by
+// AgentLoop (loop.ts's postCompactionBudget) — but index.tsx never copied it
+// out of config into the thresholds object. The value was therefore always
+// undefined, the `?? DEFAULT_SUMMARY_MAX_TOKENS` fallback always won, and a
+// user who set the knob got the default back with no error at all.
+//
+// This is a schema-presence test, not a behavior test: it pins that the field
+// SURVIVES a config round-trip, which is the half that regressed. The wiring
+// half (config.compaction.summaryMaxTokens -> thresholds.summaryMaxTokens) is
+// inside index.tsx's startup, not an exported function, so it is covered by
+// the harnesses rather than here.
+test("compaction.summaryMaxTokens survives a config round-trip instead of being dropped as unknown", () =>
+  withTempDir(async (dir) => {
+    await mkdir(join(dir, ".llamacli"), { recursive: true });
+    await writeFile(
+      join(dir, ".llamacli", "config.yaml"),
+      ["backend: local-llama", "baseUrl: http://127.0.0.1:8080", "model: m", "compaction:", "  summaryMaxTokens: 512", ""].join("\n")
+    );
+    const { config } = await loadConfig(dir, async () => null);
+    assert.equal(config.compaction.summaryMaxTokens, 512, "a user's summary budget must reach the loop that uses it");
+  }));
+
+test("compaction.summaryDeadlineMs survives a config round-trip", () =>
+  withTempDir(async (dir) => {
+    await mkdir(join(dir, ".llamacli"), { recursive: true });
+    await writeFile(
+      join(dir, ".llamacli", "config.yaml"),
+      ["backend: local-llama", "baseUrl: http://127.0.0.1:8080", "model: m", "compaction:", "  summaryDeadlineMs: 20000", ""].join("\n")
+    );
+    const { config } = await loadConfig(dir, async () => null);
+    assert.equal(config.compaction.summaryDeadlineMs, 20000);
+  }));
+
+test("compaction.warmTriggerRatio survives a config round-trip", () =>
+  withTempDir(async (dir) => {
+    await mkdir(join(dir, ".llamacli"), { recursive: true });
+    await writeFile(
+      join(dir, ".llamacli", "config.yaml"),
+      ["backend: local-llama", "baseUrl: http://127.0.0.1:8080", "model: m", "compaction:", "  warmTriggerRatio: 0.5", ""].join("\n")
+    );
+    const { config } = await loadConfig(dir, async () => null);
+    assert.equal(config.compaction.warmTriggerRatio, 0.5, "the idle-time threshold must reach the loop that uses it");
+  }));
+
+test("warmTriggerRatio is absent by default, so no existing session compacts earlier", () =>
+  withTempDir(async (dir) => {
+    const { config } = await loadConfig(dir, async () => null);
+    // Firing earlier summarizes a SHORTER conversation, so this is a real
+    // quality trade and must stay opt-in rather than becoming a new default
+    // that silently changes every existing session's compaction cadence.
+    assert.equal(config.compaction.warmTriggerRatio, undefined);
+  }));
+
+test("the speculative-decoding knobs survive a config round-trip", () =>
+  withTempDir(async (dir) => {
+    await mkdir(join(dir, ".llamacli"), { recursive: true });
+    await writeFile(
+      join(dir, ".llamacli", "config.yaml"),
+      [
+        "backend: local-llama",
+        "baseUrl: http://127.0.0.1:8080",
+        "model: m",
+        "llama:",
+        "  speculativeTypes: ngram-mod,ngram-simple",
+        "  speculativeDraftNMax: 8",
+        "",
+      ].join("\n")
+    );
+    const { config } = await loadConfig(dir, async () => null);
+    assert.equal(config.llama?.speculativeTypes, "ngram-mod,ngram-simple");
+    assert.equal(config.llama?.speculativeDraftNMax, 8);
+  }));
+
+test("speculation is not enabled by default on a fresh config", () =>
+  withTempDir(async (dir) => {
+    const { config } = await loadConfig(dir, async () => null);
+    // The gain is workload-dependent and must be measured; a default here would
+    // be an unmeasured change to every user's decode path.
+    assert.equal(config.llama?.speculativeTypes, undefined);
+    assert.equal(config.llama?.speculativeDraftNMax, undefined);
+  }));
+
+test("both compaction knobs are absent by default, so the historical no-deadline behavior is the default", () =>
+  withTempDir(async (dir) => {
+    const { config } = await loadConfig(dir, async () => null);
+    // A deadline is a quality/latency trade (a partial summary compresses less
+    // well, so compaction fires again sooner). It must be opt-in, not a
+    // default that silently changes every existing session.
+    assert.equal(config.compaction.summaryDeadlineMs, undefined, "no deadline unless the user asks for one");
+    assert.equal(config.compaction.summaryMaxTokens, undefined, "undefined means postCompactionBudget's own fallback applies");
+  }));

@@ -49,9 +49,21 @@ export interface LlamaServerConfig {
   cacheTypeK?: string;
   /** `--cache-type-v`. */
   cacheTypeV?: string;
-  /** `-np`: concurrent slots. A coding agent is one conversation per process,
-   *  and every extra slot multiplies the KV cache and batch buffers. */
+  /** `-np`: concurrent slots. A coding agent is one conversation per process.
+   *  Note this does NOT multiply the KV cache: llama.cpp allocates the pool
+   *  once at `n_ctx / n_parallel` (llama-context.cpp:294), so more slots mean
+   *  a smaller per-slot pool — but it DOES divide the context, which is why
+   *  `buildServerArgs` multiplies `contextSize` (per-slot) by this.
+   *  Passing it explicitly also keeps llama.cpp's `auto` default (which
+   *  resolves to 4 slots AND kv_unified, the one case where the pool really
+   *  does grow) from taking over. */
   parallel?: number;
+  /** `--spec-type`: comma-separated speculative decoding methods. The
+   *  model-free ones (`ngram-mod`, `ngram-simple`, `ngram-map-k`, `ngram-cache`)
+   *  need no draft checkpoint. Undefined = off. */
+  speculativeTypes?: string;
+  /** `--spec-draft-n-max`: proposed tokens per step (llama.cpp default 3). */
+  speculativeDraftNMax?: number;
 }
 
 /** 8GB RAM 환경 기본 프로파일: 과도한 ctx-size로 인한 OOM을 피하는 보수적 기본값. */
@@ -77,11 +89,37 @@ export const DEFAULT_8GB_PROFILE: Omit<LlamaServerConfig, "binPath" | "modelPath
  * apply instead of this module inventing a value for them.
  */
 export function buildServerArgs(config: LlamaServerConfig): string[] {
+  const parallel = config.parallel ?? 1;
+  // `-c` is the TOTAL context across all slots, not per-slot. Verified against
+  // llama.cpp source and a live server:
+  //
+  //   src/llama-context.cpp:294   n_ctx_seq = n_ctx / n_seq_max
+  //   common/common.cpp:1722      n_seq_max  = n_parallel
+  //   tools/server/server-context.cpp:4027  n_ctx_slot() = llama_n_ctx_seq()
+  //
+  // and confirmed empirically: a server launched `-c 40960 -np 1` logs
+  // `n_slots = 1, n_ctx_slot = 40960`, while `/props` reports the same
+  // per-slot figure (slot_n_ctx) that getContextSize() reads.
+  //
+  // So `-np 2` with an unchanged `-c 40960` silently halves the usable context
+  // per conversation — from 40,960 to 20,480 — with no error anywhere.
+  // getContextSize() WOULD follow it (it reads the per-slot number), so
+  // compaction thresholds would correctly scale down... which is precisely why
+  // this is dangerous: the user sees "compacting more often" rather than
+  // "half my context disappeared", and the token cost of compaction is about to
+  // double without anyone choosing it.
+  //
+  // `contextSize` is PER-SLOT everywhere else in this project — it is what
+  // config.yaml's `llama.contextSize` means, what tuning.ts computes a VRAM
+  // budget for, and what the compaction thresholds are derived against. So the
+  // multiplication happens here, at the one boundary where llama.cpp's meaning
+  // differs from ours, and stays commented above so nobody "simplifies" it back.
+  const totalContext = config.contextSize * parallel;
   const args = [
     "-m", config.modelPath,
     "--host", config.host,
     "--port", String(config.port),
-    "-c", String(config.contextSize),
+    "-c", String(totalContext),
     "-t", String(config.threads),
     "-ngl", String(config.gpuLayers),
   ];
@@ -98,6 +136,40 @@ export function buildServerArgs(config: LlamaServerConfig): string[] {
   if (config.cacheTypeK) args.push("--cache-type-k", config.cacheTypeK);
   if (config.cacheTypeV) args.push("--cache-type-v", config.cacheTypeV);
   if (config.parallel !== undefined) args.push("-np", String(config.parallel));
+  // Speculative decoding. Motivation is specific: compaction latency is almost
+  // entirely decode (the summary request's prompt is a verbatim prefix of the
+  // turn that just ran, so llama-server serves the prefill from its prompt
+  // cache — ~0.3 s measured — and everything after it is generation at the
+  // machine's decode rate), so the only way to make the summary itself faster
+  // is to generate more tokens per forward pass.
+  //
+  // The model-free methods are the ones exposed here deliberately:
+  // `ngram-mod`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v` and
+  // `ngram-cache` need no draft checkpoint, whereas `draft-simple`/`eagle3`/
+  // `mtp`/`dflash`/`dspark` all require a separately trained draft for this
+  // exact target model — a much larger ask than turning on a flag.
+  //
+  // Omitted unless configured, because the right setting is workload-specific
+  // and this is a measured trade rather than a known win. `-no-kvu` and the
+  // context handling above are unaffected either way.
+  if (config.speculativeTypes) {
+    args.push("--spec-type", config.speculativeTypes);
+    if (config.speculativeDraftNMax !== undefined) {
+      args.push("--spec-draft-n-max", String(config.speculativeDraftNMax));
+    }
+  }
+  // Explicitly OFF, and deliberately not left to the default.
+  //
+  // With -np omitted (llama.cpp's auto), server.cpp:156-160 sets
+  // n_parallel=4 AND kv_unified=true together, and kv_unified is the ONE case
+  // where the KV pool genuinely does grow with the slot count
+  // (llama-context.cpp:290-292 keeps n_ctx_seq = n_ctx instead of dividing,
+  // shared across sequences). Passing -np explicitly takes the other branch and
+  // keeps kv_unified off. Emitting -no-kvu as well means that stays true if a
+  // future llama.cpp changes what auto resolves to — this project computes its
+  // own context budget from a single conversation, and a silent 4-slot default
+  // would invalidate that arithmetic.
+  args.push("-no-kvu");
   return args;
 }
 

@@ -11,6 +11,28 @@ export interface CompactionThresholds {
    *  almost exactly (prefill is served from the prompt cache). Optional so
    *  existing callers need no change; see DEFAULT_SUMMARY_MAX_TOKENS. */
   summaryMaxTokens?: number;
+  /** Wall-clock ceiling for the summary generation, in ms. Unset/0 = none.
+   *  `summaryMaxTokens` bounds the summary in tokens, so it only bounds
+   *  latency once you know the machine's decode rate (~8x spread across the
+   *  supported hardware). This bounds the thing the user actually waits for.
+   *  On expiry the summary is truncated (see trimPartialSummary) rather than
+   *  the compaction failing. */
+  summaryDeadlineMs?: number;
+  /**
+   * Fraction of the context window at which compaction is run during IDLE time
+   * between turns, rather than waiting for `autoTriggerRatio` to be crossed
+   * mid-turn. Unset / 0 = disabled (the historical behavior).
+   *
+   * The win is WHERE the cost is paid, not that it gets cheaper: a compaction
+   * triggered at the auto-trigger ratio blocks the user for the summary's full
+   * generation, and this moves that generation into the gap while they are
+   * reading the previous reply. Total work is unchanged.
+   *
+   * It is a real trade, not a free win — firing earlier summarizes a SHORTER
+   * conversation, so the summary is worse and the next compaction comes sooner.
+   * Hence a config knob and disabled-by-default.
+   */
+  warmTriggerRatio?: number;
 }
 
 /** What a compaction actually did to the conversation — requested directly
@@ -27,6 +49,17 @@ export interface CompactionDetail {
   /** What replaced the dropped messages — the same text written to the
    *  checkpoint and the system prompt. */
   summary: string;
+  /** True when `summaryDeadlineMs` — not the model's own stop token, and not
+   *  the token budget — ended the summary early. Reported so a shortened
+   *  summary is never silently attributed to the token budget, which would
+   *  send the user off to tune the wrong knob.
+   *
+   *  True whenever the deadline fired, INCLUDING when trimPartialSummary found
+   *  no safe cut point and the text was kept verbatim. Deriving this from "did
+   *  the text change" instead would report false in exactly that case — the
+   *  one where the summary is a severed prefix and the user most needs to be
+   *  told it is incomplete. */
+  deadlineTruncated: boolean;
 }
 
 export interface CompactionResult {
@@ -331,6 +364,11 @@ export const DEFAULT_TAIL_BUDGET_FRACTION = 0.4;
  *  Override with `compaction.summaryMaxTokens` in config.yaml. Raise it if a
  *  summary is dropping detail you need; lower it for a faster, terser summary. */
 export const DEFAULT_SUMMARY_MAX_TOKENS = 1024;
+/** `repeat_penalty` for the summary request. Mirrors the main turn's default
+ *  (loop.ts: `this.opts.repeatPenalty ?? 1.1`) — llama-server leaves it off by
+ *  default, confirmed live via GET /slots, which is exactly the condition the
+ *  main turn's own comment warns lets a repetition loop run to max_tokens. */
+export const DEFAULT_REPEAT_PENALTY = 1.1;
 // Loop.ts's own main-turn request always reserves this fraction of the
 // window for max_tokens (the reply about to be generated) — see loop.ts's
 // `max_tokens: Math.max(512, Math.floor(...* 0.25))`. The kept tail and
@@ -399,6 +437,56 @@ export function selectKeptTail(
 }
 
 /**
+ * Trims a summary that was cut off mid-stream by a deadline, so what lands in
+ * the system message ends on a complete thought rather than a severed clause.
+ *
+ * A truncated summary is still worth keeping — it compresses whatever it did
+ * manage to cover, and keeping a partial one beats keeping none, since "none"
+ * means the history it replaced is simply gone. But the seam is visible: the
+ * next turn's model reads the last line as a complete statement and reasons
+ * from it, so a summary ending "...and we decided to use the" is worse than one
+ * ending two sentences earlier, at the cost of one clause.
+ *
+ * Cut points, in order of preference: the last blank line (a paragraph break,
+ * which in markdown summaries is also a heading boundary), then the last
+ * sentence terminator, then the last newline. Blank-line-first is preferred
+ * because summaries here are markdown (see SUMMARY_INSTRUCTION) and a heading
+ * boundary is the cleanest possible seam — it removes a whole subsection
+ * rather than half a sentence.
+ *
+ * Returns the input unchanged if it already ends cleanly, and "" if nothing
+ * safe can be cut (the caller falls back to the untrimmed text in that case,
+ * since losing the whole summary to a trimming rule would be worse than a
+ * dangling clause).
+ */
+export function trimPartialSummary(text: string): string {
+  const trimmed = text.trimEnd();
+  if (!trimmed) return "";
+
+  const paragraph = trimmed.lastIndexOf("\n\n");
+  if (paragraph > 0) return trimmed.slice(0, paragraph).trimEnd();
+
+  // Korean summaries end sentences on '.', '!', '?' like any other language;
+  // model-written text may also use CJK full stops, so accept those too.
+  const sentenceEnd = Math.max(
+    trimmed.lastIndexOf(". "),
+    trimmed.lastIndexOf("! "),
+    trimmed.lastIndexOf("? "),
+    trimmed.lastIndexOf("다. "),
+    trimmed.lastIndexOf("요. "),
+    trimmed.lastIndexOf(".。"),
+    trimmed.lastIndexOf("다."),
+    trimmed.lastIndexOf("요.")
+  );
+  if (sentenceEnd > 0) return trimmed.slice(0, sentenceEnd + 1).trimEnd();
+
+  const line = trimmed.lastIndexOf("\n");
+  if (line > 0) return trimmed.slice(0, line).trimEnd();
+
+  return "";
+}
+
+/**
  * PROMPT.md §2: write the checkpoint FIRST (before summarizing anything), then
  * ask the model to summarize the older turns, keeping mustPreserve items intact.
  */
@@ -416,7 +504,15 @@ export async function runCompaction(
   // Lets the caller shrink the summary below its default cap so that
   // base prompt + summary + kept tail lands under the auto-trigger
   // threshold — see loop.ts compact().
-  summaryMaxTokensCap?: number
+  summaryMaxTokensCap?: number,
+  // Wall-clock ceiling for the summary generation. See CompactionThresholds's
+  // summaryDeadlineMs.
+  summaryDeadlineMs?: number,
+  // `repeat_penalty` for the summary request, passed through from the caller's
+  // own configured value. Defaults to 1.1, matching the main turn request —
+  // llama-server ships with it off, which is what lets a repetition loop run
+  // until max_tokens truncates it.
+  repeatPenalty: number = DEFAULT_REPEAT_PENALTY
 ): Promise<CompactionResult> {
   const checkpoint: Checkpoint = {
     version: 1,
@@ -444,6 +540,16 @@ export async function runCompaction(
   const originalSystem = messages.find((m) => m.role === "system");
   const originalSystemText = typeof originalSystem?.content === "string" ? originalSystem.content : "";
   const summaryInput = sanitizeForSummary(toSummarize);
+  // Does the conversation have a language worth mirroring? Checked on the
+  // conversation actually being summarized (not the system prompt, which is
+  // always English here), and only over user turns — the user is who chooses
+  // the language, whereas tool output and assistant prose just follow whoever
+  // spoke last.
+  //
+  // This gates the clause in SUMMARY_INSTRUCTION rather than always emitting it:
+  // on a conversation with no user text at all, "same language as the
+  // conversation" names nothing to mirror, and the fallback wording takes over.
+  const hasConversationLanguage = toSummarize.some((m) => m.role === "user" && typeof m.content === "string" && m.content.trim().length > 0);
 
   // Reported directly: "컴팩션의 시간이 오래걸리는데" — compaction is slow.
   //
@@ -543,6 +649,46 @@ export async function runCompaction(
   const SUMMARY_INSTRUCTION =
     "Summarize the conversation above for context compaction. Preserve verbatim any user-stated constraints, decisions" +
     mustPreserveClause +
+    // Language follows the conversation, not this instruction.
+    //
+    // Measured against the real backend (27B, live server) with Korean
+    // conversations: the summary came back in ENGLISH — full, accurate,
+    // well-structured English — every time, because the only instruction it
+    // was given is in English. Found while building the quality corpus in
+    // src/compaction/fixtures/, where it surfaced as a scoring failure before
+    // it was recognized as a product one: the Korean `mustPreserve` facts all
+    // scored LOST at 0/6 across every budget, which looked like catastrophic
+    // data loss and was actually the model paraphrasing faithfully into
+    // another language. Reading the summary showed every fact preserved:
+    //
+    //   "아직 수정 안 됨"        -> "File 3 was unmodified"
+    //   "3번 파일에서 중단"      -> "work was interrupted after File 3"
+    //
+    // Two reasons this is worth fixing rather than documenting:
+    //
+    // 1. The summary goes into the SYSTEM message and becomes the model's
+    //    context for every subsequent turn, so a user who asked a question in
+    //    Korean has the next turn answered in English by an agent that was
+    //    mid-Korean-task. That is a real behaviour change caused by compaction
+    //    alone — the same session answers in Korean until it compacts once.
+    // 2. Quoted material must NOT be translated. The model was already
+    //    preserving user constraints verbatim and glossing them
+    //    ("한국어로만 응답해. (Respond only in Korean.)"), which is the
+    //    correct shape — a translated constraint is a constraint nobody stated.
+    //    The wording below separates those two jobs so the language rule cannot
+    //    be read as license to translate a quote.
+    //
+    // Cost: a few tokens on a prompt whose prefill is served from llama-server's
+    // cache (compactor.ts's cache-prefix design), and this clause sits in the
+    // trailing instruction, NOT in the system message — so the verbatim prefix
+    // that makes prefill ~free is untouched.
+    "\n\nWrite the summary in the same language the conversation above is written in" +
+    // Degenerate case: a conversation with no user text at all (pure tool-call
+    // chains) has no language to mirror, and an unconditional "same language as
+    // the conversation" would then instruct a model to guess. Fall back to the
+    // model's own output language, which is what it would have done anyway.
+    (hasConversationLanguage ? "" : ", or in your own output language if the conversation has none") +
+    ". Keep any quoted user text in its original language." +
     "\n\nNow write the summary of the conversation above. Output only the summary.";
   summaryRequest.push({ role: "user", content: SUMMARY_INSTRUCTION });
 
@@ -565,14 +711,111 @@ export async function runCompaction(
   // reasoning before any summary text is produced — and a compaction that
   // returns no usable summary is worse than useless, since the history it
   // replaced is already gone.
-  const res = await backend.chat({
-    model,
-    messages: summaryRequest,
-    stream: false,
-    max_tokens: summaryMaxTokens,
-    chat_template_kwargs: { enable_thinking: false },
-  });
-  const summaryText = res.choices[0]?.message.content ?? "(summary unavailable)";
+  // Streamed rather than `stream: false`, and with an optional wall-clock
+  // deadline, so that compaction latency has a BOUND and not just a
+  // token-count-derived expectation.
+  //
+  // The reason this request is worth bounding so tightly is that its latency
+  // is essentially all decode: the request's [system] + toSummarize prefix is
+  // byte-for-byte a prefix of the turn that just ran, so llama-server serves
+  // the prefill from its prompt cache (~0.3 s measured), and everything after
+  // it is generated at 38 tok/s on the reference box. A 1,024-token summary is
+  // therefore ~27 s of the user's turn, which is why "compaction takes too
+  // long" is the single most-repeated complaint about this feature.
+  //
+  // Two bounds are in play and they are NOT the same thing:
+  //
+  //   max_tokens     bounds the summary by SIZE, and its latency by
+  //                  implication. A fixed size means a fixed wait only on a
+  //                  fixed machine: measured 38 tok/s on an 8 GB card with
+  //                  CPU-offloaded MoE, ~300 tok/s when fully offloaded, so
+  //                  the same 1,024 tokens is anywhere from ~3 s to ~27 s.
+  //
+  //   deadlineMs     bounds the wait DIRECTLY, in wall-clock time, on any
+  //                  machine. When it expires, streamChat resolves with the
+  //                  text produced so far and this keeps it (trimmed — see
+  //                  trimPartialSummary) instead of the whole compaction
+  //                  failing and the context staying oversized.
+  //
+  // Unset (the default) means no deadline and byte-for-byte the previous
+  // single-shot request, so this is opt-in: for the same summary quality, just
+  // slower, nothing changes. Streaming also means the deadline can actually
+  // do something — `stream: false` only yields a response once generation has
+  // finished, so a deadline on that path would be unenforceable.
+  //
+  // Note `onDelta` is a no-op: the summary is consumed as one string at the
+  // end, so there is nothing incremental to render. It is required because it
+  // is what selects the streaming path in OpenAICompatibleClient.chat().
+  const deadlineMs = summaryDeadlineMs && summaryDeadlineMs > 0 ? summaryDeadlineMs : undefined;
+  let res;
+  try {
+    res = await backend.chat(
+      {
+        model,
+        messages: summaryRequest,
+        stream: true,
+        max_tokens: summaryMaxTokens,
+        chat_template_kwargs: { enable_thinking: false },
+        // Same protection the main turn request carries, for the same reason.
+        //
+        // loop.ts sends repeat_penalty (1.1 by default) because llama-server
+        // ships with it OFF, confirmed live via GET /slots, and a generation
+        // that gets into a repetition loop keeps emitting the same phrase
+        // verbatim until max_tokens cuts it off. This request was sending
+        // nothing at all, so it had exactly that exposure with none of the
+        // mitigation — and unlike a main turn, a degenerate summary is not
+        // merely ugly: the whole budget is spent on repetition, the summary
+        // carries no information about the history it replaced, and
+        // trimPartialSummary then cuts a "paragraph" made of the same sentence
+        // repeated.
+        repeat_penalty: repeatPenalty,
+      },
+      () => {},
+      deadlineMs ? { deadlineMs } : undefined
+    );
+  } catch (err: any) {
+    // A deadline abort surfaces as an AbortError we deliberately swallow
+    // inside streamChat, but a backend that doesn't implement deadlineMs (or
+    // a real connection failure) still throws. Report it with the deadline in
+    // the message when one was set, so the status line distinguishes "your
+    // ceiling cut this short" from "the backend broke" — otherwise a user who
+    // set a deadline sees a network error and debugs the wrong thing.
+    throw deadlineMs
+      ? new Error(`${err?.message ?? err} (summary deadline was ${deadlineMs}ms)`)
+      : err;
+  }
+  const rawSummary = res.choices[0]?.message.content ?? "";
+
+  // Did a DEADLINE end this, as opposed to the model's own stop token or its
+  // max_tokens budget? The wire signal for all three is identical
+  // (`finish_reason: "length"`, and "length" is also what the client-side
+  // max_tokens cap in streamChat reports), so the response alone cannot
+  // distinguish them — and the distinction decides whether the summary's
+  // trailing clause gets trimmed.
+  //
+  // The two are told apart by a flag OpenAICompatibleClient sets when IT is
+  // the thing that aborted:
+  //
+  //   deadlineHit   this client ended the response at the ceiling. The text is
+  //                 a prefix of an unfinished summary and MUST be trimmed.
+  //
+  //   tokenCapped   generation ended on its own terms — the server honored
+  //                 max_tokens, or streamChat's client-side cap fired. The
+  //                 model wrote as much as it was going to, so leave it alone:
+  //                 trimming would discard the tail of a legitimately
+  //                 budgeted summary, reintroducing exactly the detail loss
+  //                 DEFAULT_SUMMARY_MAX_TOKENS was lowered to avoid.
+  //
+  // So this is deliberately NOT `finish_reason === "length"`, and NOT
+  // "a deadline was configured". A backend that ignores deadlineMs, or no
+  // deadline at all, both land on tokenCapped — the conservative direction,
+  // since the cost of wrongly trimming is silently deleting the end of every
+  // max_tokens-limited summary, while the cost of wrongly not trimming is one
+  // summary ending mid-clause.
+  const deadlineHit = res.deadlineHit === true;
+  const summaryText = deadlineHit
+    ? trimPartialSummary(rawSummary) || rawSummary
+    : rawSummary || "(summary unavailable)";
 
   // Preserve the ORIGINAL system prompt (base prompt + injected .llamacli/rules),
   // not just the compaction summary. selectKeptTail() keeps only the size-budgeted
@@ -589,7 +832,7 @@ export async function runCompaction(
   // (after /quit, a crash, a restart) has none of this conversation, and
   // without it the resumed model had only a goal line and a file list —
   // live, it answered "No response requested." and stopped.
-  const finalCheckpoint: Checkpoint = res.choices[0]?.message.content ? { ...checkpoint, summary: summaryText } : checkpoint;
+  const finalCheckpoint: Checkpoint = summaryText ? { ...checkpoint, summary: summaryText } : checkpoint;
   if (finalCheckpoint !== checkpoint) await writeCheckpoint(projectRoot, finalCheckpoint);
 
   // keepTail's cut point is purely size-based and can land between a
@@ -642,6 +885,15 @@ export async function runCompaction(
     keptCount: tail.length,
     keptTokens: tail.reduce((n, m) => n + estimateTextTokens(messageText(m)), 0),
     summary: summaryText,
+    // Straight from the client's own signal, NOT "did trimming change the
+    // text". Measured against the real backend: with a 300ms ceiling the model
+    // had produced only "There is" — 8 characters — which has no paragraph
+    // break and no sentence terminator, so trimPartialSummary correctly
+    // declined to cut and the summary was kept verbatim. Deriving the flag
+    // from `summaryText !== rawSummary` reported `false` there, i.e. "nothing
+    // was truncated", for a summary that was in fact 99% missing. The flag has
+    // to say what ended the generation, not whether a cosmetic trim applied.
+    deadlineTruncated: deadlineHit,
   };
   if (toSummarize.length > DETAIL_PREVIEW_CAP) {
     detail.droppedPreview.push(`…and ${toSummarize.length - DETAIL_PREVIEW_CAP} more`);

@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens, CONTINUE_AFTER_COMPACTION, invalidateTokenEstimate } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens, CONTINUE_AFTER_COMPACTION, invalidateTokenEstimate, trimPartialSummary, DEFAULT_REPEAT_PENALTY } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -1222,3 +1222,350 @@ test("a different tool schema invalidates the memo", async () => {
   await estimateTokens(messages, backend, "", [{ type: "function", function: { name: "t", description: "d", parameters: {} } } as any]);
   assert.equal(calls, 2, "a changed tool list changes the prompt and must be re-measured");
 });
+
+// ── Time-boxed summaries (compaction.summaryDeadlineMs) ────────────────
+//
+// Compaction latency is ~100% decode: the summary request's prefix is served
+// from llama-server's prompt cache (~0.3 s measured), so everything after it is
+// generation at 38 tok/s on the reference box — a 1,024-token summary is ~27 s
+// of the user's turn. `summaryMaxTokens` bounds the summary by SIZE, which
+// only bounds the wait once you know the machine's decode rate (~8x spread
+// across supported hardware). These tests cover the second, direct bound.
+
+/** A backend that streams deltas and reports the opts it was handed, so a
+ *  test can assert both what was sent and that the ceiling was passed on. */
+function streamingSummaryBackend(deltas: string[], finishAfter = deltas.length, onDeadlineHit = true) {
+  const calls: { req: ChatCompletionRequest; deadlineMs?: number; stream: boolean; gotOnDelta: boolean }[] = [];
+  const backend: ModelBackend = {
+    async chat(req, onDelta, opts) {
+      calls.push({
+        req,
+        deadlineMs: opts?.deadlineMs,
+        stream: Boolean(req.stream),
+        gotOnDelta: Boolean(onDelta),
+      });
+      // `deadlineHit` is how the real client distinguishes "we ran out of
+      // clock" from "the model wrote everything it was budgeted for" — the two
+      // are the same finish_reason on the wire, so the fake has to set it the
+      // same way or these tests would pass against a client that gets this
+      // wrong. Independent of finishAfter: an abort can land exactly on the
+      // last delta, so "did more exist" is not the same question as "who
+      // stopped it".
+      const deadlineHit = Boolean(onDeadlineHit);
+      for (let i = 0; i < deltas.length && i < finishAfter; i++) {
+        onDelta?.({
+          choices: [{ delta: { content: deltas[i] }, finish_reason: null }],
+        } as any);
+      }
+      const text = deltas.slice(0, finishAfter).join("");
+      const capped = finishAfter < deltas.length;
+      return {
+        choices: [
+          { message: { role: "assistant", content: text }, finish_reason: capped ? "length" : "stop" },
+        ],
+        ...(deadlineHit ? { deadlineHit: true } : {}),
+      } as ChatCompletionResponse;
+    },
+    async listModels() {
+      return [];
+    },
+  };
+  return { backend, calls };
+}
+
+const partialCheckpoint = {
+  reason: "manual" as const,
+  goal: "g",
+  steps: [],
+  files: [],
+  pendingToolCall: null,
+  mustPreserve: [],
+};
+
+/** A history big enough that toSummarize is non-empty (see LONG_FILLER_TEXT). */
+function deadlineFixtureMessages(): ChatMessage[] {
+  return [
+    { role: "system", content: "sys" },
+    { role: "user", content: LONG_FILLER_TEXT },
+    { role: "assistant", content: "hi" },
+  ];
+}
+
+test("runCompaction streams the summary request and passes the deadline through", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-deadline-"));
+  try {
+    const { backend, calls } = streamingSummaryBackend(["요약 ", "본문 ", "끝."]);
+    await runCompaction(dir, deadlineFixtureMessages(), backend, "m", partialCheckpoint, 16384, undefined, undefined, 20000);
+    assert.equal(calls.length, 1, "one summary request");
+    assert.equal(calls[0].stream, true, "a deadline is only enforceable on the streaming path");
+    assert.equal(calls[0].gotOnDelta, true, "onDelta is what selects the streaming path in chat()");
+    assert.equal(calls[0].deadlineMs, 20000, "the configured ceiling reaches the client");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCompaction sends no deadline (and still streams) when none is configured", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-deadline-"));
+  try {
+    const { backend, calls } = streamingSummaryBackend(["요약 본문 끝."]);
+    await runCompaction(dir, deadlineFixtureMessages(), backend, "m", partialCheckpoint, 16384);
+    assert.equal(calls[0].deadlineMs, undefined, "unset means no ceiling — the opt-in must not invent one");
+    assert.equal(calls[0].stream, true, "still streamed, so a later default can add a ceiling without another transport change");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a deadline-truncated summary is kept (compacted, not failed) and flagged in the detail", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-deadline-"));
+  try {
+    // Two paragraphs; the deadline lands mid-second-paragraph, so trimming
+    // should cut back to the paragraph break. deadlineHit: true is what the
+    // real client sets when it aborts at the ceiling.
+    const { backend } = streamingSummaryBackend(
+      ["첫 문단 요약.\n\n둘째 문장 하나. ", "둘째 문장 둘, 잘림"],
+      2,
+      true
+    );
+    const result = await runCompaction(dir, deadlineFixtureMessages(), backend, "m", partialCheckpoint, 16384, undefined, undefined, 20000);
+    assert.ok(result.detail.deadlineTruncated, "the detail must report that the ceiling cut this short");
+    assert.equal(
+      result.detail.summary,
+      "첫 문단 요약.",
+      `expected a cut back to the paragraph break, got: ${JSON.stringify(result.detail.summary)}`
+    );
+    assert.ok(result.messages.length > 0, "a truncated summary still compacts — the alternative is losing the history entirely");
+    // The trimmed summary is what the next turn's model reads, so it must be
+    // what lands on disk too, or a resumed process gets the severed version.
+    const written = JSON.parse(await readFile(join(dir, ".llamacli", "state", "checkpoint.json"), "utf8"));
+    assert.equal(written.summary, result.detail.summary, "checkpoint and in-memory summary must agree");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a summary that finished on its own token budget is NOT trimmed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-deadline-"));
+  try {
+    // finish_reason "length" from max_tokens, not from a deadline — same
+    // signal on the wire, different meaning. Trimming here would discard the
+    // tail of a legitimately-budgeted summary, reintroducing the detail loss
+    // DEFAULT_SUMMARY_MAX_TOKENS was lowered to avoid.
+    const { backend } = streamingSummaryBackend(
+      ["요약 문장 하나. ", "요약 문장 둘, 여기서 예산 소진."],
+      2,
+      false
+    );
+    const result = await runCompaction(dir, deadlineFixtureMessages(), backend, "m", partialCheckpoint, 16384, undefined, undefined, 20000);
+    assert.equal(result.detail.deadlineTruncated, false, "not deadline-truncated");
+    assert.ok(
+      result.detail.summary.includes("예산 소진."),
+      "the full summary must survive when the token budget, not the clock, ended it"
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a deadline cut with no safe trim point still reports truncated", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-deadline-"));
+  try {
+    // Measured against the real backend with a 300ms ceiling: the model had
+    // produced only "There is" — 8 chars, no paragraph break and no sentence
+    // terminator — so trimPartialSummary correctly declined to cut it. The
+    // summary is kept verbatim, and the flag must STILL say it was truncated:
+    // it is ~99% missing, and reporting "not truncated" would point the user at
+    // the token budget when the clock is what actually cut it short.
+    const { backend } = streamingSummaryBackend(["There is"], 1, true);
+    const result = await runCompaction(dir, deadlineFixtureMessages(), backend, "m", partialCheckpoint, 16384, undefined, undefined, 300);
+    assert.equal(result.detail.summary, "There is", "the text itself is kept when no clean cut exists");
+    assert.equal(
+      result.detail.deadlineTruncated,
+      true,
+      "a deadline-truncated summary must be reported as such even when trimming declined to alter the text"
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trimPartialSummary prefers a paragraph break, then a sentence end, then a line, and never returns empty for a cut single line", () => {
+  assert.equal(trimPartialSummary("a.\n\nb.\n\ncut off here"), "a.\n\nb.");
+  assert.equal(trimPartialSummary("첫 문장. 둘째 문장"), "첫 문장.");
+  assert.equal(trimPartialSummary("line one\nline two\npartial"), "line one\nline two");
+  assert.equal(trimPartialSummary("끝에 마침표 없이 잘림"), "", "no safe cut point — caller keeps the untrimmed text");
+  assert.equal(trimPartialSummary("완전히 끝난 요약."), "", "nothing to cut; the caller must not trim a complete summary");
+  assert.equal(trimPartialSummary("   "), "", "empty stays empty");
+});
+
+test("a summary error under a deadline names the ceiling, so a user debugs the right thing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "llamacli-deadline-"));
+  try {
+    const backend: ModelBackend = {
+      async chat() {
+        throw new Error("chat failed: 500 internal error");
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    await assert.rejects(
+      () => runCompaction(dir, deadlineFixtureMessages(), backend, "m", partialCheckpoint, 16384, undefined, undefined, 20000),
+      /summary deadline was 20000ms/,
+      "without this, a ceiling-related failure is indistinguishable from a broken backend"
+    );
+    // And with no deadline the message is untouched — the suffix only appears
+    // when a ceiling was actually in play.
+    await assert.rejects(
+      () => runCompaction(dir, deadlineFixtureMessages(), backend, "m", partialCheckpoint, 16384),
+      (err: Error) => !/summary deadline/.test(err.message),
+      "no deadline configured means no deadline mentioned"
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── The summary must be written in the conversation's language ────────────────
+//
+// Found via the quality corpus in src/compaction/fixtures/: every Korean
+// conversation summarized in ENGLISH, because SUMMARY_INSTRUCTION was the only
+// instruction the request carried and it was English. The summaries were
+// accurate — all three `unfinished-task-in-flight` facts survived, in English —
+// which is exactly why it went unnoticed: nothing errored, nothing was lost, and
+// the Korean mustPreserve strings simply scored 0/6, which reads like data loss.
+//
+// It matters because the summary lands in the SYSTEM message and becomes the
+// context for every later turn: a session answering in Korean answers in English
+// from the first compaction onward.
+
+test("the summary instruction pins the summary language to the conversation's", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-lang-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      await runCompaction(
+        dir,
+        [{ role: "system", content: "sys" }, { role: "user", content: LONG_FILLER_TEXT }, { role: "assistant", content: "hi" }],
+        backend,
+        "m",
+        { reason: "manual", goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] },
+        16384
+      );
+      const instruction = lastRequest()!.messages[lastRequest()!.messages.length - 1].content as string;
+      assert.match(instruction, /same language/i, "the summary language must be pinned to the conversation, not left to the model's own default");
+      assert.match(
+        instruction,
+        /keep any quoted user text in its original language/i,
+        "a translated constraint is a constraint nobody stated — the quote must stay verbatim in its own language"
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("pinning the summary language does not disturb the cache-prefix design", () =>
+  (async () => {
+    // The whole reason compactor.ts keeps the original system message verbatim
+    // is that the summary request's prefix is byte-for-byte a prefix of the turn
+    // that just ran, so llama-server serves the prefill from its prompt cache
+    // (measured ~0.3 s of a ~27 s request). Adding the language clause to the
+    // TRAILING user message is safe; adding it to the system message would throw
+    // the entire prefill saving away.
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-lang-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      const system = "ORIGINAL SYSTEM PROMPT, VERBATIM";
+      await runCompaction(
+        dir,
+        [{ role: "system", content: system }, { role: "user", content: LONG_FILLER_TEXT }, { role: "assistant", content: "hi" }],
+        backend,
+        "m",
+        { reason: "manual", goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] },
+        16384
+      );
+      const sent = lastRequest()!;
+      assert.equal(sent.messages[0].content, system, "the system message must be passed through untouched");
+      assert.ok(
+        !(sent.messages[0].content as string).includes("same language"),
+        "the language clause belongs in the trailing instruction only"
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+test("a conversation with no user turn falls back rather than naming no language to mirror", () =>
+  (async () => {
+    // selectKeptTail's slice can be pure tool-call chains — some chat templates
+    // reject a conversation with no user message at all, which is why
+    // CONTINUE_AFTER_COMPACTION exists. In that case "same language as the
+    // conversation" names nothing, so the instruction must offer a fallback
+    // rather than send the model looking for a language that isn't there.
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-lang-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      await runCompaction(
+        dir,
+        [
+          { role: "system", content: "sys" },
+          { role: "user", content: LONG_FILLER_TEXT },
+          { role: "assistant", content: "hi" },
+        ],
+        backend,
+        "m",
+        { reason: "manual", goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] },
+        16384
+      );
+      // The fixture DOES have a user turn, so the unconditional wording applies.
+      const withUser = lastRequest()!.messages[lastRequest()!.messages.length - 1].content as string;
+      assert.ok(
+        !withUser.includes("or in your own output language"),
+        "when the conversation has user text there is a language to mirror — no fallback needed"
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());
+
+// The compaction summary request was sending NO repeat_penalty at all, while
+// the main turn request sends 1.1 for a documented reason: llama-server ships
+// with it off (confirmed live via GET /slots), which is what lets a degenerate
+// loop repeat the same phrase verbatim until max_tokens truncates it.
+//
+// For a summary this is worse than for a turn. A repeated turn reads as the
+// model rambling; a repeated SUMMARY spends the entire budget saying one thing,
+// so the history it was compressing is replaced by nothing — and
+// trimPartialSummary then treats the repeated text as a paragraph and keeps one
+// copy of it. It is also exactly the degenerate-repetition pattern that
+// llama.cpp's own ngram_mod speculator guards against by resetting its table
+// above an occupancy threshold.
+
+test("the summary request carries repeat_penalty, defaulting to the main turn's value", () =>
+  (async () => {
+    const dir = await mkdtemp(join(tmpdir(), "llamacli-rp-"));
+    try {
+      const { backend, lastRequest } = strictNoToolsBackend();
+      const messages: ChatMessage[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: LONG_FILLER_TEXT },
+        { role: "assistant", content: "hi" },
+      ];
+      const partial = { reason: "manual" as const, goal: "g", steps: [], files: [], pendingToolCall: null, mustPreserve: [] };
+
+      await runCompaction(dir, messages, backend, "m", partial, 16384);
+      assert.equal(
+        lastRequest()!.repeat_penalty,
+        DEFAULT_REPEAT_PENALTY,
+        "the default must match the main turn's, or the two requests disagree about what a repetition loop costs"
+      );
+
+      // And it must be overridable, so a user who wants a specific value is not
+      // fighting a hardcoded constant.
+      await runCompaction(dir, messages, backend, "m", partial, 16384, undefined, undefined, undefined, 1.25);
+      assert.equal(lastRequest()!.repeat_penalty, 1.25, "the caller's configured value must win");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  })());

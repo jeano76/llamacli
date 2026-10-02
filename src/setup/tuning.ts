@@ -314,13 +314,51 @@ export function tuneForHardware(
   }
 
   // --- Parallel slots ------------------------------------------------------ //
-  // This is a *coding agent*, one conversation per process. Every extra slot
-  // multiplies the KV cache and the batch buffer, and the repo's own measured
-  // configuration runs `--parallel 1` explicitly. Defaulting to llama.cpp's own
-  // default of 4 would silently quadruple the memory a config-sized context
-  // actually costs — which is how a tuned 16k context OOMs at load.
+  // This is a *coding agent*, one conversation per process, so the number of
+  // slots we need is 1. The reason below was WRONG, and correcting it matters
+  // beyond tidiness because it was cited as a load-time OOM argument:
+  //
+  //   "Every extra slot multiplies the KV cache and the batch buffer ...
+  //    would silently quadruple the memory a config-sized context actually costs"
+  //
+  // That is false for an EXPLICIT -np, which is the only thing this file emits.
+  // Verified against llama.cpp source and a live server:
+  //
+  //   src/llama-context.cpp:294   n_ctx_seq = n_ctx / n_seq_max   (kv_unified=false)
+  //   src/llama-model.cpp:2600    attn_kv_size = n_ctx_seq
+  //   common/common.cpp:1722      n_seq_max  = n_parallel
+  //
+  // So the KV pool is allocated ONCE at n_ctx/n_parallel. Adding a slot
+  // SHRINKS it. The "quadruples the memory" scenario requires kv_unified=true.
+  //
+  // kv_unified is the one case where the old warning is right, and it is a
+  // real trap — but it is triggered by OMITTING -np, not by raising it:
+  //
+  //   tools/server/server.cpp:156-160
+  //     if (n_parallel < 0) { n_parallel = 4; kv_unified = true; }
+  //
+  // Leave -np at llama.cpp's default (auto) and the server silently picks 4
+  // slots AND turns on unified KV — which is precisely the 4x multiplication
+  // this comment used to blame on raising -np. Passing -np explicitly is what
+  // keeps kv_unified off (llama-context.cpp:290-292 takes the other branch).
+  // So the flag is load-bearing for a reason, just not the stated one.
+  //
+  // What the extra slot actually costs, stated honestly:
+  //   - per-slot context becomes n_ctx / n_parallel (a REAL cost, and silent)
+  //   - host-side batch/output bookkeeping scales with n_seq_max (CPU, not VRAM)
+  //   - VRAM: no increase under kv_unified=false
+  //
+  // The per-slot halving is why buildServerArgs now multiplies -c by the slot
+  // count (see there) — without that, raising `parallel` in config.yaml would
+  // quietly halve the user's working memory.
   const parallel = 1;
-  rationale.push("--parallel 1: 에이전트는 세션 1개이므로 슬롯을 늘리면 KV 캐시와 배치 버퍼만 낭비합니다.");
+  rationale.push(
+    "--parallel 1: 에이전트는 세션 1개이므로 슬롯이 필요 없습니다. " +
+      "명시적으로 지정하는 이유는 llama.cpp 의 auto(-1) 기본값이 슬롯 4개 + kv_unified 를 함께 켜서 " +
+      "KV 캐시를 공유 풀로 늘리기 때문입니다 (tools/server/server.cpp). " +
+      "명시적 -np 에서는 슬롯을 늘려도 KV 캐시가 곱해지지 않습니다 — 총 -c 를 슬롯 수로 나눕니다. " +
+      "단, 슬롯 수를 늘리면 슬롯당 컨텍스트도 그만큼 줄어드므로 -c 를 함께 늘려야 합니다."
+  );
 
   return {
     gpuLayers,

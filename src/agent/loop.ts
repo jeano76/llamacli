@@ -8,6 +8,7 @@ import {
   CompactionThresholds,
   DEFAULT_TAIL_BUDGET_FRACTION,
   DEFAULT_SUMMARY_MAX_TOKENS,
+  DEFAULT_REPEAT_PENALTY,
   splitSystemMessage,
   stripResumePrefix,
   invalidateTokenEstimate,
@@ -537,12 +538,71 @@ export class AgentLoop {
    *  inside send() still runs as a fallback either way. */
   warmCompactIfNeeded(): void {
     this.enqueue(async () => {
-      await this.maybeCompact();
+      await this.maybeWarmCompact();
     }).catch(() => {
       // Swallowed: the next send() re-checks and retries synchronously if
       // this attempt failed, exactly as if warmCompactIfNeeded had never
       // been called.
     });
+  }
+
+  /** Compaction triggered by IDLE time rather than by the context threshold.
+   *
+   *  The distinction is the whole point. `maybeCompact()` (used at the top of
+   *  every turn and between tool calls) fires AT the auto-trigger ratio, so a
+   *  turn that crosses it mid-flight blocks for the summary's full generation —
+   *  measured at 4.3-13.6 s per compaction on this box, and 27-31 s at the
+   *  1024-token budget. That is the user staring at a frozen UI.
+   *
+   *  This one fires EARLIER, during the idle gap between turns, so the summary
+   *  is generated while the user is reading the previous reply or typing the
+   *  next message rather than while they are waiting on one. Same total work
+   *  (see the doc comment below — this moves the cost, it does not remove it),
+   *  but it moves it off the critical path.
+   *
+   *  WHY IT IS NOT JUST "LOWER THE THRESHOLD":
+   *
+   *  Lowering `autoTriggerRatio` would make compaction fire earlier in general
+   *  — including mid-turn, where it is exactly as blocking as before — while
+   *  also compacting more often overall. This path is reached ONLY from
+   *  warmCompactIfNeeded, which the UI calls once per finished turn
+   *  (index.tsx's send() finally block), so it can fire earlier without ever
+   *  firing mid-turn. The mid-turn check keeps using the real threshold.
+   *
+   *  The cost of firing early is real and is not hidden: a compaction at a
+   *  LOWER usage level summarizes a SHORTER conversation, so the result is a
+   *  worse summary (less context condensed into the same budget) and the next
+   *  compaction comes sooner (less room left). That is why the ratio is a
+   *  config knob rather than a hardcoded constant, and why it defaults to
+   *  DISABLED — this is a latency/quality trade a user opts into, not a
+   *  free win. With it unset, behavior is byte-for-byte what it was.
+   *
+   *  Also bounded below the real trigger, so enabling this can never cause the
+   *  mid-turn interrupt to fire EARLIER than it already does: the ladder only
+   *  ever adds a step below it, never removes the step at the threshold.
+   */
+  private async maybeWarmCompact(): Promise<void> {
+    const warmRatio = this.opts.thresholds.warmTriggerRatio;
+    if (!warmRatio || warmRatio <= 0) {
+      // Not configured — fall back to the ordinary threshold check, which is
+      // exactly what this method did before the warm ladder existed.
+      await this.maybeCompact();
+      return;
+    }
+    const window = this.opts.thresholds.contextWindowTokens;
+    // Above the real trigger, the normal path is already correct and will fire
+    // on the next turn anyway. Warming up here would burn the summary early
+    // and for no latency gain.
+    const trigger = this.opts.thresholds.autoTriggerRatio;
+    if (warmRatio >= trigger) {
+      await this.maybeCompact();
+      return;
+    }
+    const used = await estimateTokens(this.messages, this.opts.backend, toolDefsJson(), activeToolDefs());
+    this.opts.onContextUsage?.(used, window);
+    if (used >= window * warmRatio) {
+      await this.compact("auto-threshold", null);
+    }
   }
 
   async send(userText: string): Promise<void> {
@@ -1639,7 +1699,13 @@ export class AgentLoop {
           partial,
           this.opts.thresholds.contextWindowTokens,
           budget.tailBudgetFraction,
-          budget.summaryMaxTokens
+          budget.summaryMaxTokens,
+          this.opts.thresholds.summaryDeadlineMs,
+          // The summary request needs the same repetition protection the main
+          // turn request has — it was sending nothing, so a degenerate summary
+          // could spend the entire budget on one repeated sentence and still be
+          // accepted as a summary of everything it replaced.
+          this.opts.repeatPenalty ?? DEFAULT_REPEAT_PENALTY
         );
         this.messages = messages;
         // The whole conversation was just replaced; the memoized count belongs
@@ -1648,7 +1714,8 @@ export class AgentLoop {
         this.progress.onCompaction();
         this.opts.onStatus?.(
           `[compaction] ${((Date.now() - startedAt) / 1000).toFixed(1)}s ` +
-          `(요약 ${detail.summary.length}자, 요약 예산 ${budget.summaryMaxTokens} 토큰)`
+          `(요약 ${detail.summary.length}자, 요약 예산 ${budget.summaryMaxTokens} 토큰` +
+          `${detail.deadlineTruncated ? `, 시간 제한 ${(this.opts.thresholds.summaryDeadlineMs ?? 0) / 1000}s 도달로 요약이 잘렸습니다` : ""})`
         );
         // Working notes go back in with the summary, so what the model had
         // established survives the compaction verbatim.

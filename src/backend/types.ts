@@ -61,13 +61,38 @@ export interface ChatCompletionResponse {
     finish_reason: string;
   }>;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  /**
+   * True when THIS client ended the response by aborting at a `deadlineMs`
+   * it was given, as opposed to the model stopping on its own or the request
+   * hitting `max_tokens`.
+   *
+   * Necessary because all three endings are indistinguishable on the wire —
+   * every one of them is `finish_reason: "length"`. A caller that has to react
+   * differently to "we ran out of clock" than to "the model finished what we
+   * budgeted for it to write" cannot use `finish_reason` alone to tell them
+   * apart. Not part of the OpenAI wire format: set locally by the client that
+   * imposed the deadline, absent otherwise (so callers must treat undefined as
+   * "not deadline-truncated").
+   */
+  deadlineHit?: boolean;
 }
 
 export interface ModelBackend {
   /** Streams assistant deltas; resolves with the final assembled message. */
   chat(
     req: ChatCompletionRequest,
-    onDelta?: (chunk: ChatCompletionChunk) => void
+    onDelta?: (chunk: ChatCompletionChunk) => void,
+    /**
+     * `deadlineMs` bounds the whole request in wall-clock time and, on hit,
+     * resolves with whatever text arrived instead of throwing. Requires
+     * streaming (`stream: true` AND an `onDelta`); a non-streaming response is
+     * one JSON document that only exists after generation ends, so there is
+     * nothing partial to return. Optional and ignored by backends that don't
+     * implement it — but see the OpenAICompatibleClient doc comment: it
+     * deliberately THROWS rather than ignoring it, so a caller can never
+     * believe it set a ceiling that silently wasn't applied.
+     */
+    opts?: { deadlineMs?: number }
   ): Promise<ChatCompletionResponse>;
 
   listModels(): Promise<string[]>;

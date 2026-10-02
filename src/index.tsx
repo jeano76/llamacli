@@ -667,6 +667,27 @@ async function main() {
     // turn (AgentLoop reads this object, not a captured copy), so updating it
     // after setup takes effect without rebuilding the loop.
     contextWindowTokens: config.llama?.contextSize ?? 8192,
+    // `compaction.summaryMaxTokens` was declared in the config schema and
+    // documented as "the single biggest lever on compaction latency" in three
+    // places (config.ts, compactor.ts, loop.ts), and AgentLoop genuinely reads
+    // it (loop.ts's postCompactionBudget: `this.opts.thresholds.summaryMaxTokens
+    // ?? DEFAULT_SUMMARY_MAX_TOKENS`) — but nothing ever COPIED it into this
+    // object. So the value was always undefined, the `??` fallback always won,
+    // and a user who set the knob in config.yaml silently got the default back
+    // with no error of any kind. Found while reviewing the compaction-latency
+    // research prompt (docs/compaction-latency-research-prompt.md, T3): the
+    // lever recommended there as "the only certain improvement" did not exist.
+    //
+    // Left undefined (not defaulted to DEFAULT_SUMMARY_MAX_TOKENS here) on
+    // purpose: postCompactionBudget already owns that fallback AND the
+    // window-derived clamp on top of it, so defaulting it twice would make the
+    // two places that are supposed to agree about the budget silently diverge.
+    summaryMaxTokens: config.compaction.summaryMaxTokens,
+    summaryDeadlineMs: config.compaction.summaryDeadlineMs,
+    // See CompactionThresholds.warmTriggerRatio: run the compaction during the
+    // idle gap between turns instead of letting it interrupt a live one.
+    // Undefined by default — a latency/quality trade, not a free win.
+    warmTriggerRatio: config.compaction.warmTriggerRatio,
   };
   const ui = () => (globalThis as any).__llamacli_ui;
 

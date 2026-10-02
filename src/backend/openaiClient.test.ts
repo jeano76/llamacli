@@ -711,3 +711,107 @@ test("getContextSize still throws when every endpoint is unusable", () => {
     }
   );
 });
+
+// ── deadlineMs: a wall-clock ceiling on the whole request ──────────────
+//
+// The compaction summary's latency is essentially all decode (its prompt
+// prefix is served from llama-server's prompt cache, ~0.3 s measured), so the
+// only way to bound "how long does the user stare at [compaction]" is to bound
+// generation in wall-clock time. A token budget can't do that job —
+// `max_tokens` is a duration only once you know the machine's tok/s, which
+// varies ~8x across the hardware this supports.
+
+test("deadlineMs aborts a stream that never stops and returns what arrived, flagged as deadline-truncated", () =>
+  withUnboundedSSEServer(
+    500, // would otherwise keep streaming for ~2.5 s
+    () => {},
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const start = Date.now();
+      const res = await client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
+        () => {},
+        { deadlineMs: 120 }
+      );
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 2000, `expected the deadline to cut the stream near 120ms, took ${elapsed}ms`);
+      // The partial text is the whole point: a caller that set a ceiling wants
+      // the answer so far, not an exception and nothing.
+      assert.ok(res.choices[0].message.content, "partial content must be returned rather than discarded");
+      assert.equal(res.deadlineHit, true, "callers must be able to tell this apart from a max_tokens cut");
+    }
+  ));
+
+test("deadlineMs does not fire on a request that finishes first, and leaves deadlineHit unset", () =>
+  withUnboundedSSEServer(
+    4,
+    () => {},
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const res = await client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
+        () => {},
+        { deadlineMs: 5000 }
+      );
+      assert.equal(res.deadlineHit, undefined, "a completed response must not claim the deadline ended it");
+      assert.equal(res.choices[0].message.content, "xxxx", "the full text must be intact");
+    }
+  ));
+
+test("chat() refuses deadlineMs without streaming instead of silently ignoring it", async () => {
+  // A `stream: false` response is one JSON document that only exists after
+  // generation ends, so there is no partial body to return — a deadline there
+  // is unenforceable. Throwing is deliberate: a caller that believes it set a
+  // ceiling and silently didn't gets exactly the unbounded wait it was trying
+  // to avoid.
+  const client = new OpenAICompatibleClient("http://127.0.0.1:1");
+  await assert.rejects(
+    () => client.chat({ model: "m", messages: [{ role: "user", content: "hi" }], stream: false }, () => {}, { deadlineMs: 1000 }),
+    /deadlineMs is not supported without streaming/,
+    "must reject rather than accept-and-ignore"
+  );
+});
+
+test("a max_tokens cut and a deadline cut are distinguishable, even though both report finish_reason 'length'", () =>
+  withUnboundedSSEServer(
+    500,
+    () => {},
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      // Same server, same endless stream. Only the bound differs.
+      const capped = await client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 3 },
+        () => {}
+      );
+      const timedOut = await client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
+        () => {},
+        { deadlineMs: 120 }
+      );
+      assert.equal(capped.choices[0].finish_reason, "length");
+      assert.equal(timedOut.choices[0].finish_reason, "length");
+      // Both report the same thing on the wire; only this flag separates them.
+      // compactor.ts depends on that to avoid trimming the tail of a
+      // legitimately max_tokens-budgeted summary.
+      assert.equal(capped.deadlineHit, undefined, "a token cap is not a deadline");
+      assert.equal(timedOut.deadlineHit, true, "a deadline is not a token cap");
+    }
+  ));
+
+test("cancel() still wins over a pending deadline", () =>
+  withUnboundedSSEServer(
+    500,
+    () => {},
+    async (baseUrl) => {
+      const client = new OpenAICompatibleClient(baseUrl);
+      const promise = client.chat(
+        { model: "m", messages: [{ role: "user", content: "hi" }], stream: true },
+        () => {},
+        { deadlineMs: 60_000 }
+      );
+      setTimeout(() => client.cancel(), 40);
+      // A user cancelling must never be reported as a successful, merely
+      // truncated answer — that would silently discard their turn.
+      await assert.rejects(() => promise, /cancelled by user/);
+    }
+  ));

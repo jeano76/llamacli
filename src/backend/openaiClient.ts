@@ -210,9 +210,35 @@ export class OpenAICompatibleClient implements ModelBackend {
 
   async chat(
     req: ChatCompletionRequest,
-    onDelta?: (chunk: ChatCompletionChunk) => void
+    onDelta?: (chunk: ChatCompletionChunk) => void,
+    // An ABSOLUTE wall-clock budget for the whole request — connection,
+    // prefill, and every generated token — as opposed to the two timers
+    // below it, which bound "time since the last thing happened" and so a
+    // chatty-but-slow stream can run unbounded under both.
+    //
+    // Exists for the compaction summary (compactor.ts). Its latency is 100%
+    // decode — prefill is served from the prompt cache — so the only way to
+    // bound "how long does the user stare at [compaction]" is to bound the
+    // generation itself. A token budget can't do that job: `max_tokens` is a
+    // duration only once you know the machine's tok/s, and that varies ~8x
+    // across the hardware this supports. Hitting the deadline returns
+    // whatever text arrived (NOT an error) — see streamChat's deadlineHit
+    // handling for why a partial answer is the right answer here, and why
+    // that is safe only because the caller opted in by passing this.
+    opts?: { deadlineMs?: number }
   ): Promise<ChatCompletionResponse> {
     if (!req.stream || !onDelta) {
+      // A deadline cannot be honored on the non-streaming path the way it is
+      // below: the whole point is keeping the partial body, and a
+      // `stream: false` response is one JSON document that only exists once
+      // generation has finished. Refusing rather than silently ignoring it,
+      // because a caller that believes it set a ceiling and silently didn't
+      // gets exactly the unbounded wait it was trying to avoid.
+      if (opts?.deadlineMs) {
+        throw new Error(
+          `chat: deadlineMs is not supported without streaming (stream: ${req.stream}, onDelta: ${Boolean(onDelta)})`
+        );
+      }
       const controller = new AbortController();
       this.currentChatController = controller;
       try {
@@ -230,7 +256,7 @@ export class OpenAICompatibleClient implements ModelBackend {
       }
     }
 
-    return this.streamChat(req, onDelta);
+    return this.streamChat(req, onDelta, opts?.deadlineMs);
   }
 
   /** Consumes an SSE stream and reassembles it into a single final response,
@@ -251,7 +277,8 @@ export class OpenAICompatibleClient implements ModelBackend {
    *  respecting it. */
   private async streamChat(
     req: ChatCompletionRequest,
-    onDelta: (chunk: ChatCompletionChunk) => void
+    onDelta: (chunk: ChatCompletionChunk) => void,
+    deadlineMs?: number
   ): Promise<ChatCompletionResponse> {
     const controller = new AbortController();
     // Set immediately (before the connection even completes) so cancel()
@@ -315,6 +342,26 @@ export class OpenAICompatibleClient implements ModelBackend {
       }, CHAT_FETCH_TIMEOUT_MS);
     };
     armIdleTimer();
+
+    // The absolute ceiling. Started AFTER the connection is established, so it
+    // measures generation time rather than including however long the request
+    // spent queued behind other work on a busy single-slot server — queueing is
+    // the caller's business (CHAT_FETCH_TIMEOUT_MS / the retry loop in
+    // loop.ts), and folding it in here would make the deadline fire on a
+    // request that never even started generating, which is not what a caller
+    // asking to bound "how long the answer takes" means.
+    //
+    // Deliberately NOT re-armed per chunk, unlike armIdleTimer above: this one
+    // is a total budget, and re-arming it would silently turn it back into a
+    // second copy of the idle timer.
+    let deadlineHit = false;
+    const deadlineTimer: ReturnType<typeof setTimeout> | undefined =
+      deadlineMs && deadlineMs > 0
+        ? setTimeout(() => {
+            deadlineHit = true;
+            controller.abort();
+          }, deadlineMs)
+        : undefined;
 
     try {
       for await (const chunk of res.body as unknown as AsyncIterable<Buffer>) {
@@ -429,9 +476,18 @@ export class OpenAICompatibleClient implements ModelBackend {
       if (err?.name === "AbortError" && idleTimedOut) {
         throw new Error(`chat stream went idle (no new data) for over ${CHAT_FETCH_TIMEOUT_MS}ms`);
       }
-      if (!(clientCapped && err?.name === "AbortError")) throw err;
+      // The deadline, like the max_tokens cap, is an intended ending rather
+      // than a failure: fall through to returning the partial text assembled
+      // so far. The caller asked for a ceiling and opted into truncation by
+      // passing deadlineMs, and for the compaction summary a shorter answer is
+      // a strictly better outcome than no compaction at all.
+      if (!(clientCapped && err?.name === "AbortError") && !(deadlineHit && err?.name === "AbortError")) {
+        throw err;
+      }
+      if (deadlineHit) finishReason = "length";
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
       this.currentChatController = null;
     }
 
@@ -489,6 +545,12 @@ export class OpenAICompatibleClient implements ModelBackend {
           finish_reason: finishReason,
         },
       ],
+      // Set only when WE ended it via the deadline. `finish_reason` is
+      // "length" for the deadline, the client-side max_tokens cap, and the
+      // server honoring max_tokens alike, so this is the only thing that
+      // separates "out of clock" from "the model wrote what it was going to".
+      // Callers that don't care about the distinction never read it.
+      ...(deadlineHit ? { deadlineHit: true } : {}),
     };
   }
 }

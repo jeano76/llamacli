@@ -62,6 +62,29 @@ test("the known-good 12-core tuning is unchanged by the clamp", () => {
   assert.equal(t.parallel, 1);
 });
 
+// The slot decision's stated reason used to be "every extra slot multiplies the
+// KV cache", cited as a load-time OOM argument. That is false for an explicit
+// -np — llama.cpp allocates the KV pool once at n_ctx/n_parallel
+// (llama-context.cpp:294 -> llama-model.cpp:2600), so more slots mean a SMALLER
+// pool. Multiplication only happens under kv_unified, which llama.cpp turns on
+// when -np is omitted (server.cpp:156-160). The rationale has to name the real
+// trap, because "raise parallel" and "drop -np" both used to be described as
+// dangerous for the same false reason and they are the opposite of each other.
+test("the parallel-slot rationale explains the unified-KV trap rather than repeating the disproven claim", () => {
+  const t = tuneForHardware(machine({ cpuCount: 12, ramGiB: 30, gpu: { name: "RTX 2070 SUPER", totalGiB: 8, freeGiB: 7.2 } }));
+  const slot = t.rationale.find((r) => r.includes("--parallel"));
+  assert.ok(slot, "the slot decision must be explained to the user");
+  assert.match(slot, /kv_unified/, "must name unified KV as the thing that actually grows the pool");
+  // "곱해지지 않습니다" (does NOT multiply) legitimately contains 곱해, so match
+  // the disproven ASSERTION instead: the old text claimed extra slots DO
+  // multiply the cache. Asserting on the substring alone would reject the
+  // correction that documents the opposite.
+  assert.ok(
+    !/(슬롯을 늘리면|extra slot).{0,30}(곱|multiply)/.test(slot) && !/4배/.test(slot),
+    `the disproven "a slot multiplies the KV cache" claim must be gone, got: ${slot}`
+  );
+});
+
 test("no GPU means CPU-only, and a GPU always wins over the CPU", () => {
   for (const cpuCount of [1, 4, 8, 32]) {
     const cpuOnly = tuneForHardware(machine({ cpuCount, ramGiB: 16 }));

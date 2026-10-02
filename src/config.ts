@@ -39,7 +39,37 @@ export interface LlamacliConfig {
     flashAttn?: boolean;
     cacheTypeK?: string;
     cacheTypeV?: string;
+    /**
+     * `-c` in llama.cpp is the TOTAL context across all slots, not per-slot
+     * (`llama-context.cpp:294`: `n_ctx_seq = n_ctx / n_seq_max`). This field
+     * means PER-SLOT — it is what the tuning layer's VRAM budget is sized
+     * against and what compaction thresholds are derived from — so
+     * `buildServerArgs` multiplies it by `parallel` when writing the real flag.
+     * Without that, raising `parallel` silently halves the working context.
+     */
     parallel?: number;
+    /**
+     * Speculative decoding: `--spec-type`, a comma-separated list.
+     *
+     * Speculation exists to cut DECODE latency, which is ~100% of compaction
+     * latency (the summary's prompt is served from llama-server's prompt cache,
+     * so everything after it is generation). The model-free methods —
+     * `ngram-mod`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-cache`
+     * — need no draft checkpoint, which matters because those require a
+     * separately trained draft for this exact target model.
+     *
+     * Off by default: the gain is workload-dependent and MUST be measured, and
+     * a wrong value here costs throughput rather than only latency. See
+     * `llama.speculativeDraftNMax` for the draft-length knob.
+     */
+    speculativeTypes?: string;
+    /**
+     * `--spec-draft-n-max`: how many tokens the speculative method proposes per
+     * step. llama.cpp's own default is 3; sweep 4/8/16 when tuning. Larger
+     * values propose more per verification pass but are accepted less often at
+     * later positions, so throughput can flatten or regress.
+     */
+    speculativeDraftNMax?: number;
   };
   /** Checks run after each file edit, keyed "*.ext" → command with {file}
    *  (merged over the built-in ones in agent/harness.ts), or false to turn
@@ -68,6 +98,55 @@ export interface LlamacliConfig {
      * need, lower it for a faster/terser summary.
      */
     summaryMaxTokens?: number;
+    /**
+     * Wall-clock ceiling for the summary generation, in milliseconds. Unset /
+     * 0 = no ceiling, which is the historical behavior.
+     *
+     * `summaryMaxTokens` bounds the summary in TOKENS, which makes its latency
+     * a function of a decode rate that varies by an order of magnitude across
+     * the machines this runs on (38 tok/s measured on the 8 GB RTX 2070 box,
+     * ~300 tok/s on a fully-offloaded 24 GB card). So a token budget tuned on
+     * one machine is a 27-second wait on one and a 3-second wait on the other,
+     * and the thing the user actually experiences — "how long am I staring
+     * at this" — has no bound at all on any machine.
+     *
+     * This puts a bound on the thing being bounded. When the deadline passes,
+     * the summary request is aborted and whatever text arrived so far becomes
+     * the summary (compactor.ts's trimPartialSummary drops the trailing
+     * half-sentence so the model never resumes mid-clause). A partial summary
+     * compresses a 14k-token history less well than a complete one, which
+     * means compaction fires again sooner — so this trades summary detail and
+     * compaction frequency for a hard latency ceiling, and the right value is
+     * a judgement call. Leave it unset if you would rather have the best
+     * summary and accept however long it takes.
+     *
+     * 20_000 ms is suggested as a starting point on slow hardware (roughly
+     * where a 1024-token summary at 38 tok/s would finish anyway, so it costs
+     * nothing there and bounds the machines that are far slower).
+     */
+    summaryDeadlineMs?: number;
+    /**
+     * Run compaction during the idle gap BETWEEN turns at this fraction of the
+     * context window, instead of only when `autoTriggerRatio` is crossed
+     * mid-turn. Unset = disabled.
+     *
+     * A compaction fired at the trigger interrupts a live turn: the user is
+     * looking at a frozen UI for the summary's whole generation (measured
+     * 4.3-13.6 s per compaction on the reference box, more at a larger
+     * summary budget). This threshold fires the same work while the UI is idle
+     * waiting for the next message, so it stops being a wait.
+     *
+     * It does NOT make compaction cheaper — the summary is still generated
+     * either way. It changes only WHEN. Set it near `autoTriggerRatio` (e.g.
+     * 0.5 against a 0.7 trigger) to catch most of the benefit while barely
+     * changing how often compaction runs.
+     *
+     * The trade, stated plainly: a lower threshold summarizes a SHORTER
+     * conversation, so the summary is a little worse and the next compaction
+     * arrives sooner. This is a quality-for-latency exchange, which is why it
+     * is opt-in and why the number belongs in config rather than in code.
+     */
+    warmTriggerRatio?: number;
   };
   /** Remote debugging (Chrome DevTools Protocol) for the browser tools —
    *  connects to an already-running Chrome/Chromium started with

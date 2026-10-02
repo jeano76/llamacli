@@ -295,7 +295,17 @@ test("NVIDIA GPU is prioritised over CPU on a multi-core box", () => {
   // Threads are halved rather than oversubscribed, matching the hand-tuned
   // working config on this very box (-t 6 of 12 cores).
   assert.equal(t.threads, 6);
-  assert.equal(t.parallel, 1, "an agent is one conversation; more slots only waste KV");
+  // An agent is one conversation, so 1 slot is what it NEEDS. The reason is no
+  // longer "a slot multiplies the KV cache" — that is false for an explicit
+  // -np (llama-context.cpp:294 divides n_ctx by n_seq_max). The real reason to
+  // pass -np explicitly is that OMITTING it makes llama.cpp auto-resolve to 4
+  // slots WITH kv_unified=true (server.cpp:156-160), and that is the case where
+  // the KV pool really does grow. See tuning.ts's parallel-slots comment.
+  assert.equal(t.parallel, 1);
+  assert.ok(
+    t.rationale.some((r) => /kv_unified/.test(r)),
+    "the slot decision must explain the unified-KV trap, not repeat the disproven claim"
+  );
 });
 
 test("a box with no GPU gets gpuLayers 0 and threads up to the core count", () => {

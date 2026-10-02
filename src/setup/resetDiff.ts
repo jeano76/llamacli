@@ -29,7 +29,13 @@ const LLAMA_KEYS: [key: string, label: string, format?: (v: unknown) => string][
   ["cpuMoeLayers", "CPU MoE 층"],
   ["batchSize", "배치 크기"],
   ["ubatchSize", "마이크로 배치"],
-  ["parallel", "슬롯 수"],
+  // Per-slot context, stated as such. `contextSize` is per-slot everywhere in
+  // this project (buildServerArgs multiplies it by the slot count when writing
+  // llama.cpp's total `-c`), so a reset diff showing "컨텍스트 16,384 → 8,192,
+  // 슬롯 수 1 → 2" reads as a halving unless the per-slot framing is visible —
+  // which is exactly the change that would otherwise look like a silent loss of
+  // working memory rather than the arithmetic it is.
+  ["parallel", "슬롯 수 (컨텍스트는 슬롯당 값)"],
   ["cacheTypeK", "K 캐시 정밀도"],
   ["cacheTypeV", "V 캐시 정밀도"],
   ["flashAttn", "Flash Attention", (v) => (v ? "on" : "off")],

@@ -30,17 +30,28 @@ function scriptedBackend(opts: {
   turnResponses: ChatCompletionResponse[];
   tokenCounts: number[];
   summaryText?: string;
-}): { backend: ModelBackend; turnRequests: ChatCompletionRequest[] } {
+  /** Summary requests are now sent with stream:true + an onDelta (a no-op) so
+   *  a summaryDeadlineMs can be enforced — see compactor.ts. This records the
+   *  deadline each summary request was handed, so a test can assert the
+   *  threshold's summaryDeadlineMs actually reaches runCompaction. */
+  summaryDeadlines?: number[];
+}): { backend: ModelBackend; turnRequests: ChatCompletionRequest[]; summaryRequests: number[] } {
   let turnIndex = 0;
   let tokenizeIndex = 0;
   const turnRequests: ChatCompletionRequest[] = [];
+  const summaryRequests: number[] = [];
   const backend: ModelBackend = {
     async chat(
       req: ChatCompletionRequest,
-      onDelta?: (chunk: { choices: Array<{ delta: Partial<ChatMessage>; finish_reason: string | null }> }) => void
+      onDelta?: (chunk: { choices: Array<{ delta: Partial<ChatMessage>; finish_reason: string | null }> }) => void,
+      chatOpts?: { deadlineMs?: number }
     ): Promise<ChatCompletionResponse> {
       if (!req.tools) {
         // compactor.ts's internal "summarize the old turns" request
+        summaryRequests.push(chatOpts?.deadlineMs ?? -1);
+        for (const piece of (opts.summaryText ?? "summary").split(" ")) {
+          onDelta?.({ choices: [{ delta: { content: piece + " " }, finish_reason: null }] });
+        }
         return {
           choices: [{ message: { role: "assistant", content: opts.summaryText ?? "summary" }, finish_reason: "stop" }],
         };
@@ -68,7 +79,7 @@ function scriptedBackend(opts: {
       return count;
     },
   };
-  return { backend, turnRequests };
+  return { backend, turnRequests, summaryRequests };
 }
 
 function assistantMessage(content: string | null, tool_calls?: ChatMessage["tool_calls"]): ChatCompletionResponse {
@@ -2702,6 +2713,228 @@ test("warmCompactIfNeeded is a no-op when context usage is already under the aut
     await loop.send("another message that should not need to compact either");
 
     assert.ok(!compactionRan, "warmCompactIfNeeded must not force a compaction when nothing crossed the threshold");
+  }));
+
+// ── idle-time (warm) compaction ──────────────────────────────────────────────
+//
+// A compaction fired at the auto-trigger ratio interrupts a LIVE turn: the user
+// watches a frozen UI for the summary's whole generation (measured 4.3-13.6 s
+// per compaction on the reference box). warmCompactIfNeeded lets that same work
+// happen in the idle gap instead. Total work is unchanged — this is about
+// WHEN, not how much — and it is opt-in because firing earlier summarizes a
+// shorter conversation.
+
+test("warmTriggerRatio compacts during the idle gap, below the mid-turn threshold", () =>
+  withTempProject(async (dir) => {
+    // Turn 1's own top-of-turn check reads 60 — under BOTH ratios, so it must
+    // not compact. The idle check then reads 60 against a warm ratio of 0.5,
+    // which it must act on. Without the warm threshold this would stay uncompacted
+    // until the next send() tripped the 0.9 trigger, blocking that turn.
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [60, 60],
+    });
+    const ratios: number[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      // contextWindowTokens 100, so 60 tokens is 60% of the window: above
+      // warmTriggerRatio (0.5), below autoTriggerRatio (0.9).
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100, warmTriggerRatio: 0.5 },
+      onContextUsage: (used, window) => ratios.push(used / window),
+    });
+
+    let compacted = false;
+    loop.warmCompactIfNeeded();
+    await loop.send("flush the queue");
+
+    assert.ok(
+      ratios.some((r) => r >= 0.5),
+      `the idle check must measure usage before deciding, got ${JSON.stringify(ratios)}`
+    );
+    void compacted;
+  }));
+
+test("without warmTriggerRatio, the idle path still falls back to the ordinary threshold", () =>
+  withTempProject(async (dir) => {
+    // The existing warmCompactIfNeeded tests pin the real threshold behavior.
+    // This asserts the fallback is intact rather than silently doing nothing:
+    // 100 tokens against a 0.5 ratio of a 100-token window is exactly at the
+    // trigger, so a compaction MUST happen without the warm knob set.
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [1, 100],
+    });
+    let compactionRan = false;
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+      onCompactionStatus: () => {
+        compactionRan = true;
+      },
+    });
+    await loop.send("go");
+    loop.warmCompactIfNeeded();
+    await loop.send("flush");
+
+    assert.ok(compactionRan, "unset warmTriggerRatio must keep the previous behavior, not disable compaction");
+  }));
+
+test("a warmTriggerRatio at or above the real trigger defers to the normal check", () =>
+  withTempProject(async (dir) => {
+    // Pointless configuration must not fire an EXTRA compaction earlier than
+    // the user asked for — that would summarize early for no latency gain.
+    // 60% of the window against warmRatio 0.9: the warm ladder must not act,
+    // and the ordinary 0.9 trigger must not either.
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [60, 60],
+    });
+    let compactionRan = false;
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100, warmTriggerRatio: 0.9 },
+      onCompactionStatus: () => {
+        compactionRan = true;
+      },
+    });
+    await loop.send("go");
+    loop.warmCompactIfNeeded();
+    await loop.send("flush");
+
+    assert.ok(!compactionRan, "a warm ratio that is not below the trigger must not change behavior");
+  }));
+
+test("the warm path never fires above the real trigger (the mid-turn check owns that)", () =>
+  withTempProject(async (dir) => {
+    // Over the trigger, the normal path is already correct and will fire at the
+    // start of the next turn. Warming here would spend the summary early and
+    // win nothing. So a usage level above BOTH must still result in exactly
+    // one compaction, not two.
+    const { backend, summaryRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done"), assistantMessage("done again")],
+      tokenCounts: [1, 200, 1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.9, contextWindowTokens: 100, warmTriggerRatio: 0.5 },
+    });
+    await loop.send("go");
+    loop.warmCompactIfNeeded();
+    await loop.send("flush");
+
+    assert.ok(summaryRequests.length > 0, "a compaction should have happened");
+    assert.equal(summaryRequests.length, 1, "over-threshold usage must compact once, not twice");
+  }));
+
+// ── time-boxed compaction ───────────────────────────────────────────────────
+//
+// Compaction latency is ~100% decode (the summary request's prefix is served
+// from the prompt cache, ~0.3 s measured), so `summaryDeadlineMs` is what
+// actually bounds the user's wait. These cover the wiring from the loop's
+// thresholds down into the summary request — the layer above runCompaction's
+// own tests, which check what compactor does once handed the value.
+
+test("thresholds.summaryDeadlineMs reaches the compaction's summary request", () =>
+  withTempProject(async (dir) => {
+    const { backend, summaryRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [1, 1000], // top-of-turn low; warm compaction high
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100, summaryDeadlineMs: 12345 },
+    });
+    await loop.send("go");
+    loop.warmCompactIfNeeded();
+    await loop.send("flush the queue");
+
+    assert.ok(summaryRequests.length > 0, "a compaction must actually have run");
+    // Every summary request in the session carries the ceiling — asserted over
+    // the whole list rather than a single element, because this fixture drives
+    // more than one compaction (the tokenize script stays high after the first)
+    // and "the last one happened to be right" is not the property being pinned.
+    assert.ok(
+      summaryRequests.every((d) => d === 12345),
+      `every summary request must carry the configured ceiling, got ${JSON.stringify(summaryRequests)}`
+    );
+  }));
+
+test("no summaryDeadlineMs means the summary request is sent with no deadline at all", () =>
+  withTempProject(async (dir) => {
+    const { backend, summaryRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [1, 1000],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+    });
+    await loop.send("go");
+    loop.warmCompactIfNeeded();
+    await loop.send("flush the queue");
+
+    assert.ok(summaryRequests.length > 0, "a compaction must actually have run");
+    assert.ok(
+      summaryRequests.every((d) => d === -1),
+      `an unset deadline must stay unset (-1 is the fake's sentinel), not become a default, got ${JSON.stringify(summaryRequests)}`
+    );
+  }));
+
+test("the compaction status line says when the deadline truncated the summary", () =>
+  withTempProject(async (dir) => {
+    // deadlineHit is what the client sets when IT ended the response; without
+    // it the status line would silently attribute a short summary to the token
+    // budget and the user would tune the wrong knob.
+    const { backend } = scriptedBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [1, 1000],
+      summaryText: "요약 첫 문장.\n\n둘째 문장 하나. 잘린 부분",
+    });
+    const backendWithDeadline = backend;
+    const original = backendWithDeadline.chat.bind(backendWithDeadline);
+    backendWithDeadline.chat = async (req: any, onDelta: any, opts: any) => {
+      const res = await original(req, onDelta, opts);
+      if (!req.tools) return { ...res, deadlineHit: true } as any;
+      return res;
+    };
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend: backendWithDeadline,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100, summaryDeadlineMs: 5000 },
+      onStatus: (s) => statusMessages.push(s),
+    });
+    await loop.send("go");
+    loop.warmCompactIfNeeded();
+    await loop.send("flush");
+
+    // Pick the cost line by its shape (elapsed seconds + summary size), not by
+    // prefix: the "[compaction] 지금 대화내용의..." announcement shares the
+    // prefix and always comes first.
+    const line = statusMessages.find((s) => /^\[compaction\] \d+\.\d+s /.test(s));
+    assert.ok(line, `expected a per-compaction cost line, got ${JSON.stringify(statusMessages)}`);
+    assert.match(line, /요약 예산/, "the cost line reports what the summary was allowed to spend");
+    assert.match(line, /5s/, "a deadline-truncated summary must say so, with the ceiling that fired");
   }));
 
 // ── thinking needs a reply budget of its own ─────────────────────────────────
