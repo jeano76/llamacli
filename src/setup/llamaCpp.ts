@@ -82,7 +82,7 @@ const BIN_NAME = binNameFor();
 export interface LlamaLocation {
   binPath: string;
   /** Where it was found, for an honest status line ("PATH", "기존 빌드", …). */
-  source: "env" | "path" | "existing-build" | "llamacli-build" | "model-adjacent" | "systemd" | "built";
+  source: "env" | "path" | "existing-build" | "llamacli-build" | "model-adjacent" | "systemd" | "built" | "downloaded";
   /** Best guess at the accelerator it was compiled for, from the directory
    *  name / build flags. Verified separately by probeLlamaServer. */
   backend: "cuda" | "vulkan" | "cpu" | "unknown";
@@ -803,6 +803,17 @@ export interface BuildOptions {
   /** Called with human-readable progress lines. */
   log?: (line: string) => void;
   installDeps?: boolean;
+  /** Which repository to build. Defaults to stock llama.cpp.
+   *
+   *  Overridable because it is not always interchangeable: the ternary quants
+   *  (PTQ1_0 / PQ2_0) that the Bonsai family ships in are a fork feature, and a
+   *  stock build rejects them with "invalid ggml type 143". Compiling the default
+   *  for such a model burns 10-40 minutes and produces a binary that cannot load
+   *  it. Callers that know the model needs the fork pass its URL. */
+  repo?: string;
+  /** Where to keep the checkout. Separate per repo, so building the fork does not
+   *  clobber a stock tree (or vice versa) and the two can coexist. */
+  home?: string;
 }
 
 /** Clones (or updates) and builds llama.cpp, returning the built binary path.
@@ -814,7 +825,11 @@ export interface BuildOptions {
  */
 export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
   const { hw, run, log = () => {} } = opts;
-  const dir = LLAMA_CPP_HOME;
+  const repo = opts.repo ?? LLAMA_CPP_REPO;
+  // One checkout per repository. A fork and stock share nothing, and overwriting
+  // one with the other would make `findLlamaServer` return whichever sorted first
+  // for a model only one of them can read.
+  const dir = opts.home ?? (repo === LLAMA_CPP_REPO ? LLAMA_CPP_HOME : join(LLAMA_CPP_HOME + "-fork"));
 
   if (opts.installDeps !== false) {
     log(`빌드 패키지를 설치합니다 (CUDA: ${hw.canBuildCuda ? "예" : "아니오"})…`);
@@ -828,7 +843,21 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
 
   if (!(await dirExists(join(dir, ".git")))) {
     log(`llama.cpp 소스를 받습니다 → ${dir}`);
-    await run("git", ["clone", "--depth", "1", LLAMA_CPP_REPO, dir], { timeout: 20 * 60_000 });
+    await run("git", ["clone", "--depth", "1", repo, dir], { timeout: 20 * 60_000 });
+  } else {
+    // An existing checkout is only usable if it is the repository asked for. A
+    // stock tree left over from an earlier run would silently be rebuilt here and
+    // then handed a model it cannot read, so the mismatch is stated instead.
+    const origin = await run("git", ["config", "--get", "remote.origin.url"], { cwd: dir, timeout: 10_000 })
+      .then((s) => s.trim())
+      .catch(() => "");
+    const sameRepo = origin.replace(/\.git$/, "") === repo.replace(/\.git$/, "");
+    if (!sameRepo) {
+      throw new Error(
+        `${dir} 에는 다른 저장소(${origin || "알 수 없음"})가 있습니다. ` +
+          `${repo} 빌드에는 다른 위치가 필요합니다.`
+      );
+    }
   }
 
   const buildDir = hw.canBuildCuda ? "build-cuda" : "build-cpu";

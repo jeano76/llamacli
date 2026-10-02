@@ -34,6 +34,9 @@ import {
   type LlamaLocation, type Run,
 } from "./llamaCpp.js";
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
+import {
+  downloadPrismRuntime, detectCudaVersion, PRISM_LLAMA_CPP_REPO,
+} from "./ternaryRuntime.js";
 import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
@@ -216,11 +219,60 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
         log(`찾은 llama-server 가 실행되지 않습니다: ${rejected.join(", ")}`);
         log("드라이버 또는 런타임 라이브러리 문제일 수 있습니다. 그래도 직접 빌드를 시도합니다.");
       }
-      const binPath = await step("llama.cpp 빌드", async () => {
-        log("llama-server 를 찾지 못해 빌드합니다. CUDA 빌드는 10~40분 걸릴 수 있습니다.");
-        return buildLlamaCpp({ hw: hardware, run, log });
-      });
-      if (binPath) llama = { binPath, source: "built", backend: hardware.canBuildCuda ? "cuda" : "cpu" };
+      // Which llama.cpp is being installed is decided by what the MODEL needs, not
+      // by what is easiest to build. The ternary quants (PTQ1_0 / PQ2_0) are a fork
+      // feature -- stock ggml-org rejects them as "invalid ggml type 143" -- and the
+      // fork's own roadmap still lists the CUDA kernels as unmerged upstream. So
+      // building the stock repo for a Bonsai model spends 10-40 minutes to produce a
+      // binary that fails on the very model it was built for.
+      const wantsTernary =
+        needsTernaryBuild(basename(configuredModel ?? "")) ||
+        (rejectedForModel?.length ?? 0) > 0 ||
+        (rejected ?? []).length > 0;
+
+      if (wantsTernary) {
+        // Download first. The fork publishes pinned prebuilts per platform, so the
+        // common case is seconds rather than half an hour.
+        const prebuilt = await step("PrismML llama-server 받기", async () => {
+          const cudaVersion = await detectCudaVersion(run);
+          return downloadPrismRuntime({
+            machine: {
+              platform: hardware.platform,
+              arch: process.arch,
+              gpuBackend: hardware.gpuBackend,
+              cudaVersion,
+            },
+            log,
+          }).then((r) => {
+            // A falsy detail would be recorded as a SUCCESSFUL step that installed
+            // nothing. Throwing keeps the "no prebuilt for this platform" outcome
+            // in the failed-step channel, where the build fallback can read it.
+            if (!r.ok || !r.binPath) throw new Error(r.lines[r.lines.length - 1] ?? "사전 빌드 없음");
+            return r.binPath;
+          });
+        });
+        if (prebuilt) {
+          llama = {
+            binPath: prebuilt,
+            source: "downloaded",
+            // The asset itself says which accelerator it was built for; "unknown"
+            // is honest rather than claiming a backend we did not verify.
+            backend: hardware.gpuBackend === "none" ? "cpu" : hardware.gpuBackend,
+          };
+        } else {
+          const built = await step("PrismML llama.cpp 빌드", async () => {
+            log("사전 빌드가 없어 PrismML fork 에서 직접 빌드합니다. 10~40분 걸릴 수 있습니다.");
+            return buildLlamaCpp({ hw: hardware, run, log, repo: PRISM_LLAMA_CPP_REPO });
+          });
+          if (built) llama = { binPath: built, source: "built", backend: hardware.canBuildCuda ? "cuda" : "cpu" };
+        }
+      } else {
+        const binPath = await step("llama.cpp 빌드", async () => {
+          log("llama-server 를 찾지 못해 빌드합니다. CUDA 빌드는 10~40분 걸릴 수 있습니다.");
+          return buildLlamaCpp({ hw: hardware, run, log });
+        });
+        if (binPath) llama = { binPath, source: "built", backend: hardware.canBuildCuda ? "cuda" : "cpu" };
+      }
     }
   } else {
     steps.push({
