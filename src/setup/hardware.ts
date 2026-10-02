@@ -19,7 +19,9 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export type GpuBackend = "cuda" | "vulkan" | "none";
+export type GpuBackend = "cuda" | "rocm" | "vulkan" | "metal" | "none";
+
+export type GpuVendor = "nvidia" | "amd" | "intel" | "apple";
 
 export interface Gpu {
   /** nvidia-smi's device index, as llama.cpp's `--main-gpu` / `CUDA_VISIBLE_DEVICES` want it. */
@@ -27,6 +29,13 @@ export interface Gpu {
   name: string;
   vramTotalBytes: number;
   vramFreeBytes: number;
+  /** Absent means NVIDIA — the only vendor this type described originally, so
+   *  every existing literal and `parseNvidiaSmiCsv` stays valid unchanged. */
+  vendor?: GpuVendor;
+  /** True when "VRAM" is really system RAM the GPU may address (Apple Silicon).
+   *  Then `vramTotalBytes` is the GPU's working-set budget, NOT physical memory
+   *  that is additional to RAM — callers that add the two together double-count. */
+  unifiedMemory?: boolean;
 }
 
 export interface Hardware {
@@ -43,6 +52,12 @@ export interface Hardware {
    *  what the *machine* has: a box can have a GPU and no CUDA compiler, in
    *  which case building must not ask for `-DGGML_CUDA=ON`. */
   canBuildCuda: boolean;
+  /** A ROCm/HIP compiler is present AND an AMD GPU is, so `-DGGML_HIP=ON` can work. */
+  canBuildRocm?: boolean;
+  /** A Vulkan shader compiler (`glslc`) is present, so `-DGGML_VULKAN=ON` can work. */
+  canBuildVulkan?: boolean;
+  /** CPU architecture as Node names it ("x64" | "arm64" …). */
+  arch?: string;
   /** Build toolchain availability, as found on PATH. */
   tools: Record<string, boolean>;
   platform: string;
@@ -248,12 +263,93 @@ export async function ownLlamaServerVramGiB(
  *  attempted. `curl` is not a build dep but IS needed to download a model, and
  *  its absence is a very different failure than a missing compiler, so it's
  *  reported here too. */
-const PROBE_TOOLS = ["git", "cmake", "make", "ninja", "g++", "cc", "nvcc", "curl", "pkg-config"];
+const PROBE_TOOLS = [
+  "git", "cmake", "make", "ninja", "g++", "cc", "nvcc", "curl", "pkg-config",
+  // Accelerator toolchains: decide whether a GPU-targeted source build can work.
+  "hipcc", "glslc", "vulkaninfo",
+  // Installers and privilege: decide HOW missing build tools could be installed.
+  "sudo", "apt-get", "dnf", "pacman", "apk", "zypper", "brew", "winget", "choco", "pip3",
+  // Windows-only compiler; harmless to probe elsewhere.
+  "cl",
+];
 
-export async function detectHardware(run: Run = defaultRun): Promise<Hardware> {
+/** Everything `detectHardware` reads from the host besides running commands.
+ *  A seam so a synthetic AMD / Apple / Windows machine can be tested on any box. */
+export interface HostProbe {
+  platform: string;
+  arch: string;
+  ramTotalBytes: number;
+  ramAvailableBytes: number;
+  cpuCount: number;
+  /** UTF-8 contents of a file, or null when absent/unreadable. */
+  readText: (path: string) => Promise<string | null>;
+  /** Entries of a directory, or [] when absent. */
+  listDir: (path: string) => Promise<string[]>;
+}
+
+export const realHostProbe = (): HostProbe => ({
+  platform: platform(),
+  arch: process.arch,
+  ramTotalBytes: totalmem(),
+  ramAvailableBytes: freemem(),
   // os.cpus() returns [] in some container/VM setups, so keep a floor of 1
   // rather than propagating 0 into every downstream division.
-  const cpuCount = Math.max(1, cpus().length || 1);
+  cpuCount: Math.max(1, cpus().length || 1),
+  readText: async (p) => {
+    const { readFile } = await import("node:fs/promises");
+    return readFile(p, "utf8").catch(() => null);
+  },
+  listDir: async (p) => {
+    const { readdir } = await import("node:fs/promises");
+    return readdir(p).catch(() => []);
+  },
+});
+
+/** Share of unified memory macOS lets the GPU wire by default. Apple documents no
+ *  fixed number; the commonly observed default on machines up to ~64 GB is about
+ *  two thirds, rising toward three quarters on larger ones. 0.67 is deliberately
+ *  on the low side: a model sized to a budget the OS then refuses fails at load,
+ *  whereas an under-sized one only runs slightly smaller. */
+export const APPLE_GPU_MEMORY_FRACTION = 0.67;
+
+const PCI_VENDORS: Record<string, GpuVendor> = { "0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel" };
+
+/** AMD GPUs from the kernel's own amdgpu sysfs files (`mem_info_vram_*`, bytes).
+ *  Read from sysfs rather than parsing `rocm-smi` output, because sysfs works with
+ *  no ROCm userspace installed — which is exactly the machine being provisioned. */
+export async function detectAmdGpus(host: HostProbe): Promise<Gpu[]> {
+  const gpus: Gpu[] = [];
+  const cards = (await host.listDir("/sys/class/drm")).filter((n) => /^card\d+$/.test(n)).sort();
+  for (const card of cards) {
+    const dev = `/sys/class/drm/${card}/device`;
+    const vendor = (await host.readText(`${dev}/vendor`))?.trim().toLowerCase();
+    if (!vendor || PCI_VENDORS[vendor] !== "amd") continue;
+    const total = Number((await host.readText(`${dev}/mem_info_vram_total`))?.trim());
+    if (!Number.isFinite(total) || total <= 0) continue; // an APU reports none here
+    const used = Number((await host.readText(`${dev}/mem_info_vram_used`))?.trim());
+    const product = (await host.readText(`${dev}/product_name`))?.trim();
+    gpus.push({
+      index: gpus.length,
+      name: product || `AMD GPU (${card})`,
+      vramTotalBytes: total,
+      vramFreeBytes: Number.isFinite(used) ? Math.max(0, total - used) : total,
+      vendor: "amd",
+    });
+  }
+  return gpus;
+}
+
+/** True when `vulkaninfo --summary` lists a real (non-software) device. */
+export function vulkanSummaryHasGpu(summary: string): boolean {
+  return /PHYSICAL_DEVICE_TYPE_(DISCRETE|INTEGRATED|VIRTUAL)_GPU/.test(summary);
+}
+
+export async function detectHardware(
+  run: Run = defaultRun,
+  hostOverride: Partial<HostProbe> = {}
+): Promise<Hardware> {
+  const host: HostProbe = { ...realHostProbe(), ...hostOverride };
+  const isWin = host.platform === "win32";
 
   let gpus: Gpu[] = [];
   try {
@@ -266,7 +362,11 @@ export async function detectHardware(run: Run = defaultRun): Promise<Hardware> {
   await Promise.all(
     PROBE_TOOLS.map(async (tool) => {
       try {
-        await run("sh", ["-c", `command -v ${tool}`]);
+        // `command -v` is a shell builtin that does not exist on Windows, where
+        // every tool would read as absent and a perfectly equipped machine would
+        // be told to install a compiler it already has.
+        if (isWin) await run("where", [tool]);
+        else await run("sh", ["-c", `command -v ${tool}`]);
         tools[tool] = true;
       } catch {
         tools[tool] = false;
@@ -274,15 +374,53 @@ export async function detectHardware(run: Run = defaultRun): Promise<Hardware> {
     })
   );
 
+  // Non-NVIDIA accelerators. NVIDIA wins when present ("Nvidia GPU를 우선 순으로").
+  let gpuBackend: GpuBackend = gpus.length > 0 ? "cuda" : "none";
+  if (gpus.length === 0) {
+    if (host.platform === "darwin" && host.arch === "arm64") {
+      // Apple Silicon: one GPU sharing system RAM. Reported as a GPU so every
+      // consumer of `gpus` sizes the model against it, flagged so the memory is
+      // not counted twice.
+      const budget = Math.floor(host.ramTotalBytes * APPLE_GPU_MEMORY_FRACTION);
+      gpus = [{
+        index: 0,
+        name: "Apple Silicon (unified memory)",
+        vramTotalBytes: budget,
+        vramFreeBytes: Math.floor(host.ramAvailableBytes * APPLE_GPU_MEMORY_FRACTION),
+        vendor: "apple",
+        unifiedMemory: true,
+      }];
+      gpuBackend = "metal";
+    } else if (host.platform === "linux") {
+      gpus = await detectAmdGpus(host);
+      if (gpus.length > 0) gpuBackend = tools.hipcc ? "rocm" : "vulkan";
+    }
+  }
+  if (gpuBackend === "none" && tools.vulkaninfo) {
+    // Intel, or any device with no VRAM figure we can read. The backend is known
+    // (Vulkan runs on it) even though its memory is not, so the model is sized as
+    // for a CPU box while the engine still uses the accelerator.
+    try {
+      if (vulkanSummaryHasGpu(await run("vulkaninfo", ["--summary"], { timeout: 10_000 }))) {
+        gpuBackend = "vulkan";
+      }
+    } catch {
+      /* no usable Vulkan driver */
+    }
+  }
+
   return {
-    cpuCount,
-    ramTotalBytes: totalmem(),
-    ramAvailableBytes: freemem(),
+    cpuCount: host.cpuCount,
+    ramTotalBytes: host.ramTotalBytes,
+    ramAvailableBytes: host.ramAvailableBytes,
     gpus,
-    gpuBackend: gpus.length > 0 ? "cuda" : "none",
-    canBuildCuda: gpus.length > 0 && Boolean(tools.nvcc),
+    gpuBackend,
+    canBuildCuda: gpus.length > 0 && (gpus[0].vendor ?? "nvidia") === "nvidia" && Boolean(tools.nvcc),
+    canBuildRocm: gpus.some((g) => g.vendor === "amd") && Boolean(tools.hipcc),
+    canBuildVulkan: Boolean(tools.glslc),
+    arch: host.arch,
     tools,
-    platform: platform(),
+    platform: host.platform,
   };
 }
 

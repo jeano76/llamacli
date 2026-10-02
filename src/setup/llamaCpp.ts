@@ -85,7 +85,7 @@ export interface LlamaLocation {
   source: "env" | "path" | "existing-build" | "llamacli-build" | "model-adjacent" | "systemd" | "built" | "downloaded";
   /** Best guess at the accelerator it was compiled for, from the directory
    *  name / build flags. Verified separately by probeLlamaServer. */
-  backend: "cuda" | "vulkan" | "cpu" | "unknown";
+  backend: "cuda" | "rocm" | "vulkan" | "metal" | "cpu" | "unknown";
 }
 
 /**
@@ -126,6 +126,8 @@ function backendFromPath(p: string): LlamaLocation["backend"] {
   const s = p.toLowerCase();
   if (s.includes("cuda") || s.includes("opt") || s.includes("gpu")) return "cuda";
   if (s.includes("vulkan")) return "vulkan";
+  if (s.includes("rocm") || s.includes("hip")) return "rocm";
+  if (s.includes("metal")) return "metal";
   if (s.includes("release") || s.includes("cpu")) return "cpu";
   return "unknown";
 }

@@ -39,6 +39,7 @@ import { extractZip } from "./zip.js";
 import { downloadFile } from "./download.js";
 import type { TransferProgress } from "./download.js";
 import type { Run } from "./llamaCpp.js";
+import type { GpuBackend } from "./hardware.js";
 
 /** The fork that carries the ternary quants. Never the stock repo for these models. */
 export const PRISM_LLAMA_CPP_REPO = "https://github.com/PrismML-Eng/llama.cpp";
@@ -430,7 +431,7 @@ export interface AcquireResult {
  * fallback, it is the original bug.
  */
 export async function acquireTernaryLlamaServer(opts: {
-  hardware: { platform: string; gpuBackend: "cuda" | "vulkan" | "none"; canBuildCuda: boolean };
+  hardware: { platform: string; gpuBackend: GpuBackend; canBuildCuda: boolean };
   run: Run;
   log?: (line: string) => void;
   /** The model to verify against, when it is already on disk. Absent on a first
@@ -496,8 +497,14 @@ export async function acquireTernaryLlamaServer(opts: {
   };
 
   // 1 & 2. Published assets, GPU-shaped first and CPU always available as a floor.
-  if (opts.hardware.gpuBackend !== "none") {
-    const got = await tryAsset(opts.hardware.gpuBackend, `${opts.hardware.gpuBackend} 사전 빌드`);
+  // The fork publishes CUDA, Vulkan and CPU builds only. ROCm has no fork asset, but
+  // its Vulkan build runs on AMD; Metal is the macOS asset, which ignores the field.
+  const prismBackend: PrismMachine["gpuBackend"] =
+    opts.hardware.gpuBackend === "rocm" ? "vulkan"
+    : opts.hardware.gpuBackend === "metal" ? "none"
+    : opts.hardware.gpuBackend;
+  if (prismBackend !== "none") {
+    const got = await tryAsset(prismBackend, `${prismBackend} 사전 빌드`);
     if (got) return got;
   }
   const cpu = await tryAsset("none", "CPU 사전 빌드");

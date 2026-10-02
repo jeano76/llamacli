@@ -155,8 +155,12 @@ export function tuneForHardware(
     gpuLayers = 0;
     rationale.push("NVIDIA GPU 미검출 → CPU 전용(-ngl 0)으로 실행합니다.");
   } else {
+    // The NVIDIA wording is kept byte-for-byte: it is what every existing machine
+    // has seen, and a test pins it. Other vendors get an honest label instead of
+    // being called NVIDIA.
+    const vendorLabel = !gpu.vendor || gpu.vendor === "nvidia" ? "NVIDIA GPU" : `${gpu.vendor.toUpperCase()} GPU`;
     rationale.push(
-      `NVIDIA GPU ${gpu.index}번 (${gpu.name}, VRAM ${(gpu.vramTotalBytes / GiB).toFixed(1)} GiB) 우선 오프로드(-ngl 999)를 사용합니다.`
+      `${vendorLabel} ${gpu.index}번 (${gpu.name}, ${gpu.unifiedMemory ? "GPU 사용 가능 통합 메모리" : "VRAM"} ${(gpu.vramTotalBytes / GiB).toFixed(1)} GiB) 우선 오프로드(-ngl 999)를 사용합니다.`
     );
   }
 
@@ -286,6 +290,11 @@ export function tuneForHardware(
     rationale.push(
       `--n-cpu-moe ${cpuMoeLayers} 은(는) 이 머신에서 실측된 값이라 그대로 유지합니다 (자동 계산값으로 덮지 않습니다).`
     );
+  } else if (gpu?.unifiedMemory) {
+    // Nothing to page: "VRAM" and system RAM are the same pool, so moving expert
+    // layers to the CPU frees no memory and only costs speed. A model that does not
+    // fit is a model-choice problem (chooseModel), not a tuning one.
+    rationale.push("통합 메모리라 MoE expert 를 CPU 로 옮겨도 메모리가 늘지 않아 --n-cpu-moe 를 쓰지 않습니다.");
   } else if (gpu && modelBytes) {
     const deficit = modelBytes + 0.3 * GiB * (contextSize / 1024) - gpu.vramTotalBytes;
     if (deficit > 0) {
