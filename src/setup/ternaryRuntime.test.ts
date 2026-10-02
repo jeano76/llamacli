@@ -192,60 +192,135 @@ test("a successful download extracts with the leading directory stripped and ret
   assert.ok(res.binPath?.endsWith("/cpu/llama-server"));
   assert.match(res.lines.join("\n"), /준비 완료/);
 });
-test("acquireTernaryLlamaServer downloads a prebuilt rather than building", async () => {
+const OK = async () => ({ ok: true });
+
+/** A `run` that reports a CUDA driver, as a real box does. Without a version the
+ *  CUDA rung is skipped by DESIGN (an unreadable version cannot pick an asset), so
+ *  a test that means to exercise CUDA has to supply one. */
+const withCuda = (version = "13.2") => async (file: string) =>
+  file === "nvidia-smi" ? `CUDA Version: ${version}` : "";
+
+test("a verified GPU prebuilt wins, and no build is attempted", async () => {
   // The whole point of preferring a download: 30-40 minutes of compilation versus
   // seconds, for the same binary.
-  const got = await acquireTernaryLlamaServer({
+  const res = await acquireTernaryLlamaServer({
     hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: true },
-    run: async () => "",
-    download: async () => ({ ok: true, binPath: "/opt/prism/llama-server", asset: "a", lines: [] }),
+    run: withCuda(),
+    verify: OK,
+    download: async ({ machine }) => ({
+      ok: true,
+      binPath: machine.gpuBackend === "cuda" ? "/opt/prism/cuda/llama-server" : "/opt/prism/cpu/llama-server",
+      asset: "a",
+      lines: [],
+    }),
     build: async () => {
-      throw new Error("must not build when a prebuilt exists");
+      throw new Error("must not build when a verified prebuilt exists");
     },
   });
-  assert.equal(got?.binPath, "/opt/prism/llama-server");
-  assert.equal(got?.backend, "cuda");
+  assert.equal(res?.binPath, "/opt/prism/cuda/llama-server");
+  assert.equal(res?.backend, "cuda");
+  assert.equal(res?.attempts.length, 1);
 });
 
-test("acquireTernaryLlamaServer builds the FORK when no prebuilt covers the platform", async () => {
-  let builtRepo = "";
-  const got = await acquireTernaryLlamaServer({
+test("a prebuilt that unpacks but will not RUN falls back to the CPU build", async () => {
+  // The failure the ladder exists for: a GPU prebuilt binds to the driver, and no
+  // amount of local inspection predicts whether that driver can load it. Windows
+  // CUDA is the same shape — the server unpacks, its runtime bundle may be missing,
+  // and it does not start. Verified by EXECUTING it, which the previous version
+  // never did.
+  let verifyCalls = 0;
+  const res = await acquireTernaryLlamaServer({
     hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: true },
-    run: async () => "",
+    run: withCuda(),
+    verify: async (bin) => {
+      verifyCalls++;
+      return bin.includes("cuda") ? { ok: false, detail: "libggml-cuda.so: cannot open shared object file" } : { ok: true };
+    },
+    download: async ({ machine }) => ({
+      ok: true,
+      binPath: machine.gpuBackend === "cuda" ? "/p/cuda/llama-server" : "/p/cpu/llama-server",
+      asset: "a",
+      lines: [],
+    }),
+  });
+  assert.equal(res?.binPath, "/p/cpu/llama-server", "must land on the CPU prebuilt");
+  assert.equal(res?.backend, "cpu");
+  assert.equal(res?.attempts[0].ok, false);
+  assert.match(res!.attempts[0].detail ?? "", /cannot open shared object file/,
+    "the failure that caused the fallback must be recorded, not swallowed");
+  assert.ok(verifyCalls >= 2, "each candidate must actually be executed");
+});
+
+test("falls through to a source build when no prebuilt works", async () => {
+  let builtRepo = "";
+  const res = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: false },
+    run: withCuda(),
+    verify: OK,
     download: async () => ({ ok: false, lines: ["사전 빌드 없음"] }),
     build: async (o) => {
       builtRepo = (o as { repo: string }).repo;
-      return "/home/u/.llamacli/llama.cpp-fork/build-cuda/bin/llama-server";
+      return "/home/u/.llamacli/llama.cpp-fork/build-cpu/bin/llama-server";
     },
   });
-  assert.ok(got, "a build should still produce a usable binary");
-  // Building STOCK here is the bug this whole path exists to fix: stock rejects the
-  // quant with "invalid ggml type 143".
+  assert.ok(res, "a build should still produce a usable binary");
+  // Building STOCK here is the bug this path exists to fix: stock rejects the quant
+  // with "invalid ggml type 143".
   assert.equal(builtRepo, PRISM_LLAMA_CPP_REPO);
   assert.notEqual(builtRepo, "https://github.com/ggml-org/llama.cpp");
 });
 
-test("acquireTernaryLlamaServer reports failure instead of returning a wrong binary", async () => {
-  const got = await acquireTernaryLlamaServer({
-    hardware: { platform: "linux", gpuBackend: "none", canBuildCuda: false },
+test("no CUDA TOOLKIT means a CPU source build, not a CUDA configure that cannot work", async () => {
+  // A box can have a GPU and no nvcc. Asking cmake for -DGGML_CUDA=ON there
+  // produces a configure error, so "the GPU is present" must not decide this.
+  let built = 0;
+  const res = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: false },
     run: async () => "",
+    verify: OK,
     download: async () => ({ ok: false, lines: ["없음"] }),
-    build: async () => {
-      throw new Error("cmake: command not found");
+    build: async (o) => {
+      built++;
+      assert.equal((o as { hw: { canBuildCuda: boolean } }).hw.canBuildCuda, false);
+      return "/built/cpu/llama-server";
     },
   });
-  assert.equal(got, null, "null, so the caller reports rather than pretending");
+  assert.equal(res?.backend, "cpu", "the result must claim CPU, not the GPU the box has");
+  assert.equal(built, 1);
 });
 
-test("acquireTernaryLlamaServer survives a throwing download", async () => {
-  // A network error must reach the build fallback, not abort provisioning.
-  const got = await acquireTernaryLlamaServer({
+test("reports every rung when nothing works", async () => {
+  const res = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: true },
+    run: withCuda(),
+    verify: async () => ({ ok: false, detail: "boom" }),
+    download: async () => ({ ok: true, binPath: "/p/llama-server", asset: "a", lines: [] }),
+    build: async () => "/built/llama-server",
+  });
+  assert.equal(res, null, "null, so the caller reports rather than pretending");
+});
+
+test("survives a throwing download and reaches the build", async () => {
+  // A network error must move to the next rung, not abort provisioning.
+  const res = await acquireTernaryLlamaServer({
     hardware: { platform: "linux", gpuBackend: "none", canBuildCuda: false },
     run: async () => "",
+    verify: OK,
     download: async () => {
       throw new Error("ETIMEDOUT");
     },
     build: async () => "/built/llama-server",
   });
-  assert.equal(got?.binPath, "/built/llama-server");
+  assert.equal(res?.binPath, "/built/llama-server");
+  assert.match(res!.attempts.map((a) => a.detail).join("\n"), /ETIMEDOUT/);
 });
+
+test("Windows CUDA brings its runtime bundle, because the server will not load without it", async () => {
+  const { prismAssetFor } = await import("./ternaryRuntime.js");
+  const cuda = prismAssetFor({ platform: "win32", arch: "x64", gpuBackend: "cuda", cudaVersion: "12.4" });
+  assert.deepEqual(cuda?.companions, ["cudart-llama-bin-win-cuda-12.4-x64.zip"],
+    "the release ships the Windows CUDA runtime as a separate asset");
+  const cpu = prismAssetFor({ platform: "win32", arch: "x64", gpuBackend: "none" });
+  assert.equal(cpu?.companions, undefined, "a CPU build needs no runtime bundle");
+});
+

@@ -144,6 +144,14 @@ export interface PrismAsset {
   binName: string;
   /** True when the choice had to fall back, so the caller can say so. */
   fellBack?: boolean;
+  /** Extra archives that must sit beside this one for it to run.
+   *
+   *  Windows CUDA is the case that makes this necessary: the release publishes the
+   *  server and the CUDA runtime as SEPARATE assets, and unpacking only the server
+   *  yields a binary that fails to load. Discovered from the release's own asset
+   *  list — `llama-…-win-cuda-12.4-x64.zip` alongside `cudart-llama-bin-win-cuda-
+   *  12.4-x64.zip` — not guessed. */
+  companions?: string[];
 }
 
 /** Normalises Node's `process.arch` to the fork's naming. */
@@ -186,17 +194,24 @@ export function prismAssetFor(machine: PrismMachine): PrismAsset | null {
       if (a === "x64") {
         const t = pickPublishedCudaTag(machine.cudaVersion, WINDOWS_CUDA_TAGS_X64);
         if (!t) return null;
-        return make(`llama-${tag}-bin-win-cuda-${t}-x64.zip`, `cuda-${t}`, "zip", 0, "llama-server.exe");
+        const out = make(`llama-${tag}-bin-win-cuda-${t}-x64.zip`, `cuda-${t}`, "zip", 0, "llama-server.exe");
+        // The CUDA runtime ships separately on Windows and the binary will not load
+        // without it. Fetched with the server, not after a failure.
+        out.companions = [`cudart-llama-bin-win-cuda-${t}-x64.zip`];
+        return out;
       }
       // arm64 publishes exactly one CUDA build, so there is no choice to make and
       // no driver comparison to do — it is the only one that can exist here.
-      return make(
-        `llama-${tag}-bin-win-cuda-${WINDOWS_CUDA_TAGS_ARM64[0]}-arm64.zip`,
-        `cuda-${WINDOWS_CUDA_TAGS_ARM64[0]}`,
+      const armTag = WINDOWS_CUDA_TAGS_ARM64[0];
+      const out = make(
+        `llama-${tag}-bin-win-cuda-${armTag}-arm64.zip`,
+        `cuda-${armTag}`,
         "zip",
         0,
         "llama-server.exe"
       );
+      out.companions = [`cudart-llama-bin-win-cuda-${armTag}-arm64.zip`];
+      return out;
     }
     if (machine.gpuBackend === "vulkan") {
       // Vulkan is published for x64 only.
@@ -310,32 +325,42 @@ export async function downloadPrismRuntime(
   }
 
   say(`PrismML llama-server(${PRISM_RELEASE_TAG}) 를 받습니다: ${asset.asset}`);
-  const archive = join(opts.destRoot ?? PRISM_RUNTIME_HOME, asset.asset);
-  await mkdir(join(root, ".."), { recursive: true });
+  const base = opts.destRoot ?? PRISM_RUNTIME_HOME;
+  const archive = join(base, asset.asset);
+  await mkdir(base, { recursive: true });
+  const dl = opts.download ?? downloadFile;
+
+  // The runtime bundle first: if it fails there is no point fetching a server that
+  // cannot load without it, and the failure is reported before a large transfer.
+  const wanted = [asset, ...(asset.companions ?? []).map((c) => ({ asset: c, url: prismAssetUrl(c) }))];
   try {
-    const dl = opts.download ?? downloadFile;
-    await dl(asset.url, archive, {
-      fetchImpl: opts.fetchImpl,
-      onProgress: opts.onProgress,
-    });
+    for (const a of wanted) {
+      const dest = join(base, a.asset);
+      await dl(a.url, dest, { fetchImpl: opts.fetchImpl, onProgress: opts.onProgress });
+    }
   } catch (err) {
-    await rm(archive, { force: true }).catch(() => {});
+    await Promise.all(wanted.map((a) => rm(join(base, a.asset), { force: true }).catch(() => {})));
     say(`다운로드 실패: ${err instanceof Error ? err.message : String(err)}`);
     say(`fork(${PRISM_LLAMA_CPP_REPO})에서 빌드하는 경로로 갑니다.`);
     return { ok: false, lines };
   }
+  const extractFor = wanted[0];
 
   try {
     // Format and strip both come from the asset: Linux/macOS tarballs nest under
     // `llama-<tag>/` and must drop it, Windows zips are flat and must not.
     const extract = opts.extract ?? (asset.format === "zip" ? extractZip : extractTarGz);
-    extract(archive, root, { strip: asset.strip });
+    // Companions go into the same directory: a CUDA DLL next to the binary is the
+    // only way Windows finds it.
+    for (const a of wanted) {
+      extract(join(base, a.asset), root, { strip: a.asset === extractFor.asset ? asset.strip : 0 });
+    }
   } catch (err) {
-    await rm(archive, { force: true }).catch(() => {});
+    await Promise.all(wanted.map((a) => rm(join(base, a.asset), { force: true }).catch(() => {})));
     say(`압축 해제 실패: ${err instanceof Error ? err.message : String(err)}`);
     return { ok: false, lines };
   }
-  await rm(archive, { force: true }).catch(() => {});
+  await Promise.all(wanted.map((a) => rm(join(base, a.asset), { force: true }).catch(() => {})));
 
   if (!(await isExecutable(binPath))) {
     say(`압축은 풀렸지만 ${binPath} 를 찾을 수 없습니다.`);
@@ -363,60 +388,159 @@ async function readStamp(dir: string): Promise<string | null> {
     return null;
   }
 }
+export interface AcquireAttempt {
+  /** What was tried, in words the user can act on. */
+  label: string;
+  ok: boolean;
+  binPath?: string;
+  /** Why it did not work, when it did not. */
+  detail?: string;
+}
+
+export interface AcquireResult {
+  binPath: string;
+  backend: "cuda" | "vulkan" | "cpu";
+  /** Every rung of the ladder, in order, so a failure explains itself. */
+  attempts: AcquireAttempt[];
+}
+
 /**
  * A llama-server that reads the ternary quants, for THIS machine.
  *
- * One entry point on purpose. Two call sites need it — the bootstrap's binary step
- * and its post-model-choice step — and they must not be able to drift: if the
- * binary step downloaded a prebuilt while the model step built the fork, the
- * install would depend on which ran first.
+ * ── A LADDER, not a single guess ─────────────────────────────────────────────
+ * The first version picked one asset from one set of facts and believed it. That
+ * is wrong whenever the facts are incomplete, and they are routinely incomplete:
  *
- * Download first, build the FORK second. Never stock, and never silently: if both
- * fail, this returns null with the reasons, and the caller reports rather than
- * pretending an install happened.
+ *   - A GPU is present (so `gpuBackend` is "cuda") but the DRIVER is older than the
+ *     prebuilt's CUDA build, so it will not load. Prebuilts bind to the driver, not
+ *     to a toolkit, and nothing here can predict the combination from the outside.
+ *   - Windows CUDA needs its runtime bundle, which ships as a SEPARATE asset. Miss
+ *     it and the binary exists and does not start — indistinguishable from a
+ *     corrupt download unless you try to run it.
+ *   - No CUDA TOOLKIT on a box that has a GPU: a from-source build cannot target
+ *     the GPU either, so the honest fallback is a CPU build, which is much slower
+ *     but runs.
+ *
+ * So each rung is VERIFIED by actually executing it, and a failure moves to the
+ * next. The order is "best first, cheapest first": GPU prebuilt, CPU prebuilt, then
+ * from source — CUDA if a toolkit exists, CPU if not. Nothing is claimed without
+ * having been run.
+ *
+ * Never stock, at any rung: a stock build cannot read these models, so it is not a
+ * fallback, it is the original bug.
  */
 export async function acquireTernaryLlamaServer(opts: {
   hardware: { platform: string; gpuBackend: "cuda" | "vulkan" | "none"; canBuildCuda: boolean };
   run: Run;
   log?: (line: string) => void;
+  /** The model to verify against, when it is already on disk. Absent on a first
+   *  run, where only "does it execute" can be checked. */
+  modelPath?: string;
+  /** Where runtimes are installed. Defaults to PRISM_RUNTIME_HOME.
+   *
+   *  Threaded through rather than left to downloadPrismRuntime's own default so a
+   *  caller (or a test) can point the whole ladder at a scratch tree; otherwise the
+   *  ladder silently consults and writes the real install, which makes it impossible
+   *  to exercise a failure path at all. */
+  destRoot?: string;
   /** Injected for tests. */
   download?: typeof downloadPrismRuntime;
   /** Injected for tests. Defaults to the real build. */
   build?: (o: { hw: never; run: Run; log?: (l: string) => void; repo: string }) => Promise<string>;
-}): Promise<{ binPath: string; backend: "cuda" | "vulkan" | "cpu" } | null> {
+  /** Injected for tests. Defaults to running the binary. */
+  verify?: (binPath: string) => Promise<{ ok: boolean; detail?: string }>;
+}): Promise<AcquireResult | null> {
   const log = opts.log ?? (() => {});
+  const attempts: AcquireAttempt[] = [];
   const cudaVersion = await detectCudaVersion(opts.run);
-  const machine: PrismMachine = {
+  const machineBase = {
     platform: opts.hardware.platform,
     arch: process.arch,
-    gpuBackend: opts.hardware.gpuBackend,
     cudaVersion,
   };
+  const verify = opts.verify ?? ((binPath: string) => verifyLlamaServer(binPath, opts.run, opts.modelPath));
 
-  const dl = opts.download ?? downloadPrismRuntime;
-  const prebuilt = await dl({ machine, log }).catch((err) => {
-    log(`PrismML 사전 빌드 받기 실패: ${err instanceof Error ? err.message : String(err)}`);
-    return { ok: false as const, lines: [] };
-  });
-  if (prebuilt.ok && prebuilt.binPath) {
-    return {
-      binPath: prebuilt.binPath,
-      backend: opts.hardware.gpuBackend === "none" ? "cpu" : opts.hardware.gpuBackend,
-    };
+  /** Try one published asset. */
+  const tryAsset = async (gpuBackend: PrismMachine["gpuBackend"], label: string): Promise<AcquireResult | null> => {
+    const machine: PrismMachine = { ...machineBase, gpuBackend };
+    if (!prismAssetFor(machine)) {
+      attempts.push({ label, ok: false, detail: "이 플랫폼에 해당하는 사전 빌드가 없습니다" });
+      return null;
+    }
+    const dl = opts.download ?? downloadPrismRuntime;
+    let res;
+    try {
+      res = await dl({ machine, log, destRoot: opts.destRoot });
+    } catch (err) {
+      attempts.push({ label, ok: false, detail: err instanceof Error ? err.message : String(err) });
+      return null;
+    }
+    if (!res.ok || !res.binPath) {
+      attempts.push({ label, ok: false, detail: res.lines[res.lines.length - 1] });
+      return null;
+    }
+    const verdict = await verify(res.binPath);
+    if (!verdict.ok) {
+      // A prebuilt that unpacks and then will not start is the failure this ladder
+      // exists for. Say so plainly rather than reporting a broken install.
+      attempts.push({ label, ok: false, detail: `다운로드는 되었지만 실행되지 않음: ${verdict.detail ?? "알 수 없음"}` });
+      return null;
+    }
+    attempts.push({ label, ok: true, binPath: res.binPath });
+    const backend: AcquireResult["backend"] = gpuBackend === "none" ? "cpu" : gpuBackend;
+    return { binPath: res.binPath, backend, attempts };
+  };
+
+  // 1 & 2. Published assets, GPU-shaped first and CPU always available as a floor.
+  if (opts.hardware.gpuBackend !== "none") {
+    const got = await tryAsset(opts.hardware.gpuBackend, `${opts.hardware.gpuBackend} 사전 빌드`);
+    if (got) return got;
   }
+  const cpu = await tryAsset("none", "CPU 사전 빌드");
+  if (cpu) return cpu;
 
-  log("사전 빌드가 없어 PrismML fork 에서 직접 빌드합니다. 10~40분 걸릴 수 있습니다.");
+  // 3. From source, against the fork. CUDA only when a TOOLKIT exists — `nvcc`
+  //    absent means `-DGGML_CUDA=ON` configures to an error, and asking cmake for a
+  //    GPU build we cannot make is how a 40-minute build dies at minute one.
+  const cuda = opts.hardware.canBuildCuda;
+  log(`사전 빌드가 동작하지 않아 fork(${PRISM_LLAMA_CPP_REPO})에서 직접 빌드합니다 (${cuda ? "CUDA" : "CPU"}). 10~40분 걸릴 수 있습니다.`);
   const build = opts.build ?? ((o) => import("./llamaCpp.js").then((m) => m.buildLlamaCpp(o as never)));
   try {
-    const binPath = await build({
-      hw: opts.hardware as never,
-      run: opts.run,
-      log,
-      repo: PRISM_LLAMA_CPP_REPO,
-    } as never);
-    return { binPath, backend: opts.hardware.canBuildCuda ? "cuda" : "cpu" };
+    const binPath = await build({ hw: opts.hardware as never, run: opts.run, log, repo: PRISM_LLAMA_CPP_REPO } as never);
+    const verdict = await verify(binPath);
+    const label = `${cuda ? "CUDA" : "CPU"} 소스 빌드 (fork)`;
+    if (!verdict.ok) {
+      attempts.push({ label, ok: false, binPath, detail: verdict.detail });
+      return null;
+    }
+    attempts.push({ label, ok: true, binPath });
+    return { binPath, backend: cuda ? "cuda" : "cpu", attempts };
   } catch (err) {
-    log(`PrismML fork 빌드 실패: ${err instanceof Error ? err.message : String(err)}`);
+    const detail = err instanceof Error ? err.message : String(err);
+    attempts.push({ label: "소스 빌드 (fork)", ok: false, detail });
+    log(`fork 빌드 실패: ${detail}`);
     return null;
   }
+}
+
+/** Does this binary actually RUN, and can it read the model if we have one?
+ *
+ *  "Runs" is the load-bearing test. A prebuilt that unpacks cleanly and then dies on
+ *  a missing CUDA runtime looks identical to a working install until something tries
+ *  to execute it, and the previous version of this code never executed anything. */
+async function verifyLlamaServer(
+  binPath: string,
+  run: Run,
+  modelPath?: string
+): Promise<{ ok: boolean; detail?: string }> {
+  const { probeLlamaServer, probeModelCompatibility, looksLikeUnsupportedModelFormat } = await import("./llamaCpp.js");
+  const runIt = probeLlamaServer(binPath, run);
+  const probe = await runIt;
+  if (!probe.ok) return { ok: false, detail: probe.error ?? "실행 실패" };
+  if (!modelPath) return { ok: true };
+  const compat = await probeModelCompatibility(binPath, modelPath, { run });
+  if (!compat.ok && looksLikeUnsupportedModelFormat(compat.error)) {
+    return { ok: false, detail: `이 모델의 양자화를 읽지 못함: ${compat.error}` };
+  }
+  return { ok: true };
 }
