@@ -31,7 +31,7 @@
 import { access, constants } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn as spawnProc } from "node:child_process";
 import { promisify } from "node:util";
 import type { Hardware } from "./hardware.js";
 
@@ -251,7 +251,9 @@ export async function findLlamaServer(opts: {
    *  type registry rejects it (a stock llama.cpp cannot read a ternary 1-bit
    *  quant) instead of accepting it and failing at server-start time. */
   modelPath?: string;
-  probeModel?: (binPath: string, modelPath: string | undefined, run: Run) => Promise<{ ok: boolean; error?: string }>;
+  probeModel?: typeof probeModelCompatibility;
+  /** Injected for tests; defaults to a real spawn. */
+  spawnProbe?: ProbeSpawn;
   /** Set false to skip the model-compatibility pass entirely (tests, or when
    *  no model is known yet). */
   checkModel?: boolean;
@@ -273,6 +275,9 @@ export async function findLlamaServer(opts: {
   // builds and the one picked cannot read this quant" is a completely
   // different instruction from "that binary is broken".
   const rejectedForModel: string[] = [];
+  // Kept, but never confirmed to be able to read the model. Kept because
+  // discarding a working install over a bad download would be worse.
+  const unverified: string[] = [];
   // Memoised per path, because `candidatePaths` yields the same binary under
   // each of the three real build layouts and the loop below tries all three.
   // Without this, one binary is probed with `--version` up to three times and —
@@ -300,14 +305,24 @@ export async function findLlamaServer(opts: {
     // the failure surfaced much later, as a server that exited with
     // "invalid ggml type 143" and a message blaming the port.
     if (opts.checkModel !== false && opts.modelPath) {
-      const compat = await (opts.probeModel ?? probeModelCompatibility)(binPath, opts.modelPath, run);
+      const compat = await (opts.probeModel ?? probeModelCompatibility)(binPath, opts.modelPath, {
+        run,
+        spawn: opts.spawnProbe,
+      });
       if (!compat.ok && looksLikeUnsupportedModelFormat(compat.error)) {
         rejectedForModel.push(binPath);
         return null;
       }
-      // Any other load failure (a genuinely corrupt file, a missing dependency)
-      // says nothing about this binary, so it is kept rather than skipped —
+      // "Other" load failures (a genuinely corrupt file, a missing dependency)
+      // say nothing about this binary, so it is kept rather than skipped —
       // discarding a working install over a bad download would be worse.
+      //
+      // "Inconclusive" is different in kind: nothing was learned at all, so the
+      // binary is still kept — it is the best candidate available — but it is
+      // ALSO recorded, because "kept" here means "not disproven", not "verified".
+      // Presenting that as a positive result is how a stock build ends up
+      // reported as able to read a ternary quant.
+      if (compat.verdict === "inconclusive") unverified.push(binPath);
     }
     return { binPath, source, backend: backendFromPath(binPath) };
   };
@@ -321,7 +336,7 @@ export async function findLlamaServer(opts: {
     const value = env[key];
     if (value && (await exists(value))) {
       const hit = await accept(value, "env");
-      if (hit) return { location: hit, rejected, rejectedForModel };
+      if (hit) return { location: hit, rejected, rejectedForModel, unverified };
     }
   }
 
@@ -334,7 +349,7 @@ export async function findLlamaServer(opts: {
     const candidate = join(dir, BIN_NAME);
     if (await exists(candidate)) {
       const hit = await accept(candidate, "path");
-      if (hit) return { location: hit, rejected, rejectedForModel };
+      if (hit) return { location: hit, rejected, rejectedForModel, unverified };
     }
   }
 
@@ -360,7 +375,7 @@ export async function findLlamaServer(opts: {
     for (const candidate of candidatePaths(root.dir, buildDirs)) {
       if (await exists(candidate)) {
         const hit = await accept(candidate, root.source);
-        if (hit) return { location: hit, rejected, rejectedForModel };
+        if (hit) return { location: hit, rejected, rejectedForModel, unverified };
       }
     }
   }
@@ -373,7 +388,7 @@ export async function findLlamaServer(opts: {
   if (opts.modelPath) {
     for (const binPath of await runtimeCandidatesNearModel(opts.modelPath, { exists, listDirs })) {
       const hit = await accept(binPath, "model-adjacent");
-      if (hit) return { location: hit, rejected, rejectedForModel };
+      if (hit) return { location: hit, rejected, rejectedForModel, unverified };
     }
   }
 
@@ -384,10 +399,10 @@ export async function findLlamaServer(opts: {
   //    install look like "llama.cpp is not installed" to llamacli.
   for (const binPath of await systemdLlamaServerPaths(env, { exists, run: opts.run ?? defaultRun })) {
     const hit = await accept(binPath, "systemd");
-    if (hit) return { location: hit, rejected, rejectedForModel };
+    if (hit) return { location: hit, rejected, rejectedForModel, unverified };
   }
 
-  return { location: null, rejected, rejectedForModel };
+  return { location: null, rejected, rejectedForModel, unverified };
 }
 
 /** A machine where a binary EXISTS but cannot run is otherwise reported as
@@ -402,6 +417,13 @@ export interface FindResult {
    *  instruction is specific: point `llama.binPath` at one of these, or use a
    *  quant the chosen build understands. */
   rejectedForModel?: string[];
+  /**
+   * Paths that were KEPT because nothing proved them wrong, while also not
+   * being confirmed able to read the configured model. Non-empty means the
+   * answer to "will this build read your model" is unknown, and saying so is
+   * more useful than a confident guess.
+   */
+  unverified?: string[];
 }
 
 /** Parses a llama-server binary path out of a systemd user unit.
@@ -509,26 +531,194 @@ export async function probeLlamaServer(binPath: string, run: Run = defaultRun): 
  * which is a few hundred KB of the file, and treats the "invalid ggml type"
  * family of errors as "wrong build" rather than "bad download".
  */
+export type CompatVerdict =
+  /** The build read the model. Established, not assumed. */
+  | "ok"
+  /** The build's type registry rejected the file. */
+  | "unsupported"
+  /** The load failed for some other reason (corrupt file, missing dependency). */
+  | "other"
+  /** Nothing was learned -- the process neither reported a verdict nor finished. */
+  | "inconclusive";
+
+export interface CompatResult {
+  ok: boolean;
+  error?: string;
+  /**
+   * Optional so existing injected probes that only return `{ ok, error }` still
+   * typecheck. Absent means "did not say", which is treated as the pre-existing
+   * `ok` semantics rather than as a new claim.
+   */
+  verdict?: CompatVerdict;
+}
+
+/** Streams a candidate binary's output so a verdict can be reached without
+ *  waiting for the process to exit. Injected for tests. */
+export type ProbeSpawn = (
+  binPath: string,
+  args: string[],
+  handlers: {
+    onOutput: (chunk: string) => void;
+    onError: (err: Error) => void;
+    /** The process ended on its own, with its exit code. */
+    onExit: (code: number | null) => void;
+  }
+) => { kill(): void };
+
+const realProbeSpawn: ProbeSpawn = (binPath, args, { onOutput, onError, onExit }) => {
+  // A top-level import, not a lazy `require`: this module is ESM, where
+  // `require` is undefined. A lazy require threw, every probe returned "other",
+  // and since "other" is not a format complaint the candidate was KEPT -- which
+  // silently reported the stock build as able to read a ternary quant. A probe
+  // that cannot start must never look like a probe that passed.
+  const proc = spawnProc(binPath, args);
+  proc.stdout?.on("data", (d: Buffer) => onOutput(d.toString()));
+  proc.stderr?.on("data", (d: Buffer) => onOutput(d.toString()));
+  // Without this, a binary that cannot be executed emits an `error` event that
+  // nothing handles, and Node turns it into an uncaught exception that takes the
+  // caller down. A probe that cannot START must resolve to a verdict, not crash
+  // the process that asked the question.
+  proc.on("error", (err) => onError(err));
+  proc.on("exit", (code) => onExit(code));
+  return { kill: () => { try { proc.kill("SIGKILL"); } catch { /* already gone */ } } };
+};
+
+/** Output that can only appear once the model is loaded and the context is
+ *  being created -- i.e. the header parsed AND the tensors were accepted.
+ *
+ *  Deliberately a "post-load" marker rather than a "parsed" one: the type
+ *  registry is consulted while tensor infos are read, so anything that survives
+ *  to this point has already proved it understands every type in the file. */
+const MODEL_LOADED = /load_tensors:\s*done|load_model:\s*initializing|model\s+loaded/i;
+
+/** A load that failed for a reason that is NOT about tensor types -- a corrupt
+ *  file, a truncated download, a missing dependency.
+ *
+ *  Recognised separately so it is not confused with "we learned nothing". These
+ *  say something definite about the FILE while saying nothing about the binary,
+ *  which is exactly the case that must not be reported as a build mismatch and
+ *  must not be left to time out. Ordering matters: the type check runs first, so
+ *  an "invalid ggml type" line is never swallowed by this. */
+const LOAD_FAILED =
+  /llama_model_loader:[^\n]*failed|failed to load model|error loading model|unexpected end of file|file is corrupted/i;
+
+/**
+ * Can this build READ this model?
+ *
+ * ── Why this streams and kills instead of awaiting exit ─────────────────────
+ * The previous version ran the binary with `--no-warmup` and awaited it, on the
+ * belief that the flag "stops after loading". Measured on this machine, that is
+ * false: `--no-warmup` suppresses the warmup REQUEST, and the process then goes
+ * on to serve forever. A build that CAN read the model therefore never exits and
+ * always burned the full 60 s timeout -- measured 180 s when the timeout was
+ * raised, with the model itself fully loaded by ~3 s. A build that CANNOT read
+ * it failed in 178 ms. So the expensive case was the successful one, on every
+ * `/models` and every `/reset`.
+ *
+ * The verdict is therefore taken from the OUTPUT and the process killed the
+ * moment it is known: ~3 s instead of 60 s, and the positive answer is now
+ * actually established rather than merely never-disproven.
+ *
+ * ── Why "inconclusive" is its own answer ───────────────────────────────────
+ * A timeout used to be caught, turned into a generic error, and then — because
+ * a timeout is not a format complaint — the candidate was KEPT. So "this build
+ * can read your model" was never verified for a working build; it was inferred
+ * from a failure that carried no information. That is the same class of bug as
+ * treating silence as consent, and it is reported as `inconclusive` instead so
+ * the caller can say so out loud rather than presenting an assumption as a
+ * measurement.
+ */
 export async function probeModelCompatibility(
   binPath: string,
   modelPath: string | undefined,
-  run: Run = defaultRun
-): Promise<{ ok: boolean; error?: string }> {
-  if (!modelPath) return { ok: true };
-  try {
-    // `--no-warmup` stops after loading rather than allocating a context, and
-    // `-c 64` keeps the KV buffer tiny; we want the header parsed, not a
-    // running model. -ngl 0 keeps it off the GPU so this is cheap and cannot
-    // disturb a server that is already using VRAM.
-    await run(binPath, ["-m", modelPath, "-c", "64", "-ngl", "0", "--no-warmup"], {
-      timeout: 60_000,
-      // The load failure is the signal here, so its output must not throw.
-      tolerateExitCode: true,
-    } as never);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
+  deps: { run?: Run; spawn?: ProbeSpawn; timeoutMs?: number } = {}
+): Promise<CompatResult> {
+  if (!modelPath) return { ok: true, verdict: "ok" };
+
+  const spawnProbe = deps.spawn ?? realProbeSpawn;
+  const timeoutMs = deps.timeoutMs ?? 60_000;
+  const args = [
+    "-m", modelPath,
+    "-c", "64",
+    // Off the GPU, so the probe is cheap and cannot disturb a server that is
+    // already holding VRAM we are about to need.
+    "-ngl", "0",
+    "--no-warmup",
+  ];
+
+  return new Promise<CompatResult>((resolve) => {
+    let text = "";
+    let settled = false;
+    let proc: { kill(): void } | undefined;
+    let timer: NodeJS.Timeout | undefined;
+
+    const finish = (verdict: CompatVerdict) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      // Kill unconditionally: in every non-timeout path the process is still
+      // running and serving, and leaving it alive would put a second
+      // llama-server on the machine holding the model's VRAM.
+      //
+      // The handle may not exist yet if a verdict arrived before the spawn
+      // returned. That ordering is easy to lose track of — the kill is the one
+      // side effect that must not be skipped, so the verdict is remembered and
+      // applied below as soon as there is something to kill. A probe that
+      // decides "ok" and then leaves a server running is worse than a slow one.
+      try { proc?.kill(); } catch { /* not started yet, or already gone */ }
+      resolve({ ok: verdict === "ok", verdict, error: verdict === "ok" ? undefined : tailOf(text) });
+    };
+
+    try {
+      proc = spawnProbe(
+        binPath,
+        args,
+        {
+          onExit: (code) => {
+            // A process that ENDS is a definite answer, and this case was
+            // missing: the probe resolved only on a marker or the timeout, so
+            // any binary that exited early -- a wrapper script, a build that
+            // fails before it says anything -- waited the full 60 s for a
+            // verdict that had already happened. The harness's stub server
+            // exits instantly and still cost a minute per probe.
+            //
+            // Exit 0 with no complaint means it did what was asked. Non-zero
+            // means the load did not complete -- "other", which says the file is
+            // at fault rather than the build, and is not "inconclusive".
+            finish(code === 0 ? "ok" : "other");
+          },
+          onOutput: (chunk) => {
+            if (settled) return;
+            text += chunk;
+            if (looksLikeUnsupportedModelFormat(text)) return finish("unsupported");
+            if (MODEL_LOADED.test(text)) return finish("ok");
+            if (LOAD_FAILED.test(text)) return finish("other");
+          },
+          // The process could not be started, so nothing was learned about the
+          // model -- "other", not "ok". Treating a failed launch as success is
+          // how an unreadable model gets reported as loadable.
+          onError: () => finish("other"),
+        }
+      );
+    } catch (err) {
+      return finish("other");
+    }
+    // A verdict that landed while the handle did not yet exist still has to kill.
+    if (settled) {
+      try { proc.kill(); } catch { /* already gone */ }
+    }
+    timer = setTimeout(() => finish("inconclusive"), timeoutMs);
+  });
+}
+
+/** The last few lines of a probe's output -- the diagnosis, when there is one. */
+function tailOf(text: string, lines = 6): string {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(-lines)
+    .join("\n");
 }
 
 /** True when a load failure looks like "this build cannot read this format".

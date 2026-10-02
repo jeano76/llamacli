@@ -144,10 +144,19 @@ async function checkLlama(
           "설치된 llama-server 를 찾지 못했습니다. 다음 실행 시 자동으로 찾아 빌드합니다.",
       };
     }
+    // `unverified` non-empty alongside a location means the chosen build was
+    // kept because nothing DISPROVED it, not because it was shown to work.
+    // Reporting that as "can read this model" would be presenting an assumption
+    // as a measurement, so the hedge is stated rather than dropped.
+    const unverified = found.unverified ?? [];
+    const hedge =
+      unverified.includes(loc.binPath)
+        ? " (확인되지 않음 — 이 빌드가 이 양자화를 읽는다는 근거가 아직 없습니다)"
+        : "";
     return {
       ok: true,
       binPath: loc.binPath,
-      detail: `llama-server 가 이 모델을 읽을 수 있습니다 (${loc.binPath}, ${loc.backend} 빌드).`,
+      detail: `llama-server 가 이 모델을 읽을 수 있습니다 (${loc.binPath}, ${loc.backend} 빌드).${hedge}`,
     };
   } catch (err) {
     return {

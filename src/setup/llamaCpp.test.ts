@@ -6,6 +6,7 @@ import {
   probeModelCompatibility,
   runtimeCandidatesNearModel,
   MODEL_RUNTIME_SCAN_DEPTH,
+  type ProbeSpawn,
 } from "./llamaCpp.js";
 
 // ── a binary that runs but cannot read the model is a different failure ─────
@@ -194,7 +195,12 @@ test("checkModel: false skips the pass entirely", async () => {
 test("probeModelCompatibility resolves ok without a model path", async () => {
   // A first run has no model yet; this must not fail the binary search, and it
   // must not spawn anything.
-  assert.deepEqual(await probeModelCompatibility("/nonexistent/llama-server", undefined), { ok: true });
+  // `verdict` is included because it is what callers now branch on, and a
+  // no-model probe is genuinely an "ok" rather than an absence of one.
+  assert.deepEqual(await probeModelCompatibility("/nonexistent/llama-server", undefined), {
+    ok: true,
+    verdict: "ok",
+  });
 });
 
 test("a candidate that cannot even run is reported separately from a model mismatch", async () => {
@@ -410,4 +416,132 @@ test("an unrelated sibling llama-server is probed and rejected, not launched", a
   });
   assert.equal(result.location?.binPath, good);
   assert.deepEqual([...new Set(result.rejectedForModel ?? [])], [stray], "the stray build is reported, not used");
+});
+
+// ── The streaming probe: 60s -> 3s, and "verified" vs "not disproven" ───────
+
+/** A fake spawn that emits scripted output and records whether it was killed. */
+function fakeSpawn(script: string[], exitWith?: number) {
+  const state = { killed: false, calls: 0 };
+  const spawn: ProbeSpawn = (_bin, _args, { onOutput, onError, onExit }) => {
+    state.calls++;
+    for (const chunk of script) onOutput(chunk);
+    // A script that printed its verdict and exited is the common real case.
+    if (exitWith !== undefined) onExit(exitWith);
+    return {
+      kill: () => {
+        state.killed = true;
+      },
+    };
+  };
+  return { spawn, state };
+}
+
+test("a build that reads the model is killed as soon as the verdict is known", async () => {
+  // The bug: the probe awaited a process that never exits, so a WORKING build
+  // always burned the full timeout. If the process is not killed on a verdict,
+  // the probe is back to waiting, and each un-killed probe also leaves a second
+  // llama-server on the machine holding the model's VRAM.
+  const { spawn, state } = fakeSpawn(["load_model: initializing, n_slots = 4\n"]);
+  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn });
+  assert.equal(r.verdict, "ok");
+  assert.equal(state.killed, true, "the process must be killed, not left serving");
+});
+
+test("an unreadable quant is detected from output, not from the exit code", async () => {
+  // The stock build refuses in ~180ms with this exact message. Waiting for the
+  // exit code cannot tell it apart from any other failure.
+  const { spawn, state } = fakeSpawn([
+    "gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 143\n",
+  ]);
+  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn });
+  assert.equal(r.verdict, "unsupported");
+  assert.equal(r.ok, false);
+  assert.equal(state.killed, true);
+  assert.match(r.error ?? "", /invalid ggml type/);
+});
+
+test("a spawn that cannot start is NOT reported as ok", async () => {
+  // The failure mode found while verifying this: a lazy `require` in an ESM
+  // module threw, every probe returned a non-format error, and because that is
+  // not a format complaint the candidate was KEPT -- silently reporting the
+  // stock build as able to read a ternary quant. A probe that never ran must
+  // never look like one that passed.
+  const spawn: ProbeSpawn = (_bin, _args, { onError }) => {
+    onError(new Error("spawn ENOENT"));
+    return { kill: () => {} };
+  };
+  const r = await probeModelCompatibility("/nope/llama-server", "/m.gguf", { spawn });
+  assert.equal(r.ok, false);
+  assert.notEqual(r.verdict, "ok");
+});
+
+test("a process that never reports anything is inconclusive, not ok", async () => {
+  // Silence used to be read as consent: the timeout produced a generic error,
+  // which is not a format complaint, so the binary was kept and reported as
+  // able to read the model. It was only ever "not disproven".
+  const spawn: ProbeSpawn = () => ({ kill: () => {} });
+  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 5 });
+  assert.equal(r.verdict, "inconclusive");
+  assert.equal(r.ok, false);
+});
+
+test("a non-type load failure is 'other', kept but not blamed on the build", async () => {
+  // A corrupt file says nothing about the binary, so it must not be reported as
+  // a build mismatch -- that would send the user rebuilding a working install
+  // over a bad download.
+  const { spawn } = fakeSpawn(["llama_model_loader: failed to load model\n"]);
+  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn });
+  assert.equal(r.verdict, "other");
+  assert.equal(r.ok, false);
+});
+
+test("findLlamaServer records a kept-but-unconfirmed build as unverified", async () => {
+  // Kept because discarding a working install over a bad download is worse, but
+  // recorded, because "kept" means "not disproven" and presenting that as a
+  // positive result is how a wrong build gets reported as usable.
+  const r = await findLlamaServer({
+    env: { LLAMACLI_LLAMA_SERVER: "/bin/llama-server" } as NodeJS.ProcessEnv,
+    // modelPath is required: without it the compatibility check is skipped
+    // entirely, which is correct behaviour and would make this test vacuous.
+    modelPath: "/m.gguf",
+    exists: async () => true,
+    probe: async () => true,
+    spawnProbe: () => ({ kill: () => {} }),
+    probeModel: async () => ({ ok: false, verdict: "inconclusive" as const }),
+  });
+  assert.equal(r.location?.binPath, "/bin/llama-server", "still chosen -- it is the best candidate");
+  assert.deepEqual(r.unverified, ["/bin/llama-server"], "but not presented as confirmed");
+  assert.deepEqual(r.rejectedForModel, [], "and not blamed for the model");
+});
+
+test("a process that EXITS is a verdict, not a reason to wait for the timeout", async () => {
+  // The defect the project harness caught: the probe resolved only on a marker
+  // or the timeout, so a binary that ended on its own — a wrapper script, or any
+  // build that fails before printing a recognisable line — waited the full 60 s
+  // for an answer that had already been given. A stub that exits instantly cost
+  // a minute per probe, which is how this was found.
+  const { spawn, state } = fakeSpawn([], 0);
+  const t0 = Date.now();
+  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
+  assert.equal(r.verdict, "ok", "exit 0 with no complaint means the load was done");
+  assert.ok(Date.now() - t0 < 1000, `must not wait for the timeout, took ${Date.now() - t0}ms`);
+  assert.equal(state.calls, 1);
+});
+
+test("a non-zero exit is 'other' — the file failed, not the build", async () => {
+  // Reporting this as a build mismatch would send the user rebuilding a working
+  // install over a bad download.
+  const { spawn } = fakeSpawn(["some unrecognised failure\n"], 1);
+  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
+  assert.equal(r.verdict, "other");
+  assert.equal(r.ok, false);
+});
+
+test("output that already decided the verdict wins over a later exit", async () => {
+  // The order the two events arrive in must not change the answer: a build that
+  // printed "invalid ggml type" and then exited 0 is still a build mismatch.
+  const { spawn } = fakeSpawn(["tensor 'output.weight' has invalid ggml type 143\n"], 0);
+  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
+  assert.equal(r.verdict, "unsupported");
 });

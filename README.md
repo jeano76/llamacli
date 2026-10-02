@@ -660,6 +660,58 @@ ornith-35b    30ms  port=8084  20.4 GiB  /media/jeano/nvme-usb/models/Ornith-1.5
 ornith-9b     32ms  port=8084  not on disk → would download
 ```
 
+#### The compatibility probe: 60 s → 3 s, and "verified" vs "not disproven"
+
+`probeModelCompatibility` answers "can this build read this model?" by running
+the candidate against the file. It used to run the binary with `--no-warmup` and
+**await it**, on the belief that the flag "stops after loading". Measured here,
+that is false: `--no-warmup` suppresses the warmup *request*, and the process
+then serves forever.
+
+| | before | after |
+|---|---|---|
+| build that CAN read the model | always burned the full 60 s timeout — measured **180 s** when raised, model loaded by ~3 s | **~3.3 s**, killed on a post-load marker |
+| build that CANNOT | 178 ms | **98 ms** |
+| `findLlamaServer`, real Bonsai | **60 784 ms** | **3 316 ms** |
+
+So the expensive case was the *successful* one, on every `/models` and every
+`/reset`.
+
+**The bug underneath was worse than the wait.** A timeout was caught, turned into
+a generic error, and — because a timeout is not a format complaint — the
+candidate was **kept**. So "this build can read your model" was never verified
+for a working build; it was inferred from a failure carrying no information.
+That is silence read as consent. It is now reported as `inconclusive` and
+surfaced through `FindResult.unverified` rather than presented as a
+measurement.
+
+Verdicts are `ok` · `unsupported` · `other` · `inconclusive`, and they are
+distinguished on purpose:
+
+- **`unsupported`** — the type registry rejected the file. A build mismatch.
+- **`other`** — the load failed for a reason that is not about types (corrupt
+  file, missing dependency). Says nothing about the binary, so it is **kept and
+  not blamed** — reporting it as a build mismatch sends the user rebuilding a
+  working install over a bad download.
+- **`inconclusive`** — nothing was learned. Kept (discarding a working install
+  is worse) but recorded in `unverified` so the answer is stated as unknown.
+
+Three defects were found while verifying this, two of them introduced by the fix
+itself and caught only because the probe was measured on real binaries:
+
+1. A lazy `require` in an ESM module threw, so every probe returned a non-format
+   error and every candidate was kept — silently reporting the **stock build as
+   able to read a ternary quant**. A probe that cannot start must never look like
+   one that passed.
+2. A binary that could not be executed emitted an unhandled `error` event, which
+   Node turned into an **uncaught exception** that killed the caller.
+3. The probe resolved only on a marker or the timeout and **ignored the process
+   exiting**. Any binary that ends on its own — a wrapper script, a build that
+   fails before printing a recognisable line — waited the full 60 s for an answer
+   it had already given. The project harness caught this: its stub server exits
+   instantly and the harness went from seconds to a timeout. Now `onExit`
+   resolves it, and `project_persona_check` runs in **5.4 s**.
+
 #### Who owns the port decides what happens
 
 Something is usually already listening, and whether llamacli may stop it depends
@@ -704,7 +756,7 @@ thrown.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 805 unit tests
+npm test                                              # 814 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -712,7 +764,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **805** | pass |
+| Unit / regression | `npm test` | **814** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
