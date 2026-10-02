@@ -175,8 +175,12 @@ verify() { # $1 binPath
   if [ "$WANT_GPU" -eq 1 ]; then
     local devs
     devs="$({ $T "$1" --list-devices; } 2>&1)"
-    if [ $? -ne 0 ] || ! printf '%s' "$devs" | grep -qiE 'CUDA[0-9]|Vulkan|ROCm'; then
-      echo "가속기를 초기화할 수 없음: $(printf '%s' "$devs" | grep -viE '^$' | head -1)"
+    # Herestring, never `printf | grep -q`: with `pipefail` the early-exiting grep
+    # closes the pipe, a large printf dies of SIGPIPE, and the pipeline reports 141 —
+    # so a match is reported as ABSENT. That inverted exactly the checks whose whole
+    # job is to notice a failure.
+    if [ $? -ne 0 ] || ! grep -qiE 'CUDA[0-9]|Vulkan|ROCm' <<<"$devs"; then
+      echo "가속기를 초기화할 수 없음: $(grep -viE '^$' <<<"$devs" | head -1)"
       if [ "$IS_WSL" -eq 1 ]; then
         echo "(WSL: Windows NVIDIA 드라이버가 /usr/lib/wsl/lib 에 CUDA 런타임을 제공합니다 — 없으면 --gpu cpu 로 다시 시도하세요)"
       fi
@@ -191,17 +195,21 @@ verify() { # $1 binPath
     local out rc
     out="$({ $T "$1" -m "$MODEL" -c 64 -ngl 0 --no-warmup; } 2>&1)"
     rc=$?
-    if printf '%s' "$out" | grep -qiE 'invalid ggml type|unknown ggml type'; then
-      echo "양자화 미지원: $(printf '%s' "$out" | grep -iE 'invalid ggml type|unknown ggml type' | head -1)"
+    if grep -qiE 'invalid ggml type|unknown ggml type' <<<"$out"; then
+      echo "양자화 미지원: $(grep -iE 'invalid ggml type|unknown ggml type' <<<"$out" | head -1)"
       return 1
     fi
     # 124 is timeout's code. Having read the weights without complaint is the
     # signal, so a bounded run that loaded successfully still counts as a pass.
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ! printf '%s' "$out" | grep -qi 'model loaded'; then
-      echo "모델 로드 실패: $(printf '%s' "$out" | tail -1)"
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ! grep -qi 'model loaded' <<<"$out"; then
+      echo "모델 로드 실패: $(tail -1 <<<"$out")"
       return 1
     fi
-    printf '%s' "$out" | grep -qi 'model loaded' || { echo "모델 로드 실패 (model loaded 없음)"; return 1; }
+    # The diagnostic the user needs to act on, not just a verdict.
+    grep -qi 'model loaded' <<<"$out" || {
+      echo "모델 로드 실패 (model loaded 없음): $(tail -3 <<<"$out" | tr '\n' ' ')"
+      return 1
+    }
   fi
   echo "ok"; return 0
 }
@@ -252,6 +260,9 @@ try_prebuilt() { # $1 kind, $2 label
   why="$(verify "$bin")"
   if [ "$why" != "ok" ]; then
     fail "검증 실패: $why"; record FAIL "$2 ($why)"; rm -rf "$root"; return 1
+  fi
+  if [ -n "$MODEL" ] && [ -f "$MODEL" ] && [ "${QUIET:-0}" -eq 0 ]; then
+    say "모델 검증 통과: $MODEL"
   fi
   printf '%s' "$RELEASE_TAG" > "$root/.llama_release"
   say "준비 완료: $bin"; record OK "$2"; RESULT="$bin"; return 0
