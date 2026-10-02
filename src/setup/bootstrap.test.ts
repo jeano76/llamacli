@@ -1,11 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { planPorts, COMMON_PORTS, LLAMA_PORT, type PortState } from "./ports.js";
 import { findLlamaServer, installBuildPackages, candidatePaths } from "./llamaCpp.js";
-import { needsTernaryBuild, quantSuffixOf, checkBinaryAgainstChosenModel } from "./bootstrap.js";
+import { needsTernaryBuild, quantSuffixOf, checkBinaryAgainstChosenModel, ensureLocalStack } from "./bootstrap.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
 const GiB = 1024 ** 3;
@@ -422,4 +422,79 @@ test("the warning never claims the build is incompatible when it was not asked",
   )) ?? "";
   assert.doesNotMatch(msg, /읽지 못합니다/);
   assert.doesNotMatch(msg, / 실패|불가능합니다/);
+});
+
+
+// The ternary warning was a false positive on a machine whose build reads the
+// model perfectly well, and the cause was a path, not a quantisation. These two
+// drive the real bootstrap rather than the extracted helper, because the bug was
+// never in the helper: it was the caller handing it a reconstructed path.
+test("ensureLocalStack probes the real model file, kept outside modelsDir", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "llamacli-bs-"));
+  const modelsDir = join(projectRoot, "models-dir-with-nothing-in-it");
+  const elsewhere = join(projectRoot, "usb", "bonsai2");
+  const modelFile = join(elsewhere, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+  const binPath = join(projectRoot, "llama-server");
+
+  try {
+    await mkdir(elsewhere, { recursive: true });
+    await writeFile(modelFile, "pretend weights");
+    await writeFile(binPath, "#!/bin/sh\n");
+    await chmod(binPath, 0o755);
+    await writeFile(
+      join(projectRoot, ".llamacli", "config.yaml") as string,
+      ""
+    ).catch(() => {}); // no config dir yet is fine
+    await mkdir(join(projectRoot, ".llamacli"), { recursive: true });
+    await writeFile(
+      join(projectRoot, ".llamacli", "config.yaml"),
+      `backend: local-llama\nmodel: ${modelFile}\nllama:\n  binPath: ${binPath}\n  modelPath: ${modelFile}\n  port: 8080\n  contextSize: 4096\n  threads: 4\n  gpuLayers: 0\n`
+    );
+
+    const lines: string[] = [];
+    const report = await ensureLocalStack({
+      projectRoot,
+      modelsDir,
+      offline: true,
+      allowBuild: false,
+      log: (l) => lines.push(l),
+      run: async () => "",
+      probe: async () => "free",
+      detectServer: async () => ({ kind: "none" }),
+      listExistingModels: async () => [],
+      serverPids: [],
+      hardware: {
+        cpus: 12,
+        ramTotalBytes: 32 * 1024 ** 3,
+        gpus: [],
+        os: "linux",
+      } as never,
+    });
+
+    const compat = report.steps.find((s) => s.name === "모델/빌드 호환성");
+    assert.equal(
+      compat,
+      undefined,
+      `the model is on disk and the build reads it, so no compatibility step should have failed: ${JSON.stringify(compat)}`
+    );
+    assert.doesNotMatch(lines.join("\n"), /ternary\(3값\)/, "no invented incompatibility");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("ensureLocalStack still warns when the model is absent and the build is a guess", async () => {
+  // The warning is not wrong in general — only when a file was available to ask
+  // about and nobody asked. Keep it for the case that justifies it.
+  const projectRoot = await mkdtemp(join(tmpdir(), "llamacli-bs-"));
+  try {
+    const missing = join(projectRoot, "not-here", "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+    const warn = await checkBinaryAgainstChosenModel("/build/llama-server", basename(missing), missing, {
+      probeModel: async () => ({ ok: true }),
+    });
+    // No file → filename heuristic may speak, so confirm it is not silent.
+    assert.notEqual(warn, null);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });

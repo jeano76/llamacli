@@ -27,6 +27,45 @@ const PROBE_TIMEOUT_MS = 2000;
 export interface DetectedServer {
   baseUrl: string;
   model: string;
+  /**
+   * What actually answered.
+   *
+   * "llama.cpp"  /props carries `build_info`, which llama.cpp always emits
+   *              (server-context.cpp's props handler fills it from
+   *              llama_build_info()).
+   * "other"      an OpenAI-compatible server that isn't llama.cpp (Ollama,
+   *              vLLM). Genuinely usable, so it IS adopted -- just labelled.
+   * "stub"       answers the API but has no real weights behind it.
+   * undefined    an injected detector that predates this field; treated as
+   *              "unknown, assume fine" so test doubles need not know about it.
+   */
+  verified?: ServerKind;
+  /** Why a server was rejected, when it was. User-facing. */
+  reason?: string;
+}
+
+export type ServerKind = "llama.cpp" | "other" | "stub";
+
+/** Whether a reported model id names a .gguf file on disk.
+ *
+ *  llama.cpp reports the FULL PATH of the file it loaded, so that is what a
+ *  real one looks like. Ollama reports names like `llama3:8b`, which is not a
+ *  path -- that difference is what keeps the stub test below from rejecting
+ *  Ollama. */
+function looksLikeGgufPath(model: string): boolean {
+  return model.includes("/") && /\.gguf$/i.test(model);
+}
+
+/** Reads the model list. llama.cpp has used two shapes for this over time --
+ *  OpenAI's `data[].id` and a `models[]` array -- so both are read. Picking
+ *  one and missing the other means silently falling back to "local-model",
+ *  which is a name the server does not actually have. */
+function modelFromListResponse(json: any): string | null {
+  const fromData = json?.data?.[0]?.id;
+  if (typeof fromData === "string" && fromData) return fromData;
+  const fromModels = json?.models?.[0]?.name ?? json?.models?.[0]?.model;
+  if (typeof fromModels === "string" && fromModels) return fromModels;
+  return null;
 }
 
 async function probePort(
@@ -37,12 +76,55 @@ async function probePort(
   const baseUrl = `http://${host}:${port}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const get = async (url: string): Promise<any | null> => {
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      return res.ok ? await res.json() : null;
+    } catch {
+      return null;
+    }
+  };
   try {
-    const res = await fetch(`${baseUrl}/v1/models`, { signal: controller.signal });
-    if (!res.ok) return null;
-    const json = (await res.json()) as { data?: Array<{ id: string }> };
-    const model = json.data?.[0]?.id ?? "local-model";
-    return { baseUrl, model };
+    const listJson = await get(`${baseUrl}/v1/models`);
+    if (!listJson) return null;
+    // Fall back to a placeholder name when the list carries no usable id, and
+    // DO NOT return null for it. Returning null here would make this port look
+    // empty, and the caller would then bind a different port and start a second
+    // llama-server beside whatever is already holding this one — the exact
+    // out-of-memory the adopt-before-spawn path exists to prevent. A degenerate
+    // responder is still a responder occupying the port.
+    const model = modelFromListResponse(listJson) ?? "local-model";
+
+    // One extra cheap GET. /props is llama.cpp-specific and is the only way to
+    // tell a real llama-server from a stand-in that copied the two endpoints
+    // llamacli actually calls.
+    const props = await get(`${baseUrl}/props`);
+    if (typeof props?.build_info === "string" && props.build_info) {
+      return { baseUrl, model, verified: "llama.cpp" };
+    }
+
+    // No llama.cpp marker. If it names a .gguf that is not on disk, the API
+    // answers but the weights do not exist -- a test double.
+    const namedPath =
+      (typeof props?.model_path === "string" && props.model_path) ||
+      (looksLikeGgufPath(model) ? model : "");
+    if (namedPath) {
+      const { stat } = await import("node:fs/promises");
+      const exists = await stat(namedPath).then((s) => s.isFile(), () => false);
+      if (!exists) {
+        return {
+          baseUrl,
+          model,
+          verified: "stub",
+          reason:
+            `포트 ${port} 에서 API 는 응답하지만 그 모델 파일이 디스크에 없습니다: ${namedPath}. ` +
+            `테스트용 더블 서버(CI 픽스처 등)가 llama.cpp 서버 자리를 차지한 것으로 보입니다. ` +
+            `llamacli 는 이 서버에 연결하지 않습니다 — 정식 llama-server 를 띄우거나 그 포트를 비워 주세요.`,
+        };
+      }
+    }
+
+    return { baseUrl, model, verified: "other" };
   } catch {
     return null;
   } finally {
@@ -54,13 +136,34 @@ async function probePort(
  *  with a valid OpenAI-compatible /v1/models response, or null if none do.
  *  Never throws — a failed detection is not an error. `ports` defaults to
  *  COMMON_PORTS but is overridable for testing against non-privileged
- *  fake servers instead of real fixed ports. */
+ *  fake servers instead of real fixed ports.
+ *
+ *  A server classified as a **stub** is skipped. That is the whole point of the
+ *  `verified` field: on this machine `harnessCli`'s CI fixture
+ *  (`fake-llama-server.mjs`, configured via HARNESSIDE_LLAMA_SERVER) held port
+ *  8080, answered /health and /v1/models perfectly, and returned a canned
+ *  "가짜 응답입니다." to everything. Adoption existed to avoid spawning a SECOND
+ *  llama-server — a real hazard, since a second one on an 8 GB card OOMs — but
+ *  adopting a test double is not better than the alternative. A stub is not
+ *  adopted and is not treated as "some server found"; it is reported, via
+ *  `findStubServers`. */
 export async function detectRunningServer(
   host = "127.0.0.1",
   ports: number[] = COMMON_PORTS
 ): Promise<DetectedServer | null> {
   const results = await Promise.all(ports.map((port) => probePort(host, port)));
-  return results.find((r): r is DetectedServer => r !== null) ?? null;
+  const found = results.filter((r): r is DetectedServer => r !== null);
+  return found.find((r) => r.verified !== "stub") ?? null;
+}
+
+/** Every stub found on the probed ports, so the caller can SAY why it refused
+ *  instead of silently moving on and looking like "no server found". */
+export async function findStubServers(
+  host = "127.0.0.1",
+  ports: number[] = COMMON_PORTS
+): Promise<DetectedServer[]> {
+  const results = await Promise.all(ports.map((port) => probePort(host, port)));
+  return results.filter((r): r is DetectedServer => r?.verified === "stub");
 }
 
 /** How long to keep re-probing a port that is LISTENING but not yet serving.
@@ -150,6 +253,10 @@ export async function waitForServer(
 export type Discovery =
   | { kind: "found"; server: DetectedServer }
   | { kind: "loading"; baseUrl: string; port: number; waitedMs: number }
+  /** Every listening port answered the API but has no real model behind it —
+   *  a CI fixture holding the canonical port. Distinct from `none` so the
+   *  caller can say WHY it refused instead of looking like an empty machine. */
+  | { kind: "stub"; baseUrl: string; port: number; reason: string }
   | { kind: "none" };
 
 /** Finds a running server, waiting out one that is still loading its model.
@@ -181,7 +288,14 @@ export async function discoverRunningServer(
   const budget = opts.loadingWaitMs ?? LOADING_WAIT_MS;
   // Probe every port once, fast, in parallel.
   const first = await Promise.all(ports.map((port) => probePort(host, port, opts.probeTimeoutMs)));
-  const serving = first.find((r): r is DetectedServer => r !== null);
+  // A STUB is not a serving server. Adopting one means talking to a test
+  // double that answers every request with a canned string, so it is filtered
+  // out here exactly as it is in detectRunningServer -- and it is deliberately
+  // NOT added to `listeners` below, because a stub will never finish loading a
+  // model it does not have; waiting out the whole budget on one is how a
+  // first launch comes to look hung.
+  const stubs = first.filter((r): r is DetectedServer => r?.verified === "stub");
+  const serving = first.find((r): r is DetectedServer => r !== null && r.verified !== "stub");
   if (serving) return { kind: "found", server: serving };
 
   // Nothing is serving. Now find out which ports are merely LISTENING, and
@@ -209,7 +323,12 @@ export async function discoverRunningServer(
     // llama-server onto the same GPU.
     return { kind: "loading", baseUrl: `http://${host}:${port}`, port, waitedMs: Date.now() - startedAt };
   }
-  return { kind: "none" };
+  // Only reachable when every listening port was a stub. `none` alone would be
+  // indistinguishable from "nothing is running", which is what makes a test
+  // double holding 8080 look like an empty machine.
+  return stubs.length > 0
+    ? { kind: "stub", baseUrl: stubs[0].baseUrl, port: Number(new URL(stubs[0].baseUrl).port), reason: stubs[0].reason ?? "" }
+    : { kind: "none" };
 }
 
 /** Whether a TCP connection is accepted. Distinct from an HTTP probe. */
@@ -244,8 +363,11 @@ export async function detectModelAt(baseUrl: string): Promise<string | null> {
   try {
     const res = await fetch(`${baseUrl}/v1/models`, { signal: controller.signal });
     if (!res.ok) return null;
-    const json = (await res.json()) as { data?: Array<{ id: string }> };
-    return json.data?.[0]?.id ?? null;
+    // Both shapes, for the same reason probePort reads both: this value is
+    // written into every project's config.yaml as the live model name, so
+    // missing the `models[]` variant records a name the server never reported.
+    const json = await res.json();
+    return modelFromListResponse(json);
   } catch {
     return null;
   } finally {

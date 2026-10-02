@@ -503,6 +503,14 @@ export class AgentLoop {
    *  doc comment) — applied at the next turnLoop iteration, not held until
    *  the whole turn ends. `send()` remains how a message submitted while
    *  IDLE starts a turn; this is only for the busy case. */
+  /** The messages queued so far, for `/queue` to show. Read-only: queuing is
+   *  the only way to add to this list, and the turn loop drains it. Exposed
+   *  because `/queue` is advertised in the slash menu and a menu entry with no
+   *  implementation behind it filters to nothing and dispatches nowhere. */
+  getQueuedMessages(): readonly string[] {
+    return this.queuedMessages;
+  }
+
   queueMessage(text: string): void {
     this.queuedMessages.push(text);
     this.opts.onQueueChange?.(this.queuedMessages.slice());

@@ -24,6 +24,8 @@ import { execFileSync } from "node:child_process";
 import { getCursorPlacement } from "./tui/cursorPlacement.js";
 import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
+import { ensureLocalStack } from "./setup/bootstrap.js";
+import { describeReset, describeInForce } from "./setup/resetDiff.js";
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing
@@ -905,6 +907,72 @@ async function main() {
                   "네이티브 선택이 필요하면 Shift 를 누른 상태로 드래그하세요."
                 : "[mouse] 꺼짐 — Shift 없이 드래그해 텍스트를 선택할 수 있습니다. 단, 이 화면은 alt screen 이라 " +
                   "터미널 스크롤백이 없어 화면 위로 드래그해도 과거 출력까지 이어지지 않습니다."
+            );
+            break;
+          }
+          // /reset re-derives the model + llama flags + context from the CURRENT
+          // hardware. Two-step confirmation rather than a Y/N dialog: the dialog
+          // has to be rendered by App.tsx, which threads its resume-prompt
+          // question through ~8 places, and generalizing that is a large change
+          // to the busiest file in the TUI. Requiring a second, explicit
+          // `/reset confirm` cannot be triggered by a stray Enter and needs no
+          // new UI surface — a strictly stronger guarantee than a Y/N that
+          // defaults either way.
+          case "reset": {
+            const arg = (argument ?? "").trim().toLowerCase();
+            if (arg !== "confirm") {
+              const llama = (config as any)?.llama ?? {};
+              ui?.pushStatus(
+                [
+                  "[reset] 현재 GPU·VRAM·RAM 기준으로 모델과 llama 설정을 다시 계산합니다.",
+                  "  · 지금 설정: 모델 " + String((config as any)?.model ?? "(없음)"),
+                  "  ·           컨텍스트 " + Number(llama.contextSize ?? 0).toLocaleString() +
+                    " 토큰, 스레드 " + String(llama.threads ?? "?"),
+                  "  · 직접 입력한 값(apiKey·verify·browser·compaction)은 그대로 유지됩니다.",
+                  "  · 세션 중이므로 모델은 내려받지 않습니다 (다음 실행 시 获取).",
+                  "",
+                  "실행하려면  /reset confirm  을 입력하세요. 취소하려면 아무것도 하지 마세요.",
+                ].join("\n")
+              );
+              break;
+            }
+            ui?.setBusy(true);
+            try {
+              ui?.pushStatus("[reset] 지금 시스템의 GPU·VRAM·메모리를 확인하고 설정을 재계산합니다…", "status");
+              const report = await ensureLocalStack({
+                projectRoot,
+                force: true,
+                log: (line) => ui?.pushStatus(`[reset] ${line}`),
+              });
+              const changed = describeReset(config as unknown as Record<string, unknown>, report.config);
+              const inForce = describeInForce(report.config);
+              ui?.pushStatus(
+                changed.length > 0
+                  ? `[reset] 완료. 바뀐 항목 ${changed.length}개:\n${changed.map((c) => `  · ${c}`).join("\n")}\n` +
+                    `[reset] 적용된 설정\n${inForce.map((c) => `  · ${c}`).join("\n")}\n` +
+                    "새 설정을 적용하려면 llamacli 를 재시작하세요."
+                  : "[reset] 현재 시스템에 이미 최적이었습니다. 바뀐 항목이 없습니다.\n" +
+                    `[reset] 적용된 설정\n${inForce.map((c) => `  · ${c}`).join("\n")}\n` +
+                    "재시작할 필요도 없습니다."
+              );
+            } catch (err) {
+              ui?.pushStatus(`[reset 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
+            } finally {
+              ui?.setBusy(false);
+            }
+            break;
+          }
+          // /queue was advertised in the slash menu with no dispatcher behind
+          // it: typing it filtered the menu to nothing and Enter went nowhere.
+          // It now reports the queue the turn loop will drain next.
+          case "queue": {
+            const queued = loop.getQueuedMessages();
+            ui?.pushStatus(
+              queued.length === 0
+                ? "[queue] 대기 중인 메시지가 없습니다."
+                : `[queue] 대기 중인 메시지 ${queued.length}개:\n${queued
+                    .map((m, i) => `  ${i + 1}. ${m.length > 80 ? m.slice(0, 80) + "…" : m}`)
+                    .join("\n")}`
             );
             break;
           }

@@ -93,6 +93,11 @@ export interface BootstrapOptions {
    *  a test that silently adopts whatever happens to be running on :8080 is
    *  testing the machine, not the code. Defaults to the real detector. */
   detectServer?: (host: string, ports: number[]) => Promise<Discovery>;
+  /** Re-derive the machine-derived settings (model, llama flags, context,
+   *  port) from the CURRENT hardware instead of inheriting them, keeping only
+   *  the keys a human typed. `/reset` uses this; a normal launch never does,
+   *  because the bootstrap being idempotent is the whole point. */
+  force?: boolean;
   /** Candidate .gguf files already present in the models dir. Injected in
    *  tests; read from disk otherwise. */
   listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>;
@@ -145,7 +150,18 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   });
   log(steps[0].detail);
 
-  const existing = await readConfig(opts.projectRoot);
+  // `force` is what `/reset` uses: re-derive the machine-derived settings from
+  // the CURRENT hardware instead of inheriting them. It keeps only the keys a
+  // human typed (apiKey, verify, browser, compaction…) — see
+  // `keepUserOwnedKeys` — and it skips the adopt-a-running-server short-circuit
+  // below, because a reset that just adopts whatever happens to be running has
+  // re-derived nothing at all.
+  //
+  // Without it `/reset` would be a near no-op on a machine whose hardware has
+  // not changed, and the user would reasonably conclude it did nothing.
+  const existing = opts.force
+    ? keepUserOwnedKeys(await readConfig(opts.projectRoot))
+    : await readConfig(opts.projectRoot);
 
   // ── 2. llama-server binary ────────────────────────────────────────────────
   // The model is chosen in step 3, but a config that already names one is
@@ -271,7 +287,39 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // So llamacli points at the loading server instead. Its requests will fail
   // until the load finishes, which the agent loop's existing transient-failure
   // retry already handles, and no VRAM is spent on a duplicate.
-  if (discovery.kind === "loading") {
+  if (discovery.kind === "stub") {
+    // The canonical port answers the API but has no real weights behind it — a
+    // test double (here: harnessCli's `fake-llama-server.mjs`, configured via
+    // HARNESSIDE_LLAMA_SERVER) that took port 8080 after the real server was
+    // stopped.
+    //
+    // Two things matter here. First, DO NOT adopt it: every reply would be a
+    // canned string, and it looks like a working session until you notice the
+    // model never changes its mind. Second, DO NOT bind a different port and
+    // spawn a second llama-server for it either — that is the OOM this whole
+    // adopt-before-spawn path exists to prevent, and the port is not ours to
+    // take. So: report it and let the operator free the port.
+    steps.push({ name: "기존 서버 연결", ok: false, detail: discovery.reason });
+    errors.push(`기존 서버 연결: ${discovery.reason}`);
+    log(discovery.reason);
+    steps.push({
+      name: "포트 결정",
+      ok: false,
+      detail: `${discovery.port} 포트가 테스트용 더블 서버에 잡혀 있어 그대로 둡니다 (두 번째 서버를 띄우지 않음).`,
+    });
+    errors.push(
+      `포트 결정: ${discovery.port} 이 더블 서버에 점유되어 있습니다. 그 서버를 종료하면 기존 llama-server 가 그 포트를 다시 사용할 수 있습니다.`
+    );
+    return {
+      ok: false,
+      steps,
+      hardware,
+      errors,
+      config: existing,
+    };
+  }
+
+  if (!opts.force && discovery.kind === "loading") {
     const waitedSec = Math.round(discovery.waitedMs / 1000);
     steps.push({
       name: "기존 서버 연결",
@@ -312,7 +360,7 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     };
   }
 
-  if (discovery.kind === "found") {
+  if (!opts.force && discovery.kind === "found") {
     const running = discovery.server;
     const adoptedPort = Number(new URL(running.baseUrl).port);
     steps.push({
@@ -377,9 +425,12 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     const size = await fileSize(alreadyInUse);
     modelPath = alreadyInUse;
     model = {
-      candidate: { repo: "(기존 설정)", filename: alreadyInUse.split("/").pop()!, sizeBytes: size, url: "" },
+      candidate: { repo: "(기존 설정)", filename: basename(alreadyInUse), sizeBytes: size, url: "" },
       reason: `이미 사용 중인 모델을 유지합니다: ${alreadyInUse}`,
       alternatives: [],
+      // The file's real location, not something to be reconstructed later from
+      // a basename — it usually lives outside `modelsDir`.
+      localPath: alreadyInUse,
     };
     steps.push({ name: "모델 결정", ok: true, detail: `기존 모델 유지 (다운로드 불필요): ${alreadyInUse}` });
     log(`이미 사용 중인 모델을 유지합니다 — 내려받지 않습니다: ${alreadyInUse}`);
@@ -415,8 +466,24 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   // claimed — a normal quant on a fork build passes silently, because proving
   // otherwise would require the file this step exists to avoid needing.
   if (model && llama) {
-    const already = join(modelsDir, model.candidate.filename);
-    const detail = await checkBinaryAgainstChosenModel(llama.binPath, model.candidate.filename, already);
+    // The path to ask about is the path the model will ACTUALLY be read from.
+    // `model.candidate.filename` is a basename, so joining it onto `modelsDir`
+    // rebuilt a path that usually does not exist: on this machine that produced
+    // `/home/jeano/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf` while the model sat
+    // at `/media/jeano/nvme-usb/models/bonsai2/…`. The file-presence test in
+    // checkBinaryAgainstChosenModel then failed, the exact binary probe never
+    // ran, and the filename heuristic reported a build incompatibility that had
+    // not been established — "ternary 지원 빌드가 필요합니다" about a build that
+    // reads the model fine.
+    //
+    // `localPath` is set by the "keep existing model" branch and is the only
+    // trustworthy locator; the models dir is a guess that applies solely to a
+    // model still to be downloaded.
+    const detail = await checkBinaryAgainstChosenModel(
+      llama.binPath,
+      model.candidate.filename,
+      model.localPath ?? join(modelsDir, model.candidate.filename)
+    );
     if (detail) {
       steps.push({ name: "모델/빌드 호환성", ok: false, detail });
       errors.push(detail);

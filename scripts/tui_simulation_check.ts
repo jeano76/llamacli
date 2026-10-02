@@ -528,7 +528,13 @@ async function runInPty(cmd: string, cols: number, rows: number, timeoutMs = 20_
     const { stdout } = await run(
       "script",
       ["-qec", `stty cols ${cols} rows ${rows}; npx tsx ${typescript}`, "/dev/null"],
-      { timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, cwd: repo, env: { ...process.env, TERM: "xterm-256color", COLUMNS: String(cols), LINES: String(rows) } }
+      { timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, cwd: repo, // COLORTERM is pinned, not inherited. The pty checks below assert the TRUECOLOR
+      // background path (`48;2;r;g;b`), which is only emitted at colorDepth 24 — and
+      // `...process.env` leaked whatever COLORTERM the shell happened to have.
+      // Without this the assertion passed or failed depending on where the harness was
+      // launched from, which is exactly the kind of ambient-environment dependence
+      // that makes a test lie.
+      env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor", NO_COLOR: undefined as any, COLUMNS: String(cols), LINES: String(rows) } }
     );
     return { out: stdout, code: 0 };
   } catch (e: any) {

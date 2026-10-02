@@ -492,30 +492,33 @@ function invariantUserKeySelection(p: Persona): void {
   );
 }
 
-/** I14. The three removed features are GONE, not merely hidden.
+/** I14. Menu/feature integrity across the add-remove churn.
  *
- *  A removal that left the menu entry, the config key or a dispatch path in
- *  place would be a removal in name only: the user would still see the command
- *  offered and a stale config would still advertise a toggle. Asserted
- *  explicitly so a future re-introduction is a deliberate, visible act. */
-function invariantRemovedFeaturesAreGone(p: Persona): void {
+ *  `/fastcheck` was removed and must STAY removed: it drove the laya gate,
+ *  which no longer exists, so a menu entry for it would advertise a command
+ *  with no dispatcher behind it.
+ *
+ *  `/reset` was removed and then RESTORED, together with local model search and
+ *  tuning. It must be in the menu, AND it must have a real dispatcher -- a menu
+ *  entry with no `case` behind it is the exact dead end this harness exists to
+ *  catch, and it is how /fastcheck originally failed to dispatch.
+ */
+function invariantMenuMatchesDispatch(p: Persona): void {
   const keys = SLASH_MENU_ITEMS.map((i) => i.key);
-  for (const gone of ["fastcheck", "reset"]) {
-    check(p.name, `/${gone} is not offered in the menu`, !keys.includes(gone), `/${gone} is still registered`);
-  }
-  // The gate module and the model downloader are gone at the source level, so
-  // these imports cannot resolve. A comment cannot assert that; a build that
-  // compiles does.
+  check(p.name, "/fastcheck is not offered in the menu", !keys.includes("fastcheck"), "/fastcheck is still registered");
+  check(p.name, "/reset IS offered in the menu", keys.includes("reset"), "/reset is missing from the menu");
   check(
     p.name,
     "the slash menu still resolves its remaining commands",
     keys.includes("help") && keys.includes("copy") && keys.includes("compact"),
     `menu has ${keys.length} items`
   );
-  // Every advertised command must still be dispatchable by its own key: a menu
-  // entry with no case behind it is a dead end.
   for (const k of keys) {
     check(p.name, `/${k} is a plausible identifier`, /^[a-z][a-z-]*$/.test(k), `key "${k}" is malformed`);
+    // label and key must agree, or typing what the menu advertised matches
+    // nothing and Enter never dispatches.
+    const item = SLASH_MENU_ITEMS.find((i) => i.key === k)!;
+    check(p.name, `/${k} label matches its key`, item.label === `/${k}`, `label was ${item.label}`);
   }
 }
 
@@ -543,7 +546,7 @@ for (const p of personas) {
   await step("path invariants", () => invariantPathIsUsable(p, root));
   await step("menu invariants", () => invariantMenuIsCoherent(p));
   await step("user key selection", () => invariantUserKeySelection(p));
-  await step("removed features are gone", () => invariantRemovedFeaturesAreGone(p));
+  await step("menu matches dispatch", () => invariantMenuMatchesDispatch(p));
   await step("bootstrap survives", () => invariantBootstrapSurvives(p, root));
   await step("user keys survive", () => invariantUserKeysSurvive(p, root));
   await step("cold load", () => invariantColdLoad(p, root));

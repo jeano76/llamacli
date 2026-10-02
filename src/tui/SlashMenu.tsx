@@ -8,11 +8,11 @@ export interface SlashMenuItem {
   description: string;
 }
 
-// `/fastcheck` and `/reset` are both absent from this list, and both are absent
-// from the dispatcher behind it — they were removed outright, not hidden behind
-// a flag. `/fastcheck` drove the deleted laya gate; `/reset` drove a destructive
-// re-derivation of the model, the llama flags and the ports. Neither has any
-// code path left, so a stale config key or keybinding doc cannot revive them.
+// `/fastcheck` is absent from this list AND from the dispatcher behind it: it
+// drove the removed laya gate, so there is no code path left that could answer
+// it and a stale config key cannot revive it. `/reset` IS here — it re-derives
+// the model, llama flags and context from the current hardware, and is
+// dispatched in index.tsx.
 export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   { key: "help", label: "/help", description: "도움말 + 키보드 단축키 전체" },
   { key: "keys", label: "/keys", description: "키보드 단축키만 보기" },
@@ -27,6 +27,11 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   // "0 matching commands" and Enter never dispatches it — which is exactly
   // what happened the first time this was added.
   { key: "copy", label: "/copy", description: "화면 로그 복사 (드래그 선택과 같은 클립보드)" },
+  // /reset re-derives the model + llama flags + context from the CURRENT
+  // hardware. It is destructive to machine-derived settings, so it asks first —
+  // and the ask lives in the command rather than a separate screen, so this menu
+  // item is the whole affordance.
+  { key: "reset", label: "/reset", description: "현재 GPU·VRAM·RAM에 맞는 모델/설정으로 다시 초기화" },
   { key: "skills", label: "/skills", description: "List loaded skills" },
   { key: "rules", label: "/rules", description: "List loaded rules" },
   // Label and key must agree. This one didn't: the key is "plan-clear"

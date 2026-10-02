@@ -56,6 +56,16 @@ export interface ModelChoice {
   reason: string;
   /** Ranked alternatives, so a user who disagrees can pick the next one. */
   alternatives: ModelCandidate[];
+  /** The full path to this model when it is ALREADY on disk, and undefined when
+   *  it still has to be downloaded.
+   *
+   *  Carried because `candidate.filename` is a basename — it is what a remote
+   *  catalogue calls the file and what a download target is named — so it is not
+   *  enough to locate a model the user already has. Anything that needs to touch
+   *  the real file (the build-compatibility probe, a size check) must use this,
+   *  not `join(modelsDir, filename)`: `modelsDir` is only a default, and models
+   *  kept on an external drive are the normal case on this machine. */
+  localPath?: string;
 }
 
 export const HF_ENDPOINT = "https://huggingface.co";

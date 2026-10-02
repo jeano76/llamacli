@@ -4,9 +4,9 @@ import { mkdtemp, mkdir, writeFile, rm, readFile, chmod } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
-import { resolveBackend, startWithCompatibleFallback } from "./resolve.js";
+import { resolveBackend, startWithCompatibleFallback, configuredPort } from "./resolve.js";
 import { DEFAULT_CONFIG, type LlamacliConfig } from "../config.js";
-import type { Discovery } from "./detect.js";
+import { discoverRunningServer, type Discovery } from "./detect.js";
 import type { BootstrapOptions, BootstrapReport } from "../setup/bootstrap.js";
 
 async function project(): Promise<string> {
@@ -956,4 +956,61 @@ test("the model path reaches the search even when the binary came from env", asy
     })) as never,
   });
   assert.equal(searchedFor, "/m/bonsai.gguf");
+});
+
+test("configuredPort reads the recorded llama port", () => {
+  assert.equal(
+    configuredPort(localConfig({ backend: "local-llama", llama: { ...DEFAULT_CONFIG.llama!, port: 8084 } })),
+    8084
+  );
+});
+
+test("configuredPort reads the port out of an openai-compatible baseUrl", () => {
+  assert.equal(
+    configuredPort(localConfig({ backend: "openai-compatible", baseUrl: "http://127.0.0.1:8084" })),
+    8084
+  );
+});
+
+test("configuredPort returns null when no port is recorded", () => {
+  assert.equal(configuredPort(localConfig({ backend: "openai-compatible" })), null);
+  assert.equal(configuredPort(localConfig({ backend: "openai-compatible", baseUrl: "not a url" })), null);
+  // A baseUrl with no explicit port is the default for its scheme, not a
+  // discoverable local endpoint — nothing to probe.
+  assert.equal(configuredPort(localConfig({ backend: "openai-compatible", baseUrl: "https://api.example.com" })), null);
+});
+
+test("discovery probes the recorded port before the heuristic list", async () => {
+  // The bug this covers: a server on 8084 is up and serving, the config records
+  // 8084, but COMMON_PORTS is [8080, 8081, 11434]. Probing only the list
+  // reported "nothing is running" and the fallback spawned a second
+  // llama-server, which OOMed on a card the first one already held 7.3 GB of.
+  // Answers only on 8084, so the list order decides whether it is found at all.
+  const fakeFetch = async (url: string) => {
+    if (new URL(url).port !== "8084") throw new Error("refused");
+    const parsed = new URL(url);
+    // /props carries build_info on every real llama.cpp, and that is what
+    // distinguishes it from a stand-in. Serving it here keeps this fixture
+    // honest: without it a server reporting a .gguf path that isn't on disk
+    // is, correctly, classified as a stub rather than adopted.
+    if (parsed.pathname === "/props") {
+      return { ok: true, json: async () => ({ build_info: "b1234", model_path: "/models/recorded.gguf" }) } as never;
+    }
+    return {
+      ok: true,
+      json: async () => ({ data: [{ id: "/models/recorded.gguf" }] }),
+    } as never;
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = fakeFetch as never;
+  try {
+    const disc = await discoverRunningServer("127.0.0.1", [8084, 8080, 8081, 11434]);
+    assert.equal(disc.kind, "found");
+    if (disc.kind === "found") {
+      assert.equal(disc.server.baseUrl, "http://127.0.0.1:8084");
+      assert.equal(disc.server.model, "/models/recorded.gguf");
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

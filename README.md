@@ -481,53 +481,83 @@ once per start, forever.
 `0` is read as "not measured" rather than "measured as zero" — zero is
 llama.cpp's own default and is exactly what a small card cannot do.
 
+## `/reset`, model search and tuning
+
+`/reset` re-derives the model, the llama flags and the context size from the
+**current** hardware — GPU, VRAM, RAM — and reports what actually changed, so a
+run that changes nothing reads as "already optimal" rather than as "broken".
+
+It asks first (`Y/N`; `N` changes nothing at all) and does two things that make
+it safe to run inside a live session:
+
+- **`noDownload`** — it re-derives *settings* and never transfers a model. A
+  20 GB fetch inside a TUI session wedges the agent loop for hours behind a
+  spinner on a prompt that will never answer.
+- **`calibrate`** — it measures the backend's own reported `timings`
+  (prefill/decode tok/s) rather than reading the hardware table. That is what
+  catches a throttled card, a fallback build, or a busy box. The measurement
+  can only ever **tighten** the context downward; one slow sample must not be
+  able to talk a machine into an OOM at load. If the probe is unusable, it says
+  so and falls back to the hardware profile.
+
+First-run bootstrap keeps the model already in use (no Hub lookup, no download)
+whenever the file the config records still exists — the Hub republishes
+filenames and byte counts disagree, so re-resolving from it once produced a
+20 GB download of weights the machine had been serving all along.
+
+### Verifying the server before adopting it
+
+Adoption exists to avoid starting a **second** llama-server, which on an 8 GB
+card OOMs. So llamacli adopts what it finds — but it now *checks* what it found,
+because "answers the API" and "is a model server" are different claims.
+
+`GET /props` carries `build_info` on every real llama.cpp (it is filled from
+`llama_build_info()`), which is the discriminator:
+
+| Found | Verdict | Action |
+|---|---|---|
+| `/props` has `build_info` | `llama.cpp` | adopted |
+| No marker, id is not a path (e.g. `llama3:8b`) | `other` (Ollama, vLLM) | adopted, labelled honestly |
+| Names a `.gguf` that is **not on disk** | `stub` | **refused, with the reason reported** |
+
+That last row is a real incident. `harnessCli`'s CI fixture
+(`fake-llama-server.mjs`, wired in via `HARNESSIDE_LLAMA_SERVER`) held port
+8080 after the real server was stopped, answered `/health` and `/v1/models`
+perfectly, and returned a canned `가짜 응답입니다.` to every turn. llamacli
+adopted it silently. Note that the existing "garbage" health probe does **not**
+catch this — it sends a prompt and asks whether the reply is language, and
+`가짜 응답입니다.` is valid Korean. A missing weights file cannot be argued
+around, which is why this check sits alongside it.
+
+A stub is refused rather than adopted *and* rather than worked around by binding
+another port: the port is not ours to take, and starting a second server beside
+whatever is holding it is the OOM the whole adopt-before-spawn path prevents.
+
+### A model name is read, not guessed
+
+llama.cpp has shipped two shapes for `/v1/models` — OpenAI's `data[].id` and a
+`models[]` array. Both are read, because this value is written into every
+project's `config.yaml` as the live model. Verified against a real server here:
+the `models[]` shape is what the current llama.cpp returns, so reading only
+`data[].id` recorded **`local-model`** — a name that server never reported.
+
 ## Removed features
 
-Two things that used to be here have been **removed, not disabled**. There is no
-flag to flip and no code path left to re-enable them.
+One feature has been **removed, not disabled**: there is no flag and no code
+path left to re-enable it.
 
 | Removed | What it did | Why it is gone |
 |---|---|---|
-| **`/fastcheck`** | Consulted a second "System 1" model before each turn to pick a reasoning budget, and could downgrade a turn to a cheap mode. | Measured over a labelled prompt set: it added ~0.11 s per turn, agreed with "this needs the real model" on 33% of the prompts that did, and could not be made to separate the classes by any prompt wording. See git history for the full measurement. |
-| **`/reset`** | Re-derived the model, the llama flags and the ports from current hardware, discarding the recorded ones first. | It discarded exactly the keys that identify the model the machine was **already running**, so the "keep the model in use" check failed every time and the bootstrap went to HuggingFace for a different model. It also dropped `baseUrl` on its way out, leaving the next launch pointing at a port nothing was listening on. The bootstrap re-derives these settings on every launch anyway; the command added a way to lose them. |
+| **`/fastcheck`** | Consulted a second "System 1" model (laya) before each turn to pick a reasoning budget, and could downgrade a turn to a cheap mode. | Measured over a labelled prompt set: ~0.11 s per turn, agreement with "this needs the real model" on only 67% of the prompts that did, and no prompt wording separated the classes — the judge is the same model it was trying to avoid calling. See git history. Its risk rail went with it: it only mattered *because* a turn could be downgraded. |
 
-**Consequences, stated plainly:**
-
-- Model acquisition is **back**, and it is what makes a first run on a fresh
-  machine possible. It runs only after the two checks that must come first: an
-  adoptable running server, and the model this install is already using. The
-  model recorded in `.llamacli/config.yaml` is never replaced while its file is
-  present, and an existing file is matched on **quant + exact byte size**, not on
-  filename — the Hub republishes names and sizes, which is how a 20 GB
-  re-download of weights the machine was already serving once happened.
-- `MODEL_REPO_35B` / `MODEL_REPO_9B` override the pinned repositories. The
-  defaults are the publisher's own (`ornith-ai/…`, verified: both list the
-  `Q4_K_M` quant). The un-namespaced form of those ids — which is what this
-  repository shipped for a while — is a repository that does not exist and
-  answers HTTP 401, so a machine with no model configured could not resolve
-  anything and the spawn condition was never satisfiable. A pinned repo that
-  becomes unreachable now falls back to a repository search, so a rename
-  degrades to a slower start rather than a dead one.
-- Bootstrap reports every failure as a **failed step with a reason** rather than
-  silently degrading, and a machine that ends up with a binary but no model
-  records that honestly instead of claiming a local backend it cannot serve.
-- A `laya:` block left in an old `config.yaml` is **dropped, not preserved** —
-  nothing can act on it any more.
-
-The `laya` gate's risk rail (`highRiskMatches` / `decideGate`) went with it.
-It only ever mattered *because* a turn could be downgraded to a cheap mode; with
-no such mode, there is nothing to protect.
-
-**Binary self-update is unaffected.** `llamacli` still checks GitHub for a new
-release of itself at startup (opt out with `LLAMACLI_NO_UPDATE=1`). That is the
-app updating, not the model — a different code path, in `src/selfUpdate.ts`.
+`/reset`, local model search and tuning are **present and implemented**.
 
 ## Validation — what is actually checked, and what is not
 
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 590 unit tests
+npm test                                              # 764 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -535,9 +565,9 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **590** | pass |
-| Terminal identity (100 personas) | `persona_usability_check.ts` | **5,877** | 0 violations |
-| Project shape (100 real directories) | `project_persona_check.ts` | **7,037** | 0 violations |
+| Unit / regression | `npm test` | **764** | pass |
+| Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
+| Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
 | Hardware matrix (one-off sweep) | *(not committed — see below)* | 168,668 | 0 violations |
 
@@ -568,11 +598,11 @@ useful:
 
 The honest summary: the **decision and rendering logic** is now well covered,
 and the **OS and hardware layers are not covered at all**. Anyone reading
-"13,713 checks, all passing" as "this works everywhere" is reading it wrong.
+"14,413 checks, all passing" as "this works everywhere" is reading it wrong.
 
 ## Usability validation across 100 personas
 
-`scripts/persona_usability_check.ts` runs **5,877 assertions across 100
+`scripts/persona_usability_check.ts` runs **5,777 assertions across 100
 distinct usage configurations** — 3 platforms, 10 terminal families, 5 locales,
 6 terminal sizes and 4 colour modes, crossed so every value of every axis is
 exercised.
@@ -719,7 +749,7 @@ a read-only checkout, or a model file sitting inside the repo.
   path you type and the path on disk differ)
 - **5 locales**, **5 disk conditions**
 
-**7,237 checks across 100 real project directories.**
+**8,037 checks across 100 real project directories.**
 
 ### What it found
 

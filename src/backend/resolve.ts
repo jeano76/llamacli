@@ -2,7 +2,7 @@ import { stat } from "node:fs/promises";
 import { formatBytes, type TransferProgress } from "../setup/download.js";
 import { LlamaServerManager, type LlamaServerConfig } from "./llamaServer.js";
 import { OpenAICompatibleClient } from "./openaiClient.js";
-import { discoverRunningServer, type Discovery } from "./detect.js";
+import { discoverRunningServer, COMMON_PORTS, type Discovery } from "./detect.js";
 import { probeBackendHealth, describeUnhealthyBackend, type BackendHealth } from "./healthCheck.js";
 import type { LlamacliConfig } from "../config.js";
 import {
@@ -101,6 +101,34 @@ export interface ResolveOptions {
 
 const GiB = 1024 ** 3;
 
+/** The port this project already recorded, if it names one.
+ *
+ *  `COMMON_PORTS` is a heuristic for a project with no config: it guesses where
+ *  a server *might* be. Once a config exists it is no longer a guess — it is a
+ *  record of where the server actually was, and on this machine it was 8084,
+ *  which is not in the heuristic list. Probing only the list meant discovery
+ *  reported "nothing is running" about a server that was up and serving, and the
+ *  fallback spawned a SECOND llama-server that then OOMed: the first one already
+ *  held 7.3 GB of an 8 GB card.
+ *
+ *  So the recorded port is probed FIRST, and the heuristic list follows as a
+ *  fallback for the case where the recorded server has since died. Order
+ *  matters — `discoverRunningServer` takes the first responder. */
+export function configuredPort(config: LlamacliConfig): number | null {
+  if (config.backend === "local-llama") {
+    const port = config.llama?.port;
+    return Number.isFinite(port) && (port as number) > 0 ? (port as number) : null;
+  }
+  // openai-compatible: the port lives in the URL, and may be absent (default 80/443).
+  if (!config.baseUrl) return null;
+  try {
+    const port = Number(new URL(config.baseUrl).port);
+    return Number.isFinite(port) && port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> {
   const { projectRoot, config, log } = opts;
 
@@ -115,7 +143,13 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
   // loaded. A fast probe cannot tell that apart from "nothing is running", and
   // answering it wrongly is how a second llama-server used to get spawned beside
   // a healthy one.
-  const discover = opts.discover ?? (() => discoverRunningServer("127.0.0.1"));
+  const discover =
+    opts.discover ??
+    (() => {
+      const recorded = configuredPort(config);
+      const ports = recorded === null ? COMMON_PORTS : [recorded, ...COMMON_PORTS.filter((p) => p !== recorded)];
+      return discoverRunningServer("127.0.0.1", ports);
+    });
   // A download that reported progress by rewriting one terminal line would
   // corrupt the TUI rendering into the same screen — Ink owns those bytes here,
   // and a bare `\r\x1b[2K` from the installer would cut its output in half. So
@@ -193,6 +227,29 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
       // load, so the recorded value is only a placeholder.
       model: config.model,
       port: discovery.port,
+    };
+  }
+
+  if (discovery.kind === "stub") {
+    // A test double holds the port: the API answers, the weights do not exist.
+    // Deliberately NOT falling through to case 2 — the port is not ours to take,
+    // and starting a real second llama-server beside it is the OOM this module's
+    // ordering exists to avoid.
+    //
+    // Same shape as the "garbage" case above, and for the same reason
+    // (`usable: true`): something IS answering, so the app comes up and puts the
+    // reason on screen rather than exiting and stranding it. The difference is
+    // that the garbage verdict is caught by SENDING a prompt and asking whether
+    // the reply is language — which a fixture returning valid Korean
+    // ("가짜 응답입니다.") passes. A missing weights file cannot be argued
+    // around, which is why the stub check exists alongside it rather than
+    // instead of it.
+    log(discovery.reason);
+    return {
+      kind: "unresolved",
+      backend: new OpenAICompatibleClient(discovery.baseUrl),
+      reason: discovery.reason,
+      usable: true,
     };
   }
 
