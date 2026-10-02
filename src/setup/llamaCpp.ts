@@ -44,10 +44,54 @@ export const LLAMA_CPP_REPO = "https://github.com/ggml-org/llama.cpp";
 /** Where llamacli keeps its OWN build, so it never touches a user's checkout. */
 export const LLAMA_CPP_HOME = join(homedir(), ".llamacli", "llama.cpp");
 
-export type Run = (file: string, args: string[], opts?: { cwd?: string; timeout?: number }) => Promise<string>;
+export type Run = (
+  file: string,
+  args: string[],
+  opts?: {
+    cwd?: string;
+    timeout?: number;
+    /** Called with each output line as it is produced (stdout and stderr). Present only
+     *  for long steps whose silence reads as a hang — a compile prints for 30 minutes
+     *  and `execFile` hands none of it back until the end. */
+    onLine?: (line: string) => void;
+  }
+) => Promise<string>;
 
-export const defaultRun: Run = async (file, args, opts = {}) =>
-  (await execFileAsync(file, args, { cwd: opts.cwd, timeout: opts.timeout ?? 20 * 60_000, maxBuffer: 32 * 1024 * 1024 })).stdout;
+export const defaultRun: Run = async (file, args, opts = {}) => {
+  if (!opts.onLine) {
+    return (await execFileAsync(file, args, { cwd: opts.cwd, timeout: opts.timeout ?? 20 * 60_000, maxBuffer: 32 * 1024 * 1024 })).stdout;
+  }
+  return new Promise<string>((resolve, reject) => {
+    const child = spawnProc(file, args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    // Only the tail is kept: a full build log is tens of MB, and the tail is what
+    // says why it failed.
+    let tail: string[] = [];
+    const feed = (stream: NodeJS.ReadableStream) => {
+      let pending = "";
+      stream.setEncoding?.("utf8");
+      stream.on("data", (chunk: string) => {
+        pending += chunk;
+        const lines = pending.split(/\r?\n|\r/);
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line) continue;
+          tail.push(line);
+          if (tail.length > 40) tail = tail.slice(-40);
+          opts.onLine!(line);
+        }
+      });
+    };
+    feed(child.stdout!);
+    feed(child.stderr!);
+    const timer = opts.timeout ? setTimeout(() => child.kill("SIGKILL"), opts.timeout) : undefined;
+    child.on("error", (err) => { if (timer) clearTimeout(timer); reject(err); });
+    child.on("close", (code, signal) => {
+      if (timer) clearTimeout(timer);
+      if (code === 0) resolve(tail.join("\n"));
+      else reject(new Error(`${file} 가 ${signal ?? `종료 코드 ${code}`} 로 끝났습니다:\n${tail.slice(-12).join("\n")}`));
+    });
+  });
+};
 
 async function isExecutable(path: string): Promise<boolean> {
   try {
@@ -927,9 +971,11 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
   log(`cmake 설정 중… (${target.label})`);
   await run("cmake", cmakeFlags, { cwd: dir, timeout: 20 * 60_000 });
 
+  const progress = makeBuildProgress(log, target.label);
   const buildCmd = (jobs: number) =>
     run("cmake", ["--build", buildDir, "--config", "Release", "-j", String(jobs)], {
       cwd: dir,
+      onLine: progress,
       // A CUDA build of llama.cpp is genuinely long; the generic 20 min default
       // is not enough on a slow CPU and would abort a build that was working.
       timeout: 120 * 60_000,
@@ -951,6 +997,49 @@ export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
     throw new Error(`빌드가 끝났지만 ${dir}/${buildDir} 아래에서 ${binNameFor()} 를 찾을 수 없습니다.`);
   }
   return bin;
+}
+
+/** `[ 42%] Building CXX object …` → 42. Makefile and Ninja generators both print it
+ *  (Ninja as `[12/340]`, which carries no percentage and is converted). */
+export function parseBuildPercent(line: string): number | null {
+  const pct = /^\s*\[\s*(\d{1,3})%\]/.exec(line);
+  if (pct) return Math.min(100, Number(pct[1]));
+  const frac = /^\s*\[(\d+)\/(\d+)\]/.exec(line);
+  if (frac && Number(frac[2]) > 0) return Math.min(100, Math.floor((Number(frac[1]) / Number(frac[2])) * 100));
+  return null;
+}
+
+/**
+ * Turns a build's output into a few progress lines: one per ten percent, plus a
+ * heartbeat when a long step (a single CUDA translation unit can take minutes) prints
+ * nothing, so the user sees elapsed time instead of a frozen screen. Goes through
+ * `log` — the TUI's own sink — rather than writing to stdout, which would corrupt an
+ * Ink-rendered screen.
+ */
+export function makeBuildProgress(
+  log: (line: string) => void,
+  label: string,
+  now: () => number = Date.now,
+  heartbeatMs = 60_000
+): (line: string) => void {
+  const t0 = now();
+  let lastDecile = -1;
+  let lastEmit = t0;
+  let lastPct: number | null = null;
+  const mins = () => Math.max(0, Math.floor((now() - t0) / 60_000));
+  return (line) => {
+    const pct = parseBuildPercent(line);
+    if (pct !== null) lastPct = pct;
+    const t = now();
+    if (pct !== null && Math.floor(pct / 10) > lastDecile) {
+      lastDecile = Math.floor(pct / 10);
+      lastEmit = t;
+      log(`${label} 빌드 ${pct}% (${mins()}분 경과)`);
+    } else if (t - lastEmit >= heartbeatMs) {
+      lastEmit = t;
+      log(`${label} 빌드 중… ${lastPct !== null ? `${lastPct}%, ` : ""}${mins()}분 경과`);
+    }
+  };
 }
 
 async function firstExecutable(paths: string[]): Promise<string | null> {
