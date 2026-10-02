@@ -32,6 +32,7 @@ import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from ".
 import { tuneForHardware } from "./setup/tuning.js";
 import { switchModelAndServer } from "./setup/modelSwitch.js";
 import { reportServer } from "./setup/serverReport.js";
+import { provisionForSwitch } from "./setup/provision.js";
 import { formatProgress } from "./setup/download.js";
 import { totalmem } from "node:os";
 /** The tuning flags the config already records, for a restart that must NOT
@@ -1012,7 +1013,12 @@ async function main() {
           // not add to a list, because the config names exactly one model and
           // picking one means "run this one".
           case "models": {
-            const arg = (argument ?? "").trim();
+            const [arg, ...rest] = (argument ?? "").trim().split(/\s+/).filter(Boolean);
+            // `/models <n> confirm` — the second step for a selection that has to
+            // fetch weights. Same two-step shape as `/reset confirm`, for the same
+            // reason: a Y/N dialog has to be rendered by App.tsx, and requiring an
+            // explicit second command cannot be triggered by a stray Enter.
+            const confirmed = rest[0] === "confirm";
             // One detection, used for both the listing and the verdict on a
             // selection — otherwise `/models` and `/models 3` could disagree
             // about whether a model fits.
@@ -1093,35 +1099,80 @@ async function main() {
                 `  · ${result.llama.detail}`,
               ];
 
-              // The server switch needs both a binary that can read the model and
-              // the model itself. Either missing, the config still records the
-              // choice -- refusing would make the selection silently not happen
-              // -- but nothing is restarted, and the reason is stated rather than
-              // left to be discovered as a load error on the next launch.
-              if (!result.llama.ok || !result.llama.binPath) {
+              // The server switch needs a binary that can read the model AND the
+              // model itself. When either is missing the work used to stop here
+              // with "the next launch will do it" — which meant quitting and
+              // relaunching to do something this session can do, and meant the
+              // selection sat recorded-but-unserved in between. It now provisions
+              // first and switches in the same breath.
+              let binPath = result.llama.binPath;
+              let modelPath = result.modelPath;
+              let switchTuning = tuning;
+
+              if (!binPath || !result.presentOnDisk) {
+                // Weights are the one step big enough to warrant a second look:
+                // Bonsai is 5.5 GiB and Ornith is over 20 GiB, fetched while the
+                // user waits. `ba0243c` removed the transfer from /reset for
+                // exactly this reason. So the size is stated and confirmed; a
+                // build, by contrast, is requested by the selection itself and
+                // runs without a prompt.
+                if (!result.presentOnDisk && !confirmed) {
+                  const sizeGiB = rung.sizeBytes / 1024 ** 3;
+                  ui?.pushStatus(
+                    [
+                      ...head,
+                      `  · 모델 파일이 아직 없습니다 — 내려받으면 약 ${sizeGiB.toFixed(1)} GiB 가 필요합니다.`,
+                      "    지금 받으려면  /models " + arg + " confirm  을 입력하세요.",
+                      "    취소하려면 아무것도 하지 마세요 (설정에는 이미 기록되어 있습니다).",
+                    ].join("\n")
+                  );
+                  break;
+                }
+
                 ui?.pushStatus(
-                  [...head, `  · 서버는 그대로 둡니다 — ${result.llama.detail}`].join("\n")
+                  [...head, `  · 서버를 준비합니다 (빌드·설치·다운로드) — ${result.llama.detail}`].join("\n")
                 );
-                break;
-              }
-              if (!result.presentOnDisk) {
-                ui?.pushStatus(
-                  [
-                    ...head,
-                    "  · 모델 파일이 아직 없어 서버는 교체하지 않습니다. 다음 실행 시 내려받은 뒤",
-                    `    같은 포트(${result.port})로 새 모델로 서버가 올라갑니다.`,
-                  ].join("\n")
-                );
-                break;
+                const provisioned = await provisionForSwitch({
+                  projectRoot,
+                  port: result.port,
+                  hardware: hw,
+                  log: (line) => ui?.pushStatus(`  · ${line}`),
+                  // Same seam /reset uses: the TUI owns the screen, so the bar is
+                  // ONE row redrawn in place rather than escapes painted into an
+                  // Ink-rendered region.
+                  onProgress: (defaultReporter) => (progress) => {
+                    ui?.endTransient?.();
+                    ui?.setTransient?.(formatProgress(progress));
+                  },
+                });
+                ui?.endTransient?.();
+
+                if (!provisioned.ok || !provisioned.binPath || !provisioned.modelPath) {
+                  ui?.pushStatus(
+                    [
+                      ...head,
+                      "  · 준비하지 못해 서버는 그대로 둡니다:",
+                      ...provisioned.lines.map((l) => `    ${l}`),
+                      "    설정에는 선택이 기록되어 있으니, 문제를 고친 뒤 다음 실행이 이어서 준비합니다.",
+                    ].join("\n")
+                  );
+                  break;
+                }
+                binPath = provisioned.binPath;
+                modelPath = provisioned.modelPath;
+                // The provisioning re-derived tuning for the model it prepared;
+                // launching with the OLD model's flags is the documented way a
+                // dense model gets handed a 35B MoE's --n-cpu-moe and dies at load.
+                switchTuning = provisioned.tuning ?? tuning;
               }
 
               const sw = await switchModelAndServer({
-                modelPath: result.modelPath,
+                modelPath,
                 // Reused verbatim. Never re-planned: a model switch that quietly
                 // moves the port is the failure this exists to prevent.
                 port: result.port,
-                binPath: result.llama.binPath,
-                tuning,
+                binPath,
+                tuning: switchTuning,
               });
               ui?.pushStatus([...head, ...sw.lines.map((l) => `  · ${l}`)].join("\n"));
             } catch (err) {
