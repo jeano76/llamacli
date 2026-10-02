@@ -457,7 +457,7 @@ test("ensureLocalStack probes the real model file, kept outside modelsDir", asyn
       modelsDir,
       offline: true,
       allowBuild: false,
-      log: (l) => lines.push(l),
+      log: (l: string) => lines.push(l),
       run: async () => "",
       probe: async () => "free",
       detectServer: async () => ({ kind: "none" }),
@@ -494,6 +494,84 @@ test("ensureLocalStack still warns when the model is absent and the build is a g
     });
     // No file → filename heuristic may speak, so confirm it is not silent.
     assert.notEqual(warn, null);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+// A FIRST launch on a clean machine is the one state the user cannot recover from by
+// doing anything: step 2 picks the binary BEFORE step 3 picks the model, so with no
+// config there is nothing to know a fork was needed, stock llama.cpp gets installed,
+// and it rejects the Bonsai quant with "invalid ggml type 143". The user was told to
+// edit `llama.binPath` themselves, having never been told which build would work.
+test("a fresh install that picks a ternary model acquires a capable binary", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "llamacli-first-"));
+  const modelsDir = join(projectRoot, "models");
+  try {
+    await mkdir(modelsDir, { recursive: true });
+    let acquired = 0;
+    const lines: string[] = [];
+    const report = await ensureLocalStack({
+      projectRoot,
+      modelsDir,
+      // NOT offline: step 3 resolves the model from the catalogue, and step 3.5 is
+      // the code under test — offline skips model resolution entirely, which is
+      // itself the reason this path had no coverage.
+      offline: false,
+      allowBuild: true,
+      log: (l: string) => lines.push(l),
+      run: async () => "",
+      probe: async () => "free",
+      detectServer: async () => ({ kind: "none" }),
+      listExistingModels: async () => [],
+      serverPids: [],
+      // An 8 GiB card, i.e. the class of machine the Bonsai ladder is chosen FOR.
+      // Without a GPU the ladder rejects every rung and no model is chosen at all,
+      // which would leave the code under test unexercised.
+      hardware: {
+        cpuCount: 12,
+        ramTotalBytes: 32 * 1024 ** 3,
+        ramAvailableBytes: 24 * 1024 ** 3,
+        gpus: [{ index: 0, name: "NVIDIA GeForce RTX 2070 SUPER", vramTotalBytes: 8 * 1024 ** 3, vramFreeBytes: 7 * 1024 ** 3 }],
+        gpuBackend: "cuda",
+        canBuildCuda: true,
+        tools: {},
+        platform: "linux",
+      } as never,
+      env: { ...process.env, BONSAI_REPOS: "27B=prism-ml/Ternary-Bonsai-2-27B-gguf", MODEL_REPO_35B: "", MODEL_REPO_9B: "" },
+      // The catalogue must actually resolve a Bonsai file, or this test asserts
+      // nothing — which is exactly what a conditional assertion on the outcome does.
+      fetchImpl: (async (url: string) => {
+        const u = String(url);
+        if (u.includes("Ternary-Bonsai-2-27B-gguf")) {
+          return {
+            ok: true,
+            json: async () => ({
+              siblings: [{ rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", size: 5946648928 }],
+            }),
+          };
+        }
+        // No other family resolves, so the ladder's only candidate is the Bonsai.
+        if (u.includes("api/models/")) return { ok: true, json: async () => ({ siblings: [] }) };
+        // The weight transfer is not what this test is about; fail it fast so the
+        // bootstrap reports rather than hanging.
+        if (u.includes("/resolve/main/")) return { ok: false, status: 404, text: async () => "no" };
+        return { ok: true, json: async () => ([]) };
+      }) as never,
+      acquireTernary: async () => {
+        acquired++;
+        return { binPath: "/opt/prism/llama-server", backend: "cuda" as const };
+      },
+    } as never);
+
+    // Unconditional: prove the setup reached the state the rule is about.
+    const chosen = report.model?.candidate.filename ?? "";
+    assert.equal(chosen, "Ternary-Bonsai-2-27B-PTQ1_0.gguf", `catalogue did not resolve a Bonsai: ${JSON.stringify(report.model)}`);
+    assert.ok(acquired > 0, "a ternary model on a fresh install must acquire a capable binary, not merely warn");
+    assert.equal(report.llama?.binPath, "/opt/prism/llama-server", "the acquired binary must be the one recorded");
+    const compat = report.steps.find((st) => st.name === "모델/빌드 호환성");
+    assert.equal(compat?.ok, true, `the compatibility step must now pass: ${JSON.stringify(compat)}`);
+    assert.doesNotMatch(lines.join("\n"), /llama\.binPath 를 ternary/, "and must not tell the user to edit the path by hand");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

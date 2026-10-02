@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   cudaTagFor, prismAssetFor, archTag, prismAssetUrl,
   downloadPrismRuntime, PRISM_RELEASE_TAG, PRISM_LLAMA_CPP_REPO,
-  pickPublishedCudaTag, LINUX_CUDA_TAGS, WINDOWS_CUDA_TAGS_X64,
+  pickPublishedCudaTag, LINUX_CUDA_TAGS, WINDOWS_CUDA_TAGS_X64, acquireTernaryLlamaServer,
   type PrismMachine,
 } from "./ternaryRuntime.js";
 
@@ -191,4 +191,61 @@ test("a successful download extracts with the leading directory stripped and ret
   assert.equal(res.ok, true);
   assert.ok(res.binPath?.endsWith("/cpu/llama-server"));
   assert.match(res.lines.join("\n"), /준비 완료/);
+});
+test("acquireTernaryLlamaServer downloads a prebuilt rather than building", async () => {
+  // The whole point of preferring a download: 30-40 minutes of compilation versus
+  // seconds, for the same binary.
+  const got = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: true },
+    run: async () => "",
+    download: async () => ({ ok: true, binPath: "/opt/prism/llama-server", asset: "a", lines: [] }),
+    build: async () => {
+      throw new Error("must not build when a prebuilt exists");
+    },
+  });
+  assert.equal(got?.binPath, "/opt/prism/llama-server");
+  assert.equal(got?.backend, "cuda");
+});
+
+test("acquireTernaryLlamaServer builds the FORK when no prebuilt covers the platform", async () => {
+  let builtRepo = "";
+  const got = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "cuda", canBuildCuda: true },
+    run: async () => "",
+    download: async () => ({ ok: false, lines: ["사전 빌드 없음"] }),
+    build: async (o) => {
+      builtRepo = (o as { repo: string }).repo;
+      return "/home/u/.llamacli/llama.cpp-fork/build-cuda/bin/llama-server";
+    },
+  });
+  assert.ok(got, "a build should still produce a usable binary");
+  // Building STOCK here is the bug this whole path exists to fix: stock rejects the
+  // quant with "invalid ggml type 143".
+  assert.equal(builtRepo, PRISM_LLAMA_CPP_REPO);
+  assert.notEqual(builtRepo, "https://github.com/ggml-org/llama.cpp");
+});
+
+test("acquireTernaryLlamaServer reports failure instead of returning a wrong binary", async () => {
+  const got = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "none", canBuildCuda: false },
+    run: async () => "",
+    download: async () => ({ ok: false, lines: ["없음"] }),
+    build: async () => {
+      throw new Error("cmake: command not found");
+    },
+  });
+  assert.equal(got, null, "null, so the caller reports rather than pretending");
+});
+
+test("acquireTernaryLlamaServer survives a throwing download", async () => {
+  // A network error must reach the build fallback, not abort provisioning.
+  const got = await acquireTernaryLlamaServer({
+    hardware: { platform: "linux", gpuBackend: "none", canBuildCuda: false },
+    run: async () => "",
+    download: async () => {
+      throw new Error("ETIMEDOUT");
+    },
+    build: async () => "/built/llama-server",
+  });
+  assert.equal(got?.binPath, "/built/llama-server");
 });

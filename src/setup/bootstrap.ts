@@ -34,9 +34,7 @@ import {
   type LlamaLocation, type Run,
 } from "./llamaCpp.js";
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
-import {
-  downloadPrismRuntime, detectCudaVersion, PRISM_LLAMA_CPP_REPO,
-} from "./ternaryRuntime.js";
+import { acquireTernaryLlamaServer, PRISM_LLAMA_CPP_REPO } from "./ternaryRuntime.js";
 import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
@@ -105,6 +103,13 @@ export interface BootstrapOptions {
   /** Candidate .gguf files already present in the models dir. Injected in
    *  tests; read from disk otherwise. */
   listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>;
+  /** Acquires a llama-server that can read the ternary quants.
+   *
+   *  A seam, because both places that need one — the binary step and the
+   *  post-model-choice step — must reach the SAME acquisition logic, and a test
+   *  cannot assert that without standing in for it. Reaching the network or a
+   *  30-minute compile from a test is not an option. */
+  acquireTernary?: typeof acquireTernaryLlamaServer;
   /** PIDs of llama-server processes belonging to THIS install, whose VRAM is
    *  discounted when sizing the context (see budgetVramGiB). Injected because
    *  attributing a pid to our own server is a question about which binary we
@@ -231,40 +236,21 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
         (rejected ?? []).length > 0;
 
       if (wantsTernary) {
-        // Download first. The fork publishes pinned prebuilts per platform, so the
-        // common case is seconds rather than half an hour.
-        const prebuilt = await step("PrismML llama-server 받기", async () => {
-          const cudaVersion = await detectCudaVersion(run);
-          return downloadPrismRuntime({
-            machine: {
-              platform: hardware.platform,
-              arch: process.arch,
-              gpuBackend: hardware.gpuBackend,
-              cudaVersion,
-            },
-            log,
-          }).then((r) => {
-            // A falsy detail would be recorded as a SUCCESSFUL step that installed
-            // nothing. Throwing keeps the "no prebuilt for this platform" outcome
-            // in the failed-step channel, where the build fallback can read it.
-            if (!r.ok || !r.binPath) throw new Error(r.lines[r.lines.length - 1] ?? "사전 빌드 없음");
-            return r.binPath;
-          });
+        // Download the fork's pinned prebuilt; build the fork only if the release
+        // has nothing for this platform.
+        const binPath = await step("PrismML llama-server 준비", async () => {
+          const got = await (opts.acquireTernary ?? acquireTernaryLlamaServer)({ hardware, run, log });
+          if (!got) throw new Error("PrismML llama-server 를 받을 수도, 빌드할 수도 없었습니다.");
+          return got.binPath;
         });
-        if (prebuilt) {
+        if (binPath) {
           llama = {
-            binPath: prebuilt,
+            binPath,
             source: "downloaded",
-            // The asset itself says which accelerator it was built for; "unknown"
-            // is honest rather than claiming a backend we did not verify.
+            // The asset states which accelerator it was built for; claiming one we
+            // did not verify would be a guess wearing a fact's clothes.
             backend: hardware.gpuBackend === "none" ? "cpu" : hardware.gpuBackend,
           };
-        } else {
-          const built = await step("PrismML llama.cpp 빌드", async () => {
-            log("사전 빌드가 없어 PrismML fork 에서 직접 빌드합니다. 10~40분 걸릴 수 있습니다.");
-            return buildLlamaCpp({ hw: hardware, run, log, repo: PRISM_LLAMA_CPP_REPO });
-          });
-          if (built) llama = { binPath: built, source: "built", backend: hardware.canBuildCuda ? "cuda" : "cpu" };
         }
       } else {
         const binPath = await step("llama.cpp 빌드", async () => {
@@ -540,20 +526,53 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     // `localPath` is set by the "keep existing model" branch and is the only
     // trustworthy locator; the models dir is a guess that applies solely to a
     // model still to be downloaded.
-    const detail = await checkBinaryAgainstChosenModel(
-      llama.binPath,
-      model.candidate.filename,
-      model.localPath ?? join(modelsDir, model.candidate.filename)
-    );
+    const probePath = model.localPath ?? join(modelsDir, model.candidate.filename);
+    let detail = await checkBinaryAgainstChosenModel(llama.binPath, model.candidate.filename, probePath);
+
+    // ── ACT, not just warn ──────────────────────────────────────────────────
+    // This step used to end at "the binary may not read this model", which left
+    // the one case that cannot be recovered from by the user doing anything: a
+    // FIRST launch on a clean machine. Step 2 picks the binary BEFORE step 3 picks
+    // the model, so with no config there was nothing to know a fork was needed and
+    // it installed stock llama.cpp — which rejects the Bonsai quant outright. The
+    // user was then told to edit `llama.binPath` themselves, having never been told
+    // which build would work.
+    //
+    // So the requirement is now met here rather than described: if the chosen model
+    // needs a non-stock quant and the settled binary cannot read it, acquire one
+    // that can — the fork's pinned prebuilt, or the fork itself.
+    //
+    // BEFORE the download, deliberately. A 5.5 GB transfer followed by "invalid
+    // ggml type 143" is the failure this ordering exists to prevent, and re-running
+    // after the fact means paying for the transfer twice.
+    if (detail && needsTernaryBuild(model.candidate.filename)) {
+      log(`${model.candidate.filename} 에는 stock llama.cpp 가 읽지 못하는 양자화(${quantSuffixOf(model.candidate.filename)})가 쓰였습니다.`);
+      log("PrismML fork 의 llama-server 를 준비합니다 — 먼저 고정 릴리스 바이너리를 받고, 없으면 fork 를 빌드합니다.");
+      const got = await step("PrismML llama-server 준비", async () => {
+        const acquired = await (opts.acquireTernary ?? acquireTernaryLlamaServer)({ hardware, run, log });
+        if (!acquired) throw new Error("PrismML llama-server 를 받을 수도, 빌드할 수도 없았습니다.");
+        return acquired.binPath;
+      });
+      if (got) {
+        llama = { binPath: got, source: "downloaded", backend: hardware.gpuBackend === "none" ? "cpu" : hardware.gpuBackend };
+        steps.push({
+          name: "모델/빌드 호환성",
+          ok: true,
+          detail: `${model.candidate.filename} 을 읽을 수 있는 llama-server 로 교체했습니다: ${got}`,
+        });
+        log(`PrismML llama-server 로 교체했습니다: ${got}`);
+        detail = null;
+      }
+    }
+
     if (detail) {
       steps.push({ name: "모델/빌드 호환성", ok: false, detail });
       errors.push(detail);
       log(detail);
-      // Deliberately a warning rather than a hard stop: llama.cpp forks carry
-      // these quants and stock builds do not, but llamacli cannot read a
-      // binary's type registry from outside, and refusing outright would block
-      // every user whose build does support it. Saying it BEFORE a 5.5 GB
-      // transfer is the part that matters.
+      // Only reached when acquiring a capable build did not happen or did not
+      // work. Still a warning rather than a hard stop: llamacli cannot read a
+      // binary's type registry from outside, and refusing outright would block every
+      // user whose build does support the quant.
       log(
         `선택된 llama-server 빌드가 이 모델을 읽을 수 있는지 아직 확인되지 않았습니다. ` +
         `다운로드 후에도 실패한다면 llama.binPath 를 ternary/1-bit 를 지원하는 빌드로 바꾸세요.`

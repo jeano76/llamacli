@@ -363,3 +363,60 @@ async function readStamp(dir: string): Promise<string | null> {
     return null;
   }
 }
+/**
+ * A llama-server that reads the ternary quants, for THIS machine.
+ *
+ * One entry point on purpose. Two call sites need it — the bootstrap's binary step
+ * and its post-model-choice step — and they must not be able to drift: if the
+ * binary step downloaded a prebuilt while the model step built the fork, the
+ * install would depend on which ran first.
+ *
+ * Download first, build the FORK second. Never stock, and never silently: if both
+ * fail, this returns null with the reasons, and the caller reports rather than
+ * pretending an install happened.
+ */
+export async function acquireTernaryLlamaServer(opts: {
+  hardware: { platform: string; gpuBackend: "cuda" | "vulkan" | "none"; canBuildCuda: boolean };
+  run: Run;
+  log?: (line: string) => void;
+  /** Injected for tests. */
+  download?: typeof downloadPrismRuntime;
+  /** Injected for tests. Defaults to the real build. */
+  build?: (o: { hw: never; run: Run; log?: (l: string) => void; repo: string }) => Promise<string>;
+}): Promise<{ binPath: string; backend: "cuda" | "vulkan" | "cpu" } | null> {
+  const log = opts.log ?? (() => {});
+  const cudaVersion = await detectCudaVersion(opts.run);
+  const machine: PrismMachine = {
+    platform: opts.hardware.platform,
+    arch: process.arch,
+    gpuBackend: opts.hardware.gpuBackend,
+    cudaVersion,
+  };
+
+  const dl = opts.download ?? downloadPrismRuntime;
+  const prebuilt = await dl({ machine, log }).catch((err) => {
+    log(`PrismML 사전 빌드 받기 실패: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false as const, lines: [] };
+  });
+  if (prebuilt.ok && prebuilt.binPath) {
+    return {
+      binPath: prebuilt.binPath,
+      backend: opts.hardware.gpuBackend === "none" ? "cpu" : opts.hardware.gpuBackend,
+    };
+  }
+
+  log("사전 빌드가 없어 PrismML fork 에서 직접 빌드합니다. 10~40분 걸릴 수 있습니다.");
+  const build = opts.build ?? ((o) => import("./llamaCpp.js").then((m) => m.buildLlamaCpp(o as never)));
+  try {
+    const binPath = await build({
+      hw: opts.hardware as never,
+      run: opts.run,
+      log,
+      repo: PRISM_LLAMA_CPP_REPO,
+    } as never);
+    return { binPath, backend: opts.hardware.canBuildCuda ? "cuda" : "cpu" };
+  } catch (err) {
+    log(`PrismML fork 빌드 실패: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
