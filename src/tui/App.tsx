@@ -10,6 +10,7 @@ import { renderMarkdown } from "./markdown.js";
 import { buildArt, colored, SETTLED_SGR, BALL_SGR, LETTER_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 import { startupHintText, KEY_BINDINGS, formatKeyRow, KEY_COLUMN_WIDTH } from "./keybindings.js";
 import { getCapabilities, buildSequences, glyph, borderStyleFor } from "./terminal.js";
+import { createTransientLine } from "./transientLine.js";
 import { setCursorPlacement, clearCursorPlacement } from "./cursorPlacement.js";
 import { existsSync } from "node:fs";
 import { isLikelyPaste, looksLikePastedFilePath, formatPasteLabel, findTrailingPlaceholder, substitutePlaceholders } from "./pasteChip.js";
@@ -953,6 +954,8 @@ export function App({
   const [historyDraft, setHistoryDraft] = useState("");
   const [contextUsedRatio, setContextUsedRatio] = useState(0);
   const [planProgress, setPlanProgress] = useState<{ done: number; total: number } | null>(null);
+  const logRef = useRef<LogLine[]>([]);
+  logRef.current = log;
   // Requested directly: the "[compaction complete] ..." log line got
   // pushed out of view by later scrolling activity before it was ever
   // actually noticed. A persistent status-bar indicator instead — same
@@ -1140,6 +1143,19 @@ export function App({
   function pushLine(text: string, kind: LogLine["kind"]) {
     setLog((prev) => [...prev, { id: logIdCounter++, text, kind }].slice(-MAX_LOG_ENTRIES));
   }
+
+  /** Rewrites ONE row in place instead of appending a new one, so a long
+   *  download does not scroll the setup output off the top of the log. The
+   *  reducer is shared with its test so the two cannot drift. */
+  const transientLine = createTransientLine<LogLine>(
+    (): LogLine[] => logRef.current,
+    (next: LogLine[]) => setLog(next),
+    (text: string) => ({ id: -1, text, kind: "status" }) as unknown as LogLine,
+    (): number => logIdCounter++,
+    MAX_LOG_ENTRIES
+  );
+  const setTransient = (text: string) => transientLine.update(text);
+  const endTransient = () => transientLine.end();
 
   function pushAssistantDelta(text: string) {
     setLog((prev) => {
@@ -1871,6 +1887,8 @@ export function App({
     collapseDiffs,
     setQueue,
     pushStatus: (t: string) => pushLine(t, "status"),
+    setTransient,
+    endTransient,
     pushTool,
     finalizeToolCall,
     pushDiff: (t: string) => pushLine(t, "diff"),

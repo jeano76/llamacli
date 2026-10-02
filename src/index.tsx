@@ -31,6 +31,7 @@ import { selectModel } from "./setup/modelSelect.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
 import { switchModelAndServer } from "./setup/modelSwitch.js";
+import { formatProgress } from "./setup/download.js";
 import { totalmem } from "node:os";
 import { join } from "node:path";
 
@@ -1078,6 +1079,20 @@ async function main() {
                 projectRoot,
                 force: true,
                 log: (line) => ui?.pushStatus(`[reset] ${line}`),
+                // A 20 GB download reported through `log` scrolled the log for
+                // the entire transfer: each progress update appended a row, and
+                // the setup output the user needed was pushed off the top long
+                // before the download finished. The TUI owns the screen while
+                // this runs, so the default reporter's `\r\x1b[2K` would be
+                // painting escapes into an Ink-rendered region — its own comment
+                // says as much, and this is the seam it was left for.
+                //
+                // So the bar is ONE row, redrawn in place, and committed to the
+                // scrollback when the transfer ends.
+                onProgress: (defaultReporter) => (p) => {
+                  ui?.endTransient?.();
+                  ui?.setTransient?.(formatProgress(p));
+                },
               });
               const changed = describeReset(config as unknown as Record<string, unknown>, report.config);
               const inForce = describeInForce(report.config);

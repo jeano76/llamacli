@@ -751,6 +751,41 @@ sitting **beside the models** (`runtimeCandidatesNearModel`). `/models` only
 turns that result into something actionable. A discovery error is reported, never
 thrown.
 
+## Download progress is ONE redrawn line, not a scrolling log
+
+A `/reset` that has to fetch a 20 GB model reported every progress update through
+the normal log, and the log **appends**. So a transfer emitted hundreds of rows,
+and past `MAX_LOG_ENTRIES` the setup output the user needed was pushed off the
+top of the visible log long before the bytes arrived.
+
+The bar was never the problem — it was being **appended** rather than
+**redrawn**, which is the difference between a status readout and a log.
+
+```
+1000 updates (0% → 100% in 0.1% steps)
+  via pushStatus  →  1001 log rows      ← what the user saw
+  via setTransient →     1 log row      ← redrawn in place
+```
+
+`/reset` now passes the `onProgress` seam that already existed for exactly this
+and was never used. That seam is not incidental: the default reporter writes
+`\r\x1b[2K` to `process.stdout`, which is right when bootstrap owns a plain
+screen and **wrong** inside an Ink app rendering into the same terminal — its own
+comment says so. The TUI was written to take over, and nothing did.
+
+`setTransient` rewrites only its own row, so a `[reset] llama.cpp 빌드 완료`
+line emitted mid-transfer survives the next tick. `end()` freezes the last value
+into the scrollback, so a finished transfer still leaves a record. And if the row
+is trimmed away mid-transfer (the cap is 5000 and a chatty session can exceed
+it) it is **re-added rather than abandoned** — an abandoned id freezes the bar at
+an arbitrary percentage, which reads as a stalled download.
+
+The reducer is a pure function in `src/tui/transientLine.ts`, shared with its
+test. The first version of that test re-implemented the logic inside the test
+file, so it would have passed no matter what the app did; the second stamped the
+allocated id onto the created row, which it had not, and the bar grew the log
+anyway — caught immediately by the test that exists to catch exactly that.
+
 ## Validation on a bare machine and on Windows `cmd`
 
 The other three harnesses all assume a machine that already has things: a home
@@ -809,7 +844,7 @@ which is what made the four bugs findable at all.
 Three harnesses, one per axis, plus the unit suite. Run all of them:
 
 ```bash
-npm test                                              # 823 unit tests
+npm test                                              # 831 unit tests
 npx tsx scripts/persona_usability_check.ts           # terminal identity
 npx tsx scripts/project_persona_check.ts             # project shape
 npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
@@ -817,7 +852,7 @@ npx tsx scripts/tui_simulation_check.ts              # terminal capability + int
 
 | Axis | Harness | Checks | Status |
 |---|---|---:|---|
-| Unit / regression | `npm test` | **823** | pass |
+| Unit / regression | `npm test` | **831** | pass |
 | Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
 | Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
 | Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
