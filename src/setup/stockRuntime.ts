@@ -27,6 +27,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { extractTarGz } from "./tarGz.js";
 import { extractZip } from "./zip.js";
+import { normalizeSha256 } from "./checksum.js";
 import { downloadFile, type TransferProgress } from "./download.js";
 import { pickPublishedCudaTag, detectCudaVersion, archTag, verifyLlamaServer, type AcquireAttempt } from "./ternaryRuntime.js";
 import { binNameFor, buildLlamaCpp, LLAMA_CPP_REPO, type LlamaLocation } from "./llamaCpp.js";
@@ -36,7 +37,7 @@ import { executableExists } from "./fsUtil.js";
 export const STOCK_RUNTIME_HOME = join(homedir(), ".llamacli", "llama.cpp-prebuilt");
 export const STOCK_RELEASES_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5";
 
-export interface ReleaseAsset { name: string; url: string }
+export interface ReleaseAsset { name: string; url: string; /** GitHub's own `digest` ("sha256:…") for the asset, when the API gave one. */ sha256?: string }
 export interface Release { tag: string; assets: ReleaseAsset[] }
 
 /** Raw GitHub API → what is needed. Tolerant: a malformed entry is skipped. */
@@ -47,7 +48,11 @@ export function parseReleases(json: unknown): Release[] {
     if (!r || typeof r.tag_name !== "string" || !Array.isArray(r.assets)) continue;
     const assets: ReleaseAsset[] = r.assets
       .filter((a: any) => a && typeof a.name === "string" && typeof a.browser_download_url === "string")
-      .map((a: any) => ({ name: a.name, url: a.browser_download_url }));
+      .map((a: any) => ({
+        name: a.name,
+        url: a.browser_download_url,
+        ...(normalizeSha256(a.digest) ? { sha256: normalizeSha256(a.digest)! } : {}),
+      }));
     out.push({ tag: r.tag_name, assets });
   }
   return out;
@@ -214,7 +219,7 @@ export async function installStockRung(rung: StockRung, opts: InstallRungOptions
   const files = all.map((a) => ({ a, dest: join(base, a.name) }));
   try {
     for (const { a, dest } of [...files.slice(1), files[0]]) {
-      await dl(a.url, dest, { fetchImpl: opts.fetchImpl, onProgress: opts.onProgress, label: a.name } as never);
+      await dl(a.url, dest, { fetchImpl: opts.fetchImpl, onProgress: opts.onProgress, label: a.name, expectedSha256: a.sha256 } as never);
     }
     await rm(root, { recursive: true, force: true });
     await mkdir(root, { recursive: true });

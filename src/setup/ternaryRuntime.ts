@@ -37,6 +37,7 @@ import { join } from "node:path";
 import { extractTarGz } from "./tarGz.js";
 import { extractZip } from "./zip.js";
 import { downloadFile } from "./download.js";
+import { normalizeSha256 } from "./checksum.js";
 import type { TransferProgress } from "./download.js";
 import type { Run } from "./llamaCpp.js";
 import type { GpuBackend } from "./hardware.js";
@@ -260,6 +261,22 @@ export async function detectCudaVersion(run: Run): Promise<string | null> {
   return null;
 }
 
+/** Asset name → SHA-256, from the fork's release (GitHub publishes a `digest` per asset). */
+export async function fetchPrismDigests(fetchImpl: typeof fetch = fetch): Promise<Map<string, string>> {
+  const res = await fetchImpl(`https://api.github.com/repos/PrismML-Eng/llama.cpp/releases/tags/${PRISM_RELEASE_TAG}`, {
+    headers: { Accept: "application/vnd.github+json", "User-Agent": "llamacli" },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = (await res.json()) as { assets?: { name?: string; digest?: string }[] };
+  const out = new Map<string, string>();
+  for (const a of json.assets ?? []) {
+    const sha = normalizeSha256(a.digest);
+    if (a.name && sha) out.set(a.name, sha);
+  }
+  return out;
+}
+
 export interface DownloadRuntimeOptions {
   machine: PrismMachine;
   /** Defaults to PRISM_RUNTIME_HOME. */
@@ -267,6 +284,8 @@ export interface DownloadRuntimeOptions {
   log?: (line: string) => void;
   onProgress?: (p: TransferProgress) => void;
   fetchImpl?: typeof fetch;
+  /** Injected for tests: asset name → SHA-256 from the release. */
+  digests?: (fetchImpl?: typeof fetch) => Promise<Map<string, string>>;
   /** Injected for tests. Defaults to the extractor the asset's format calls for. */
   extract?: (archive: string, dest: string, opts: { strip: number }) => string[];
   /** Injected for tests. */
@@ -333,11 +352,18 @@ export async function downloadPrismRuntime(
 
   // The runtime bundle first: if it fails there is no point fetching a server that
   // cannot load without it, and the failure is reported before a large transfer.
+  // The release's own digests, best effort: a failure to read them (offline API, rate limit)
+  // costs only the check, never the install.
+  const digests = await (opts.digests ?? fetchPrismDigests)(opts.fetchImpl).catch(() => new Map<string, string>());
   const wanted = [asset, ...(asset.companions ?? []).map((c) => ({ asset: c, url: prismAssetUrl(c) }))];
   try {
     for (const a of wanted) {
       const dest = join(base, a.asset);
-      await dl(a.url, dest, { fetchImpl: opts.fetchImpl, onProgress: opts.onProgress });
+      await dl(a.url, dest, {
+        fetchImpl: opts.fetchImpl,
+        onProgress: opts.onProgress,
+        expectedSha256: digests.get(a.asset),
+      });
     }
   } catch (err) {
     await Promise.all(wanted.map((a) => rm(join(base, a.asset), { force: true }).catch(() => {})));

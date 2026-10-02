@@ -37,7 +37,8 @@
  * local `http.Server` with no network and no real multi-gigabyte files.
  */
 
-import { open, rename, stat } from "node:fs/promises";
+import { open, rename, rm, stat, writeFile } from "node:fs/promises";
+import { sha256File, normalizeSha256, ChecksumMismatchError } from "./checksum.js";
 import {
   loadProgress,
   saveProgress,
@@ -71,9 +72,11 @@ export interface TransferProgress {
   etaSeconds: number;
   /** 0..100, or -1 when the total size is unknown. */
   percent: number;
+  /** "verify": the finished file is being hashed (SHA-256) — `receivedBytes` is the bytes
+   *  hashed so far. Same one-line channel as the transfer itself. */
   /** "build" for a compile reported through the same one-line channel as a download,
    *  so the TUI redraws it in place with no change of its own. Absent = a transfer. */
-  phase?: "build";
+  phase?: "build" | "verify";
   /** Seconds since the compile started; only meaningful for phase "build". */
   elapsedSeconds?: number;
 }
@@ -186,6 +189,10 @@ export function progressBar(percent: number, width = 24): string {
  *  successive updates overwrite cleanly on a single terminal row — the reason
  *  a caller can print this in a loop without flooding the scrollback. */
 export function formatProgress(p: TransferProgress, barWidth = 24): string {
+  if (p.phase === "verify") {
+    const pct = p.percent >= 0 ? `${p.percent.toFixed(0)}%` : "?%";
+    return `[${progressBar(p.percent, barWidth)}] ${pct}  SHA-256 검증 중 ${formatBytes(p.receivedBytes)} / ${formatBytes(p.totalBytes)}  ${p.label}`;
+  }
   if (p.phase === "build") {
     const pct = p.percent >= 0 ? `${p.percent.toFixed(0)}%` : "?%";
     const mins = Math.floor((p.elapsedSeconds ?? 0) / 60);
@@ -305,6 +312,16 @@ export interface DownloadOptions {
    *  twice, which for an N-shard model is 2N extra round-trips before the
    *  first byte moves. */
   preProbed?: { totalBytes: number; supportsRanges: boolean; finalUrl: string; etag?: string };
+  /** The publisher's SHA-256 for this file (any of "sha256:…", bare hex, quoted etag).
+   *  When given, the file this call produces is hashed before it is returned. A mismatch
+   *  deletes it (and its resume state) and re-fetches ONCE from scratch — a resume that
+   *  stitched bytes from two versions of the object is the usual cause — then throws
+   *  `ChecksumMismatchError`. Never applied to a file that was already complete when the
+   *  call started: that one was not produced here, may legitimately differ from what the
+   *  Hub serves today, and deleting a model that works would be worse than not checking. */
+  expectedSha256?: string;
+  /** Internal: this call is the single clean retry after a mismatch. */
+  _verifyRetry?: boolean;
 }
 
 export interface DownloadResult {
@@ -312,6 +329,10 @@ export interface DownloadResult {
   bytes: number;
   /** True when the file was fetched as parallel byte-ranges. */
   parallel: boolean;
+  /** True when the file's SHA-256 was checked against the publisher's and matched. */
+  sha256Verified?: boolean;
+  /** Connections actually used (1 for a single stream). */
+  connections?: number;
 }
 
 /** Where an in-progress download is staged. Kept as a function rather than an
@@ -356,6 +377,7 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
     label = path.split("/").pop() ?? path,
   } = opts;
 
+  const expected = normalizeSha256(opts.expectedSha256);
   const probe = opts.preProbed ?? (await probeUrl(url, fetchImpl, signal));
   const transfer = new Transfer(label, probe.totalBytes, now);
 
@@ -397,12 +419,25 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
     onProgress?.(transfer.progress());
     // Promote a complete .part into its final name so the caller ends up with
     // a usable file, which is the whole point of noticing it was complete.
+    let promoted = false;
     if (atPart >= completeAt && atFinal < completeAt) {
-      try { await rename(partPath, path); } catch { /* best effort */ }
+      try { await rename(partPath, path); promoted = true; } catch { /* best effort */ }
       // The .part is gone, so its state must go too — a stale sidecar at the
       // same path would let a later, DIFFERENT download inherit a "complete"
       // verdict from this one.
       await clearProgress(partPath);
+    }
+    // A file we just promoted was produced by an earlier run of THIS downloader, so it is
+    // checked. One that was already complete under its final name is left alone (see
+    // `expectedSha256`).
+    if (promoted && expected) {
+      const v = await verifyOrDiscard(path, expected, label, onProgress, signal);
+      if (!v.ok) {
+        if (!opts._verifyRetry) return downloadFile(url, path, { ...opts, _verifyRetry: true });
+        throw new ChecksumMismatchError(path, expected, v.actual);
+      }
+      await recordVerified(path, expected);
+      return { path, bytes: completeAt, parallel: false, sha256Verified: true, connections: 0 };
     }
     return { path, bytes: completeAt, parallel: false };
   }
@@ -442,13 +477,54 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
     // Only now is the file whole: rename is atomic on the same filesystem, so
     // a reader never observes a half-written model at `path`.
     await rename(partPath, path);
+    await clearProgress(partPath);
     const finalTotal = transfer.progress().totalBytes;
     onProgress?.(transfer.progress());
-    return { path, bytes: finalTotal > 0 ? finalTotal : (await existingSize(path)), parallel: probe.supportsRanges };
+    const used = probe.supportsRanges && probe.totalBytes > 0 ? connections : 1;
+    if (expected) {
+      const v = await verifyOrDiscard(path, expected, label, onProgress, signal);
+      if (!v.ok) {
+        if (!opts._verifyRetry) return downloadFile(url, path, { ...opts, _verifyRetry: true });
+        throw new ChecksumMismatchError(path, expected, v.actual);
+      }
+      await recordVerified(path, expected);
+      return { path, bytes: finalTotal > 0 ? finalTotal : (await existingSize(path)), parallel: probe.supportsRanges, sha256Verified: true, connections: used };
+    }
+    return { path, bytes: finalTotal > 0 ? finalTotal : (await existingSize(path)), parallel: probe.supportsRanges, connections: used };
   } catch (err) {
     try { await handle.close(); } catch { /* already closed */ }
     throw err;
   }
+}
+
+/** Leaves `<file>.sha256` beside a verified download, in the format `sha256sum -c` reads. */
+async function recordVerified(path: string, sha: string): Promise<void> {
+  await writeFile(`${path}.sha256`, `${sha}  ${path.split("/").pop()}\n`, "utf8").catch(() => {});
+}
+
+/** Hashes `path` and compares it with `expected`. On a match returns true. On a mismatch
+ *  removes the file and every piece of resume state so the next attempt starts clean. */
+async function verifyOrDiscard(
+  path: string,
+  expected: string,
+  label: string,
+  onProgress: ((p: TransferProgress) => void) | undefined,
+  signal: AbortSignal | undefined
+): Promise<{ ok: true } | { ok: false; actual: string }> {
+  const started = Date.now();
+  const actual = await sha256File(path, {
+    signal,
+    onProgress: ({ hashedBytes, totalBytes }) =>
+      onProgress?.({
+        label, receivedBytes: hashedBytes, totalBytes, bytesPerSecond: hashedBytes / Math.max(0.001, (Date.now() - started) / 1000),
+        etaSeconds: -1, percent: totalBytes > 0 ? (hashedBytes / totalBytes) * 100 : -1, phase: "verify",
+      }),
+  });
+  if (actual === expected) return { ok: true };
+  await rm(path, { force: true });
+  await rm(partPathOf(path), { force: true });
+  await clearProgress(partPathOf(path));
+  return { ok: false, actual };
 }
 
 async function probeUrl(url: string, fetchImpl: typeof fetch, signal?: AbortSignal): Promise<ProbeResult> {

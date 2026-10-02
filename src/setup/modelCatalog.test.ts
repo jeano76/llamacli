@@ -235,3 +235,46 @@ test("chooseModel: with no Bonsai available, a small box still gets the 9B rathe
   const c = chooseModel({ vramTotalBytes: 0, vramFreeBytes: 0, ramTotalBytes: 4 * GiB, candidates35b: [], candidates9b: c9 });
   assert.equal(c.candidate.filename, "Ornith-1.5-9B-Q4_K_M.gguf");
 });
+
+// ── the model the user SELECTED is the one that is downloaded ──────────────
+
+import { pickPinnedCandidate, modelFamilyOf } from "./modelCatalog.js";
+
+const cand2 = (filename: string, gib = 1): ModelCandidate => ({ repo: "r", filename, sizeBytes: gib * 1024 ** 3, url: "u" });
+
+test("modelFamilyOf strips the quant and shard suffix", () => {
+  assert.equal(modelFamilyOf("Ternary-Bonsai-8B-PTQ1_0.gguf"), "Ternary-Bonsai-8B");
+  assert.equal(modelFamilyOf("Ternary-Bonsai-2-27B-PQ2_0.gguf"), "Ternary-Bonsai-2-27B");
+  assert.equal(modelFamilyOf("Ornith-1.5-35B-A3B-Q4_K_M.gguf"), "Ornith-1.5-35B-A3B");
+  assert.equal(modelFamilyOf("Ternary-Bonsai-4B-Q2_0_g64.gguf"), "Ternary-Bonsai-4B");
+  assert.equal(modelFamilyOf("Model-Q4_K_M-00001-of-00003.gguf"), "Model");
+});
+
+test("a selected 8B is never answered with the 27B — the field bug (picked #4, downloaded 5.5 GiB)", () => {
+  const all = [
+    cand2("Ternary-Bonsai-2-27B-PTQ1_0.gguf", 5.5),
+    cand2("Ternary-Bonsai-8B-F16.gguf", 15.3),
+    cand2("Ternary-Bonsai-8B-PQ2_0.gguf", 2.0),
+    cand2("Ternary-Bonsai-8B-Q2_0.gguf", 2.0),
+    cand2("Ornith-1.5-9B-Q4_K_M.gguf", 5.1),
+  ];
+  const pick = pickPinnedCandidate(all, "Ternary-Bonsai-8B-PTQ1_0.gguf")!;
+  assert.match(pick.filename, /^Ternary-Bonsai-8B-/);
+  assert.ok(pick.sizeBytes < 3 * 1024 ** 3, "the small model, not the 5.5 GiB one");
+  assert.ok(!pick.filename.includes("F16"), "and not the 15 GiB full-precision file when a quant exists");
+});
+
+test("an exact filename wins over a same-family substitute", () => {
+  const all = [cand2("Ternary-Bonsai-8B-PQ2_0.gguf"), cand2("Ternary-Bonsai-8B-PTQ1_0.gguf")];
+  assert.equal(pickPinnedCandidate(all, "Ternary-Bonsai-8B-PQ2_0.gguf")!.filename, "Ternary-Bonsai-8B-PQ2_0.gguf");
+});
+
+test("nothing in the family means null — never a different model", () => {
+  assert.equal(pickPinnedCandidate([cand2("Ternary-Bonsai-2-27B-PTQ1_0.gguf")], "Ternary-Bonsai-8B-PTQ1_0.gguf"), null);
+  assert.equal(pickPinnedCandidate([], "x.gguf"), null);
+});
+
+test("a 4B request does not match the 4B-adjacent names of other families, and mmproj files are ignored", () => {
+  const all = [cand2("Ternary-Bonsai-4B-mmproj-Q8_0.gguf", 0.6), cand2("Ternary-Bonsai-4B-Q2_0.gguf", 1.0)];
+  assert.equal(pickPinnedCandidate(all, "Ternary-Bonsai-4B-PTQ1_0.gguf")!.filename, "Ternary-Bonsai-4B-Q2_0.gguf");
+});

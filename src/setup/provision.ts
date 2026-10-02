@@ -53,6 +53,9 @@ import type { Hardware } from "./hardware.js";
 
 export interface ProvisionOptions {
   projectRoot: string;
+  /** Filename of the model that was SELECTED. Passed through so provisioning downloads that
+   *  model rather than re-choosing one for this hardware. */
+  modelFilename?: string;
   /** The port the replacement server must keep using. Pinned, never re-planned. */
   port: number;
   hardware: Hardware;
@@ -121,6 +124,7 @@ export async function provisionForSwitch(opts: ProvisionOptions): Promise<Provis
       // "No server to adopt." The one on this port is serving the previous model
       // and is about to be replaced; adopting it would skip every step below.
       detectServer: async () => ({ kind: "none" as const }),
+      pinModelFilename: opts.modelFilename,
       probe,
       log: (line) => {
         lines.push(line);

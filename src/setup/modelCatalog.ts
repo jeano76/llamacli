@@ -40,8 +40,13 @@
  * rather than to a dead first run.
  */
 
+import { normalizeSha256 } from "./checksum.js";
+
 /** A downloadable model file. */
 export interface ModelCandidate {
+  /** The Hub's SHA-256 for this file (`lfs.sha256` of the repo listing), when it gave one.
+   *  Lets the downloader verify the bytes it produced. */
+  sha256?: string;
   repo: string;
   filename: string;
   /** Bytes, from the Hub's file listing, when available. */
@@ -176,6 +181,39 @@ const GiB = 1024 ** 3;
 /** Quants in descending quality, best-first. `Q4_K_M` is the sweet spot the
  *  request named; the others are only reached if it is absent from a repo. */
 const QUANT_PREFERENCE = ["Q4_K_M", "Q5_K_M", "Q6_K", "Q4_K_S", "Q3_K_XL", "Q3_K_M", "Q2_K"];
+
+/** `Ternary-Bonsai-8B-PTQ1_0.gguf` → `Ternary-Bonsai-8B`; the model family without its quant. */
+export function modelFamilyOf(filename: string): string {
+  const base = filename.replace(/\.gguf$/i, "").replace(/-\d{5}-of-\d{5}$/, "");
+  const quant = /-(PTQ1_0|PQ2_0|Q\d_0(?:_g\d+)?|Q\d_K(?:_[SML]|_XL)?|IQ\d_\w+|BF16|F16|F32)$/i.exec(base);
+  return quant ? base.slice(0, quant.index) : base;
+}
+
+/**
+ * The candidate that IS the model the user selected, out of everything the Hub lists.
+ *
+ * An exact filename wins. Failing that, the same family (`Ternary-Bonsai-8B`) in the best
+ * available quant: the model table estimates a quant per rung from a catalogue that is
+ * not always what the repo publishes (the 8B has no PTQ1_0 file; its smallest are PQ2_0
+ * and Q2_0), and refusing there would make a valid selection undownloadable. Anything
+ * outside the family is NEVER returned — substituting a different model for the chosen one
+ * is the bug this exists to prevent (a selected 8B downloaded a 27B).
+ */
+export function pickPinnedCandidate(candidates: ModelCandidate[], filename: string): ModelCandidate | null {
+  const exact = candidates.find((c) => c.filename.toLowerCase() === filename.toLowerCase());
+  if (exact) return exact;
+  const family = modelFamilyOf(filename).toLowerCase();
+  const sameFamily = candidates.filter(
+    (c) => !/mmproj/i.test(c.filename) && modelFamilyOf(c.filename).toLowerCase() === family
+  );
+  if (sameFamily.length === 0) return null;
+  const rank = (f: string) => {
+    const b = BONSAI_QUANT_PREFERENCE.findIndex((q) => f.includes(q));
+    if (b !== -1) return b;
+    return BONSAI_QUANT_PREFERENCE.length + quantRank(f);
+  };
+  return [...sameFamily].sort((a, b) => rank(a.filename) - rank(b.filename) || a.filename.localeCompare(b.filename))[0];
+}
 
 function quantRank(filename: string): number {
   const i = QUANT_PREFERENCE.findIndex((q) => filename.includes(q));
@@ -358,7 +396,7 @@ export async function listGgufFiles(
   // what lets the progress bar have a denominator before anything downloads.
   const res = await doFetch(`${HF_ENDPOINT}/api/models/${repo}?blobs=true`, { signal: opts.signal });
   if (!res.ok) throw new Error(`HuggingFace 파일 목록 실패 (${repo}): HTTP ${res.status}`);
-  const json = (await res.json()) as { siblings?: { rfilename?: string; size?: number }[] };
+  const json = (await res.json()) as { siblings?: { rfilename?: string; size?: number; lfs?: { sha256?: string } }[] };
   return (json.siblings ?? [])
     .filter((s) => s.rfilename?.toLowerCase().endsWith(".gguf"))
     .map((s) => ({
@@ -366,6 +404,7 @@ export async function listGgufFiles(
       filename: s.rfilename!,
       sizeBytes: s.size ?? 0,
       url: `${HF_ENDPOINT}/${repo}/resolve/main/${s.rfilename}`,
+      ...(normalizeSha256(s.lfs?.sha256) ? { sha256: normalizeSha256(s.lfs?.sha256)! } : {}),
     }));
 }
 

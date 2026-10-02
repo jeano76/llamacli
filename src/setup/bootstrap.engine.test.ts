@@ -100,3 +100,52 @@ test("offline with no engine reports it, and acquires nothing", () =>
     assert.deepEqual(s.calls, { stock: 0, ternary: 0 });
     assert.ok(report.steps.some((x) => x.name === "llama.cpp" && !x.ok));
   }));
+
+// ── a pinned (selected) model is downloaded as chosen ───────────────────────
+
+test("pinModelFilename: selecting the 8B downloads the 8B even though the hardware picker would take the 27B", () =>
+  withTempDir(async (dir) => {
+    const modelsDir = join(dir, "models");
+    await mkdir(modelsDir, { recursive: true });
+    // Present, so the "download" is a no-op — what is under test is WHICH model is chosen.
+    await writeFile(join(modelsDir, "Ternary-Bonsai-8B-PQ2_0.gguf"), Buffer.alloc(4096));
+    const siblings = (files: [string, number][]) => ({ siblings: files.map(([rfilename, size]) => ({ rfilename, size })) });
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as any;
+      if (u.includes("Ternary-Bonsai-2-27B-gguf")) return ok(siblings([["Ternary-Bonsai-2-27B-PTQ1_0.gguf", 5_500_000_000]]));
+      if (u.includes("Ternary-Bonsai-8B-gguf")) return ok(siblings([["Ternary-Bonsai-8B-PQ2_0.gguf", 4096], ["Ternary-Bonsai-8B-F16.gguf", 16_000_000_000]]));
+      return { ok: false, status: 404, json: async () => ({}) } as any;
+    }) as unknown as typeof fetch;
+    const s = spies();
+    const report = await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
+      detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
+      modelsDir, fetchImpl, acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+    });
+    assert.match(report.model?.candidate.filename ?? "", /^Ternary-Bonsai-8B-/, JSON.stringify(report.steps));
+    assert.ok(!/27B/.test(report.model?.candidate.filename ?? ""));
+    assert.match(report.model?.reason ?? "", /선택한 모델/);
+  }));
+
+test("pinModelFilename: a family the Hub does not have FAILS the step instead of downloading something else", () =>
+  withTempDir(async (dir) => {
+    const fetchImpl = (async (url: any) => {
+      if (String(url).includes("Ternary-Bonsai-2-27B-gguf")) {
+        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", size: 5_500_000_000 }] }) } as any;
+      }
+      return { ok: false, status: 404, json: async () => ({}) } as any;
+    }) as unknown as typeof fetch;
+    const s = spies();
+    const report = await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
+      detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
+      modelsDir: join(dir, "models"), fetchImpl, acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+    });
+    assert.equal(report.model, undefined, "no model was chosen on the user's behalf");
+    const step = report.steps.find((x) => x.name === "모델 결정");
+    assert.equal(step?.ok, false);
+    assert.match(step?.detail ?? "", /다른 모델로 바꿔 받지 않습니다/);
+  }));

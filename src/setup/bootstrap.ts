@@ -36,7 +36,7 @@ import {
 import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } from "./ports.js";
 import { acquireTernaryLlamaServer, PRISM_LLAMA_CPP_REPO } from "./ternaryRuntime.js";
 import { acquireStockLlamaServer } from "./stockRuntime.js";
-import { chooseModel, resolveModel, type ModelChoice } from "./modelCatalog.js";
+import { chooseModel, resolveModel, pickPinnedCandidate, type ModelChoice } from "./modelCatalog.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
 import { discoverRunningServer, modelLoadBudgetMs, type Discovery } from "../backend/detect.js";
@@ -101,6 +101,12 @@ export interface BootstrapOptions {
    *  the keys a human typed. `/reset` uses this; a normal launch never does,
    *  because the bootstrap being idempotent is the whole point. */
   force?: boolean;
+  /** The model the CALLER has already chosen (a `/models` selection), by filename. When the
+   *  file is not on disk the bootstrap downloads THIS model — it does not re-decide from
+   *  the hardware. Without it, selecting the 1.9 GiB 8B ran the hardware picker, which
+   *  chose the 27B and downloaded 5.5 GiB the user never asked for. Never substituted:
+   *  if the Hub has nothing in this family the step fails instead. */
+  pinModelFilename?: string;
   /** Candidate .gguf files already present in the models dir. Injected in
    *  tests; read from disk otherwise. */
   listExistingModels?: (dir: string) => Promise<{ path: string; sizeBytes: number }[]>;
@@ -511,6 +517,27 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     const gpu = hardware.gpus[0];
     await step("모델 결정", async () => {
       const { c35, c9, bonsai } = await resolveModel({ env, fetchImpl: opts.fetchImpl, log });
+      if (opts.pinModelFilename) {
+        const all = [...c35, ...c9, ...Object.values(bonsai).flat()];
+        const pinned = pickPinnedCandidate(all, opts.pinModelFilename);
+        if (!pinned) {
+          throw new Error(
+            `선택한 모델(${opts.pinModelFilename})을 Hub 에서 찾지 못했습니다. ` +
+              `다른 모델로 바꿔 받지 않습니다 — /models 로 다시 선택하거나 모델 저장소 설정을 확인하세요.`
+          );
+        }
+        model = {
+          candidate: pinned,
+          reason:
+            `선택한 모델 ${pinned.filename} 을 받습니다 (${(pinned.sizeBytes / 1024 ** 3).toFixed(1)} GiB)` +
+            (pinned.filename.toLowerCase() !== opts.pinModelFilename.toLowerCase()
+              ? ` — ${opts.pinModelFilename} 은 저장소에 없어 같은 모델의 ${pinned.filename} 로 받습니다.`
+              : "."),
+          alternatives: [],
+        };
+        log(model.reason);
+        return model.reason;
+      }
       model = chooseModel({
         vramTotalBytes: gpu?.vramTotalBytes ?? 0,
         vramFreeBytes: gpu?.vramFreeBytes ?? 0,
@@ -690,6 +717,8 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
             fetchImpl: opts.fetchImpl,
             onProgress: reportDefault,
             signal: downloadAbort.signal,
+            // The Hub's own hash for this file: the result is hashed before it is trusted.
+            expectedSha256: model!.candidate.sha256,
           });
           } catch (err) {
             if (downloadAbort.signal.aborted) {
@@ -697,7 +726,11 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
             }
             throw err;
           }
-          return `${result.bytes} 바이트 다운로드 완료 (${result.parallel ? "병렬 range" : "단일 스트림"})`;
+          return (
+            `${result.bytes} 바이트 다운로드 완료 ` +
+            `(${result.parallel ? `병렬 ${result.connections ?? ""}연결`.replace("연결", "연결 range") : "단일 스트림"}` +
+            `${result.sha256Verified ? ", SHA-256 검증 완료" : model!.candidate.sha256 ? "" : ", 해시 미제공 — 검증 안 함"})`
+          );
         });
         modelPath = dest;
       }

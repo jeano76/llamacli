@@ -1176,6 +1176,7 @@ async function main() {
                 );
                 const provisioned = await provisionForSwitch({
                   projectRoot,
+                  modelFilename: result.modelPath.split("/").pop(),
                   port: result.port,
                   hardware: hw,
                   log: (line) => ui?.pushStatus(`  · ${line}`),
