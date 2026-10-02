@@ -45,6 +45,11 @@ export interface ServerReport {
   fromRunningServer?: boolean;
   /** The running server's own settings, parsed from its command line. */
   serverArgs?: ParsedServerArgs;
+  /** Set when the model the RUNNING server loaded differs from the one the config names —
+   *  e.g. a `/models` selection was recorded but the server was never switched. A restart
+   *  would then change which model is served, which the user must be told before it
+   *  happens, not discover after. */
+  modelMismatch?: { serving: string; configured: string };
   /** What discovery found for the configured model, and whether it can read it. */
   build?: {
     binPath: string;
@@ -108,6 +113,11 @@ export async function reportServer(opts: ReportOptions): Promise<ServerReport> {
   const live = resolved.servers?.find((x) => x.port === port);
   const serverArgs = live ? parseLlamaServerArgs(live.cmdline) : undefined;
   let fromRunningServer = false;
+  const base = (p: string) => p.split("/").pop() ?? p;
+  const modelMismatch =
+    live && serverArgs?.modelPath && configuredModel && base(serverArgs.modelPath) !== base(configuredModel)
+      ? { serving: serverArgs.modelPath, configured: configuredModel }
+      : undefined;
   if (live && !configuredModel && serverArgs?.modelPath) { configuredModel = serverArgs.modelPath; fromRunningServer = true; }
   if (live && !configuredBin && live.exe) { configuredBin = live.exe; fromRunningServer = true; }
 
@@ -149,12 +159,13 @@ export async function reportServer(opts: ReportOptions): Promise<ServerReport> {
     stalePort,
     fromRunningServer,
     serverArgs,
+    modelMismatch,
     configuredModel,
     configuredBin,
     owner,
     build,
-    summary: summarize({ port, portDiscovered: configuredPort === undefined || resolved.source === "live", stalePort, configuredModel, owner, build }),
-    restartPlan: restartPlan({ configuredModel, configuredBin, port, owner, build }),
+    summary: summarize({ port, portDiscovered: configuredPort === undefined || resolved.source === "live", stalePort, configuredModel, owner, build, modelMismatch }),
+    restartPlan: restartPlan({ configuredModel, configuredBin, port, owner, build, modelMismatch }),
   };
 }
 
@@ -162,6 +173,7 @@ function summarize(r: {
   port: number;
   portDiscovered: boolean;
   stalePort?: { recorded: number; actual: number };
+  modelMismatch?: ServerReport["modelMismatch"];
   configuredModel?: string;
   owner: PortOwner;
   build?: ServerReport["build"];
@@ -173,7 +185,11 @@ function summarize(r: {
     `포트 ${r.port}${r.portDiscovered ? " (실행 중인 서버에서 확인)" : ""}` +
       (r.stalePort ? ` — config 에는 ${r.stalePort.recorded} 로 기록돼 있어 실제와 다릅니다` : ""),
   ];
-  if (r.configuredModel) parts.push(`모델 ${r.configuredModel.split("/").pop()}`);
+  if (r.modelMismatch) {
+    // Two different models, and which one is actually answering is the first thing to know.
+    parts.push(`실행 중인 서버의 모델 ${r.modelMismatch.serving.split("/").pop()}`);
+    parts.push(`config 의 모델 ${r.modelMismatch.configured.split("/").pop()} (서버와 다름)`);
+  } else if (r.configuredModel) parts.push(`모델 ${r.configuredModel.split("/").pop()}`);
   switch (r.owner.kind) {
     case "none":
       parts.push("서버 없음 (포트 비어 있음)");
@@ -198,6 +214,7 @@ function summarize(r: {
 }
 
 function restartPlan(r: {
+  modelMismatch?: ServerReport["modelMismatch"];
   configuredModel?: string;
   configuredBin?: string;
   port: number;
@@ -222,5 +239,8 @@ function restartPlan(r: {
   if (r.owner.kind === "unknown" || r.owner.kind === "foreign") {
     return `포트 ${r.port} 의 사용자를 확인할 수 없어 재시작하지 않습니다 (${r.owner.kind}).`;
   }
-  return `기존 서버를 종료하고 같은 포트(${r.port})에서 ${r.configuredModel.split("/").pop()} 로 다시 올립니다.`;
+  const change = r.modelMismatch
+    ? ` 모델이 ${r.modelMismatch.serving.split("/").pop()} → ${r.configuredModel.split("/").pop()} 로 바뀝니다.`
+    : "";
+  return `기존 서버를 종료하고 같은 포트(${r.port})에서 ${r.configuredModel.split("/").pop()} 로 다시 올립니다.${change}`;
 }

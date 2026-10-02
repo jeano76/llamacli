@@ -277,3 +277,37 @@ test("a config that DOES record the model is never overridden by the running ser
   assert.equal(r.configuredBin, "/opt/llama-server");
   assert.equal(r.fromRunningServer, false);
 });
+
+test("the config names one model but the running server loaded another: both are shown and the restart says it will change", async () => {
+  // Field state: a /models selection (8B) was recorded in config.yaml but the server on
+  // 8084 was never switched and still serves the 27B. Reporting only the config's model
+  // said the opposite of what is answering.
+  const r = await reportServer(
+    deps({
+      config: cfg({ port: 8084, modelPath: "/home/jeano/models/Ternary-Bonsai-8B-PTQ1_0.gguf" }),
+      resolvePort: async (rec) => (await import("./modelSwitch.js")).resolveLiveServerPort(rec, {
+        servers: [{ pid: 128976, port: 8084, cmdline: HAND }],
+      }),
+      detectOwner: async () => ({ kind: "ours", pid: 128976 }),
+    })
+  );
+  assert.deepEqual(r.modelMismatch, {
+    serving: "/media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    configured: "/home/jeano/models/Ternary-Bonsai-8B-PTQ1_0.gguf",
+  });
+  assert.match(r.summary, /실행 중인 서버의 모델 Ternary-Bonsai-2-27B/);
+  assert.match(r.summary, /config 의 모델 Ternary-Bonsai-8B.*서버와 다름/);
+  assert.match(r.restartPlan, /Ternary-Bonsai-2-27B-PTQ1_0\.gguf → Ternary-Bonsai-8B-PTQ1_0\.gguf 로 바뀝니다/);
+});
+
+test("same model, no mismatch noise", async () => {
+  const r = await reportServer(
+    deps({
+      config: cfg({ port: 8084, modelPath: "/elsewhere/Ternary-Bonsai-2-27B-PTQ1_0.gguf" }),
+      resolvePort: async (rec) => (await import("./modelSwitch.js")).resolveLiveServerPort(rec, { servers: [{ pid: 1, port: 8084, cmdline: HAND }] }),
+      detectOwner: async () => ({ kind: "ours", pid: 1 }),
+    })
+  );
+  assert.equal(r.modelMismatch, undefined);
+  assert.doesNotMatch(r.summary, /서버와 다름/);
+});
