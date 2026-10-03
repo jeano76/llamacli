@@ -381,6 +381,88 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 > 프로젝트에서 다른 `.llamacli/skills/*.md` 파일과 똑같은 방식으로 덮어쓰거나
 > 추가할 수 있다.
 
+## 확정 모델: Qwen3.6-35B-A3B
+
+**2026-10-03 사용자 결정으로 Qwen3.6-35B-A3B (`UD-Q4_K_M`) 를 이 설치의 확정 모델로 한다.**
+비교 대상은 로컬에 있던 Ornith-1.5-35B-A3B 와 Ternary-Bonsai-2 27B 였고, 측정 근거는
+`docs/model-bench-2026-10-03.md`(속도·컴팩션)와 `docs/coding-eval-2026-10-03.md`(코딩)에 있다.
+
+### 서버 설정 (8 GB RTX 2070 SUPER 기준)
+
+| 항목 | 값 |
+|---|---|
+| 모델 | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (20.61 GiB, MoE: 256 experts, 활성 약 3B) |
+| 엔진 | stock llama.cpp (PrismML fork 불필요) |
+| **`--n-cpu-moe`** | **31** |
+| 컨텍스트 | **20,480** (`-c 20480`, `-np 1`, `-no-kvu`) |
+| 오프로드 / 캐시 | `-ngl 999 -fa on`, KV `q8_0`/`q8_0` |
+| 스레드 / 배치 | `-t 6 -tb 11 -b 2048 -ub 512` |
+| 포트 | 8080 |
+
+```yaml
+# .llamacli/config.yaml 의 llama 블록
+llama:
+  binPath: ~/llama.cpp/build-opt/bin/llama-server
+  modelPath: /media/<user>/<disk>/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+  port: 8080
+  contextSize: 20480
+  threads: 6
+  threadsBatch: 11
+  gpuLayers: 999
+  cpuMoeLayers: 31
+  batchSize: 2048
+  ubatchSize: 512
+  parallel: 1
+  flashAttn: true
+  cacheTypeK: q8_0
+  cacheTypeV: q8_0
+```
+
+### 측정된 성능 (이 머신, `llama-bench`, `--n-cpu-moe 31`)
+
+| | 값 |
+|---|---|
+| tg 깊이 8192 / 16384 | **42.35 / 40.14 t/s** |
+| pp 깊이 16384 | 288.3 t/s |
+| 실제 서버에서 생성 속도 | 약 39 t/s |
+| 컨텍스트 / 컴팩션 주기 | 20,480 토큰 / 주기당 약 7,168 토큰(에이전트 스텝으로 약 3스텝) |
+| 컴팩션 1회 지연 | 약 41 s (요약 생성 + 재 prefill) |
+
+### 코딩 평가 (52문제, 코드를 실제로 실행해 채점)
+
+| | HumanEval 41 | 직접 만든 어려운 문제 11 | 합계 52 |
+|---|---|---|---|
+| **Qwen3.6 (확정)** | 39 | 9 | **48** |
+| Ornith-1.5 | 37 | 11 | 48 |
+| Bonsai-2 27B | 39 | 7 | 46 |
+
+### 알아둘 점 — 이 결정이 무엇을 포기하는가
+
+이 데이터만으로 Qwen 이 우월하다는 결론이 나오는 것은 **아니다**. 사용자의 선택이며, 측정은 아래 트레이드오프를 보여 준다.
+
+- **Ornith 가 어려운 문제를 더 효율적으로 풀었다.** 직접 만든 11문제를 Ornith 는 18,297 토큰·467 초에 전부 풀었고,
+  Qwen 은 64,127 토큰·1,604 초에 9개를 풀었다(약 3.5배 차이). 같은 구조·크기의 모델이라 tg 는 비슷하다(Ornith 가 약 2~7 % 빠름).
+- 전체 통과 수(48 대 48)와 답을 낸 문제의 정답률(Qwen 96 %)은 Ornith 와 차이가 없다. Qwen 의 직접 만든 문제 실패는 `calc` 오답 1건과
+  `dijkstra` 의 12,000 토큰 상한 도달 1건이다.
+- 컨텍스트가 20,480 으로 Bonsai 27B(32,768)보다 작아 컴팩션이 더 자주(약 3스텝마다) 일어난다.
+
+### 운영 메모
+
+- **`--n-cpu-moe 31` 은 8 GB 카드의 VRAM 한계 바로 위다.** 깊이 8192 에서 30 은 동작하지만 16384 에서는 컨텍스트 생성이 실패한다
+  (29 이하는 깊이와 무관하게 실패). 긴 컨텍스트에서 CUDA 메모리 오류로 서버가 중단되면 **32 로 올린다**(32~34 는 여유가 있다).
+- 이 값은 16,384 컨텍스트까지 `llama-bench` 로 검증했고, 서버의 실제 컨텍스트 20,480 에서는 기동과 짧은 생성으로만 확인했다.
+- 튜너(`tuneForHardware`)의 계산값은 32 다. 확정 값 31 은 `.llamacli/config.yaml` 의 `cpuMoeLayers` 에 기록되어 있어야 튜너가 덮어쓰지 않는다
+  (config 에 실측값이 있으면 그 값을 쓴다).
+- 서버를 직접 띄울 때(독립 프로세스):
+
+```bash
+cd ~/llama.cpp/build-opt/bin && setsid nohup ./llama-server \
+  -m /media/<user>/<disk>/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8080 -c 20480 -t 6 -tb 11 -ngl 999 --n-cpu-moe 31 \
+  -b 2048 -ub 512 -fa on --cache-type-k q8_0 --cache-type-v q8_0 -np 1 -no-kvu \
+  > ~/.llamacli/logs/server-8080.log 2>&1 < /dev/null &
+```
+
 ## First run: finding llama.cpp, picking a port, and starting the server
 
 `src/backend/resolve.ts` answers three questions in this order, and the order is
