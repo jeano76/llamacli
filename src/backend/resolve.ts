@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import { formatBytes, formatProgress, type TransferProgress } from "../setup/download.js";
 import { LlamaServerManager, type LlamaServerConfig } from "./llamaServer.js";
+import { startCalibrated, type CalibrationResult } from "../setup/calibrate.js";
 import { OpenAICompatibleClient } from "./openaiClient.js";
 import { discoverRunningServer, COMMON_PORTS, type Discovery } from "./detect.js";
 import { detectRunningServerPorts } from "../setup/modelSwitch.js";
@@ -309,6 +310,7 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
       find: opts.findLlamaServer,
     });
     if (started.ok) {
+      await persistCalibration(projectRoot, started.calibration, log);
       const spawned = new OpenAICompatibleClient(started.baseUrl);
       // Same check as case 1, and for the same reason: a config that points
       // at a corrupt model file produces a server that loads and answers just
@@ -455,6 +457,7 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
       find: opts.findLlamaServer,
     });
     if (started.ok) {
+      await persistCalibration(projectRoot, started.calibration, log);
       log(`준비가 끝났습니다. ${started.baseUrl} 에서 llama-server 를 구동했습니다.`);
       return { kind: "spawned", backend: new OpenAICompatibleClient(started.baseUrl), stop: started.stop, port: cfg.port, modelPath: cfg.modelPath };
     }
@@ -470,12 +473,22 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
   };
 }
 
+/** Records what launch-time calibration settled on, so the next start begins from the measured value. */
+async function persistCalibration(projectRoot: string, c: CalibrationResult | undefined, log: (l: string) => void): Promise<void> {
+  if (!c) return;
+  try {
+    const { recordServerState } = await import("../setup/modelSelect.js");
+    await recordServerState(projectRoot, { tuning: { cpuMoeLayers: c.cpuMoeLayers }, calibratedFor: c.calibratedFor });
+    if (c.outcome === "raised" || c.outcome === "lowered") log(`보정 결과 --n-cpu-moe ${c.cpuMoeLayers} 를 config 에 기록했습니다.`);
+  } catch { /* a failed record only means the next start calibrates again */ }
+}
+
 /** Outcome of a spawn attempt. The two failure kinds are kept apart because
  *  they call for different messages and, merged into a single `null`, produced
  *  one that named the wrong thing: a build that cannot read the model was
  *  reported as "the port may be in use". */
 export type StartOutcome =
-  | { ok: true; baseUrl: string; stop: () => void }
+  | { ok: true; baseUrl: string; stop: () => void; calibration?: CalibrationResult }
   /** The binary runs but its type registry rejects this model's quant. */
   | { ok: false; kind: "build-mismatch"; binary: string; detail: string }
   /** The binary could not be executed, or the server did not come up. */
@@ -508,9 +521,17 @@ async function tryStart(
     return { ok: false, kind: "build-mismatch", binary: cfg.binPath, detail: line };
   }
 
-  const manager = new LlamaServerManager(cfg);
+  let manager = new LlamaServerManager(cfg);
+  let calibration: CalibrationResult | undefined;
   try {
-    await manager.start();
+    // Calibrated start: a GPU out-of-memory is retried with more experts on the CPU, and (once per
+    // model+context+card) free VRAM is used to try fewer. See setup/calibrate.ts.
+    const started = await startCalibrated(cfg, {
+      make: (c) => { manager = new LlamaServerManager(c); return manager; },
+      say: (l) => process.stderr.write(`[llamacli] ${l}\n`),
+      calibrate: process.env.LLAMACLI_CALIBRATE !== "0",
+    });
+    calibration = started.calibration;
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[llamacli] llama-server 시작 실패: ${detail}\n`);
@@ -520,7 +541,7 @@ async function tryStart(
   // Registered so the model is released from VRAM on every exit path — a
   // surviving server is the direct cause of the next session OOMing.
   registerCleanup?.(stop);
-  return { ok: true, baseUrl: manager.baseUrl, stop };
+  return { ok: true, baseUrl: manager.baseUrl, stop, calibration };
 }
 
 /**

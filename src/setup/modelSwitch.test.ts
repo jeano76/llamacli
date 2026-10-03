@@ -180,3 +180,28 @@ test("a non-default port is preserved just as strictly", async () => {
   assert.equal(seen, 8084);
   assert.equal(r.port, 8084);
 });
+
+test("launch calibration: an OOM'd plan is raised, and the value really launched is what gets reported for recording", async () => {
+  const sink = { events: [] as string[] };
+  let moe: number | undefined;
+  const r = await switchModelAndServer({
+    ...base({ kind: "none" }, sink),
+    tuning: { ...TUNING, cpuMoeLayers: 30 },
+    makeServer: (c) => ({
+      start: async () => {
+        moe = c.cpuMoeLayers;
+        sink.events.push(`start:${c.cpuMoeLayers}`);
+        if ((c.cpuMoeLayers ?? 0) < 34) throw new Error("cudaMalloc failed: out of memory");
+      },
+      stop: () => sink.events.push(`stop:${c.cpuMoeLayers}`),
+      logTail: () => "",
+    }),
+    calibrate: true,
+    calibration: { info: { moe: true, moeLayers: 40, modelBytes: 20 * 1024 ** 3 }, readVramFreeMiB: async () => 100, waitReleased: async () => {}, gpuName: "GPU" },
+  });
+  assert.equal(r.ok, true, r.lines.join("\n"));
+  assert.ok((moe ?? 0) >= 34);
+  assert.equal(r.launched?.tuning.cpuMoeLayers, moe);
+  assert.equal(r.calibration?.outcome, "raised");
+  assert.match(r.calibration?.calibratedFor ?? "", /@98304|@16384/);
+});

@@ -29,6 +29,9 @@ try {
   await writeFile(py, `
 import sys, http.server
 a = sys.argv; port = int(a[a.index("--port") + 1])
+moe = int(a[a.index("--n-cpu-moe") + 1]) if "--n-cpu-moe" in a else 0
+if moe < int(__import__("os").environ.get("FAKE_MIN_MOE", "0")):
+    sys.stderr.write("ggml_backend_cuda_buffer_type_alloc_buffer: cudaMalloc failed: out of memory\\n"); sys.exit(1)
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.send_header("content-type", "application/json"); self.end_headers()
@@ -78,6 +81,22 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
   const cmd = (await import("node:fs/promises")).readFile(`/proc/${(ownerB as any).pid}/cmdline`, "utf8");
   assert.match((await cmd).replace(/\0/g, " "), /B-Q4_K_M\.gguf/);
   console.log(`[live] confirmed restart: pid ${pidA} → ${(ownerB as any).pid}, same port ${port}, model B ✔`);
+
+  // calibration: a launch that runs out of memory is retried with more CPU experts (real processes,
+  // real LlamaServerManager; only the GPU is fake: the fake server exits with a CUDA OOM below 34).
+  process.env.FAKE_MIN_MOE = "34";
+  const cport = await freePort();
+  const calib = await switchModelAndServer({
+    modelPath: modelB, port: cport, binPath: bin, tuning: { contextSize: 8192, threads: 2, gpuLayers: 99, cpuMoeLayers: 30 },
+    detectOwner: async () => ({ kind: "none" }), calibrate: true,
+    calibration: { info: { moe: true, moeLayers: 40, modelBytes: 20 * 1024 ** 3 }, readVramFreeMiB: async () => 100, waitReleased: async () => {}, gpuName: "fake" },
+  });
+  assert.equal(calib.ok, true, calib.lines.join("\n"));
+  assert.ok((calib.launched?.tuning.cpuMoeLayers ?? 0) >= 34, JSON.stringify(calib.launched));
+  assert.equal(calib.calibration?.outcome, "raised");
+  const co = await detectPortOwner(cport); assert.equal(co.kind, "ours"); spawned.push((co as any).pid);
+  console.log(`[live] calibration: OOM at --n-cpu-moe 30 → running with ${calib.launched?.tuning.cpuMoeLayers} ✔`);
+  delete process.env.FAKE_MIN_MOE;
 
   // foreign: a plain listener on a different port must never be signalled.
   const fport = await freePort();

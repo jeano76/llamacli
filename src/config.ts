@@ -36,6 +36,8 @@ export interface LlamacliConfig {
     batchSize?: number;
     ubatchSize?: number;
     cpuMoeLayers?: number;
+    /** Calibration key (model@context@gpu) already trialled; see setup/calibrate.ts. */
+    calibratedFor?: string;
     flashAttn?: boolean;
     cacheTypeK?: string;
     cacheTypeV?: string;

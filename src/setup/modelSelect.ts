@@ -321,7 +321,7 @@ async function resolvePort(
  *  port); everything else in the file is preserved. */
 export async function recordServerState(
   projectRoot: string,
-  state: { port?: number; binPath?: string; modelPath?: string; tuning?: Record<string, unknown> },
+  state: { port?: number; binPath?: string; modelPath?: string; tuning?: Record<string, unknown>; calibratedFor?: string },
   io: { read?: SelectOptions["readConfigFile"]; write?: SelectOptions["writeConfigFile"] } = {}
 ): Promise<boolean> {
   const read = io.read ?? defaultRead;
@@ -343,6 +343,7 @@ export async function recordServerState(
       if (v !== undefined) next.llama[k] = v;
     }
   }
+  if (state.calibratedFor) next.llama.calibratedFor = state.calibratedFor;
   if (state.port !== undefined && typeof next.baseUrl === "string") {
     try {
       const u = new URL(next.baseUrl);

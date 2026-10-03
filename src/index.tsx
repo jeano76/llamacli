@@ -61,6 +61,7 @@ function recordedTuning(config: unknown) {
     flashAttn: typeof llama.flashAttn === "boolean" ? llama.flashAttn : undefined,
     cacheTypeK: typeof llama.cacheTypeK === "string" ? llama.cacheTypeK : undefined,
     cacheTypeV: typeof llama.cacheTypeV === "string" ? llama.cacheTypeV : undefined,
+    calibratedFor: typeof llama.calibratedFor === "string" ? llama.calibratedFor : undefined,
   };
 }
 
@@ -1271,6 +1272,7 @@ async function main() {
                 port: result.port,
                 binPath,
                 tuning: switchTuning,
+                calibrate: true,
                 // Once the old server has released its VRAM: re-measure, re-size for the
                 // new model against the memory that is free NOW, and say whether the GPU
                 // will be used. The sizing above was done while the old server still held
@@ -1290,6 +1292,7 @@ async function main() {
                 await recordServerState(projectRoot, {
                   port: sw.port, binPath: sw.launched.binPath, modelPath: sw.launched.modelPath,
                   tuning: sw.launched.tuning as Record<string, unknown>,
+                  calibratedFor: sw.calibration?.calibratedFor,
                 }).catch(() => false);
               }
               const synced = sw.ok ? await syncSessionToServer(modelPath, { contextSize: switchTuning.contextSize }) : [];

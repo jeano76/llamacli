@@ -35,6 +35,7 @@
 
 import { LlamaServerManager, type LlamaServerConfig } from "../backend/llamaServer.js";
 import { summarizeGpuOffload, waitForGpuRelease } from "./gpuReport.js";
+import { startCalibrated, type CalibrationResult, type StartCalibratedOptions } from "./calibrate.js";
 import { hasSystemd, listeningPortsCommand, PORT_FIELD_SEPARATOR, type HostPlatform } from "./hostEnv.js";
 
 export type PortOwner =
@@ -90,6 +91,10 @@ export interface SwitchOptions {
   stopProcess?: (pid: number, say: (line: string) => void) => Promise<void>;
   /** Injected for tests. */
   onProgress?: (line: string) => void;
+  /** Allow the one-time downward `--n-cpu-moe` trial (see calibrate.ts). The OOM retry is always on. */
+  calibrate?: boolean;
+  /** Injected for tests. */
+  calibration?: Pick<StartCalibratedOptions, "readVramFreeMiB" | "waitReleased" | "info" | "gpuName">;
   /** Injected for tests; defaults to the host platform. */
   platform?: HostPlatform;
   /** Injected for tests; defaults to a real child-process exec. */
@@ -107,6 +112,8 @@ export interface SwitchResult {
   /** What the new server was actually launched with (after the post-stop re-tune), so the
    *  config can record the real thing rather than the pre-stop estimate. */
   launched?: { binPath: string; modelPath: string; tuning: SwitchOptions["tuning"] };
+  /** What launch-time calibration found, when it ran (recorded so it is not repeated). */
+  calibration?: CalibrationResult;
   /** User-facing lines. */
   lines: string[];
 }
@@ -213,11 +220,16 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
   };
 
   const make = opts.makeServer ?? ((c: LlamaServerConfig) => new LlamaServerManager(c));
-  const server = make(cfg);
+  let server = make(cfg);
+  let calibration: CalibrationResult | undefined;
+  let runCfg = cfg;
 
   try {
     say(`${opts.binPath} 로 새 모델을 올립니다 (포트 ${port}, 그대로)…`);
-    await server.start();
+    const started = await startCalibrated(cfg, {
+      make, say, calibrate: opts.calibrate === true, ...opts.calibration,
+    });
+    server = started.server as typeof server; runCfg = started.cfg; calibration = started.calibration;
   } catch (err) {
     const tail = server.logTail?.(12) ?? "";
     return {
@@ -233,10 +245,13 @@ export async function switchModelAndServer(opts: SwitchOptions): Promise<SwitchR
   }
 
   say(`${port} 포트에서 새 모델이 응답합니다.`);
-  const launched = { binPath: opts.binPath, modelPath: opts.modelPath, tuning: launchTuning };
+  const launched = {
+    binPath: opts.binPath, modelPath: opts.modelPath,
+    tuning: { ...launchTuning, ...(runCfg.cpuMoeLayers !== undefined ? { cpuMoeLayers: runCfg.cpuMoeLayers } : {}) },
+  };
   // The result, from the server's own load log — the plan above is what was asked for.
-  say(summarizeGpuOffload(server.gpuLog?.() ?? server.logTail?.(200) ?? "", { gpuLayers: cfg.gpuLayers ?? 0 }));
-  return { ok: true, port, stopped, ready: true, lines, launched };
+  say(summarizeGpuOffload(server.gpuLog?.() ?? server.logTail?.(200) ?? "", { gpuLayers: runCfg.gpuLayers ?? 0 }));
+  return { ok: true, port, stopped, ready: true, lines, launched, calibration };
 }
 
 /** Who is listening on `port`.

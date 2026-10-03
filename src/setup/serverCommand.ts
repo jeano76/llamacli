@@ -10,7 +10,7 @@ import { diffServer, gateServerReplacement, type ServerGate } from "./serverPoli
 export interface RestartDeps {
   switchServer: (opts: SwitchOptions) => Promise<SwitchResult>;
   /** Persist what is really running afterwards. */
-  record: (state: { port: number; binPath: string; modelPath: string }) => Promise<unknown>;
+  record: (state: { port: number; binPath: string; modelPath: string; tuning?: Record<string, unknown>; calibratedFor?: string }) => Promise<unknown>;
   /** Bring the session's client in line with the new server. */
   sync: (modelPath: string, o: { contextSize?: number }) => Promise<string[]>;
   describePlan: (tuning: SwitchOptions["tuning"]) => Promise<string[]>;
@@ -58,10 +58,15 @@ export async function runServerRestart(input: RestartInput, deps: RestartDeps): 
     port: report.port,
     binPath,
     tuning,
+    calibrate: true,
     retune: async () => ({ lines: await deps.describePlan(tuning) }),
   });
   if (sw.ok && sw.launched) {
-    await deps.record({ port: sw.port, binPath: sw.launched.binPath, modelPath: sw.launched.modelPath }).catch(() => false);
+    await deps.record({
+      port: sw.port, binPath: sw.launched.binPath, modelPath: sw.launched.modelPath,
+      // The calibrated --n-cpu-moe (if the launch adjusted it) and the key that stops the trial repeating.
+      ...(sw.calibration ? { tuning: sw.launched.tuning as Record<string, unknown>, calibratedFor: sw.calibration.calibratedFor } : {}),
+    }).catch(() => false);
   }
   const synced = sw.ok ? await deps.sync(report.configuredModel, { contextSize: tuning.contextSize }) : [];
   return { restarted: sw.ok, lines: [...sw.lines, ...synced] };

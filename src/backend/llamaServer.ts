@@ -43,6 +43,8 @@ export interface LlamaServerConfig {
    * the right thing on a card with VRAM to spare.
    */
   cpuMoeLayers?: number;
+  /** Not a llama-server flag: the calibration key already tried for this model/context/card (see setup/calibrate.ts). */
+  calibratedFor?: string;
   /** `-fa`: flash attention. */
   flashAttn?: boolean;
   /** `--cache-type-k`. q8_0 halves the KV cache versus f16 at a speed cost
