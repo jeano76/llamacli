@@ -313,7 +313,10 @@ export function tuneForHardware(
   // A DENSE model has no experts to stream: the weights either fit on the card or the layers that do not
   // fit run on the CPU. `-ngl 999` on a 5.1 GiB model and a 4 GiB card is a load-time OOM, not an
   // optimisation, so offload only the share of layers the card can hold beside the KV cache.
-  if (gpu && opts?.moe === false && modelBytes && opts.modelLayers && opts.modelLayers > 0) {
+  // Not on unified memory (Apple Silicon): there is no separate VRAM to overflow — the model and the "GPU" share one
+  // pool and Metal decides what it can keep resident — so the discrete-card arithmetic below would wrongly turn the GPU
+  // off (found on a real macOS runner: 7 GiB RAM, -ngl 0).
+  if (gpu && !gpu.unifiedMemory && opts?.moe === false && modelBytes && opts.modelLayers && opts.modelLayers > 0) {
     const modelGiB = modelBytes / GiB;
     const kvGiB = (contextSize * kvPerToken) / GiB;
     const room = budgetGiB - 0.5 - kvGiB;

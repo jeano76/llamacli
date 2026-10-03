@@ -13,7 +13,7 @@ const probe = join(here, "..", "containers", "probe.mjs");
 const dist = resolve(process.env.LLAMACLI_DIST || join(here, "../../dist"));
 const env = { ...process.env, LLAMACLI_DIST: dist, LLAMACLI_NO_UPDATE: "1" };
 delete env.FAKE_NVIDIA; delete env.FAKE_VULKAN;
-const expect = { "detected.platform": "darwin", "detected.gpuBackend": "metal", "engineLadder.0": "metal", "engineLadder.1": undefined, "buildPlan.manager": "brew" };
+const expect = { "detected.platform": "darwin", "detected.gpuBackend": "metal", "engineLadder.0": "metal", "engineLadder.1": undefined, "buildPlan.manager": "brew", "tuning.gpuLayers": { min: 1 } }; // Metal must actually be used (-ngl > 0)
 const shells = [["zsh", ["zsh", "-c"]], ["bash", ["bash", "-c"]], ["sh", ["sh", "-c"]]];
 const results = [];
 for (const [name, [sh, flag]] of shells) {

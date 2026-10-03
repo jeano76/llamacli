@@ -45,7 +45,7 @@ test("a user-space cmake is verified by its path, not by PATH", async () => {
   assert.ok(ran.includes(plan.cmakeBin!));
 });
 
-test("buildLlamaCpp invokes the user-space cmake by absolute path", { skip: WIN_SKIP }, async () => {
+test("buildLlamaCpp invokes the user-space cmake by absolute path", { skip: WIN_SKIP || (process.getuid?.() === 0 ? "running as root: no user-space cmake is needed" : false) }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "llc-"));
   await mkdir(join(dir, ".git"), { recursive: true });
   const calls: string[] = [];

@@ -134,7 +134,15 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
     // config with no `llama` block at all, and failed its own assertion. That
     // is precisely "testing the machine, not the code", the failure mode every
     // injectable seam in this codebase exists to prevent.
+    // The machine under test must not matter: this test passed on a box that happens to have llama.cpp installed and
+    // failed on a clean CI runner. A fake llama-server and an env that points ONLY at it make both the same.
+    const { mkdir: mk, writeFile: wf, chmod: cm } = await import("node:fs/promises");
+    await mk(join(dir, "bin"), { recursive: true });
+    const fakeBin = join(dir, "bin", "llama-server");
+    await wf(fakeBin, "#!/bin/sh\necho 'version: 1 (abc)'\n");
+    await cm(fakeBin, 0o755);
     const report = await ensureLocalStack({
+      env: { HOME: join(dir, "home"), PATH: "", LLAMACLI_LLAMA_SERVER: fakeBin } as NodeJS.ProcessEnv,
       projectRoot: dir,
       offline: true,
       allowBuild: false,

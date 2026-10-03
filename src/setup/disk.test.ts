@@ -243,6 +243,7 @@ test("discovered mounts are consulted when the requested path is too small", { s
     env: {} as NodeJS.ProcessEnv,
     create: false,
     discoverMounts: true,
+    discover: async () => mounts, // the faked tree above, not whatever this machine has under /media
   });
   assert.equal(choice.switched, true, "the under-sized path must not be used");
   assert.equal(hasRoom(choice, 21 * GiB), true);

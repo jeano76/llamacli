@@ -379,3 +379,14 @@ test("CPU-only: the weights are taken out of RAM before the KV cache is sized (a
   assert.ok(small.contextSize < 98304, "a model that does not fit RAM must not get the maximum context");
   assert.equal(big.contextSize, 98304);
 });
+
+test("Apple Silicon (unified memory): a dense model larger than the GPU share still offloads (-ngl > 0), it is not turned into CPU-only", () => {
+  const G = 1024 ** 3;
+  const mac: any = {
+    cpuCount: 3, ramTotalBytes: 7 * G, ramAvailableBytes: 5 * G,
+    gpus: [{ index: 0, name: "Apple Silicon (unified memory)", vramTotalBytes: 4.7 * G, vramFreeBytes: 3.5 * G, vendor: "apple", unifiedMemory: true }],
+    gpuBackend: "metal", canBuildCuda: false, tools: {}, platform: "darwin", arch: "arm64",
+  };
+  const t = tuneForHardware(mac, { modelBytes: 5.1 * G, moe: false, kvElementsPerToken: 10240, modelLayers: 32 });
+  assert.equal(t.gpuLayers, 999, `got -ngl ${t.gpuLayers}: the discrete-VRAM arithmetic must not apply to unified memory`);
+});

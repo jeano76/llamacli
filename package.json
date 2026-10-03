@@ -19,7 +19,8 @@
     "matrix:host": "node test/containers/run-host.mjs && node test/containers/download-scenario.mjs && python3 test/containers/tui-smoke.py",
     "matrix:containers": "node test/containers/run-containers.mjs",
     "matrix:all": "npm test && node test/containers/run-host.mjs && node test/containers/download-scenario.mjs && python3 test/containers/tui-smoke.py && node test/containers/run-containers.mjs && node test/clipboard-check.mjs",
-    "matrix:clipboard": "node test/clipboard-check.mjs"
+    "matrix:clipboard": "node test/clipboard-check.mjs",
+    "matrix:clean-unit": "bash test/containers/unit-in-container.sh"
   },
   "dependencies": {
     "ink": "^4.4.1",

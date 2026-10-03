@@ -52,7 +52,7 @@ jobs:
         run: |
           {
             echo "## macOS run"
-            [ -f unit-tests.log ] && echo "- unit tests: $(grep -E '^# (pass|fail|skipped)' unit-tests.log | tr '\n' ' ')" && echo && grep -E '^not ok' unit-tests.log | head -40 | sed 's/^/  - /'
+            if [ -f unit-tests.log ]; then echo "- unit tests: $(grep -E '^# (pass|fail|skipped)' unit-tests.log | tr '\n' ' ')"; echo; { grep -E '^not ok' unit-tests.log || true; } | head -40 | sed 's/^/  - /'; fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()

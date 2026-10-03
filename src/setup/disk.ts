@@ -190,6 +190,8 @@ export interface SelectPathOptions {
    *  was written for, which is what made it refuse a download while 55 GiB sat
    *  unused two directories away. */
   discoverMounts?: boolean;
+  /** Injected for tests: the mounts to consider instead of reading the machine's real /media and /mnt. */
+  discover?: (env?: NodeJS.ProcessEnv) => Promise<string[]>;
 }
 
 /**
@@ -213,7 +215,7 @@ export async function selectModelPath(opts: SelectPathOptions): Promise<PathChoi
   const candidates =
     opts.candidates || opts.discoverMounts === false
       ? base
-      : [...new Set([...base, ...(await discoverMounts({ env: opts.env }).catch(() => []))])];
+      : [...new Set([...base, ...(await (opts.discover ?? ((e) => discoverMounts({ env: e })))(opts.env).catch(() => []))])];
   const create = opts.create ?? true;
 
   const requested = await diskInfoFor(requestedDir, statfsImpl);

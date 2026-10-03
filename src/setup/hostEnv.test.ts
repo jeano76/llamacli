@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { homeDir, defaultModelsDir, listeningPortsCommand, hasSystemd } from "./hostEnv.js";
@@ -26,7 +27,8 @@ test("HOME wins over USERPROFILE when both are set", () => {
   assert.equal(homeDir({ HOME: "/home/jeano", USERPROFILE: "C:\\Users\\jeano" } as any), "/home/jeano");
 });
 
-test("neither set does NOT yield /root", () => {
+// When the process really IS root (a container), "/root" is the true answer, not a hardcoded fallback.
+test("neither set does NOT yield /root", { skip: homedir() === "/root" ? "running as root: /root is the real home" : false }, () => {
   // The specific failure: a hardcoded fallback is indistinguishable from a real
   // answer, so the caller cannot tell it is wrong.
   const h = homeDir({} as any);
