@@ -164,7 +164,10 @@ export interface LlamacliConfig {
      *  would just fail with "couldn't reach the browser debug port" —
      *  while still costing ~400-500 prompt tokens on EVERY request for
      *  their schema (measured: the full tool schema is 1,238 tokens, 7.6%
-     *  of a 16,384-token window). So a session that never starts a
+     *  of a 16,384-token window — an 11-tool schema on a previous tokenizer;
+     *  re-measured 2026-10-04 as 1,002 for the 12-tool schema on Ornith.
+     *  Token counts are tokenizer-dependent. Neither number changes the
+     *  conclusion, which is why this stays opt-in.) So a session that never starts a
      *  debuggable browser never pays for them, and one that does gets
      *  them with no configuration at all.
      *

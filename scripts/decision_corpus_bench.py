@@ -72,7 +72,10 @@ def p_true(entry):
     return float(entry)
 
 
-for sub in (None, "multilingual"):
+# typed-decisions is the FINE-TUNED checkpoint (the article's 0.766 vs the root's
+# 0.36 zero-shot). If anything can overturn the T0-5 verdict, it is this one —
+# which is why it gets its own run rather than being folded into the others.
+for sub in (None, "multilingual", "typed-decisions"):
     label = "root (english)" if sub is None else f"subfolder={sub}"
     try:
         kw = {"device": "cpu"}

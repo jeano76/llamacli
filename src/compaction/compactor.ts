@@ -170,7 +170,13 @@ function charBasedEstimate(messages: ChatMessage[], extraText: string): number {
  *  threshold before a compaction ever fired. Measured directly: the tool
  *  schema JSON alone tokenizes to 626 real tokens — sent on every single
  *  request, and never counted here at all before this, silently
- *  undercounting every threshold check by that much. Callers that don't
+ *  undercounting every threshold check by that much. (That 626 was a 9-tool
+ *  schema on the September model's tokenizer. Re-measured 2026-10-04: 698
+ *  for the current 8-tool browser-off schema on Ornith-1.5-35B. Token counts
+ *  are tokenizer-dependent, so treat any fixed number here as stale the
+ *  moment the model changes — the live path below re-measures through
+ *  /apply-template + /tokenize and does not rely on it. See
+ *  docs/decision-layer-report.md §8.) Callers that don't
  *  send tools (the compaction summary request itself) simply omit this. */
 /**
  * Memo for the last exact token count, so an unchanged conversation is not
