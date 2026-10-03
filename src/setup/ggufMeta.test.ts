@@ -24,6 +24,8 @@ function gguf(kvs: Buffer[]) {
 const dense = () => gguf([kvStr("general.architecture", "qwen35"), kvU32("qwen35.block_count", 64), kvStrArr("tokenizer.ggml.tokens", ["a", "b"])]);
 const moe = () => gguf([kvStr("general.architecture", "qwen35moe"), kvU32("qwen35moe.expert_count", 256), kvU32("qwen35moe.block_count", 40), kvStrArr("tokenizer.ggml.tokens", ["a"])]);
 
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
+
 test("a header with expert_count is MoE", () => {
   assert.deepEqual(parseGgufArchInfo(moe()), { arch: "qwen35moe", expertCount: 256, conclusive: true });
 });
@@ -120,21 +122,22 @@ async function launchedArgs(modelBuf: Buffer, cpuMoeLayers: number): Promise<str
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
-test("launch: a stale cpuMoeLayers is NOT passed to a dense model", async () => {
+test("launch: a stale cpuMoeLayers is NOT passed to a dense model", { skip: WIN_SKIP }, async () => {
   assert.ok(!(await launchedArgs(dense(), 32)).includes("--n-cpu-moe"));
 });
 
-test("launch: a MoE model still gets the flag", async () => {
+test("launch: a MoE model still gets the flag", { skip: WIN_SKIP }, async () => {
   const args = await launchedArgs(moe(), 32);
   assert.equal(args[args.indexOf("--n-cpu-moe") + 1], "32");
 });
 
-test("launch: a file whose header cannot be read is left as configured (unknown ≠ dense)", async () => {
+test("launch: a file whose header cannot be read is left as configured (unknown ≠ dense)", { skip: WIN_SKIP }, async () => {
   assert.ok((await launchedArgs(Buffer.from("garbage"), 32)).includes("--n-cpu-moe"));
 });
 
 // ── KV shape (what the cache really costs) ──────────────────────────────────
 import { parseGgufKeys, kvShapeFromKeys, kvBytesPerElement, readGgufKvShape } from "./ggufMeta.js";
+
 
 const kvU32Arr = (k: string, vs: number[]) => Buffer.concat([str(k), u32(9), u32(4), u64(vs.length), ...vs.map(u32)]);
 

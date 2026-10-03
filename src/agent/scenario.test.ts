@@ -310,7 +310,7 @@ async function runOneDeveloper(devIndex: number, turnsPerDeveloper: number): Pro
 
 test(
   "many concurrent long-running developer sessions, across different languages and program types, never produce an unhandled crash",
-  { timeout: 60_000 },
+  { timeout: 180_000 },
   async () => {
     // Real toolchain commands (go/rustc/java/etc.) aren't necessarily
     // installed in this environment, and this scenario runs many of them

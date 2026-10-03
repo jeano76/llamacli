@@ -35,6 +35,7 @@ import { tuningToConfigKeys } from "./bootstrap.js";
 import { candidateDirs, discoverMounts, selectModelPath } from "./disk.js";
 import type { LlamaTuning } from "./tuning.js";
 import type { ModelRung } from "./modelMetrics.js";
+import { baseName } from "../util/path.js";
 
 export interface SelectResult {
   /** The rung chosen. */
@@ -381,7 +382,7 @@ function configuredModelPath(existing: Record<string, any> | undefined, filename
       ? existing.model
       : undefined;
   if (!p) return undefined;
-  return p.split("/").pop() === filename ? p : undefined;
+  return baseName(p) === filename ? p : undefined;
 }
 
 /** Depth-first search for an already-downloaded file.
@@ -443,7 +444,7 @@ async function searchDirs(requested?: string): Promise<string[]> {
 function existingModelFilename(existing: Record<string, any> | undefined): string {
   const p = typeof existing?.llama?.modelPath === "string" ? existing.llama.modelPath
     : typeof existing?.model === "string" ? existing.model : "";
-  const name = p.split("/").pop() ?? "";
+  const name = baseName(p) ?? "";
   // Only a 35B file may stand in for the 35B rung. When the config currently names ANOTHER model (the 9B,
   // after a switch to it) following "whatever the config used" recorded that other model's file for the
   // 35B selection — the server then restarted on the 9B with the 35B's MoE flags, and the 35B could no

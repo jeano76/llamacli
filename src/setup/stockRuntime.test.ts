@@ -29,6 +29,8 @@ const release: Release = { tag: TAG, assets: NAMES.map((name) => ({ name, url: `
 const m = (o: Partial<StockMachine>): StockMachine => ({ platform: "linux", arch: "x64", gpuBackend: "none", hasCudaToolkit: false, ...o });
 const names = (rs: ReturnType<typeof stockRungsFor>) => rs.map((r) => `${r.backend}:${r.asset.name}`);
 
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
+
 test("CPU-only Linux gets exactly the CPU asset", () => {
   assert.deepEqual(names(stockRungsFor(release, m({}))), [`cpu:llama-${TAG}-bin-ubuntu-x64.tar.gz`]);
 });
@@ -186,6 +188,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listInstalledStock, acceptableStockBackends } from "./stockRuntime.js";
 
+
 async function installed(...subdirs: string[]) {
   const root = await mkdtemp(join(tmpdir(), "stockroot-"));
   for (const d of subdirs) {
@@ -196,7 +199,7 @@ async function installed(...subdirs: string[]) {
   return root;
 }
 
-test("an installed prebuilt that still runs is used with ZERO network and ZERO downloads", async () => {
+test("an installed prebuilt that still runs is used with ZERO network and ZERO downloads", { skip: WIN_SKIP }, async () => {
   const root = await installed("cuda-12.8");
   try {
     let fetched = 0, downloaded = 0, built = 0;
@@ -213,7 +216,7 @@ test("an installed prebuilt that still runs is used with ZERO network and ZERO d
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("an installed prebuilt that no longer runs is skipped, and the ladder carries on to the next rung", async () => {
+test("an installed prebuilt that no longer runs is skipped, and the ladder carries on to the next rung", { skip: WIN_SKIP }, async () => {
   const root = await installed("cuda-12.8");
   try {
     const got = await acquireStockLlamaServer({
@@ -227,7 +230,7 @@ test("an installed prebuilt that no longer runs is skipped, and the ladder carri
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("only backends that suit this machine count as 'installed': a cuda build is no use on a CPU box", async () => {
+test("only backends that suit this machine count as 'installed': a cuda build is no use on a CPU box", { skip: WIN_SKIP }, async () => {
   const root = await installed("cuda-12.8", "cpu");
   try {
     const cpuBox = await listInstalledStock({ gpuBackend: "none", platform: "linux", arch: "x64" }, root);

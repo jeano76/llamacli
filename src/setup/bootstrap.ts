@@ -23,7 +23,7 @@
  */
 
 import { mkdir, writeFile, readFile, rename } from "node:fs/promises";
-import { join, dirname, basename } from "node:path";
+import { join, dirname, basename, isAbsolute } from "node:path";
 import { stringify, parse } from "yaml";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB, type Hardware } from "./hardware.js";
 import { getCapabilities } from "../tui/terminal.js";
@@ -46,6 +46,7 @@ import { rm } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 import { defaultModelsDir } from "./hostEnv.js";
 import { MODEL_RUNGS, evaluateFit } from "./modelMetrics.js";
+import { baseName } from "../util/path.js";
 
 export interface BootstrapStep {
   name: string;
@@ -925,7 +926,7 @@ export async function keepSelectedModelOnReset(
 ): Promise<Record<string, any> | undefined> {
   const path =
     typeof before?.llama?.modelPath === "string" && before.llama.modelPath ? before.llama.modelPath
-      : typeof before?.model === "string" && before.model.startsWith("/") ? before.model
+      : typeof before?.model === "string" && isAbsolute(before.model) ? before.model
       : undefined;
   if (!path || (await fileSize(path)) <= 0) return kept;
   const name = basename(path).toLowerCase();
@@ -1007,7 +1008,7 @@ export async function findEquivalentModel(
     return null;
   }
   for (const f of files) {
-    const base = f.path.split("/").pop() ?? f.path;
+    const base = baseName(f.path);
     if (base === candidate.filename) continue;
     if (f.sizeBytes !== candidate.sizeBytes) continue;
     if (quantOf(base) !== wantQuant) continue;

@@ -20,6 +20,7 @@
 
 import { detectPortOwner, resolveLiveServerPort, parseLlamaServerArgs, type ParsedServerArgs, type LiveLlamaServer, type PortOwner } from "./modelSwitch.js";
 import { findLlamaServer } from "./llamaCpp.js";
+import { baseName, lastSegments } from "../util/path.js";
 
 export interface ServerReport {
   /** The port the config records. Absent when it records none. */
@@ -115,7 +116,7 @@ export async function reportServer(opts: ReportOptions): Promise<ServerReport> {
   const live = resolved.servers?.find((x) => x.port === port);
   const serverArgs = live ? parseLlamaServerArgs(live.cmdline) : undefined;
   let fromRunningServer = false;
-  const base = (p: string) => p.split("/").pop() ?? p;
+  const base = (p: string) => baseName(p);
   const modelMismatch =
     live && serverArgs?.modelPath && configuredModel && base(serverArgs.modelPath) !== base(configuredModel)
       ? { serving: serverArgs.modelPath, configured: configuredModel }
@@ -190,9 +191,9 @@ function summarize(r: {
   ];
   if (r.modelMismatch) {
     // Two different models, and which one is actually answering is the first thing to know.
-    parts.push(`실행 중인 서버의 모델 ${r.modelMismatch.serving.split("/").pop()}`);
-    parts.push(`config 의 모델 ${r.modelMismatch.configured.split("/").pop()} (서버와 다름)`);
-  } else if (r.configuredModel) parts.push(`모델 ${r.configuredModel.split("/").pop()}`);
+    parts.push(`실행 중인 서버의 모델 ${baseName(r.modelMismatch.serving)}`);
+    parts.push(`config 의 모델 ${baseName(r.modelMismatch.configured)} (서버와 다름)`);
+  } else if (r.configuredModel) parts.push(`모델 ${baseName(r.configuredModel)}`);
   switch (r.owner.kind) {
     case "none":
       parts.push("서버 없음 (포트 비어 있음)");
@@ -211,7 +212,7 @@ function summarize(r: {
       break;
   }
   if (r.build) {
-    parts.push(r.build.canReadModel ? `빌드 ${r.build.binPath.split("/").slice(-2).join("/")}` : "빌드가 이 모델의 양자화를 읽지 못함");
+    parts.push(r.build.canReadModel ? `빌드 ${lastSegments(r.build.binPath, 2)}` : "빌드가 이 모델의 양자화를 읽지 못함");
   }
   return parts.join(" · ");
 }
@@ -243,7 +244,7 @@ function restartPlan(r: {
     return `포트 ${r.port} 의 사용자를 확인할 수 없어 재시작하지 않습니다 (${r.owner.kind}).`;
   }
   const change = r.modelMismatch
-    ? ` 모델이 ${r.modelMismatch.serving.split("/").pop()} → ${r.configuredModel.split("/").pop()} 로 바뀝니다.`
+    ? ` 모델이 ${baseName(r.modelMismatch.serving)} → ${baseName(r.configuredModel)} 로 바뀝니다.`
     : "";
-  return `기존 서버를 종료하고 같은 포트(${r.port})에서 ${r.configuredModel.split("/").pop()} 로 다시 올립니다.${change}`;
+  return `기존 서버를 종료하고 같은 포트(${r.port})에서 ${baseName(r.configuredModel)} 로 다시 올립니다.${change}`;
 }

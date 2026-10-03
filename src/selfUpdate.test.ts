@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename, dirname } from "node:path";
 import {
   sha256Hex, parseManifest, updateAvailable, checkAndApplyUpdate, LOCAL_HASH_FILE,
   updateRefusedForCheckout, selfUpdateForced, readAppliedUpdate, readWithProgress,
@@ -36,7 +36,8 @@ async function buildFixtureArchive(files: Record<string, string>): Promise<{ byt
       await writeFile(join(srcDir, path), content, "utf8");
     }
     const archivePath = join(srcDir, "..", `fixture-${Date.now()}-${Math.random().toString(36).slice(2)}.tar.gz`);
-    await execFileAsync("tar", ["-czf", archivePath, "-C", srcDir, "."]);
+    // Relative archive name + cwd: GNU tar (Git for Windows) reads "C:\\..." as host "C" + path.
+    await execFileAsync("tar", ["-czf", basename(archivePath), "-C", srcDir, "."], { cwd: dirname(archivePath) });
     const bytes = await readFile(archivePath);
     await rm(archivePath, { force: true });
     return { bytes, sha256: sha256Hex(bytes) };
@@ -296,7 +297,7 @@ test("the update URLs are overridable from the environment", async () => {
     await writeFile(join(stage, "index.js"), "console.log('new')\n");
     await writeFile(join(stage, "tui", "App.js"), "export const x = 1;\n");
     const tgz = join(dir, "arch.tar.gz");
-    await execFileAsync("tar", ["-czf", tgz, "-C", stage, "."]);
+    await execFileAsync("tar", ["-czf", basename(tgz), "-C", stage, "."], { cwd: dirname(tgz) });
     const bytes = await readFile(tgz);
     const sha = createHash("sha256").update(bytes).digest("hex");
 

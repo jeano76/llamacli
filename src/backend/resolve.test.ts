@@ -9,6 +9,7 @@ import { DEFAULT_CONFIG, type LlamacliConfig } from "../config.js";
 import { discoverRunningServer, type Discovery } from "./detect.js";
 import type { BootstrapOptions, BootstrapReport } from "../setup/bootstrap.js";
 
+
 async function project(): Promise<string> {
   return mkdtemp(join(tmpdir(), "llamacli-resolve-"));
 }
@@ -21,6 +22,8 @@ const localConfig = (over: Partial<LlamacliConfig> = {}): LlamacliConfig => ({
 /** A discovery result, defaulted to "nothing is running" so each test states
  *  only the case it is about. */
 const none: Discovery = { kind: "none" };
+
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("case 1: an already-running server is adopted, nothing is installed or spawned", async () => {
   const root = await project();
@@ -361,7 +364,7 @@ test("case 1: an inconclusive probe still adopts — a slow backend is not a bro
   }
 });
 
-test("case 2: a freshly spawned server serving garbage is reported, not handed to the agent loop", async () => {
+test("case 2: a freshly spawned server serving garbage is reported, not handed to the agent loop", { skip: WIN_SKIP }, async () => {
   const root = await project();
   const cleanup: Array<() => void> = [];
   try {

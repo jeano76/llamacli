@@ -9,6 +9,7 @@ import {
   type ProbeSpawn,
 } from "./llamaCpp.js";
 
+
 // ── a binary that runs but cannot read the model is a different failure ─────
 //
 // Two llama.cpp builds coexisted on this machine: a stock `~/llama.cpp` build
@@ -22,6 +23,8 @@ import {
 // `~/llama.cpp/build-opt` first and returned it, because the only check was
 // `probeLlamaServer`, which runs `--version` — a check that a binary unable to
 // read the weights it is about to be handed passes perfectly.
+
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("an unsupported-format error is recognised as a build mismatch, not a bad file", () => {
   assert.equal(
@@ -41,7 +44,7 @@ test("a generic load failure is NOT claimed to be a build mismatch", () => {
   assert.equal(looksLikeUnsupportedModelFormat(""), false);
 });
 
-test("a build that cannot read the configured model is skipped in favour of the next candidate", async () => {
+test("a build that cannot read the configured model is skipped in favour of the next candidate", { skip: WIN_SKIP }, async () => {
   // The stock build answers `--version` fine and would previously be accepted.
   // With the newer-quant model it must be rejected specifically for the model, and
   // the search must continue to a build that can read it.
@@ -67,7 +70,7 @@ test("a build that cannot read the configured model is skipped in favour of the 
   assert.deepEqual(result.rejected, [], "a running binary is not 'rejected: cannot execute'");
 });
 
-test("a build that CAN read the model is accepted", async () => {
+test("a build that CAN read the model is accepted", { skip: WIN_SKIP }, async () => {
   // The other half of the previous test: the check must not reject everything,
   // or a working install would be discarded for a problem it does not have.
   const result = await findLlamaServer({
@@ -84,7 +87,7 @@ test("a build that CAN read the model is accepted", async () => {
   assert.deepEqual(result.rejectedForModel, []);
 });
 
-test("the search proceeds past a mismatched build to one that works", async () => {
+test("the search proceeds past a mismatched build to one that works", { skip: WIN_SKIP }, async () => {
   // The stock `~/llama.cpp` build is ranked FIRST, so this is the real shape of
   // the failure: the wrong build is found before the right one is even looked
   // at, and returning it ends the session. The working build is here on PATH,
@@ -110,7 +113,7 @@ test("the search proceeds past a mismatched build to one that works", async () =
   assert.deepEqual(seen, [stock, fork], "the mismatch must be established before moving on");
 });
 
-test("a working build outside every searched location is genuinely unreachable", async () => {
+test("a working build outside every searched location is genuinely unreachable", { skip: WIN_SKIP }, async () => {
   // Recorded deliberately rather than papered over. The search covers env
   // overrides, PATH, and llama.cpp checkouts under $HOME — and nothing else.
   // The build that reads the model on this machine lives in neither, so
@@ -137,7 +140,7 @@ test("a working build outside every searched location is genuinely unreachable",
   );
 });
 
-test("a model-compatibility failure that is NOT a format mismatch keeps the binary", async () => {
+test("a model-compatibility failure that is NOT a format mismatch keeps the binary", { skip: WIN_SKIP }, async () => {
   // A truncated download says nothing about the build. Discarding a working
   // install over it would be worse than the original problem.
   const result = await findLlamaServer({
@@ -153,7 +156,7 @@ test("a model-compatibility failure that is NOT a format mismatch keeps the bina
   assert.deepEqual(result.rejectedForModel, []);
 });
 
-test("model compatibility is not checked when no model is known yet", async () => {
+test("model compatibility is not checked when no model is known yet", { skip: WIN_SKIP }, async () => {
   // A first run has no model. Probing for compatibility with nothing would be
   // both meaningless and a wasted process spawn per candidate.
   let probed = false;
@@ -203,7 +206,7 @@ test("probeModelCompatibility resolves ok without a model path", async () => {
   });
 });
 
-test("a candidate that cannot even run is reported separately from a model mismatch", async () => {
+test("a candidate that cannot even run is reported separately from a model mismatch", { skip: WIN_SKIP }, async () => {
   // The two lists answer different questions and lead to different fixes, so
   // collapsing them would lose the distinction that makes the message useful:
   // "cannot execute" means a broken install, "cannot read this quant" means the
@@ -240,7 +243,7 @@ test("a candidate that cannot even run is reported separately from a model misma
   assert.deepEqual(chosen.rejectedForModel, []);
 });
 
-test("one binary reachable through several layouts is probed only once", async () => {
+test("one binary reachable through several layouts is probed only once", { skip: WIN_SKIP }, async () => {
   // `candidatePaths` yields the same binary under each of the three real build
   // layouts (bin/, build/bin/, Release/), and the search tries all three. Both
   // probes are process spawns — `--version`, and a GGUF header parse for
@@ -272,7 +275,7 @@ test("one binary reachable through several layouts is probed only once", async (
   assert.equal(versionProbes, 1, "the same path must not be executed three times");
 });
 
-test("a binary rejected for the model is listed once however many layouts expose it", async () => {
+test("a binary rejected for the model is listed once however many layouts expose it", { skip: WIN_SKIP }, async () => {
   const bin = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
   const result = await findLlamaServer({
     home: "/home/jeano",
@@ -304,7 +307,7 @@ test("a binary rejected for the model is listed once however many layouts expose
 // that can read it is `<drive>/alt-runtime/llama-server` — same disk, two
 // directories away, invisible to every existing rule.
 
-test("a runtime beside the model directory is found", async () => {
+test("a runtime beside the model directory is found", { skip: WIN_SKIP }, async () => {
   const tree: Record<string, string[]> = {
     "/m/models/gguf": [],
     "/m/models": [],
@@ -349,7 +352,7 @@ test("no model means no adjacent-runtime scan", async () => {
   assert.equal(listed, false, "the filesystem must not be touched");
 });
 
-test("llama-server is never treated as its own parent directory", async () => {
+test("llama-server is never treated as its own parent directory", { skip: WIN_SKIP }, async () => {
   // Harmless but wrong: `<dir>/llama-server/llama-server` is not a candidate,
   // and reporting it would put a nonexistent path in front of the user.
   const found = await runtimeCandidatesNearModel("/m/models/m.gguf", {
@@ -359,7 +362,7 @@ test("llama-server is never treated as its own parent directory", async () => {
   assert.deepEqual(found, ["/m/runtime/llama-server"]);
 });
 
-test("the search prefers a declared location over an adjacent runtime", async () => {
+test("the search prefers a declared location over an adjacent runtime", { skip: WIN_SKIP }, async () => {
   // Ranking matters: a build the user put in PATH is a decision, whereas an
   // adjacent runtime is a guess about where a tarball was unpacked. The guess
   // may be tried, but must never outrank the decision.
@@ -378,7 +381,7 @@ test("the search prefers a declared location over an adjacent runtime", async ()
   assert.equal(result.location?.source, "path");
 });
 
-test("an adjacent runtime is used when the declared builds cannot read the model", async () => {
+test("an adjacent runtime is used when the declared builds cannot read the model", { skip: WIN_SKIP }, async () => {
   // The case that was actually dead-ended: a stock build in PATH that runs fine
   // and cannot read the model, and one working runtime beside the model files.
   const inPath = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
@@ -398,7 +401,7 @@ test("an adjacent runtime is used when the declared builds cannot read the model
   assert.deepEqual(result.rejectedForModel, [inPath]);
 });
 
-test("an unrelated sibling llama-server is probed and rejected, not launched", async () => {
+test("an unrelated sibling llama-server is probed and rejected, not launched", { skip: WIN_SKIP }, async () => {
   // Widening WHERE we look is only safe because the probe still decides WHAT we
   // accept. A sibling project that happens to contain a llama-server must not
   // be able to talk its way in.

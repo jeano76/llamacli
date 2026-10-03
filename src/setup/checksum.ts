@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
+import { baseName } from "../util/path.js";
 
 /** "sha256:ABC…" / "ABC…" / 'W/"abc…"' → lowercase 64-hex, or null when it is not one. */
 export function normalizeSha256(raw: string | null | undefined): string | null {
@@ -61,7 +62,7 @@ export class ChecksumMismatchError extends Error {
     readonly actual: string
   ) {
     super(
-      `SHA-256 이 일치하지 않습니다 (${path.split("/").pop()}): 기대 ${expected.slice(0, 16)}…, 실제 ${actual.slice(0, 16)}…`
+      `SHA-256 이 일치하지 않습니다 (${baseName(path)}): 기대 ${expected.slice(0, 16)}…, 실제 ${actual.slice(0, 16)}…`
     );
     this.name = "ChecksumMismatchError";
   }

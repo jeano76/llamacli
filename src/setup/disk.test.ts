@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { diskInfoFor, selectModelPath, hasRoom, candidateDirs, discoverMounts, RESERVE_BYTES, type Statfs } from "./disk.js";
 
+
 const GiB = 1024 ** 3;
 
 /** A fake filesystem: `path prefix -> { totalGiB, freeGiB }`. Anything not
@@ -24,6 +25,8 @@ function fakeDisks(map: Record<string, { totalGiB: number; freeGiB: number }>, p
 }
 
 // ── Free space ──────────────────────────────────────────────────────────────
+
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("free space is read from the nearest existing ancestor, not just the exact path", async () => {
   // A models directory normally does not exist yet — it is created BY the
@@ -173,7 +176,7 @@ test("an unwritable fallback is skipped rather than failing the whole bootstrap"
   assert.equal(hasRoom(choice, 25 * GiB), true);
 });
 
-test("the candidate list is de-duplicated and honours an explicit override first", () => {
+test("the candidate list is de-duplicated and honours an explicit override first", { skip: WIN_SKIP }, () => {
   const list = candidateDirs({ HOME: "/home/u", LLAMACLI_MODELS_DIR: "/mnt/x/models" } as NodeJS.ProcessEnv);
   assert.equal(list[0], "/mnt/x/models", "an explicit override is preferred");
   assert.equal(new Set(list).size, list.length, "no duplicates");
@@ -196,7 +199,7 @@ function fakeReaddir(tree: Record<string, string[]>) {
   };
 }
 
-test("mount discovery finds the automount shape /media/<user>/<label>", async () => {
+test("mount discovery finds the automount shape /media/<user>/<label>", { skip: WIN_SKIP }, async () => {
   // The machine that motivated this feature keeps its models on an external
   // drive at /media/<user>/<label>/models, which matched neither /mnt/models
   // nor /media/models — so the "switch to a path with room" logic refused to
@@ -222,7 +225,7 @@ test("mount discovery skips dotfiles and survives a missing /media or /mnt", asy
   assert.deepEqual(await discoverMounts({ readdir: async () => { throw new Error("ENOENT"); } }), []);
 });
 
-test("discovered mounts are consulted when the requested path is too small", async () => {
+test("discovered mounts are consulted when the requested path is too small", { skip: WIN_SKIP }, async () => {
   const mounts = await discoverMounts({
     readdir: fakeReaddir({ "/media": ["jeano"], "/media/jeano": ["nvme-usb"] }),
   });

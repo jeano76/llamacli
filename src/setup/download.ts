@@ -52,6 +52,7 @@ import {
   type RangeSpan,
 } from "./downloadProgress.js";
 import type { FileHandle } from "node:fs/promises";
+import { baseName } from "../util/path.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Progress accounting
@@ -418,7 +419,7 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
     openFile = (p: string) => open(p, "r+"),
     now = () => Date.now(),
     signal,
-    label = path.split("/").pop() ?? path,
+    label = baseName(path),
   } = opts;
 
   const expected = normalizeSha256(opts.expectedSha256);
@@ -565,7 +566,7 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
 
 /** Leaves `<file>.sha256` beside a verified download, in the format `sha256sum -c` reads. */
 async function recordVerified(path: string, sha: string): Promise<void> {
-  await writeFile(`${path}.sha256`, `${sha}  ${path.split("/").pop()}\n`, "utf8").catch(() => {});
+  await writeFile(`${path}.sha256`, `${sha}  ${baseName(path)}\n`, "utf8").catch(() => {});
 }
 
 /** Hashes `path` and compares it with `expected`. On a match returns true. On a mismatch
@@ -931,7 +932,7 @@ export async function downloadFiles(
         }
         const r = await downloadFile(f.url, f.path, {
           ...rest,
-          label: f.label ?? f.path.split("/").pop() ?? f.path,
+          label: f.label ?? baseName(f.path),
           onProgress: wrap(f.path),
           // Hand over the probe we already did. Its finalUrl is what the range
           // requests must use (a redirect target may not support Range), so

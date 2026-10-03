@@ -17,6 +17,7 @@
  *    a stray Enter cannot trigger it and it needs no new UI surface.)
  */
 import type { LiveLlamaServer, ParsedServerArgs, PortOwner } from "./modelSwitch.js";
+import { baseName } from "../util/path.js";
 
 export interface DesiredServer {
   modelPath?: string;
@@ -24,7 +25,7 @@ export interface DesiredServer {
   tuning?: Partial<Omit<ParsedServerArgs, "modelPath" | "port">>;
 }
 
-const base = (p: string) => p.split("/").pop() ?? p;
+const base = (p: string) => baseName(p);
 
 /** What would change between the running server and the one that would replace it. */
 export function diffServer(serving: ParsedServerArgs | undefined, servingBin: string | undefined, desired: DesiredServer): string[] {

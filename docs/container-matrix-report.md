@@ -91,12 +91,18 @@ GPU 는 전부 가짜 주입이므로 컨테이너의 실제 가속은 검증되
 
 워크플로가 처음 두 번 실패한 원인은 모두 **하네스** 쪽: (1) GNU tar 가 `D:\…` 의 `D:` 를 원격 호스트로 해석 → POSIX 경로로 풀기, (2) cmd.exe 인자 따옴표를 Node 가 이중으로 감쌈 → `windowsVerbatimArguments`.
 
-### Windows 에서 실패한 단위 테스트 75개 — 아직 분류 전 (제품 결함 vs 테스트의 POSIX 가정)
-샘플 원인으로 본 큰 범주:
-- **테스트 픽스처가 POSIX 쉘 스크립트/실행 권한을 전제**(`#!/bin/sh` 가짜 llama-server, `chmod 755` → Windows 는 666): `llamaCpp`/`resolve`/`tarGz`/`zip`/`llamaServer` 계열.
-- **테스트 헬퍼가 시스템 `tar` 로 아카이브를 만듦**: `selfUpdate`(약 20개)는 같은 `D:` 문제로 헬퍼가 실패 — 제품 코드의 문제인지는 별도 확인 필요(제품은 순수 JS `extractTarGz` 사용).
-- **경로 가정**(`/tmp`, `/` 구분자, 홈 디렉토리 기대값), `run_shell` 의 쉘 가정.
-- 이번에 **내가 추가한 테스트 3개**는 Windows 에서 실제 클립보드 도구를 부르는 비밀폐 결함 → `platform: "linux"` 로 고침(이 커밋).
-제품 결함이 섞여 있을 수 있으므로 **분류가 끝나기 전에는 "Windows 지원 완료"가 아니다.**
+### Windows 단위 테스트 실패 분류 (1265 중 75 → 두 번째 실행 71 실패)
 
+두 번째 Windows 실행(`37133814937`)의 71개를 분류했다. **제품 결함 1종(경로 구분자), 나머지는 테스트의 POSIX 가정.**
+
+| 분류 | 개수 | 조치 |
+|---|---|---|
+| **제품 결함: 경로를 `split("/")` 로 자름** — Windows 경로 `C:\models\x.gguf` 에서 파일명이 전체 경로로 나옴 (`/server`·`/models` 표시, 재시작 전 diff, 설정과 파일명 비교(`configuredModelPath`, `existingModelFilename`), `.sha256` 사이드카, 체크섬 오류 문구, 모델 재사용 매칭) | 22곳 | `src/util/path.ts` (`baseName`/`lastSegments`) 로 교체, `isAbsolute` 로 절대경로 판별. 단위 테스트 3개 |
+| 테스트 헬퍼가 시스템 `tar` 에 **절대 경로 `C:\…` 아카이브명**을 넘김 → Git 의 GNU tar 가 `C` 호스트로 해석(`selfUpdate` 11 + `selfUpdateStages` 6 + `tarGz` 2). 제품은 순수 JS 추출이라 무관 | 19 | cwd + 상대 아카이브명, `rm` → `rmSync` |
+| 실행 권한 비트·심볼릭 링크(Windows 에는 실행 비트 없음 — 666 이 정상) | 3 | win32 skip (이유 명시) |
+| 테스트가 `/proc/version/nope.txt` 처럼 Linux 에서만 실패하는 경로를 사용 / JSON 이스케이프된 경로 비교 / POSIX 쉘 문법 (`pwd`, `>&2`) | 4 | 플랫폼 중립으로 수정(`afile/nope.txt`, 이스케이프 비교, `cd`/`1>&2`) |
+| **POSIX 픽스처**: `#!/bin/sh` 가짜 llama-server(.exe 없음), posix 경로 리터럴, `/media`·`/mnt` 마운트 (`llamaCpp` 14, `bootstrap` 8, `buildLlamaCpp` 5, `disk` 3, `stockRuntime` 3, `ggufMeta` 3, `remaining` 2, `bootstrap.config` 2, `resolve` 1) | 41 | win32 에서 **skip** (이유 문자열 명시). **이 부분은 Windows 에서 테스트되지 않는다** — Windows 용 픽스처(.cmd/.exe) 필요. 실제 Windows 동작은 `test/windows/run.mjs` 가 일부(탐지·다운로드·클립보드)만 덮는다 |
+| 내가 추가한 클립보드 테스트의 비밀폐 | 4 | (이전 커밋에서 수정) |
+
+솔직한 상태: **skip 한 41개는 "통과"가 아니라 "Windows 에서는 검증 안 함"** 이다. 그 영역(엔진 탐색 `findLlamaServer`, 빌드 산출물 위치, 설치된 사전빌드 재사용, 부트스트랩 흐름)에서 Windows 고유 결함이 숨어 있을 수 있다.
 **여전히 미검증:** GPU 가 있는 Windows, `winget` 설치 실행, 실제 `llama-server` 기동, Windows Terminal/conhost 의 대화형 TUI(마우스·OSC 52), macOS.

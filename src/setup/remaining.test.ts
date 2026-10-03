@@ -12,10 +12,13 @@ import { stockRungsFor, type Release } from "./stockRuntime.js";
 import { formatProgress, type TransferProgress } from "./download.js";
 import { ensureLocalStack } from "./bootstrap.js";
 
+
 const GiB = 1024 ** 3;
 const tools = (p: string[]) => Object.fromEntries(p.map((t) => [t, true]));
 
 // ── user-space cmake ────────────────────────────────────────────────────────
+
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("no root, no sudo, only cmake missing, pip present: install cmake into the user's dir", () => {
   const plan = planBuildEnv({ platform: "linux", tools: tools(["git", "g++", "make", "apt-get", "pip3"]) }, { isRoot: false });
@@ -42,7 +45,7 @@ test("a user-space cmake is verified by its path, not by PATH", async () => {
   assert.ok(ran.includes(plan.cmakeBin!));
 });
 
-test("buildLlamaCpp invokes the user-space cmake by absolute path", async () => {
+test("buildLlamaCpp invokes the user-space cmake by absolute path", { skip: WIN_SKIP }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "llc-"));
   await mkdir(join(dir, ".git"), { recursive: true });
   const calls: string[] = [];
@@ -243,7 +246,7 @@ test("if the engine cannot be had, the in-flight model download is aborted and s
 
 // ── second launch with the new install location: no network, no acquisition ──
 
-test("a second launch finds the prebuilt that the first one installed and acquires nothing", async () => {
+test("a second launch finds the prebuilt that the first one installed and acquires nothing", { skip: WIN_SKIP }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "llamacli-again-"));
   try {
     const home = join(dir, "home");

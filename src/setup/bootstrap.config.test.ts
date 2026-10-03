@@ -7,6 +7,7 @@ import { parse } from "yaml";
 import { buildConfig, writeConfig, ensureLocalStack } from "./bootstrap.js";
 import type { LlamaTuning } from "./tuning.js";
 
+
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "llamacli-bs-"));
   try { await fn(dir); } finally { await rm(dir, { recursive: true, force: true }); }
@@ -18,6 +19,8 @@ const tuning: LlamaTuning = {
   cacheTypeK: "q8_0", cacheTypeV: "q8_0", parallel: 1,
   rationale: [], gpu: null,
 };
+
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("a hand-tuned config survives the bootstrap — the keys a user set by hand are not clobbered", async () => {
   // The bootstrap runs on EVERY launch, so "replace the config" would silently
@@ -117,7 +120,7 @@ test("an existing config is read back and merged, not discarded", async () =>
     assert.equal(report.ports?.llamaPort, 8080);
   }));
 
-test("a bootstrap that cannot fully do its job still returns a report and a usable config", async () =>
+test("a bootstrap that cannot fully do its job still returns a report and a usable config", { skip: WIN_SKIP }, async () =>
   withTempDir(async (dir) => {
     // Offline, so no model can be resolved, and building is forbidden. The point
     // is that this RETURNS rather than throwing: a bootstrap that throws takes
@@ -167,7 +170,7 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
 // spawn a server with an empty model path and die with "failed to open GGUF
 // file" — a working machine turned into a three-stage failure.
 
-test("a model kept from the existing config never enters the download step", async () =>
+test("a model kept from the existing config never enters the download step", { skip: WIN_SKIP }, async () =>
   withTempDir(async (dir) => {
     await mkdir(join(dir, ".llamacli"), { recursive: true });
     // Outside any models dir, which is the normal case: modelsDir is only a default.

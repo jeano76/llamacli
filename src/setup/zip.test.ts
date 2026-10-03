@@ -77,7 +77,7 @@ function writeZip(path: string, members: Member[]): void {
   writeFileSync(path, Buffer.concat([...locals, ...centrals, eocd]));
 }
 
-test("unpacks a stored zip and marks binaries executable", () => {
+test("unpacks a stored zip and marks binaries executable", { skip: process.platform === "win32" ? "POSIX-only: Windows has no executable bit" : false }, () => {
   const root = mkdtempSync(join(tmpdir(), "zip-stored-"));
   const zip = join(root, "a.zip");
   writeZip(zip, [zipStored("llama-server.exe", "MZfake", 0o755)]);

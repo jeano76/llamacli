@@ -2119,12 +2119,16 @@ test("a completed write_file's content is dropped from the conversation, since t
     const followUp = JSON.stringify(sentRequests[1].messages);
     assert.ok(!followUp.includes(bigContent), "the written content must not still be sitting in the conversation");
     assert.match(followUp, /characters written to disk/);
-    assert.ok(followUp.includes(target), "the path must be kept — the conversation should still read as 'I wrote this file'");
+    assert.ok(followUp.includes(JSON.stringify(target).slice(1, -1)), "the path must be kept — the conversation should still read as 'I wrote this file'");
   }));
 
 test("a FAILED write_file keeps its content in the conversation (it's the only copy left)", () =>
   withTempProject(async (dir) => {
     const content = "Y".repeat(3000);
+    // A path that cannot be written on any OS: a directory component that is a regular file. (The old
+    // "/proc/version/nope.txt" only failed on Linux; on Windows it resolved to a writable drive-root path.)
+    await writeFile(join(dir, "afile"), "x");
+    const unwritable = join(dir, "afile", "nope.txt");
     const sentRequests: ChatCompletionRequest[] = [];
     let turnCallCount = 0;
     const backend: ModelBackend = {
@@ -2135,7 +2139,7 @@ test("a FAILED write_file keeps its content in the conversation (it's the only c
         if (turnCallCount === 1) {
           return assistantMessage(null, [
             // A path that can't be written (a directory component that is a file)
-            { id: "c1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "/proc/version/nope.txt", content }) } },
+            { id: "c1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: unwritable, content }) } },
           ]);
         }
         return assistantMessage("done");

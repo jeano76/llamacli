@@ -39,7 +39,9 @@ function makeArchive(root: string, entries: Array<{ name: string; body: string; 
   return gz;
 }
 
-test("extracts files and PRESERVES THE EXECUTABLE BIT", () => {
+const POSIX_ONLY = process.platform === "win32" ? "POSIX-only: executable bits / symlinks" : false;
+
+test("extracts files and PRESERVES THE EXECUTABLE BIT", { skip: POSIX_ONLY }, () => {
   // The whole point: an unpacked llama-server that is not executable is a
   // non-executable llama-server, and that reads as a corrupt download.
   const root = mkdtempSync(join(tmpdir(), "targz-exec-"));
@@ -132,7 +134,7 @@ test("unpacks what GNU tar actually produced", () => {
   writeFileSync(join(stage, "llama-b1-real", "llama-server"), "#!/bin/sh\n", { mode: 0o755 });
   writeFileSync(longName, "ELF");
   const gz = join(root, "real.tar.gz");
-  execFileSync("tar", ["czf", gz, "-C", stage, "."]);
+  execFileSync("tar", ["czf", "real.tar.gz", "-C", stage, "."], { cwd: root }); // relative name: GNU tar reads "C:\\…" as a host
 
   const dest = join(root, "out");
   mkdirSync(dest, { recursive: true });
@@ -150,7 +152,7 @@ test("a non-tar payload throws instead of yielding a silent empty tree", () => {
   writeFileSync(bad, gzipSync(Buffer.from("this is not a tar archive at all")));
   assert.throws(() => extractTarGz(bad, join(root, "out")));
 });
-test("materialises symlinks, because the shipped runtime depends on them", () => {
+test("materialises symlinks, because the shipped runtime depends on them", { skip: POSIX_ONLY }, () => {
   // Not optional: the pinned llama.cpp release ships
   // `libllama-common.so.0 -> libllama-common.so.0.2.0`, and llama-server resolves
   // exactly that name. Without the link it dies with
@@ -169,7 +171,7 @@ test("materialises symlinks, because the shipped runtime depends on them", () =>
   writeFileSync(join(stage, "libllama-common.so.0.2.0"), "REAL-SO-BYTES");
   execFileSync("ln", ["-s", "libllama-common.so.0.2.0", join(stage, "libllama-common.so.0")]);
   const gz = join(root, "s.tar.gz");
-  execFileSync("tar", ["czf", gz, "-C", stage, "."]);
+  execFileSync("tar", ["czf", "s.tar.gz", "-C", stage, "."], { cwd: root }); // relative name: GNU tar reads "C:\\…" as a host
 
   const dest = join(root, "out");
   mkdirSync(dest, { recursive: true });

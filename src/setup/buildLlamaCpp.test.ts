@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { buildLlamaCpp } from "./llamaCpp.js";
 import type { Hardware } from "./hardware.js";
 
+
 const GiB = 1024 ** 3;
 const hw = (o: Partial<Hardware> = {}): Hardware => ({
   cpuCount: 12, ramTotalBytes: 32 * GiB, ramAvailableBytes: 24 * GiB, gpus: [], gpuBackend: "none",
@@ -38,14 +39,16 @@ function fakeRun(dir: string, o: { failBuildAbove?: number } = {}) {
   return { run, calls };
 }
 
-test("a machine with every tool installs nothing and never touches sudo", async () => {
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
+
+test("a machine with every tool installs nothing and never touches sudo", { skip: WIN_SKIP }, async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir);
   await buildLlamaCpp({ hw: hw(), run, home: dir, statfs: roomy });
   assert.ok(!calls.some((c) => c.file === "sudo" || c.file === "apt-get"));
 });
 
-test("CPU box configures a CPU build; no CUDA flag", async () => {
+test("CPU box configures a CPU build; no CUDA flag", { skip: WIN_SKIP }, async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir);
   const bin = await buildLlamaCpp({ hw: hw(), run, home: dir, statfs: roomy });
@@ -55,7 +58,7 @@ test("CPU box configures a CPU build; no CUDA flag", async () => {
   assert.ok(bin.endsWith("build-cpu/bin/llama-server"));
 });
 
-test("a Vulkan-capable AMD box builds Vulkan", async () => {
+test("a Vulkan-capable AMD box builds Vulkan", { skip: WIN_SKIP }, async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir);
   await buildLlamaCpp({
@@ -65,7 +68,7 @@ test("a Vulkan-capable AMD box builds Vulkan", async () => {
   assert.ok(calls.find((c) => c.file === "cmake" && c.args.includes("-DGGML_VULKAN=ON")));
 });
 
-test("CUDA build is narrowed to the card's architecture", async () => {
+test("CUDA build is narrowed to the card's architecture", { skip: WIN_SKIP }, async () => {
   const dir = await checkout();
   const calls: string[][] = [];
   const inner = fakeRun(dir);
@@ -79,7 +82,7 @@ test("CUDA build is narrowed to the card's architecture", async () => {
   assert.ok(cfg.includes("-DCMAKE_CUDA_ARCHITECTURES=75"));
 });
 
-test("an OOM-killed parallel build is retried once, serially", async () => {
+test("an OOM-killed parallel build is retried once, serially", { skip: WIN_SKIP }, async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir, { failBuildAbove: 1 });
   await buildLlamaCpp({ hw: hw({ cpuCount: 8 }), run, home: dir, statfs: roomy });

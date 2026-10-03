@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { checkAndApplyUpdate, UPDATE_STAGE_LABEL, type UpdateStage } from "./selfUpdate.js";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,9 +18,9 @@ import { join } from "node:path";
 function fixture(): { dir: string; tgz: Buffer; sha: string } {
   const dir = mkdtempSync(join(tmpdir(), "su-test-"));
   writeFileSync(join(dir, "hello.js"), "console.log('hi');");
-  execFileSync("tar", ["-czf", join(dir, "a.tgz"), "-C", dir, "hello.js"]);
+  execFileSync("tar", ["-czf", "a.tgz", "-C", dir, "hello.js"], { cwd: dir }); // relative name: GNU tar reads "C:\\…" as a remote host
   const tgz = readFileSync(join(dir, "a.tgz"));
-  execFileSync("rm", [join(dir, "a.tgz"), join(dir, "hello.js")]);
+  rmSync(join(dir, "a.tgz"), { force: true }); rmSync(join(dir, "hello.js"), { force: true });
   return { dir, tgz, sha: createHash("sha256").update(tgz).digest("hex") };
 }
 

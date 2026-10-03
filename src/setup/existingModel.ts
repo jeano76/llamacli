@@ -11,6 +11,7 @@
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { modelFamilyOf, pickPinnedCandidate, type ModelCandidate } from "./modelCatalog.js";
+import { baseName } from "../util/path.js";
 
 export interface LocalGguf {
   path: string;
@@ -80,7 +81,7 @@ export function quantTag(filename: string): string | null {
  * that works.
  */
 export function pickReusable(candidate: { filename: string; sizeBytes: number }, local: LocalGguf[]): LocalGguf | null {
-  const base = (p: string) => p.split("/").pop() ?? p;
+  const base = (p: string) => baseName(p);
   const exact = local
     .filter((f) => base(f.path).toLowerCase() === candidate.filename.toLowerCase())
     .filter((f) => !candidate.sizeBytes || f.sizeBytes >= candidate.sizeBytes)
@@ -99,8 +100,8 @@ export function pickReusable(candidate: { filename: string; sizeBytes: number },
 export function pickFamilyMatch(filename: string, local: LocalGguf[]): LocalGguf | null {
   const family = modelFamilyOf(filename).toLowerCase();
   const asCandidates: ModelCandidate[] = local
-    .filter((f) => modelFamilyOf(f.path.split("/").pop() ?? "").toLowerCase() === family)
-    .map((f) => ({ repo: "local", filename: f.path.split("/").pop() ?? f.path, sizeBytes: f.sizeBytes, url: f.path }));
+    .filter((f) => modelFamilyOf(baseName(f.path) ?? "").toLowerCase() === family)
+    .map((f) => ({ repo: "local", filename: baseName(f.path), sizeBytes: f.sizeBytes, url: f.path }));
   const pick = pickPinnedCandidate(asCandidates, filename);
   if (!pick) return null;
   return local.find((f) => f.path.endsWith(`/${pick.filename}`) && f.sizeBytes === pick.sizeBytes) ?? null;

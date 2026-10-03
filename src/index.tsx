@@ -67,6 +67,7 @@ function recordedTuning(config: unknown) {
 }
 
 import { join } from "node:path";
+import { baseName } from "./util/path.js";
 
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
@@ -875,7 +876,7 @@ async function main() {
         thresholds.contextWindowTokens = window;
       }
     } catch { /* /props unavailable: the previous window stands, and that is said nothing about */ }
-    out.push(`세션이 새 서버에 연결되었습니다 — 모델 ${modelId.split("/").pop()}`);
+    out.push(`세션이 새 서버에 연결되었습니다 — 모델 ${baseName(modelId)}`);
     return out;
   }
 
@@ -1132,7 +1133,7 @@ async function main() {
                   `[models] 이 머신 기준 — 사용 가능 VRAM ${usableVramGiB(hw, ownVramGiB).toFixed(1)} GiB, RAM ${(hw.ramTotalBytes / 1024 ** 3).toFixed(0)} GiB`,
                   ...(replacing
                     ? [
-                        `  · 지금 실행 중: ${(cur?.modelPath ?? "?").split("/").pop()} (포트 ${liveNow.servers[0].port}, VRAM ${ownVramGiB.toFixed(1)} GiB 사용` +
+                        `  · 지금 실행 중: ${baseName(cur?.modelPath ?? "?")} (포트 ${liveNow.servers[0].port}, VRAM ${ownVramGiB.toFixed(1)} GiB 사용` +
                           `${cur?.gpuLayers !== undefined ? `, -ngl ${cur.gpuLayers}` : ""}${cur?.cpuMoeLayers ? `, --n-cpu-moe ${cur.cpuMoeLayers}` : ""})`,
                         "  · 아래 판정은 지금 상태가 아니라 **교체 후** 기준입니다: 선택하면 이 서버를 종료(확인 후)하고,",
                         "    같은 llama.cpp 서버(빌드)로 모델만 바꿔 재시작합니다 — 종료로 돌려받는 VRAM 을 새 모델이 쓸 수 있는 것으로 계산했습니다.",
@@ -1259,7 +1260,7 @@ async function main() {
                 );
                 const provisioned = await provisionForSwitch({
                   projectRoot,
-                  modelFilename: result.modelPath.split("/").pop(),
+                  modelFilename: baseName(result.modelPath),
                   port: result.port,
                   hardware: hw,
                   log: (line) => ui?.pushStatus(`  · ${line}`),

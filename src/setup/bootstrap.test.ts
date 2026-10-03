@@ -16,6 +16,8 @@ const probeFor = (busy: number[]): ((p: number) => Promise<PortState>) =>
 
 // ── Ports ───────────────────────────────────────────────────────────────────
 
+const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
+
 test("a clean machine gets the canonical ports and nothing is reported as moved", async () => {
   const plan = await planPorts({ probe: probeFor([]) });
   assert.equal(plan.llamaPort, LLAMA_PORT);
@@ -86,7 +88,7 @@ test("the documented LLAMA_SERVER_BIN name is honoured too", async () => {
   assert.equal(location?.source, "env");
 });
 
-test("PATH is searched before any build tree, so an installed build wins", async () => {
+test("PATH is searched before any build tree, so an installed build wins", { skip: WIN_SKIP }, async () => {
   const { location } = await findLlamaServer({
     env: { PATH: "/usr/bin:/bin" },
     exists: only("/usr/bin/llama-server", "/home/u/llama.cpp/build/bin/llama-server"),
@@ -97,7 +99,7 @@ test("PATH is searched before any build tree, so an installed build wins", async
   assert.equal(location?.source, "path");
 });
 
-test("a CUDA-flavoured build directory is preferred over a plain build beside it", async () => {
+test("a CUDA-flavoured build directory is preferred over a plain build beside it", { skip: WIN_SKIP }, async () => {
   // Finding a CPU-only build first and silently using it is the expensive
   // mistake: a 35B MoE on CPU instead of the GPU.
   const { location } = await findLlamaServer({
@@ -123,7 +125,7 @@ test("nothing found means build, not a crash", async () => {
   assert.deepEqual(rejected, []);
 });
 
-test("build-cpu — the directory THIS module's builder creates — is found again", async () => {
+test("build-cpu — the directory THIS module's builder creates — is found again", { skip: WIN_SKIP }, async () => {
   // The builder writes to `build-cpu` on a machine with no CUDA, and the
   // preference list did not contain that name. So a CPU-only machine that let
   // llamacli build its own server could not find it on the next launch, and
@@ -139,7 +141,7 @@ test("build-cpu — the directory THIS module's builder creates — is found aga
   assert.equal(location?.source, "llamacli-build");
 });
 
-test("a build directory nobody anticipated is still found", async () => {
+test("a build directory nobody anticipated is still found", { skip: WIN_SKIP }, async () => {
   // People name build dirs after the CUDA version, the arch, or the date. A
   // hardcoded list made all of them invisible, which turned "you already have
   // a build" into a 10-40 minute rebuild.
@@ -153,7 +155,7 @@ test("a build directory nobody anticipated is still found", async () => {
   assert.equal(location?.binPath, "/home/u/llama.cpp/build-cuda-12.4-rocm/bin/llama-server");
 });
 
-test("a `make`-built llama.cpp at the repo root is found", async () => {
+test("a `make`-built llama.cpp at the repo root is found", { skip: WIN_SKIP }, async () => {
   // `make` puts the binaries at the checkout root, which is what a first-time
   // user following llama.cpp's own README ends up with. Nothing looked there.
   const { location } = await findLlamaServer({
@@ -166,7 +168,7 @@ test("a `make`-built llama.cpp at the repo root is found", async () => {
   assert.equal(location?.binPath, "/home/u/llama.cpp/llama-server");
 });
 
-test("a binary that exists but cannot run is skipped in favour of one that can", async () => {
+test("a binary that exists but cannot run is skipped in favour of one that can", { skip: WIN_SKIP }, async () => {
   // Existence is not usability. A build against an unavailable CUDA version, or
   // one missing its libggml-cuda.so, is present and executable and still fails
   // to start — and accepting it meant the failure surfaced later as an opaque
@@ -185,7 +187,7 @@ test("a binary that exists but cannot run is skipped in favour of one that can",
   assert.deepEqual(rejected, ["/home/u/llama.cpp/build-opt/bin/llama-server"]);
 });
 
-test("when every candidate is broken, the reason is reported instead of 'not installed'", async () => {
+test("when every candidate is broken, the reason is reported instead of 'not installed'", { skip: WIN_SKIP }, async () => {
   const { location, rejected } = await findLlamaServer({
     env: { PATH: "" },
     exists: only("/home/u/llama.cpp/build/bin/llama-server"),
@@ -197,7 +199,7 @@ test("when every candidate is broken, the reason is reported instead of 'not ins
   assert.deepEqual(rejected, ["/home/u/llama.cpp/build/bin/llama-server"]);
 });
 
-test("the three real build layouts are all covered", () => {
+test("the three real build layouts are all covered", { skip: WIN_SKIP }, () => {
   const root = "/llama.cpp";
   const paths = candidatePaths(root, ["build"]);
   // cmake, the usual case
@@ -430,6 +432,7 @@ test("with no model on disk there is nothing to probe, so no warning is raised",
 
 // ── /reset must not undo a /models selection ────────────────────────────────
 import { keepSelectedModelOnReset } from "./bootstrap.js";
+
 
 test("reset keeps the model the user selected when its file is on disk and it still fits", async () => {
   const root = await mkdtemp(join(tmpdir(), "llamacli-keep-"));

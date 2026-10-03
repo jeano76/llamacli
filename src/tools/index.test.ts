@@ -46,11 +46,12 @@ test("run_shell still completes normally for a fast command well under the timeo
 // in the passed project root, not wherever this test process happens to be.
 test("run_shell executes in the given project root, not the CLI process's own cwd", () =>
   withTempDir(async (dir) => {
-    const result = await executeTool("run_shell", JSON.stringify({ command: "pwd" }), dir);
+    const result = await executeTool("run_shell", JSON.stringify({ command: process.platform === "win32" ? "cd" : "pwd" }), dir);
     // Resolve both sides the same way (macOS/BSD can report /private/var/...
-    // for a path given as /var/...) so this isn't flaky across platforms.
-    const { realpath } = await import("node:fs/promises");
-    assert.equal(result.content.trim(), await realpath(dir));
+    // for a path given as /var/...; Windows temp dirs come as 8.3 short names) so this isn't flaky across platforms.
+    const { realpathSync } = await import("node:fs");
+    const real = (p: string) => realpathSync.native(p);
+    assert.equal(real(result.content.trim()), real(dir));
   }));
 
 // Found auditing for the same class of gap as run_shell's missing
@@ -192,7 +193,7 @@ test("load_skill rejects an unknown skill name and lists what's actually availab
 // pytest, cargo) that writes them to stderr alongside normal output.
 test("run_shell includes both stdout and stderr, not just whichever is non-empty first", () =>
   withTempDir(async (dir) => {
-    const result = await executeTool("run_shell", JSON.stringify({ command: "echo out; echo err >&2" }), dir);
+    const result = await executeTool("run_shell", JSON.stringify({ command: process.platform === "win32" ? "echo out & echo err 1>&2" : "echo out; echo err >&2" }), dir);
     assert.match(result.content, /out/);
     assert.match(result.content, /err/);
   }));
@@ -205,7 +206,7 @@ test("run_shell includes both stdout and stderr, not just whichever is non-empty
 test("run_shell surfaces the failing command's actual output, not just its exit message", () =>
   withTempDir(async (dir) => {
     await assert.rejects(
-      () => executeTool("run_shell", JSON.stringify({ command: "echo something specific went wrong >&2; exit 1" }), dir),
+      () => executeTool("run_shell", JSON.stringify({ command: process.platform === "win32" ? "echo something specific went wrong 1>&2 & exit /b 1" : "echo something specific went wrong >&2; exit 1" }), dir),
       /something specific went wrong/
     );
   }));

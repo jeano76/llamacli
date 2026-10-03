@@ -15,6 +15,7 @@ import type { Hardware } from "./hardware.js";
 import { keepSelectedModelOnReset, keepUserOwnedKeys } from "./bootstrap.js";
 import { isMoeModel, readGgufKvShape } from "./ggufMeta.js";
 import { stat } from "node:fs/promises";
+import { baseName } from "../util/path.js";
 
 export interface ResetPreview {
   /** One line per change; empty when the machine-derived values already match. */
@@ -37,7 +38,7 @@ export async function previewReset(opts: {
   if (!modelPath) return { changes: [], repicksModel: true };
 
   const size = (await stat(modelPath).catch(() => undefined))?.size ?? 0;
-  const moe = await isMoeModel({ path: modelPath, filename: modelPath.split("/").pop() }).catch(() => undefined);
+  const moe = await isMoeModel({ path: modelPath, filename: baseName(modelPath) }).catch(() => undefined);
   const kv = await readGgufKvShape(modelPath).catch(() => undefined);
   const t = tuneForHardware(hardware, {
     modelBytes: size, moe, kvElementsPerToken: kv?.elementsPerToken, trainedContext: kv?.contextLength, modelLayers: kv?.layers, ownServerVramGiB: opts.ownServerVramGiB,
