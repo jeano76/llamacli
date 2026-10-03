@@ -596,8 +596,9 @@ llama.cpp's own default and is exactly what a small card cannot do.
 **current** hardware — GPU, VRAM, RAM — and reports what actually changed, so a
 run that changes nothing reads as "already optimal" rather than as "broken".
 
-It asks first (`Y/N`; `N` changes nothing at all) and does two things that make
-it safe to run inside a live session:
+`/reset` first **previews** what it would change (nothing is written), and only
+`/reset confirm` applies it — see [One server, one port](#one-server-one-port--how-server-models-and-reset-fit-together).
+It does two things that make it safe to run inside a live session:
 
 - **`noDownload`** — it re-derives *settings* and never transfers a model. A
   20 GB fetch inside a TUI session wedges the agent loop for hours behind a
@@ -652,12 +653,14 @@ the `models[]` shape is what the current llama.cpp returns, so reading only
 
 ## Removed features
 
-One feature has been **removed, not disabled**: there is no flag and no code
-path left to re-enable it.
+Some features have been **removed, not disabled**: there is no flag and no code
+path left to re-enable them.
 
 | Removed | What it did | Why it is gone |
 |---|---|---|
 | **`/fastcheck`** | Consulted a second "System 1" model (laya) before each turn to pick a reasoning budget, and could downgrade a turn to a cheap mode. | Measured over a labelled prompt set: ~0.11 s per turn, agreement with "this needs the real model" on only 67% of the prompts that did, and no prompt wording separated the classes — the judge is the same model it was trying to avoid calling. See git history. Its risk rail went with it: it only mattered *because* a turn could be downgraded. |
+| **Bonsai / PrismML fork** (ternary `PTQ1_0`/`PQ2_0` quants) | A model ladder entry plus a downloaded/compiled fork of llama.cpp. | Removed on request (2026-10-03): the confirmed model is Ornith-1.5-35B-A3B on stock llama.cpp. The generic mechanisms it motivated (the run-the-binary compatibility probe, the stock engine ladder) stay; the measurement history stays in `docs/`. |
+| **Drag edge auto-scroll** | Holding a drag against the log's top/bottom edge scrolled the log. | Removed on request. A drag still selects and copies; scroll with the wheel while holding the button for more than one screen. |
 
 `/reset`, local model search and tuning are **present and implemented**.
 
@@ -896,6 +899,1274 @@ type registry rejects it into `rejectedForModel`, and it looks for a build
 sitting **beside the models** (`runtimeCandidatesNearModel`). `/models` only
 turns that result into something actionable. A discovery error is reported, never
 thrown.
+
+## One server, one port — how `/server`, `/models` and `/reset` fit together
+
+llamacli manages **one** llama-server on **one** port. A second server on an 8 GB card is an OOM, so the three
+commands share one policy (`src/setup/serverPolicy.ts`), decided in one place:
+
+- **Who holds the port** is classified `none` / `ours` / `foreign` / `systemd` / `unknown`. A `foreign`, `systemd` or
+  unreadable owner is **never** stopped. Several live llama-servers are listed and **never** cleaned up automatically.
+- **Replacing our own live server needs an explicit `confirm`.** Without it you get the change laid out (model, build,
+  context, `--n-cpu-moe`) and the exact command to run; the server is left running. An empty port starts without asking.
+
+| Command | Effect | Touches the server? |
+|---|---|---|
+| `/server` | Port, pid, owner, serving model vs configured model, build, "can this build read the model" | no |
+| `/server restart` → `/server restart confirm` | Shows the change, then stop → start on the **same port** → record what really runs | only after `confirm` |
+| `/models` | Table for **this** machine; with a server running the verdict is for the model *after it replaces that server* (its VRAM counted as returned; header `판정(교체 시)`) | no |
+| `/models <n>` → `/models <n> confirm` | Records the choice (`model` and `llama.modelPath` together), reuses a copy already on any disk, downloads only after `confirm`; the **same llama.cpp build** is reused when it can read the new model | only after `confirm` |
+| `/reset` → `/reset confirm` | Preview of what the machine-derived settings would change, then apply. Keeps a `/models` selection whose file exists and still runs here, and keeps the previous context while this machine's KV budget supports it | no (apply with `/server restart`) |
+
+At startup a running server serving a **different** model than the config is adopted untouched and the mismatch is
+reported (`/server` shows it, `/server restart` fixes it). The confirm is a typed word, not a Y/N dialog: a stray
+Enter cannot trigger it and no new UI surface is needed.
+
+### Launch-time calibration of `--n-cpu-moe` (`src/setup/calibrate.ts`)
+
+The tuner's value is arithmetic; starting the server checks it against the memory that is really free:
+
+1. **OOM at load** → keep more experts on the CPU and retry (≤ 3).
+2. **Load succeeded with room to spare** (free VRAM ≥ one expert layer + a 600 MiB safety margin) → one trial with fewer
+   CPU layers; restored if it does not load.
+3. **Load succeeded but the margin is thin** (< 600 MiB) → one trial with more CPU layers, restored if it does not load.
+
+Each trial runs once per `model@context@GPU` (`llama.calibratedFor`); the result is written to `llama.cpuMoeLayers`, and a
+recorded value is never overwritten by the tuner. `LLAMACLI_CALIBRATE=0` disables 2–3. Measured on the reference card
+(RTX 2070 SUPER, Ornith-35B, `-c 98304`): 36 → 33 (lowered), 33 stays, 32 → 33 (thin margin, 394 → 824 MiB free).
+
+### Context ceiling and offload rules
+
+- Header-read KV cost → ceiling **98,304** tokens (the largest context benchmarked end-to-end here; never above the model's
+  trained context). A size-guessed KV keeps the conservative **32,768**.
+- A **dense** model reserves its weights before the KV term; one larger than the card offloads only the layers that fit
+  (never a blanket `-ngl 999`). **Apple Silicon** unified memory is exempt (it has no separate VRAM to overflow).
+- **CPU-only**: KV is sized from RAM *minus the weights*; below 8,192 tokens the tuner says so.
+- Container/cgroup limits (`--memory`, `--cpus`, systemd slices) are read and clamp the detected RAM and cores
+  (`os.totalmem()` reports the host).
+
+### Downloads
+
+- **Resume works across re-signed CDN URLs.** The Hub redirects to a CDN URL whose signature changes on every request;
+  resume state is keyed by the stable part of the URL (`stableUrlKey`), so an interrupted 20 GB download continues.
+- **An existing file is judged by the publisher's SHA-256**, never by size: equal → used (no download; a `.sha256` record
+  caches the check); different → fetched anew and only replaced after the new file verifies. A full-length `.part` with no
+  resume record is hashed and promoted instead of re-downloaded.
+- Failures say **why** (HTTP status, checksum, no space, aborted) rather than "check disk and network".
+- `self-update` shows byte progress for the archive too.
+
+### Copy by dragging (no Shift)
+
+A plain drag selects and copies inside the app. OSC 52 cannot be confirmed and several terminals ignore it (GNOME's VTE
+among them), so the OS clipboard tool is used as well and its exit status reports success: Linux `wl-copy` (Wayland) /
+`xclip` / `xsel`, macOS `pbcopy`, Windows PowerShell `Set-Clipboard` (UTF-8; `clip.exe` mangles Korean). When none works the
+status line says so and how to fix it (e.g. `sudo apt install wl-clipboard`); the text is always in the fallback file.
+
+## Download progress is ONE redrawn line, not a scrolling log
+
+A `/reset` that has to fetch a 20 GB model reported every progress update through
+the normal log, and the log **appends**. So a transfer emitted hundreds of rows,
+and past `MAX_LOG_ENTRIES` the setup output the user needed was pushed off the
+top of the visible log long before the bytes arrived.
+
+The bar was never the problem — it was being **appended** rather than
+**redrawn**, which is the difference between a status readout and a log.
+
+```
+1000 updates (0% → 100% in 0.1% steps)
+  via pushStatus  →  1001 log rows      ← what the user saw
+  via setTransient →     1 log row      ← redrawn in place
+```
+
+`/reset` now passes the `onProgress` seam that already existed for exactly this
+and was never used. That seam is not incidental: the default reporter writes
+`\r\x1b[2K` to `process.stdout`, which is right when bootstrap owns a plain
+screen and **wrong** inside an Ink app rendering into the same terminal — its own
+comment says so. The TUI was written to take over, and nothing did.
+
+`setTransient` rewrites only its own row, so a `[reset] llama.cpp 빌드 완료`
+line emitted mid-transfer survives the next tick. `end()` freezes the last value
+into the scrollback, so a finished transfer still leaves a record. And if the row
+is trimmed away mid-transfer (the cap is 5000 and a chatty session can exceed
+it) it is **re-added rather than abandoned** — an abandoned id freezes the bar at
+an arbitrary percentage, which reads as a stalled download.
+
+The reducer is a pure function in `src/tui/transientLine.ts`, shared with its
+test. The first version of that test re-implemented the logic inside the test
+file, so it would have passed no matter what the app did; the second stamped the
+allocated id onto the created row, which it had not, and the bar grew the log
+anyway — caught immediately by the test that exists to catch exactly that.
+
+## Self-update reports every stage, with elapsed time
+
+Startup self-update printed **one banner and then went silent** for the whole
+download-verify-install. Nothing said which stage was running, so a slow step was
+indistinguishable from a hang.
+
+Worse, the window **before the manifest resolved printed nothing at all**. That
+is the worst case: a slow or unreachable GitHub looked exactly like a frozen
+startup.
+
+```
+[manifest  ] 원격 매니페스트 확인 중… (0.0초 경과)
+[download  ] 아카이브 다운로드 중… (0.03초 경과)
+[verify    ] 해시 검증 중… (0.18초 경과)
+[extract   ] 압축 푸는 중… (0.18초 경과)
+```
+
+Each stage is announced **when it begins**, not when it ends, and the `manifest`
+stage fires **before the request** — the only ordering that closes the silent
+window. On a TTY the four stages rewrite one line rather than adding four; a
+non-ANSI sink gets plain lines.
+
+The elapsed number is what does the work: a stage with no clock reads as stalled
+whether or not it is, while `(7초)` reads as progress.
+
+**A normal launch leaves the terminal untouched.** "Already up to date" is the
+overwhelmingly common case, and the manifest stage must fire before the fetch to
+close the silent window — so it flashes on every startup. It is therefore
+*erased* rather than newline-terminated when there is no update, and only a real
+update leaves a trace. Tests assert that up-to-date reports the manifest stage
+and nothing else, because a full stage list there would mean downloading an
+update that does not exist.
+
+## Validation on a bare machine and on Windows `cmd`
+
+The other three harnesses all assume a machine that already has things: a home
+directory with content, a shell, `PATH`, a GPU tool, a working `llama-server`.
+`scripts/bare_env_check.ts` removes those assumptions, because "works on my
+machine" is exactly the claim that breaks for someone who has none of them.
+
+| Family | What is removed |
+|---|---|
+| **A · bare** | no config, no model, no llama.cpp, no `PATH`, no `nvidia-smi`, no `ss`, no `systemctl`, no network |
+| **B · Windows cmd** | no `HOME` (it is `USERPROFILE`), no procfs, no `systemctl`; listening ports from `netstat -ano` in a different column layout |
+
+Windows is **simulated by injecting the platform and the real command output**,
+not by mocking the code under test — the point is to exercise the real parsing.
+`netstat` fixtures are real `netstat -ano` lines, CRLF and all.
+
+### It found four real bugs, all the same mistake
+
+A platform-specific default that degrades into a **wrong answer** instead of an
+error.
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| `env.HOME` with a hardcoded `/root` fallback | `HOME` is normally **unset** on Windows, so every default became `/root/...` — a path that cannot exist there, produced with no error | `USERPROFILE` is honoured; no POSIX fallback |
+| `ss -ltnp` for the listening port | absent on Windows; the throw was caught and the port reported **FREE** → a model switch starts a **second** server on an occupied port | `netstat -ano` on Windows; a missing tool is `unknown`, and `unknown` refuses to act |
+| `usableVramGiB` inherited the tuner's `RAM * 0.6` no-GPU fallback | a machine with **no GPU** was told `4.8 GiB` of VRAM, and `/models` printed `✅ GPU에 완전히 올라갑니다` for it | the two are deliberately different numbers; only the tuner gets the RAM fallback. The tuner still sizes a CPU-only box sanely (`-c 32768`, not 0) |
+| an unreadable `/proc` cmdline read as "not a llama-server" | `wmic` is gone from current Windows, so a real server was classified `foreign` and the switch refused with a message about a process "llamacli does not recognise" — when the truth is it could not look | unreadable ⇒ `unknown`, which says so |
+
+The third is the one worth dwelling on: the two numbers are *deliberately*
+different, and the comment in `usableVramGiB` says why. A fallback that is
+correct for one caller is not correct for another, and nothing in the types
+stopped it being inherited.
+
+### Every bug was verified by reverting it
+
+A harness that passes on its first full run is a harness that may be asserting
+nothing. Each was reintroduced and the failure watched:
+
+```
+reintroduce no-GPU VRAM bug        -> ✗ with no GPU nothing may be reported as fitting in VRAM
+reintroduce USERPROFILE bug        -> ✗ HOME is unset on Windows, so USERPROFILE must be used
+                                     ✗ must not fall back to /root when HOME is absent
+reintroduce "missing tool = free"  -> ✗ believing a tool's absence starts a second server
+```
+
+### What it does NOT prove
+
+Simulated is not native. `netstat` output is **parsed** here on Linux; it has not
+been run against a real `cmd.exe`, and `wmic`'s absence is assumed rather than
+observed. A real Windows box is still the only thing that settles those. What is
+verified is that the platform-specific code paths are *reachable and correct*,
+which is what made the four bugs findable at all.
+
+## Validation — what is actually checked, and what is not
+
+Three harnesses, one per axis, plus the unit suite. Run all of them:
+
+```bash
+npm test                                              # 850 unit tests
+npx tsx scripts/persona_usability_check.ts           # terminal identity
+npx tsx scripts/project_persona_check.ts             # project shape
+npx tsx scripts/tui_simulation_check.ts              # terminal capability + interaction
+```
+
+| Axis | Harness | Checks | Status |
+|---|---|---:|---|
+| Unit / regression | `npm test` | **850** | pass |
+| Terminal identity (100 personas) | `persona_usability_check.ts` | **5,777** | 0 violations |
+| Project shape (100 real directories) | `project_persona_check.ts` | **8,037** | 0 violations |
+| Terminal capability + TUI interaction | `tui_simulation_check.ts` | **599** | 0 violations |
+| Hardware matrix (one-off sweep) | *(not committed — see below)* | 168,668 | 0 violations |
+
+The four sections below each cover one axis. Every bug they found is in the
+unit suite now, and each was verified by **reverting the fix and requiring the
+new tests to fail** — a regression test that passes with its own fix reverted is
+asserting nothing, and one of these did exactly that before it was caught.
+
+### What this does not cover
+
+Stated plainly, because a validation section that only lists passes is not
+useful:
+
+- **No real Windows, macOS, or musl machine.** `platform: "win32"` and
+  `darwin` exercise the *branch*, not the OS. Windows path separators, `\r\n`
+  line endings, conhost behaviour, Apple unified memory and a musl libc are
+  untested. The bugs most likely to hide there are exactly the ones the
+  document set this work came from warned about.
+- **No real GPU pressure.** Synthetic VRAM figures prove the arithmetic; they
+  do not prove an 8 GB card survives a 35B MoE load.
+- **No real mouse or compositor.** Selection and edge-scroll arithmetic is
+  verified; frame pacing, and whether *your* Wayland compositor refuses OSC 52,
+  are not. The harness asserts the app behaves correctly whenever refusal
+  happens, which is the half the app owns.
+- **13 of 47 acceptance TCs remain unverified**, mostly those needing a live
+  backend, a live `laya-serve`, or a real build. Per-TC results:
+  [`docs/multienv-acceptance-report.md`](docs/multienv-acceptance-report.md).
+
+The honest summary: the **decision and rendering logic** is now well covered,
+and the **OS and hardware layers are not covered at all**. Anyone reading
+"14,413 checks, all passing" as "this works everywhere" is reading it wrong.
+
+## Usability validation across 100 personas
+
+`scripts/persona_usability_check.ts` runs **5,777 assertions across 100
+distinct usage configurations** — 3 platforms, 10 terminal families, 5 locales,
+6 terminal sizes and 4 colour modes, crossed so every value of every axis is
+exercised.
+
+It is worth being precise about what this is and is not. It is **not** 100
+simulated humans; nobody can emulate perception or taste, and a script claiming
+to is worse than useless. What it is: 100 concretely-specified configurations
+checked against the invariants that users actually reported, each of which is
+mechanically verifiable and each of which this app has genuinely broken:
+
+1. the fixed-height layout must not overflow the terminal
+2. no rendered line may exceed the terminal width, in display columns
+3. nothing may be emitted that the terminal cannot render
+4. every interaction must be reachable without a mouse
+5. every interaction must be discoverable from `/help`
+6. the gate must never be the reason a request goes unanswered
+
+```bash
+npx tsx scripts/persona_usability_check.ts [--verbose]
+```
+
+### What it found
+
+The first run failed **47 assertions across 3 invariants**, and two were real
+product bugs rather than harness noise:
+
+- **The status bar overflowed.** `statusBarFieldWidth`'s `Math.max(8, …)` floor
+  overrode its own arithmetic, so at 40 columns the row came out **41 columns
+  wide** and wrapped. 17 personas hit it. The root cause was structural: the
+  width math and the render each decided the layout *independently*, so nothing
+  ever checked the sum. Fixed by making `statusBarChrome()` the single source of
+  truth both read, dropping the gauge and then the decorative divider before the
+  row can overflow. The irreducible 8-column minimum is now a declared constant
+  rather than a hidden floor.
+- **A gate status line printed on every turn while the gate was off**, pushing
+  the real reply out of view. Caught in a real pty capture of the disabled
+  default, where it was the only non-blank line on screen.
+- A third finding was in the harness itself: it checked the border style against
+  *colour* when the correct contract is *glyph coverage* (a 16-colour terminal
+  draws box-drawing perfectly well). Worth recording, because "the test was
+  wrong" is a real outcome and the temptation is to quietly fix the test.
+
+## Hardware / environment matrix validation
+
+`scripts/persona_usability_check.ts` (above) varies the **terminal**. This section
+is about the other axis: the **machine**. The sweep behind this was run once as
+a throwaway harness over
+
+```
+CPU (1·2·4·8·12·16·32·64) × RAM (2–256 GiB)
+  × GPU (none / 4·8·12·24·80 GiB, plus a card reporting 0 MiB free)
+  × platform (linux·darwin·win32) × model size (0·1·4·20·70 GiB)
+```
+
+= **6,720 environment combinations, 168,668 invariant checks, 1,442 violations
+before the fix, 0 after.**
+
+Being precise about what survives in the repo: the one-off harness was **not
+committed** — the 168,668 figure is what that throwaway run reported, and you
+cannot re-run it from a clean checkout. What *is* committed is
+`src/setup/tuning.test.ts` (11 tests), which pins every invariant the sweep
+found broken, plus the cross-product spot-checks. The sweep's value was finding
+the three bugs below; the tests are what stop them coming back. Quoting a check
+count that no longer has anything to reproduce it would be the same mistake this
+README criticises elsewhere.
+
+The invariants are the ones whose violation the user discovers hours later:
+threads never exceed the core count, context stays in a range llama.cpp's KV
+allocator handles, `-b`/`-ub` stay powers of two, no derived flag is ever `NaN`
+or negative, and no GPU means `-ngl 0` while a GPU always wins over the CPU.
+
+### What it found
+
+Three real bugs, all of which the entire suite of its day passed straight
+through — because each one is invisible on the machine they were written on.
+
+- **Threads exceeded the core count on 1–3 core machines** (`tuning.ts`). The GPU
+  branch used a `Math.max(2, …)` floor, so a 1-core box was launched with
+  `-t 2 -tb 2`. The dev box has 12 cores, where `max(2, 6)` lands on a legal
+  value *by accident* — 1,440 of the 6,720 combinations were wrong and none of
+  them could be seen from here. Now clamped with `Math.min(cpuCount, …)`; the
+  known-good 12-core result (`threads=6`, the value in the hand-tuned config
+  below) is unchanged, and a test pins it.
+
+- **Recursive and forced deletes were classified "cheap"** (`gate.ts`). The
+  `bulk delete` rail required a delete verb *and* a separate bulk word, so the
+  `-r`/`-f` flag did not count as the qualifier. `rm -rf /home/jeano` and
+  `rm -rf /*` were caught — the first by the path pattern, the second by a literal
+  `*` — while `rm -rf /`, `rm -rf ~` and `rm -fr node_modules` passed through and
+  could be downgraded to a system1 turn. Whether a destructive command was held
+  depended on which characters sat next to it.
+
+- **Korean verb conjugations were not matched** (`gate.ts`). The rail listed
+  `지우`, but Korean changes the stem vowel `우 → 워` before a vowel-ending
+  suffix, so the imperative anyone actually types — `지워줘` — does **not**
+  contain `지우` as a prefix. `모든 파일을 지워줘` ("delete all the files") was
+  judged cheap while the identical `전부 삭제해줘` was held. `제거` and `재귀`
+  were absent from the list entirely.
+
+All three are now covered by regression tests, and the benign side is guarded
+too: 39 ordinary requests (English and Korean) must stay unflagged, because a
+rail that fires on everything is the same as having no rail.
+
+### What this does *not* cover
+
+Being explicit, because a matrix like this is easy to over-claim. It exercises
+the **decision functions** against synthetic hardware. It does not run on real
+Windows, macOS, Wayland or musl, and it does not put a real 8 GB card under
+real VRAM pressure. A green matrix means the *arithmetic* is sound; it says
+nothing about the driver, the kernel, or the terminal.
+
+For the per-TC results, what was actually executed, and the 25 test cases that
+remain **unverified** for lack of the hardware, see
+[`docs/multienv-acceptance-report.md`](docs/multienv-acceptance-report.md).
+
+## Project validation — 100 developers, 100 projects
+
+The harness above varies the **terminal**. `scripts/project_persona_check.ts`
+varies the axis next to it: the **project the developer opened**.
+
+```bash
+npx tsx scripts/project_persona_check.ts [--verbose]
+```
+
+Being precise about what this is: not 100 simulated humans, and not 100
+simulated machines. A "developer" here is a concrete, reproducible project state
+— a directory layout, a path shape, a config state, a locale, a disk
+condition. Nothing about it is fictional. The value is the coverage matrix, not
+a story about a person.
+
+What makes it different from the synthetic sweep above is that **every persona
+gets a real directory on disk and the real `ensureLocalStack` runs against it.**
+Only the network and the hardware probe are stubbed — the two things a test
+must not depend on. So this covers what pure-function tests structurally
+cannot: a project directory called `my project 28`, or `프로젝트-5`, or
+`proj-7-🚀`, or one whose `.llamacli/config.yaml` is three bytes of garbage, or
+a read-only checkout, or a model file sitting inside the repo.
+
+- **10 project kinds** — empty, git repo, dirty git repo, monorepo, already
+  bootstrapped, corrupt config, truncated config, read-only, model-in-project,
+  deeply nested
+- **8 path shapes** — ascii, spaces, Korean, emoji, many dots, very long,
+  a name that *looks* like `C:\Users\dev\project`, and a symlink (where the
+  path you type and the path on disk differ)
+- **5 locales**, **5 disk conditions**
+
+**8,037 checks across 100 real project directories.**
+
+### What it found
+
+Two real bugs, in the same shape, one layer apart:
+
+- **`ensureLocalStack` threw on an unwritable project.** `writeConfig` was the
+  one call in the whole function not wrapped in the error-catching `step()`
+  helper, so `mkdir .llamacli` failing with `EACCES` rejected the entire
+  bootstrap — directly contradicting this module's own contract that a
+  bootstrap "degrades instead of failing". A read-only mount, a checkout owned
+  by someone else, or a container running as a non-owner all reach it.
+
+- **`loadConfig` had the identical defect, and it was worse.** The same
+  unguarded `mkdir` + `writeFile`, inside the `catch` block that handles a
+  *missing* config. Since that path runs on **every launch**, a read-only
+  project could not start `llamacli` at all. It now starts with in-memory
+  defaults and says so honestly, instead of showing a stack trace.
+
+Both are now regression-tested — and the tests were themselves wrong at first:
+the read-only probe created `.llamacli` as a side effect, so on a system where
+the directory was *not* actually read-only the test passed without exercising
+anything. Reverting the fixes and watching the tests fail is the only reason
+that got caught.
+
+## TUI / terminal simulation
+
+The two harnesses above vary the terminal's *identity* and the project's
+*shape*. `scripts/tui_simulation_check.ts` covers the third axis: **what the
+terminal can actually do, and what happens when the user interacts with it.**
+
+```bash
+npx tsx scripts/tui_simulation_check.ts [--verbose]
+```
+
+- **12 terminal configurations**, each with a **ground-truth capability
+  table** — not a guess, but what that terminal genuinely does: xterm at 256
+  and truecolor, `vt100`, `dumb`, a CI pipe with no tty at all, `NO_COLOR`,
+  a `C`-locale non-UTF-8 terminal, Windows Terminal, bare conhost, macOS
+  Terminal, and tmux.
+- **5 sizes, 20×10 through 200×50** — the layout must hold at the 40×16 the
+  docs name and at a 20×10 that is genuinely too small for a 15-item popup.
+- **A real pty** (`script -qec`) for the cases only a terminal can answer:
+  background restore on exit, cursor restoration, and line width as bytes
+  actually reach the wire.
+- **Clipboard routes** — a terminal that accepts OSC 52, one that refuses it
+  (Wayland, several multiplexers), and a payload too large to send.
+- **Korean and emoji width** at every size, plus paste-chip detection driven
+  by a keystroke timeline.
+
+**599 checks.**
+
+### What it found
+
+- **Monochrome terminals were being sent colour.** `detectColorDepth` fell
+  through to a 16-colour default for unknown TERMs, and `vt100` was in that
+  unknown set — so `48;2;0;0;0m` and `95m` went to a terminal that renders
+  them as stray characters. The code's own comment warns about "guessing up";
+  this was a guess up in the direction nothing noticed, because every common
+  TERM does have colour. Now matched by exact name, with the safe fallback
+  preserved for terminals this code has never heard of.
+
+- **`altScreen` was derived from `ansi`, and they are different capabilities.**
+  `vt100` predates the alternate screen, and — more importantly — **tmux and
+  GNU screen disable `alternate-screen` by default**, because switching buffers
+  is precisely what destroys scrollback. Their inner `TERM` is still
+  `screen-256color`, so both the ANSI and the colour checks pass and *nothing
+  else would have caught it*. The app was telling tmux sessions to enter an
+  alternate buffer nobody asked for. It now answers "no" when unsure, because
+  rendering inline is recoverable and switching a session's buffer is not.
+
+- **The slash menu could render taller than the thing it overlays.** At 20×10
+  the log area is 5 rows, the `MIN_ROWS` floor produced 4 items, and the box
+  needed 6 — clipping its own bottom border. Clamped to the container now.
+
+### What the simulation got wrong, and why that matters
+
+The first run reported 17 failures. **Nine were my expectations being wrong**,
+and several would have caused damage if "fixed":
+
+- Asserting that `selectionText` strips ANSI would have "fixed" code that is
+  already correct — both real call sites (`App.tsx:1354`, `index.tsx:1136`)
+  wrap it in `stripAnsiForCopy`.
+- Asserting a reset sequence on a non-ANSI terminal would have written escapes
+  into a dumb pipe.
+- Asserting SGR `0m` on exit would have "fixed" the app to wipe the user's
+  *foreground* colour too; the real restore is SGR `49`.
+- Asserting the paste detector on a whole typed string tested an input the app
+  never receives — typing produces one `useInput` chunk per keystroke.
+
+Each was checked against the real call site, contract, and unit before being
+reclassified. Recording this because a simulation harness that reports its own
+bugs as product bugs is worse than no harness.
+
+## Testing and verification
+
+Everything is run with `npm test` (Node's `node:test` through `tsx`; no framework dependency) or `npm run matrix:all`.
+**1,272 unit tests** (all pass on Linux; the Windows runner reports 1,228 pass + 44 skipped POSIX-fixture tests, see below).
+Environment checks sit on top of them, because a green unit run says nothing about a distro, a shell or an OS the
+author does not use.
+
+> ## 테스트와 검증
+> 단위 테스트 **1,272개**(Linux 전부 통과). 그 위에 환경별 검증을 얹었다 — 아래 표의 각 줄은 **실제로 실행한 결과**이고,
+> 실행하지 못한 것은 "미검증"으로 따로 적었다.
+
+### What runs where
+
+| Method | What it verifies | Command | Result |
+|---|---|---|---|
+| Unit tests | Logic: tuner invariants, VRAM × RAM grid (40 cells), catalogue, downloads (resume, hash), single-server policy, slash-command sequences (C2→C5), calibration, clipboard, Windows-shaped paths (`src/windowsPaths.test.ts`) | `npm test` | 1,272 / 1,272 (Linux) |
+| **Clean-container unit run** | The whole suite in a clean Debian container (no llama.cpp, models or `~/.llamacli`, running as root) — catches tests that only pass on the author's machine (found 4) | `npm run matrix:clean-unit` | 1,270 pass, 2 skipped (root-only) |
+| Host-mode matrix | Shells (bash, dash, busybox), **real cgroup limits** (`systemd-run --user --scope`), fake NVIDIA 4/8/24 GiB / old driver / none, AMD (sysfs), Intel (vulkaninfo), software Vulkan | `node test/containers/run-host.mjs` | 14 / 14 |
+| **Container matrix (podman/docker)** | Debian 12, Ubuntu 24.04 (user / sudo / root), Fedora 40 (zsh), Arch (fish), **Alpine (musl)**, dash; `--memory`/`--cpus`; fake GPUs; AMD via a mounted fake sysfs | `npm run matrix:containers` | 21 / 21 |
+| Download scenarios | A mock Hub with a **re-signing CDN**: interrupted → resumed from the missing range, hash-judged reuse, same-size wrong-bytes file replaced. Fails on the pre-fix build (verified) | `node test/containers/download-scenario.mjs` | 6 / 6 (also in 4 containers, Windows and macOS) |
+| TUI smoke (pty) | The real CLI under `LANG=C`, `TERM=dumb`/`xterm`, read-only / unset / bad `HOME`, mouse off | `python3 test/containers/tui-smoke.py` | 7 / 7 |
+| Single-server policy, real processes | Unconfirmed restart keeps the pid; confirmed restart replaces it on the same port; a foreign listener survives; launch calibration retries on a real CUDA-OOM message | `npx tsx scripts/live_single_server_check.ts` | pass |
+| Clipboard round trip | Korean + emoji + newline through the app's own copy code and back: `wl-copy`/`wl-paste` (local Wayland, clipboard saved and restored), `pbcopy`, PowerShell | `npm run matrix:clipboard` | Linux ✅ · macOS ✅ · Windows ✅ |
+| Real TUI drag → system clipboard | A plain drag (no Shift) in the real binary lands in `wl-paste` | pty harness | ✅ |
+| Real GPU, real model | Calibration on the RTX 2070 SUPER with Ornith-35B at `-c 98304` (36 → 33, 33 kept, 32 → 33, OOM at 31 → retried) | manual | ✅ (the user's server was stopped with permission and restored) |
+
+### CI (GitHub Actions)
+
+| Workflow | Runner | Verifies | Latest |
+|---|---|---|---|
+| `windows.yml` | `windows-latest` (NT 10.0.26100, 4 cores, 16 GiB) | The **shipped** `bin/` dist, from pwsh, Windows PowerShell, cmd and Git-Bash: no GPU, CPU ladder, `winget`; download scenarios; PowerShell clipboard; unit tests (informational) | probes 4/4, downloads 6/6, clipboard ✅, unit 1,228 pass / 44 skipped / 0 fail |
+| `macos.yml` | `macos-14` (Apple M1, virtual) | zsh/bash/sh probes → **Metal** (unified memory), `brew`, `-ngl > 0`; downloads; `pbcopy` | probes 3/3, downloads 6/6, `pbcopy` ✅ |
+| `linux.yml` | `ubuntu-latest` | `tsc`, unit tests, build, host and container matrices, TUI smoke, Xvfb + `xclip` clipboard | unit 1,272 / 1,272 |
+
+The Windows run found a real defect that no Linux test could: model paths were cut with `split("/")`, so on
+`C:\models\x.gguf` the "name" was the whole path (and same-model reuse across quants failed). The macOS run found that
+Apple Silicon was being tuned `-ngl 0` (CPU-only). Both are fixed and covered by tests.
+
+### What is **not** verified
+
+- A **real llama-server start** on Windows or macOS, GPUs on Windows, CUDA/Vulkan anywhere except the one local card.
+- The interactive TUI in Windows Terminal, conhost, Terminal.app or iTerm2 (mouse, OSC 52); `winget` installs.
+- 44 unit tests are **skipped on Windows** (POSIX shell-script fixtures, `.exe`-less fake binaries, `/media` mounts): "skipped" is
+  not "passed", and engine discovery, build-output lookup and prebuilt reuse may hide Windows-only defects there.
+- Container images hold the setup modules only (no TUI dependencies); the TUI is covered by the pty smoke test on the host.
+- WSL, Wine (`test/windows/wine-check.sh` exists but has not been run), real Vulkan/ROCm hardware (detection is covered with fakes).
+
+Details and the full finding log: [`docs/container-matrix-report.md`](./docs/container-matrix-report.md),
+[`docs/provisioning-matrix-report.md`](./docs/provisioning-matrix-report.md),
+[`docs/container-matrix-validation-prompt.md`](./docs/container-matrix-validation-prompt.md).
+
+## Implementation status` section below is the running list.
+
+### The subsystems
+
+| Area | Entry point | Responsibility |
+|---|---|---|
+| Terminal UI | `src/tui/App.tsx` | Input, log rendering, scroll, folds, cursor placement |
+| Terminal capabilities | `src/tui/terminal.ts` | What this process may emit, per terminal |
+| Keybindings | `src/tui/keybindings.ts` | The single source of truth for `/help` and `/keys` |
+| Agent loop | `src/agent/loop.ts` | Turn driving, tool dispatch, context accounting |
+| Compaction | `src/compaction/` | Checkpoint write/resume, history summarization |
+| Self-healing | `src/hermes/` | Circuit breaker (loop + stall detection) |
+| Backend | `src/backend/` | llama-server process management, OpenAI-compatible client |
+| Tools | `src/tools/` | `read_file` / `write_file` / `edit_file` / `run_shell` / `browser_*` |
+| Skills & rules | `src/skills/` | Always-on rules, lazily-loaded skills |
+| Update | `src/selfUpdate.ts` | Manifest check, hash-verified install, restart |
+| Crash handling | `src/crashHandler.ts` | Synchronous crash log + terminal restore |
+
+`src/tui/terminal.ts`, `src/tui/keybindings.ts` and `src/selfUpdate.ts` are
+the most recent additions and the ones with the sharpest edges — see the
+developer guide below before changing them.
+
+> ## 이 프로그램이 무엇인가
+>
+> llamacli는 단일 바이너리 터미널 코딩 에이전트입니다. 프롬프트를 받아 로컬 LLM
+> 응답을 스트리밍하고, 그 응답이 요구하는 도구(파일 읽기/쓰기, 셸 실행, diff,
+> CDP 브라우저 제어)를 실행하며, 모델이 도구를 더 요구하지 않을 때까지
+> 반복합니다. 호스팅 API가 아니라 **로컬 llama.cpp** 를 전제로 만들기 때문에
+> 모델 가중치·대화 기록·에이전트가 읽은 모든 파일이 한 머신 안에 남습니다.
+>
+> 여기서 대부분의 설계가 설명됩니다.
+>
+> 1. **요청-응답 도구가 아니라 오래 사는 프로세스입니다.** 한 턴이 수 분의
+>    CPU 바운드 생성을 걸칠 수 있습니다. 그래서 컨텍스트를 자동 압축하고,
+>    도구 호출 사이마다 체크포인트를 디스크에 남기며, 다음 실행에서 복구될 수
+>    있어야 합니다.
+> 2. **부족한 자원은 디스크가 아니라 메모리입니다.** 모델 파일이 수십 GB이고
+>    머신은 데이터센터가 아닙니다. 메모리를 잡을 수 있는 서브시스템마다 예산이
+>    명시되어 있고, 설계 대상 실패 모드는 "느려진 머신이 잘못된 프로세스를
+>    죽이는 것" 입니다.
+> 3. **UI는 탈출문자열로 칠하는 고정 크기 격자입니다.** TUI 전체가 터미널의 열과
+>    행 수를 정확히 안다고 가정합니다. 실제 커서를 절대 좌표로 이동시키기
+>    때문입니다. 줄의 실제 폭이 레이아웃이 예산한 폭과 달라지는 변경은
+>    장식이 아니라 버그입니다.
+
+## Structure
+
+```
+src/
+  backend/      llama.cpp process management + OpenAI-compatible HTTP client
+  agent/        Tool-call loop (wired into compaction + self-healing)
+  compaction/   Checkpoint write/resume, context summarization (PROMPT.md §2)
+  hermes/       Self-healing circuit breaker (loop and stall detection)
+                proposal loop (§3)
+  skills/       Lazy skill loading + always-on rule loading, reuses existing
+                CLI conventions (§5); skills/builtin/ ships architecture,
+                planning, implementation, review, testing, static-analysis,
+                and security skills that are always loaded
+  tools/        read_file / write_file / edit_file / run_shell + ANSI-colored
+                diff rendering + browser_* (remote CDP control)
+  tui/          Ink-based bottom-anchored UI: input box, status bar, spinner,
+                slash popup (§6)
+.llamacli/
+  config.yaml   Backend/model/compaction settings
+  rules/        Always-applied project rules
+  skills/       Trigger-based, lazily-loaded skill docs
+  state/        Runtime checkpoint (git-ignored)
+```
+
+> ## 구조
+>
+> ```
+> src/
+>   backend/      llama.cpp 프로세스 관리 + OpenAI 호환 HTTP 클라이언트
+>   agent/        도구 호출 루프 (컴팩션·자가치유 연동)
+>   compaction/   체크포인트 기록/재개, 컨텍스트 요약 (PROMPT.md §2)
+>   hermes/       자가 치유회로차단기 (circuit breaker), 실패 로그 (§3)
+>   skills/       skill 지연 로딩 + rule 상시 로딩, 기존 CLI 컨벤션 재사용 (§5);
+>                 skills/builtin/에 아키텍처·기획·구현·리뷰·테스트·정적분석·보안
+>                 스킬이 있어 프로젝트 상태와 무관하게 항상 로드됨
+>   tools/        read_file / write_file / edit_file / run_shell 도구 + ANSI 컬러 diff 렌더링 + browser_* (원격 CDP 제어)
+>   tui/          Ink 기반 하단 고정 UI: 입력창, 상태바, 스피너, 슬래시 팝업 (§6)
+> .llamacli/
+>   config.yaml   백엔드/모델/컴팩션 설정
+>   rules/        항상 적용되는 프로젝트 규칙
+>   skills/       트리거 기반 지연 로딩 skill 문서
+>   state/        런타임 체크포인트 (git ignore 대상)
+> ```
+
+## Getting started
+
+```bash
+npm install
+# set llama.modelPath in .llamacli/config.yaml to a real .gguf path
+npm run dev
+npm test        # unit tests (node:test via tsx, no extra dependency)
+npm run typecheck
+```
+
+### Installing the `llamacli` command globally
+
+```bash
+npm run build   # compiles to dist/ (bin points here, so build before linking)
+npm link        # symlinks `llamacli` into your global npm bin (npm prefix)
+llamacli         # now runs from any directory
+```
+
+Each project gets its own `.llamacli/config.yaml`/`rules/`/`skills/` based on
+its current working directory — the global command is just the entry point;
+per-project state still lives in that project. Verified running both inside
+this repo and from an unrelated directory (`cwd` in the status bar reflects
+wherever you launched it from, and it auto-generates its own default rule
+file there if the project has no rule/skill convention yet — see the
+Skill/Rule section above). To undo: `npm unlink -g llamacli` (from anywhere)
+or `npm rm --global llamacli`.
+
+> ## 시작하기
+>
+> ```bash
+> npm install
+> # .llamacli/config.yaml 의 llama.modelPath 를 실제 .gguf 경로로 설정
+> npm run dev
+> npm test        # 유닛테스트 (node:test, tsx로 구동, 별도 의존성 없음)
+> npm run typecheck
+> ```
+>
+> ### `llamacli` 명령을 전역으로 설치하기
+>
+> ```bash
+> npm run build   # dist/로 컴파일 (bin이 dist를 가리키므로 link 전에 반드시 빌드)
+> npm link        # 전역 npm bin(prefix)에 `llamacli`를 심볼릭 링크로 등록
+> llamacli         # 이제 어느 디렉토리에서든 실행 가능
+> ```
+>
+> 프로젝트마다 실행 시점의 작업 디렉토리를 기준으로 각자의
+> `.llamacli/config.yaml`/`rules`/`skills`를 갖는다 — 전역 명령은 진입점일 뿐,
+> 프로젝트별 상태는 그대로 해당 프로젝트에 남는다. 이 저장소 내부와 무관한 디렉토리
+> (`/tmp`) 양쪽에서 실행해 검증함(상태바의 cwd가 실행한 위치를 정확히 반영하고,
+> 프로젝트에 rule/skill 컨벤션이 없으면 그 자리에 자체 기본 rule을 자동 생성함 —
+> 위 Skill/Rule 섹션 참고). 되돌리려면: 아무 위치에서나 `npm unlink -g llamacli`
+> 또는 `npm rm --global llamacli`.
+
+## Built-in skills
+
+`src/skills/builtin/` ships a fixed skill set that's always loaded regardless
+of what a project provides — the "senior engineer fundamentals" PROMPT.md §4
+calls for, made concrete and triggerable: `architecture-design`, `planning`,
+`implementation`, `code-review`, `whitebox-testing`, `blackbox-testing`,
+`static-analysis`, `security`. Each is a normal skill file (trigger +
+guidance body) using llamacli's own format, so a project can override or add
+to them the same way as any other `.llamacli/skills/*.md` file.
+
+> ## 빌트인 스킬
+>
+> `src/skills/builtin/`은 프로젝트 상태와 무관하게 항상 로드되는 고정 스킬 세트를
+> 제공한다 — PROMPT.md §4가 요구하는 "우수 아키텍처 개발자의 기본기"를 트리거
+> 가능한 형태로 구체화한 것: `architecture-design`, `planning`, `implementation`,
+> `code-review`, `whitebox-testing`, `blackbox-testing`, `static-analysis`,
+> `security`. 각각 일반 skill 파일(trigger + 본문)이며 llamacli 자체 포맷을 쓰므로,
+> 프로젝트에서 다른 `.llamacli/skills/*.md` 파일과 똑같은 방식으로 덮어쓰거나
+> 추가할 수 있다.
+
+## 확정 모델: Ornith-1.5-35B-A3B
+
+**2026-10-03 사용자 결정으로 Ornith-1.5-35B-A3B (`Q4_K_M`) 를 이 설치의 확정 모델로 한다.**
+같은 날 먼저 Qwen3.6-35B-A3B 로 확정했다가 Ornith 로 바꿨다. 비교 대상은 로컬에 있던 Qwen3.6-35B-A3B 와
+Bonsai-2 27B 였고, 측정 근거는 `docs/model-bench-2026-10-03.md`(속도·컴팩션·컨텍스트 스윕)와
+`docs/coding-eval-2026-10-03.md`(코딩)에 있다.
+
+### 서버 설정 (8 GB RTX 2070 SUPER 기준)
+
+| 항목 | 값 |
+|---|---|
+| 모델 | `Ornith-1.5-35B-A3B-Q4_K_M.gguf` (20.36 GiB, MoE: 256 experts, 활성 약 3B) |
+| 엔진 | stock llama.cpp |
+| **`--n-cpu-moe`** | **33** |
+| **컨텍스트** | **98,304** (`-c 98304`, `-np 1`, `-no-kvu`) |
+| 오프로드 / 캐시 | `-ngl 999 -fa on`, KV `q8_0`/`q8_0` |
+| 스레드 / 배치 | `-t 6 -tb 11 -b 2048 -ub 512` |
+| 포트 | 8080 |
+| VRAM | 약 7.0 GiB / 8.0 GiB (사용 가능 상한까지 약 770 MiB 여유) |
+
+```yaml
+# .llamacli/config.yaml 의 llama 블록
+llama:
+  binPath: ~/llama.cpp/build-opt/bin/llama-server
+  modelPath: /media/<user>/<disk>/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+  port: 8080
+  contextSize: 98304
+  threads: 6
+  threadsBatch: 11
+  gpuLayers: 999
+  cpuMoeLayers: 33
+  batchSize: 2048
+  ubatchSize: 512
+  parallel: 1
+  flashAttn: true
+  cacheTypeK: q8_0
+  cacheTypeV: q8_0
+```
+
+### 왜 컨텍스트가 98,304 인가 — 이 모델은 KV 캐시가 거의 공짜다
+
+Ornith 는 **하이브리드 구조**다 (모델 헤더: 41 레이어 중 `full_attention_interval = 4` → 일반 어텐션은 10개뿐,
+나머지는 컨텍스트와 무관한 고정 크기 SSM 상태, KV 헤드 2개 × 256 차원). 그래서 KV 비용이 **토큰당 약 10.6 KB**(q8_0)다.
+
+- 20,480 토큰의 KV 는 212 MiB, 98,304 토큰은 약 1 GiB. 컨텍스트를 막던 것은 VRAM 이 아니라 튜너의 KV 과대 추정(약 29배)이었고,
+  **지금은 튜너가 헤더에서 실제 값을 읽는다** (`src/setup/ggufMeta.ts: readGgufKvShape`).
+- `--n-cpu-moe` 를 한 칸 올리면 VRAM 이 약 464 MiB 줄어든다. 그 여유를 컨텍스트에 썼다.
+- **이 설정은 Ornith 로 직접 확인했다**: 98,304 / `--n-cpu-moe 33` 에서 컨텍스트를 90k 까지 채우는 동안 서버가 중단되지 않았고
+  VRAM 최대 7,017 MiB 였다. (Qwen3.6 의 같은 설정은 7,310 MiB 였다. 파일이 0.25 GiB 작아 Ornith 쪽 여유가 크다.)
+
+### 측정된 성능 (이 머신)
+
+실제 서버에서 컨텍스트를 채워 가며 잰 값 (프롬프트를 prefix 캐시로 키우며 한 단계씩, 각 깊이 1회, `--n-cpu-moe 33`, 98,304):
+
+| 깊이 (토큰) | 8k | 16k | 32k | 64k | 90k |
+|---|---|---|---|---|---|
+| tg (t/s) | 39.7 | 39.3 | 36.4 | 30.9 | 28.5 |
+| pp (t/s) | 324 | 304 | 284 | 264 | 244 |
+
+`llama-bench`, `--n-cpu-moe 32`, 컨텍스트 20,480 기준 tg: 깊이 0 45.55 / 8192 43.45 / 16384 39.09 t/s (본 문서의 부록 A).
+컴팩션(스텝당 입력 2.5K·출력 400 토큰 가정): 98,304 창에서 주기 약 34,400 토큰(약 13.8 스텝), 컴팩션 1회 약 2분.
+`compaction.warmTriggerRatio`(응답을 읽는 유휴 시간에 미리 실행)와 `compaction.summaryDeadlineMs`(상한)를 함께 쓰는 것이 좋다.
+
+### 코딩 평가 (52문제, 코드를 실제로 실행해 채점)
+
+| | HumanEval 41 | 직접 만든 어려운 문제 11 | 합계 52 | 어려운 11문제 토큰 / 시간 |
+|---|---|---|---|---|
+| **Ornith-1.5 (확정)** | 37 | **11** | **48** | **18,297 / 467 s** |
+| Qwen3.6 | 39 | 9 | 48 | 64,127 / 1,604 s |
+| Bonsai-2 27B | 39 | 7 | 46 | 59,173 / 2,614 s |
+
+Ornith 는 어려운 11문제를 전부 풀었고 Qwen 의 약 1/3.5 토큰·시간을 썼다. 전체 통과 수는 Qwen 과 같고(48), HumanEval 은 2문제 적다(37 대 39, 노이즈 수준).
+다만 토큰 상한(12,000)이 결과를 좌우하므로 "정답 능력"이 아니라 "12,000 토큰 안에 푸는 능력"이다.
+
+### 알아둘 점
+
+- **Qwen3.6 과의 차이는 작다.** 같은 구조·크기라 tg 는 비슷하고(Ornith 가 약 2~7 % 빠름), pp 는 Qwen 이 약 4 % 빠르다.
+  Ornith 의 이점은 어려운 문제에서의 **토큰 효율**이다. 품질(정확도 자체)은 이 평가로 우열을 가릴 수 없다.
+- Ornith-1.5 의 채팅 템플릿은 사용자 메시지가 없는 대화를 거부한다("No user query found in messages"). 컴팩션 코드가 이를 처리하도록 되어 있다.
+- 컨텍스트가 98,304 로 크기 때문에 컴팩션 1회가 길다(약 2분). 대신 컴팩션이 20,480 일 때보다 약 4.8배 드물게 일어난다.
+
+### 운영 메모
+
+- **VRAM 여유**: 98,304 / `--n-cpu-moe 33` 은 사용 가능 상한까지 약 770 MiB 여유가 있다. **`--n-cpu-moe 32` 도 들어가지만(여유 340 MiB)
+  tg 이득이 측정되지 않아(−1.6 ~ +0.9 t/s, 노이즈) 33 을 유지한다** (벤치 문서 부록 C.7).
+- **튜너와의 관계**: 튜너(`tuneForHardware`)는 헤더에서 KV 비용을 읽을 수 있으면(**exact KV**) 컨텍스트 상한을 **98,304**
+  (이 문서가 end-to-end 로 측정한 값, 모델의 학습 컨텍스트가 더 작으면 그 값)로 잡는다. 이 모델은 `--n-cpu-moe` 32 와 함께 98,304 로 계산된다
+  (확정값 33 과의 차이는 위 측정대로 노이즈 수준). 헤더를 못 읽는 경우(모델 미다운로드 등)는 크기로 추정한 KV 와 보수적 상한 **32,768** 을 쓴다.
+  밀집 모델은 가중치를 VRAM 에 상주시켜야 하므로 가중치 몫을 먼저 빼고 KV 를 계산하며, VRAM 보다 큰 밀집 모델은 `-ngl 999` 대신 일부 층만 GPU 에 올린다.
+  config 에 기록된 컨텍스트가 계산값보다 **크면 그대로 유지**한다(같은 모델일 때만). `/reset` 은 이전 컨텍스트가 이 머신의 KV 예산 안이면 유지한다.
+- **구동 시 보정 (`src/setup/calibrate.ts`)**: 튜너 값은 산술 예측이므로, 서버를 띄울 때 실제 메모리로 검증한다.
+  (1) 로드가 GPU 메모리 부족(OOM)으로 실패하면 `--n-cpu-moe` 를 늘려 최대 3회 재시도한다.
+  (2) 로드가 성공했고 남은 VRAM 이 (한 층 + 안전 여유 600 MiB) 이상이면, 모델·컨텍스트·GPU 조합당 **한 번만** 층 수를 줄여(= GPU 에 더 올려) 재시도한다.
+  (3) 로드는 성공했지만 남은 VRAM 이 안전 여유(600 MiB)보다 **얇으면**(긴 프롬프트 한 번에 OOM 날 위험), 여유를 되찾을 만큼 층 수를 늘려 같은 방식으로 한 번 시도한다
+  (실측: 32 → 여유 394 MiB 로 얇음 → 33 으로 올림).
+  시도한 값이 로드되지 않으면 직전에 동작한 값으로 복구한다. 결과는 `llama.cpuMoeLayers` 와 `llama.calibratedFor`(모델@컨텍스트@GPU) 로 config 에 기록되어
+  다음 구동은 측정값에서 바로 시작한다(기록된 `cpuMoeLayers` 는 튜너가 덮지 않는다). `/reset` 은 이 기록을 지우고 다시 보정한다. `LLAMACLI_CALIBRATE=0` 이면 (2) 를 끈다.
+  MoE 모델(헤더의 `expert_count`)과 GPU 오프로드가 있을 때만 동작한다. VRAM 은 `nvidia-smi` 로만 읽으므로 NVIDIA 가 아니면 (2) 는 건너뛴다.
+- 측정은 깊이당 1회라 노이즈가 있다. 64k 이후 tg 하락(31 → 28 t/s)은 어텐션 연산량 증가 때문이다.
+- 서버를 직접 띄울 때(독립 프로세스):
+
+```bash
+cd ~/llama.cpp/build-opt/bin && setsid nohup ./llama-server \
+  -m /media/<user>/<disk>/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8080 -c 98304 -t 6 -tb 11 -ngl 999 --n-cpu-moe 33 \
+  -b 2048 -ub 512 -fa on --cache-type-k q8_0 --cache-type-v q8_0 -np 1 -no-kvu \
+  > ~/.llamacli/logs/server-8080.log 2>&1 < /dev/null &
+```
+
+## First run: finding llama.cpp, picking a port, and starting the server
+
+`src/backend/resolve.ts` answers three questions in this order, and the order is
+the design.
+
+**Where this runs matters as much as the order.** Resolution happens *after* the
+alt screen is up, behind a `DeferredBackend` — not before it. A first run
+installs llama.cpp and downloads a model, which is minutes of work, and doing
+that before `render()` left the terminal sitting on a blank screen, reported
+directly as "llamacli 를 입력하면 setup 진행이 되면서 화면이 사라져". So the banner
+appears immediately and every step is a status line inside the TUI. A message
+typed while setup is still running waits for it and then executes, rather than
+failing against a port nothing is listening on yet.
+
+**1. Is a llama-server already running?** Checked before anything touches the
+network. A server that is found is **adopted** at its own endpoint and port —
+llamacli connects to it and starts nothing. On a machine that already has a
+healthy server this is the whole resolution, and it is why a first launch costs a
+few `stat()` calls rather than a 20 GB download.
+
+A port that is **listening but not yet answering** is treated as a server that
+is still loading its model, not as an absent one. llama-server binds its port
+before the weights are resident and serves nothing until they are. A single fast
+probe cannot tell those two states apart, and getting it wrong is not a
+slowdown — it is llamacli planning a different port and spawning a **second**
+llama-server beside a healthy one, on a card that has no room for it.
+
+The wait scales with the size of the model being loaded (a conservative 100 MB/s
+cold read, plus a minute for allocation and CUDA graph setup), because a fixed
+budget is shorter than a 21 GB load off a USB drive. When the budget runs out
+the port is still reported as **held**, and llamacli attaches to the loading
+server rather than binding a second one: requests fail until the load finishes,
+which the agent loop's existing transient-failure retry already handles, and no
+VRAM is spent on a duplicate.
+
+**2. Is it installed and simply not running?** Checked **before** the installer,
+so a machine that already has both a binary and a recorded model never reaches
+HuggingFace. The model file's size is checked rather than just its path: a
+`modelPath` pointing at something deleted to reclaim disk reads as *no model*,
+not as a zero-byte one. A spawn failure here does **not** fall through to the
+installer either — the binary and the model are on disk and known, so rebuilding
+would burn 10–40 minutes to fix a port that was busy or a card that was full.
+The session starts on the recorded config and says which port to change instead.
+
+**3. Is it installed at all?** If not, `ensureLocalStack` finds or builds one,
+derives a model that fits this machine, downloads it, writes the config, and the
+server is started. Cheapest and most likely source first, and a build is only
+attempted after every candidate has failed:
+
+| Order | Source |
+|---|---|
+| 1 | `$LLAMACLI_LLAMA_SERVER` or `$LLAMA_SERVER_BIN` |
+| 2 | `llama-server` on `PATH` |
+| 3 | any `*/bin/llama-server` in a `llama.cpp` checkout — every build directory is enumerated, not a fixed name list |
+| 4 | `<root>/llama-server` — what a plain `make` produces |
+| 5 | a systemd user unit's `ExecStart`, and the `BIN=` it points a wrapper script at |
+| 6 | only then: clone and build |
+
+Every candidate is **executed** (`--version`) before it is accepted. Existence is
+not usability: a build against a CUDA version this driver does not have is
+present and executable and still fails to start, and accepting it turns a
+recoverable "try the next one" into an opaque spawn error much later. A binary
+that exists but will not run is reported as such rather than as "not installed".
+
+**Which port?** Only reached when discovery found nothing adoptable. An occupied
+port is walked forward, the move is reported, and ports discovery already visited
+are excluded so the walk cannot land back on one of them.
+
+Once `backend: local-llama` and a `modelPath` are both recorded, the server is
+spawned with **every** flag the tuning layer computed. The child's output is
+drained (an undrained pipe fills and blocks the server mid-load), the ready
+budget scales with the model, and the child is reaped on every exit path so no
+session leaves one holding VRAM behind it.
+
+The server's real `n_ctx` is read back over `/config` (`model_info.n_ctx`) once
+it is up and replaces the config's value: a config that says 8192 while the
+server runs `-c 65536` makes compaction fire 8× too eagerly and interrupts every
+turn. (The old `/props` endpoint was removed from llama.cpp long ago, so reading
+it always failed and silently forced an 8192 fallback regardless of the true
+limit.)
+
+### `--n-cpu-moe` is the one flag a measurement beats a formula for
+
+`--n-cpu-moe N` keeps N Mixture-of-Experts layers in system RAM instead of VRAM.
+It is what lets a 35B MoE model load on a card that cannot hold it — only the
+~3B active parameters have to be resident, and the rest streams from RAM.
+
+The installer can compute a value from the VRAM shortfall, and it does when
+there is nothing better. But on the 8 GB card this was developed on, that
+arithmetic produced **48** where a benchmark produced **30**, with the
+difference measured at **+136% decode**. More CPU expert layers buy VRAM the
+card does not need at that point and cost throughput on every token.
+
+So a value already in `llama.cpuMoeLayers` is **kept**, and
+`LLAMACLI_CPU_MOE_LAYERS` overrides both. The installer runs whenever the earlier
+cases did not resolve; a formula that outranked a measurement would overwrite it
+once per start, forever.
+`0` is read as "not measured" rather than "measured as zero" — zero is
+llama.cpp's own default and is exactly what a small card cannot do.
+
+## `/reset`, model search and tuning
+
+`/reset` re-derives the model, the llama flags and the context size from the
+**current** hardware — GPU, VRAM, RAM — and reports what actually changed, so a
+run that changes nothing reads as "already optimal" rather than as "broken".
+
+`/reset` first **previews** what it would change (nothing is written), and only
+`/reset confirm` applies it — see [One server, one port](#one-server-one-port--how-server-models-and-reset-fit-together).
+It does two things that make it safe to run inside a live session:
+
+- **`noDownload`** — it re-derives *settings* and never transfers a model. A
+  20 GB fetch inside a TUI session wedges the agent loop for hours behind a
+  spinner on a prompt that will never answer.
+- **`calibrate`** — it measures the backend's own reported `timings`
+  (prefill/decode tok/s) rather than reading the hardware table. That is what
+  catches a throttled card, a fallback build, or a busy box. The measurement
+  can only ever **tighten** the context downward; one slow sample must not be
+  able to talk a machine into an OOM at load. If the probe is unusable, it says
+  so and falls back to the hardware profile.
+
+First-run bootstrap keeps the model already in use (no Hub lookup, no download)
+whenever the file the config records still exists — the Hub republishes
+filenames and byte counts disagree, so re-resolving from it once produced a
+20 GB download of weights the machine had been serving all along.
+
+### Verifying the server before adopting it
+
+Adoption exists to avoid starting a **second** llama-server, which on an 8 GB
+card OOMs. So llamacli adopts what it finds — but it now *checks* what it found,
+because "answers the API" and "is a model server" are different claims.
+
+`GET /props` carries `build_info` on every real llama.cpp (it is filled from
+`llama_build_info()`), which is the discriminator:
+
+| Found | Verdict | Action |
+|---|---|---|
+| `/props` has `build_info` | `llama.cpp` | adopted |
+| No marker, id is not a path (e.g. `llama3:8b`) | `other` (Ollama, vLLM) | adopted, labelled honestly |
+| Names a `.gguf` that is **not on disk** | `stub` | **refused, with the reason reported** |
+
+That last row is a real incident. `harnessCli`'s CI fixture
+(`fake-llama-server.mjs`, wired in via `HARNESSIDE_LLAMA_SERVER`) held port
+8080 after the real server was stopped, answered `/health` and `/v1/models`
+perfectly, and returned a canned `가짜 응답입니다.` to every turn. llamacli
+adopted it silently. Note that the existing "garbage" health probe does **not**
+catch this — it sends a prompt and asks whether the reply is language, and
+`가짜 응답입니다.` is valid Korean. A missing weights file cannot be argued
+around, which is why this check sits alongside it.
+
+A stub is refused rather than adopted *and* rather than worked around by binding
+another port: the port is not ours to take, and starting a second server beside
+whatever is holding it is the OOM the whole adopt-before-spawn path prevents.
+
+### A model name is read, not guessed
+
+llama.cpp has shipped two shapes for `/v1/models` — OpenAI's `data[].id` and a
+`models[]` array. Both are read, because this value is written into every
+project's `config.yaml` as the live model. Verified against a real server here:
+the `models[]` shape is what the current llama.cpp returns, so reading only
+`data[].id` recorded **`local-model`** — a name that server never reported.
+
+## Removed features
+
+Some features have been **removed, not disabled**: there is no flag and no code
+path left to re-enable them.
+
+| Removed | What it did | Why it is gone |
+|---|---|---|
+| **`/fastcheck`** | Consulted a second "System 1" model (laya) before each turn to pick a reasoning budget, and could downgrade a turn to a cheap mode. | Measured over a labelled prompt set: ~0.11 s per turn, agreement with "this needs the real model" on only 67% of the prompts that did, and no prompt wording separated the classes — the judge is the same model it was trying to avoid calling. See git history. Its risk rail went with it: it only mattered *because* a turn could be downgraded. |
+| **Bonsai / PrismML fork** (ternary `PTQ1_0`/`PQ2_0` quants) | A model ladder entry plus a downloaded/compiled fork of llama.cpp. | Removed on request (2026-10-03): the confirmed model is Ornith-1.5-35B-A3B on stock llama.cpp. The generic mechanisms it motivated (the run-the-binary compatibility probe, the stock engine ladder) stay; the measurement history stays in `docs/`. |
+| **Drag edge auto-scroll** | Holding a drag against the log's top/bottom edge scrolled the log. | Removed on request. A drag still selects and copies; scroll with the wheel while holding the button for more than one screen. |
+
+`/reset`, local model search and tuning are **present and implemented**.
+
+## `/models` — pick a model that runs on THIS machine
+
+`/models` lists the candidate local models with the metrics that decide whether
+they actually run here, and `/models <번호|이름>` selects one.
+
+```
+[models] 이 머신 기준 — 사용 가능 VRAM 6.2 GiB, RAM 30 GiB
+
+#  모델                  파라미터       양자화  크기         판정
+─  ────────────────────  ─────────────  ──────  ──────────  ──────────────
+1  Ornith-1.5-35B-A3B    3B 활성 (MoE)  Q4_K_M   20.4 GiB    ⚠️ RAM 스트리밍
+2  Ornith-1.5-9B         9B             Q4_K_M   5.1 GiB     ✅ VRAM
+```
+
+**"Will it run" is not a size question.** Three things decide it, and the table
+answers all three:
+
+| Verdict | Meaning |
+|---|---|
+| `✅ VRAM` | The whole file fits the spendable VRAM. GPU does everything. |
+| `⚠️ RAM 스트리밍` | Too big for VRAM, but the **active** parameters stay on the GPU and the rest streams from RAM (`--n-cpu-moe`). Slower, but it runs. |
+| `⚠️ CPU 전용` | Only fits in RAM. `-ngl 0`; very slow. |
+| `❌ 불가` | Fits nowhere. Refused at selection rather than written into config. |
+
+The VRAM budget is the same `budgetVramGiB` the tuner launches with, including
+its 1 GiB reserve — not a second copy of the arithmetic, which would be free to
+drift and would then promise a fit the launch does not honour.
+
+MoE residency is derived from each model's own **active-parameter count**, not a
+percentage guess. Two wrong answers were corrected while building this, both of
+which reported the 21.9 GiB 35B-A3B as a full VRAM fit on a 7 GiB card:
+
+1. a flat "15% of the file" residency estimate, then
+2. testing only the *active* size against the budget — which never asks whether
+   the **whole file** fits, and so cannot distinguish "fully resident" from
+   "streaming".
+
+### `/server` — the other half, and deliberately a separate command
+
+`/models <n>` **changes which model is served.** `/server` answers a different
+question that had no route except reading `config.yaml` by hand — *what is
+running right now, on which port, with which build, and can that build read my
+model?* — which comes up on its own after a crash or after something else took
+the port.
+
+```
+[server] 포트 8084 (실행 중인 서버에서 확인) · 실행 중 (pid 128976, 이 설치 소유) · 빌드 llama.cpp/build-opt/bin/llama-server
+[server] 재시작 시: 기존 서버를 종료하고 같은 포트(8084)에서 …로 다시 올립니다.
+  · 지금 재시작하려면  /server restart
+```
+
+`/server restart` re-serves the model **already in config**. It is not a second
+spelling of `/models <n>`: collapsing them would make "restart my server"
+silently switch models. So the restart path **reuses the recorded tuning rather
+than re-deriving it** — a restart that quietly changed the flags you are running
+with would not be a restart. Only the model-switch path re-tunes, because only
+there the model changed.
+
+The report is held to the same honesty rules as the action:
+
+| Situation | Reported as | Never as |
+|---|---|---|
+| port not in config | resolved from the **running server**, marked `(실행 중인 서버에서 확인)` | defaulted to 8080 and called free |
+| port occupied by an unidentifiable process | `확인 불가` | `비어 있음` |
+| no build can read the quant | names the **rejecting** builds | silence |
+| a build exists but was never confirmed | flagged as unconfirmed | `읽을 수 있습니다` |
+
+The first row was a live bug. This config has no `llama` block, so the first
+version reported `포트 8080 · 서버 없음` on a machine with a live server on 8084
+— confidently wrong, and worse than saying nothing, because a user who believed
+it would conclude their server had died.
+
+**The restart plan is computed from the same report the user just read**, so what
+they are told will happen and what is attempted cannot diverge. And it refuses up
+front — before touching anything — when a systemd unit holds the port (restarting
+it re-runs *its own* model), when the port cannot be inspected, or when no
+compatible build exists.
+
+### Selection REPLACES
+
+`.llamacli/config.yaml` names exactly one model, so choosing a rung overwrites
+it — it does not accumulate a list. Both `model` and `llama.modelPath` are
+written together, because `loadConfig` treats the top-level one as a live cache
+refreshed from the server while `llama.modelPath` is what the binary is launched
+with; writing only one is how a config ends up naming a model that is not being
+served. The running server still holds the old model, so the status line says a
+restart is required rather than implying the switch is already live.
+
+### The server switches too — on the SAME port
+
+Choosing a model also replaces the **server** serving it, and the port does not
+move. Both halves of that are load-bearing, and both have been violated here:
+
+| Failure | Consequence |
+|---|---|
+| **Two servers** — `planPorts` used to see 8080 busy and move llamacli to 8081, spawning a *second* llama-server | On an 8 GB card whose first server already holds 7.2 GB, that is an **OOM at load**, not a slowdown. |
+| **A moved port** — re-planning the port on each launch | An install nobody can predict. The port is recorded once and kept. |
+
+So the port is read from config and reused verbatim. There is **no code path in
+`modelSwitch.ts` that chooses a different one** — and that is asserted twice,
+including with a non-default port, because a test covering only 8080 would pass
+even if the value were hardcoded.
+
+The flags are **re-derived for the new model** before anything is written.
+`--n-cpu-moe` sized for a 35B MoE is not a harmless leftover on a dense model;
+it is an OOM at load. The old server's VRAM is also added back to the budget —
+the free-VRAM reading is taken while it is still running and is about to release
+that memory, so counting it as unavailable would collapse the context.
+
+The tuning→config key mapping is now shared (`tuningToConfigKeys`) between the
+bootstrap and this switch. Two writers is one too many: a key added to one and
+forgotten in the other does not fail loudly, it just leaves the previous model's
+value in place, so the replacement server launches with flags sized for a model
+that is no longer loaded.
+
+#### Where the port comes from — and where the model already is
+
+Both of these were wrong until the **real** config on this machine was read
+rather than assumed. That config has no `llama` block at all: no port, no
+`binPath`, no `modelPath` — while a real `llama-server` listens on **8084**.
+
+| | First version | Correct version |
+|---|---|---|
+| **Port** | fell back to `8080` when the config recorded none | asks the **running server** where it is; `8080` is the last resort, reached only when nothing is listening |
+| **Model path** | guessed `$HOME/models` | searches for the file that is **already on disk** |
+
+The port bug is the same failure the module exists to prevent, arriving by a
+different door: a server on 8084 plus a default of 8080 means the switch starts
+a **second** server. `8080` is only a safe default when nothing is listening, so
+that is exactly where it now sits.
+
+The path bug proposed re-downloading GiB the user already had. `discoverMounts`
+finds `/media/$USER/<label>/models` — which no fixed candidate list matches, and
+which is where this machine's models are — and the search **recurses**, because
+the real layout has some models at the top of that directory
+(`Ornith-1.5-35B-A3B-Q4_K_M.gguf`) and some in per-family subdirectories
+(`<family>/<model>.gguf`). A flat check found one and missed
+the other. Bounded on depth and directories visited, because this runs inside a
+slash command on a real filesystem.
+
+Verified live against this machine's actual disk:
+
+```
+ornith-35b    30ms  port=8084  20.4 GiB  /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
+ornith-9b     32ms  port=8084  not on disk → would download
+```
+
+#### The compatibility probe: 60 s → 3 s, and "verified" vs "not disproven"
+
+`probeModelCompatibility` answers "can this build read this model?" by running
+the candidate against the file. It used to run the binary with `--no-warmup` and
+**await it**, on the belief that the flag "stops after loading". Measured here,
+that is false: `--no-warmup` suppresses the warmup *request*, and the process
+then serves forever.
+
+| | before | after |
+|---|---|---|
+| build that CAN read the model | always burned the full 60 s timeout — measured **180 s** when raised, model loaded by ~3 s | **~3.3 s**, killed on a post-load marker |
+| build that CANNOT | 178 ms | **98 ms** |
+| `findLlamaServer`, real model | **60 784 ms** | **3 316 ms** |
+
+So the expensive case was the *successful* one, on every `/models` and every
+`/reset`.
+
+**The bug underneath was worse than the wait.** A timeout was caught, turned into
+a generic error, and — because a timeout is not a format complaint — the
+candidate was **kept**. So "this build can read your model" was never verified
+for a working build; it was inferred from a failure carrying no information.
+That is silence read as consent. It is now reported as `inconclusive` and
+surfaced through `FindResult.unverified` rather than presented as a
+measurement.
+
+Verdicts are `ok` · `unsupported` · `other` · `inconclusive`, and they are
+distinguished on purpose:
+
+- **`unsupported`** — the type registry rejected the file. A build mismatch.
+- **`other`** — the load failed for a reason that is not about types (corrupt
+  file, missing dependency). Says nothing about the binary, so it is **kept and
+  not blamed** — reporting it as a build mismatch sends the user rebuilding a
+  working install over a bad download.
+- **`inconclusive`** — nothing was learned. Kept (discarding a working install
+  is worse) but recorded in `unverified` so the answer is stated as unknown.
+
+Three defects were found while verifying this, two of them introduced by the fix
+itself and caught only because the probe was measured on real binaries:
+
+1. A lazy `require` in an ESM module threw, so every probe returned a non-format
+   error and every candidate was kept — silently reporting the **stock build as
+   able to read a newer quant**. A probe that cannot start must never look like
+   one that passed.
+2. A binary that could not be executed emitted an unhandled `error` event, which
+   Node turned into an **uncaught exception** that killed the caller.
+3. The probe resolved only on a marker or the timeout and **ignored the process
+   exiting**. Any binary that ends on its own — a wrapper script, a build that
+   fails before printing a recognisable line — waited the full 60 s for an answer
+   it had already given. The project harness caught this: its stub server exits
+   instantly and the harness went from seconds to a timeout. Now `onExit`
+   resolves it, and `project_persona_check` runs in **5.4 s**.
+
+#### Who owns the port decides what happens
+
+Something is usually already listening, and whether llamacli may stop it depends
+entirely on what it is:
+
+| Owner | Action |
+|---|---|
+| **ours** — a llama-server llamacli can attribute | Stopped (SIGTERM, confirmed released, then SIGKILL at 10 s), then replaced |
+| **none** — port free | Started directly |
+| **systemd unit** holding the port | **Reported, not fought.** The unit owns the port and will keep holding it, so a bare kill races the unit's own restart — and "restart the unit" does **not** load a new model, because the unit names its own. Proceeding would leave the new model unused while looking like success. |
+| **foreign** — anything not confidently a llama-server | **Refused.** The port is not ours and the holder is not ours. Failing closed is the point: misclassifying a stranger as ours would let a model switch kill it. |
+
+Verified live on this machine: port 8084 (the running `llama-server`) → `ours`;
+8080 and 9999 → `none`; a real `node` process on 7317 → `foreign`, refused.
+
+### The llama.cpp half
+
+Some quantizations need a build that can read them: a llama.cpp whose type table
+predates the model's quant rejects the file with an `invalid ggml type` error.
+
+Selecting reports it at the moment you decide, rather than letting it surface on
+the next launch as a load error:
+
+```
+[models] Ornith-1.5-9B (Q4_K_M) 로 교체했습니다.
+  · 기록된 경로: /mnt/models/Ornith-1.5-9B-Q4_K_M.gguf
+  · llama-server 가 이 모델을 읽을 수 있습니다 (…/llama.cpp/build-opt/bin/llama-server, cuda 빌드).
+  · 새 모델은 재시작 후 적용됩니다.
+```
+
+The arbitration itself is not duplicated: `findLlamaServer` already *executes*
+each candidate binary against the configured model and collects the ones whose
+type registry rejects it into `rejectedForModel`, and it looks for a build
+sitting **beside the models** (`runtimeCandidatesNearModel`). `/models` only
+turns that result into something actionable. A discovery error is reported, never
+thrown.
+
+## One server, one port — how `/server`, `/models` and `/reset` fit together
+
+llamacli manages **one** llama-server on **one** port. A second server on an 8 GB card is an OOM, so the three
+commands share one policy (`src/setup/serverPolicy.ts`), decided in one place:
+
+- **Who holds the port** is classified `none` / `ours` / `foreign` / `systemd` / `unknown`. A `foreign`, `systemd` or
+  unreadable owner is **never** stopped. Several live llama-servers are listed and **never** cleaned up automatically.
+- **Replacing our own live server needs an explicit `confirm`.** Without it you get the change laid out (model, build,
+  context, `--n-cpu-moe`) and the exact command to run; the server is left running. An empty port starts without asking.
+
+| Command | Effect | Touches the server? |
+|---|---|---|
+| `/server` | Port, pid, owner, serving model vs configured model, build, "can this build read the model" | no |
+| `/server restart` → `/server restart confirm` | Shows the change, then stop → start on the **same port** → record what really runs | only after `confirm` |
+| `/models` | Table for **this** machine; with a server running the verdict is for the model *after it replaces that server* (its VRAM counted as returned; header `판정(교체 시)`) | no |
+| `/models <n>` → `/models <n> confirm` | Records the choice (`model` and `llama.modelPath` together), reuses a copy already on any disk, downloads only after `confirm`; the **same llama.cpp build** is reused when it can read the new model | only after `confirm` |
+| `/reset` → `/reset confirm` | Preview of what the machine-derived settings would change, then apply. Keeps a `/models` selection whose file exists and still runs here, and keeps the previous context while this machine's KV budget supports it | no (apply with `/server restart`) |
+
+At startup a running server serving a **different** model than the config is adopted untouched and the mismatch is
+reported (`/server` shows it, `/server restart` fixes it). The confirm is a typed word, not a Y/N dialog: a stray
+Enter cannot trigger it and no new UI surface is needed.
+
+### Launch-time calibration of `--n-cpu-moe` (`src/setup/calibrate.ts`)
+
+The tuner's value is arithmetic; starting the server checks it against the memory that is really free:
+
+1. **OOM at load** → keep more experts on the CPU and retry (≤ 3).
+2. **Load succeeded with room to spare** (free VRAM ≥ one expert layer + a 600 MiB safety margin) → one trial with fewer
+   CPU layers; restored if it does not load.
+3. **Load succeeded but the margin is thin** (< 600 MiB) → one trial with more CPU layers, restored if it does not load.
+
+Each trial runs once per `model@context@GPU` (`llama.calibratedFor`); the result is written to `llama.cpuMoeLayers`, and a
+recorded value is never overwritten by the tuner. `LLAMACLI_CALIBRATE=0` disables 2–3. Measured on the reference card
+(RTX 2070 SUPER, Ornith-35B, `-c 98304`): 36 → 33 (lowered), 33 stays, 32 → 33 (thin margin, 394 → 824 MiB free).
+
+### Context ceiling and offload rules
+
+- Header-read KV cost → ceiling **98,304** tokens (the largest context benchmarked end-to-end here; never above the model's
+  trained context). A size-guessed KV keeps the conservative **32,768**.
+- A **dense** model reserves its weights before the KV term; one larger than the card offloads only the layers that fit
+  (never a blanket `-ngl 999`). **Apple Silicon** unified memory is exempt (it has no separate VRAM to overflow).
+- **CPU-only**: KV is sized from RAM *minus the weights*; below 8,192 tokens the tuner says so.
+- Container/cgroup limits (`--memory`, `--cpus`, systemd slices) are read and clamp the detected RAM and cores
+  (`os.totalmem()` reports the host).
+
+### Downloads
+
+- **Resume works across re-signed CDN URLs.** The Hub redirects to a CDN URL whose signature changes on every request;
+  resume state is keyed by the stable part of the URL (`stableUrlKey`), so an interrupted 20 GB download continues.
+- **An existing file is judged by the publisher's SHA-256**, never by size: equal → used (no download; a `.sha256` record
+  caches the check); different → fetched anew and only replaced after the new file verifies. A full-length `.part` with no
+  resume record is hashed and promoted instead of re-downloaded.
+- Failures say **why** (HTTP status, checksum, no space, aborted) rather than "check disk and network".
+- `self-update` shows byte progress for the archive too.
+
+### Copy by dragging (no Shift)
+
+A plain drag selects and copies inside the app. OSC 52 cannot be confirmed and several terminals ignore it (GNOME's VTE
+among them), so the OS clipboard tool is used as well and its exit status reports success: Linux `wl-copy` (Wayland) /
+`xclip` / `xsel`, macOS `pbcopy`, Windows PowerShell `Set-Clipboard` (UTF-8; `clip.exe` mangles Korean). When none works the
+status line says so and how to fix it (e.g. `sudo apt install wl-clipboard`); the text is always in the fallback file.
 
 ## Download progress is ONE redrawn line, not a scrolling log
 

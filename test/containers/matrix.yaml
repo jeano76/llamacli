@@ -3,6 +3,7 @@
 #   shell     how probe.mjs is launched: bash | dash | busybox | sh
 #   limits    cgroup limits applied for real (host mode: systemd-run --user --scope; container mode: --memory/--cpus)
 #   where     host = runnable by run-host.mjs on a machine with no container runtime;  container = needs run.sh
+#   requires  { ramGiB } host resources the row cannot fake (limits only lower RAM); the row is SKIPPED, not failed, below that
 #   expect    machine-checked values. Strings are exact; /regex/ strings are patterns; numbers are exact; {max: n} / {min: n}.
 rows:
   # ── shell axis ────────────────────────────────────────────────────────────
@@ -29,6 +30,7 @@ rows:
     where: [host, container]
     shell: bash
     limits: { memory: 64G }
+    requires: { ramGiB: 24 }   # a cgroup limit can only LOWER what the host has; picking the 35B needs >= 24 GiB of real RAM
     env: { FAKE_NVIDIA: "NVIDIA GeForce RTX 4090|24564|24000|12.9" }
     expect: { "detected.gpuBackend": cuda, "model": "/35B/", "tuning.cpuMoeLayers": 0, "tuning.contextSize": {max: 98304} }
   - id: gpu-nv-driver-old

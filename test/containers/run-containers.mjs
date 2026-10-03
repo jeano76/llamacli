@@ -3,11 +3,11 @@
 // (--memory/--cpus) and the fixtures' fake hardware, then applies the SAME machine checks as the host runner.
 //   npm run build && node test/containers/run-containers.mjs [rowId ...]      (podman or docker)
 //
-// STATUS: executed with rootless podman 5.7 (cgroup v2): 27/27 rows passed — see docs/container-matrix-report.md.
+// STATUS: executed with rootless podman 5.7 (cgroup v2): 21/21 rows passed — see docs/container-matrix-report.md.
 // The images hold the dist's setup modules only (no TUI dependencies); the TUI is covered by tui-smoke.py on the host.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, mkdtempSync, chmodSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, totalmem } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { get, check, loadMatrix } from "./lib.mjs";
@@ -39,6 +39,7 @@ for (const row of os_rows) {
 for (const row of rows) {
   if (!(row.where ?? []).includes("container")) continue;
   if (only.size && !only.has(row.id)) continue;
+  if (row.requires?.ramGiB && totalmem() / 1024 ** 3 < row.requires.ramGiB) { console.log(`SKIP  ${row.id} (needs >= ${row.requires.ramGiB} GiB of real RAM)`); continue; }
   const tag = "llamacli-matrix-os-debian-bash-user";
   const flags = [];
   if (row.limits?.memory) flags.push("--memory", row.limits.memory);

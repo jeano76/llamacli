@@ -184,12 +184,19 @@ test("a model kept from the existing config never enters the download step", { s
     // Outside any models dir, which is the normal case: modelsDir is only a default.
     const modelPath = join(dir, "existing.gguf");
     await writeFile(modelPath, Buffer.alloc(4096));
+    // A fake llama-server that prints a version, not /bin/true: coreutils' `true --version` happens to print one on
+    // Linux and prints nothing on macOS, so this test passed or failed by the machine it ran on.
+    await mkdir(join(dir, "bin"), { recursive: true });
+    const fakeBin = join(dir, "bin", "llama-server");
+    await writeFile(fakeBin, "#!/bin/sh\necho 'version: 1 (abc)'\n");
+    await (await import("node:fs/promises")).chmod(fakeBin, 0o755);
     await writeFile(
       join(dir, ".llamacli", "config.yaml"),
-      `backend: local-llama\nmodel: ${modelPath}\nllama:\n  binPath: /bin/true\n  modelPath: ${modelPath}\n  port: 8080\n`
+      `backend: local-llama\nmodel: ${modelPath}\nllama:\n  binPath: ${fakeBin}\n  modelPath: ${modelPath}\n  port: 8080\n`
     );
 
     const report = await ensureLocalStack({
+      env: { HOME: join(dir, "home"), PATH: "" } as NodeJS.ProcessEnv,
       projectRoot: dir,
       hardware: {
         cpuCount: 4, ramTotalBytes: 16 * 1024 ** 3, ramAvailableBytes: 12 * 1024 ** 3,

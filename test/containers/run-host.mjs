@@ -6,7 +6,7 @@
 // this is weaker than a container: it cannot test distro/libc/package-manager differences.
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, chmodSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, totalmem } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { get, check, loadMatrix } from "./lib.mjs";
@@ -22,6 +22,7 @@ const results = [];
 for (const row of rows) {
   if (!(row.where ?? []).includes("host")) continue;
   if (only.size && !only.has(row.id)) continue;
+  if (row.requires?.ramGiB && totalmem() / 1024 ** 3 < row.requires.ramGiB) { console.log(`SKIP  ${row.id.padEnd(22)} (needs >= ${row.requires.ramGiB} GiB of real RAM; this machine has ${(totalmem() / 1024 ** 3).toFixed(1)})`); continue; }
   if (row.limits && !hasScope) { console.log(`SKIP  ${row.id.padEnd(22)} (no systemd --user cgroup scope on this machine: the limit cannot be applied)`); continue; }
   const work = mkdtempSync(join(tmpdir(), `lc-${row.id}-`));
   try {

@@ -4,7 +4,7 @@
 
 ## 0. 2차: podman(rootless 5.7, cgroup v2) 설치 후 컨테이너를 실제로 실행했다
 
-사용자가 podman 을 설치한 뒤 `node test/containers/run-containers.mjs` 를 실행했다. **전체 27행 통과** (OS 7 + 쉘 3 + CPU/RAM 3 + GPU 14 계열).
+사용자가 podman 을 설치한 뒤 `node test/containers/run-containers.mjs` 를 실행했다. **전체 21행 통과** (OS 7 + 쉘 3 + CPU/RAM 3 + GPU 8).
 
 | 구분 | 이미지(실행 결과로 확인) | 결과 |
 |---|---|---|
@@ -113,7 +113,7 @@ GPU 는 전부 가짜 주입이므로 컨테이너의 실제 가속은 검증되
 |---|---|---|---|
 | 단위 테스트 (`npm test`, 1271) | 로직 전반 + Windows 형태 경로(`src/windowsPaths.test.ts`: 드라이브 문자·역슬래시) | 로컬 / Linux CI / Windows CI(정보용) / macOS CI(정보용) | Linux 로컬 전부 통과 |
 | 호스트 모드 매트릭스 (`run-host.mjs`) | 쉘 3종, 진짜 cgroup 한도, 가짜 GPU, 터미널·HOME 변형 | 로컬 (systemd --user 없으면 cgroup 행 SKIP 표시) | 통과 |
-| 컨테이너 매트릭스 (`run-containers.mjs`) | Debian/Ubuntu/Fedora/Arch/Alpine(musl), root·일반·sudo 없음, 한도·가짜 GPU | 로컬 podman / Linux CI(docker) | 로컬 27/27 |
+| 컨테이너 매트릭스 (`run-containers.mjs`) | Debian/Ubuntu/Fedora/Arch/Alpine(musl), root·일반·sudo 없음, 한도·가짜 GPU | 로컬 podman / Linux CI(docker) | 로컬 21/21 |
 | TUI 스모크 (`tui-smoke.py`) | 실제 CLI 를 pty 로: `LANG=C`, `TERM=dumb`, 읽기 전용/없는 HOME | 로컬 / Linux CI | 7/7 |
 | 다운로드 시나리오 | 재서명 CDN 재개, 해시 판정, 같은 크기·다른 바이트 | 로컬, 컨테이너 4종, Windows CI | 통과 |
 | 클립보드 왕복 (`test/clipboard-check.mjs`) | 한글+이모지+개행: Windows `powershell`, macOS `pbcopy`, Linux `wl-copy`/`xclip` | 로컬(Wayland) / Windows·macOS·Linux CI | 로컬 Wayland ✅ 실제 클립보드, Windows CI ✅ |
