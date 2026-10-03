@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildLlamaCpp } from "./llamaCpp.js";
 import type { Hardware } from "./hardware.js";
+import { B, P, SRV, PATHS } from "../testSupport.js";
 
 
 const GiB = 1024 ** 3;
@@ -31,34 +32,32 @@ function fakeRun(dir: string, o: { failBuildAbove?: number } = {}) {
       if (o.failBuildAbove !== undefined && j > o.failBuildAbove) throw new Error("c++: Killed");
       const bdir = args[args.indexOf("--build") + 1];
       await mkdir(join(dir, bdir, "bin"), { recursive: true });
-      await writeFile(join(dir, bdir, "bin", "llama-server"), "#!/bin/sh\n");
-      await chmod(join(dir, bdir, "bin", "llama-server"), 0o755);
+      await writeFile(join(dir, bdir, "bin", SRV), "#!/bin/sh\n");
+      await chmod(join(dir, bdir, "bin", SRV), 0o755);
     }
     return "";
   };
   return { run, calls };
 }
 
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
-
-test("a machine with every tool installs nothing and never touches sudo", { skip: WIN_SKIP }, async () => {
+test("a machine with every tool installs nothing and never touches sudo", async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir);
   await buildLlamaCpp({ hw: hw(), run, home: dir, statfs: roomy });
   assert.ok(!calls.some((c) => c.file === "sudo" || c.file === "apt-get"));
 });
 
-test("CPU box configures a CPU build; no CUDA flag", { skip: WIN_SKIP }, async () => {
+test("CPU box configures a CPU build; no CUDA flag", async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir);
   const bin = await buildLlamaCpp({ hw: hw(), run, home: dir, statfs: roomy });
   const cfg = calls.find((c) => c.file === "cmake" && c.args.includes("-B"))!;
   assert.ok(cfg.args.includes("build-cpu"));
   assert.ok(!cfg.args.some((a) => a.includes("CUDA") || a.includes("VULKAN")));
-  assert.ok(bin.endsWith("build-cpu/bin/llama-server"));
+  assert.ok(bin.endsWith(B("build-cpu/bin/llama-server")));
 });
 
-test("a Vulkan-capable AMD box builds Vulkan", { skip: WIN_SKIP }, async () => {
+test("a Vulkan-capable AMD box builds Vulkan", async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir);
   await buildLlamaCpp({
@@ -68,7 +67,7 @@ test("a Vulkan-capable AMD box builds Vulkan", { skip: WIN_SKIP }, async () => {
   assert.ok(calls.find((c) => c.file === "cmake" && c.args.includes("-DGGML_VULKAN=ON")));
 });
 
-test("CUDA build is narrowed to the card's architecture", { skip: WIN_SKIP }, async () => {
+test("CUDA build is narrowed to the card's architecture", async () => {
   const dir = await checkout();
   const calls: string[][] = [];
   const inner = fakeRun(dir);
@@ -82,7 +81,7 @@ test("CUDA build is narrowed to the card's architecture", { skip: WIN_SKIP }, as
   assert.ok(cfg.includes("-DCMAKE_CUDA_ARCHITECTURES=75"));
 });
 
-test("an OOM-killed parallel build is retried once, serially", { skip: WIN_SKIP }, async () => {
+test("an OOM-killed parallel build is retried once, serially", async () => {
   const dir = await checkout();
   const { run, calls } = fakeRun(dir, { failBuildAbove: 1 });
   await buildLlamaCpp({ hw: hw({ cpuCount: 8 }), run, home: dir, statfs: roomy });

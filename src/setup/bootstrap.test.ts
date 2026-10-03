@@ -8,6 +8,7 @@ import { findLlamaServer, installBuildPackages, candidatePaths } from "./llamaCp
 import { checkBinaryAgainstChosenModel, ensureLocalStack } from "./bootstrap.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
+import { B, P, SRV, PATHS } from "../testSupport.js";
 const GiB = 1024 ** 3;
 
 /** A probe over a fixed set of busy ports. */
@@ -15,8 +16,6 @@ const probeFor = (busy: number[]): ((p: number) => Promise<PortState>) =>
   async (p) => (busy.includes(p) ? "in-use" : "free");
 
 // ── Ports ───────────────────────────────────────────────────────────────────
-
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("a clean machine gets the canonical ports and nothing is reported as moved", async () => {
   const plan = await planPorts({ probe: probeFor([]) });
@@ -66,11 +65,11 @@ const only = (...paths: string[]) => {
 
 test("an explicit LLAMACLI_LLAMA_SERVER wins over everything else", async () => {
   const { location } = await findLlamaServer({
-    env: { LLAMACLI_LLAMA_SERVER: "/opt/mine/llama-server", PATH: "/usr/bin" },
-    exists: only("/opt/mine/llama-server", "/usr/bin/llama-server"),
+    env: { LLAMACLI_LLAMA_SERVER: B("/opt/mine/llama-server"), PATH: "/usr/bin" },
+    exists: only(B("/opt/mine/llama-server"), B("/usr/bin/llama-server")),
     probe: async () => true,
   });
-  assert.equal(location?.binPath, "/opt/mine/llama-server");
+  assert.equal(location?.binPath, B("/opt/mine/llama-server"));
   assert.equal(location?.source, "env");
 });
 
@@ -80,18 +79,18 @@ test("the documented LLAMA_SERVER_BIN name is honoured too", async () => {
   // an environment variable nothing looked at and was told llama.cpp was not
   // installed. The doc/code mismatch was the bug.
   const { location } = await findLlamaServer({
-    env: { LLAMA_SERVER_BIN: "/opt/mine/llama-server", PATH: "" },
-    exists: only("/opt/mine/llama-server"),
+    env: { LLAMA_SERVER_BIN: B("/opt/mine/llama-server"), PATH: "" },
+    exists: only(B("/opt/mine/llama-server")),
     probe: async () => true,
   });
-  assert.equal(location?.binPath, "/opt/mine/llama-server");
+  assert.equal(location?.binPath, B("/opt/mine/llama-server"));
   assert.equal(location?.source, "env");
 });
 
-test("PATH is searched before any build tree, so an installed build wins", { skip: WIN_SKIP }, async () => {
+test("PATH is searched before any build tree, so an installed build wins", async () => {
   const { location } = await findLlamaServer({
-    env: { PATH: "/usr/bin:/bin" },
-    exists: only("/usr/bin/llama-server", "/home/u/llama.cpp/build/bin/llama-server"),
+    env: { PATH: PATHS("/usr/bin", "/bin") },
+    exists: only(B("/usr/bin/llama-server"), B("/home/u/llama.cpp/build/bin/llama-server")),
     home: "/home/u",
     listDirs: async () => ["build"],
     probe: async () => true,
@@ -99,17 +98,17 @@ test("PATH is searched before any build tree, so an installed build wins", { ski
   assert.equal(location?.source, "path");
 });
 
-test("a CUDA-flavoured build directory is preferred over a plain build beside it", { skip: WIN_SKIP }, async () => {
+test("a CUDA-flavoured build directory is preferred over a plain build beside it", async () => {
   // Finding a CPU-only build first and silently using it is the expensive
   // mistake: a 35B MoE on CPU instead of the GPU.
   const { location } = await findLlamaServer({
     env: { PATH: "" },
-    exists: only("/home/u/llama.cpp/build/bin/llama-server", "/home/u/llama.cpp/build-opt/bin/llama-server"),
+    exists: only(B("/home/u/llama.cpp/build/bin/llama-server"), B("/home/u/llama.cpp/build-opt/bin/llama-server")),
     home: "/home/u",
     listDirs: async () => ["build", "build-opt"],
     probe: async () => true,
   });
-  assert.equal(location?.binPath, "/home/u/llama.cpp/build-opt/bin/llama-server");
+  assert.equal(location?.binPath, B("/home/u/llama.cpp/build-opt/bin/llama-server"));
   assert.equal(location?.source, "existing-build");
   assert.equal(location?.backend, "cuda");
 });
@@ -125,50 +124,50 @@ test("nothing found means build, not a crash", async () => {
   assert.deepEqual(rejected, []);
 });
 
-test("build-cpu — the directory THIS module's builder creates — is found again", { skip: WIN_SKIP }, async () => {
+test("build-cpu — the directory THIS module's builder creates — is found again", async () => {
   // The builder writes to `build-cpu` on a machine with no CUDA, and the
   // preference list did not contain that name. So a CPU-only machine that let
   // llamacli build its own server could not find it on the next launch, and
   // rebuilt it: 10 to 40 minutes of compilation, every single start.
   const { location } = await findLlamaServer({
     env: { PATH: "" },
-    exists: only("/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server"),
+    exists: only(B("/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server")),
     home: "/home/u",
     listDirs: async (dir) => (dir.endsWith(".llamacli/llama.cpp") ? ["build-cpu"] : []),
     probe: async () => true,
   });
-  assert.equal(location?.binPath, "/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server");
+  assert.equal(location?.binPath, B("/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server"));
   assert.equal(location?.source, "llamacli-build");
 });
 
-test("a build directory nobody anticipated is still found", { skip: WIN_SKIP }, async () => {
+test("a build directory nobody anticipated is still found", async () => {
   // People name build dirs after the CUDA version, the arch, or the date. A
   // hardcoded list made all of them invisible, which turned "you already have
   // a build" into a 10-40 minute rebuild.
   const { location } = await findLlamaServer({
     env: { PATH: "" },
-    exists: only("/home/u/llama.cpp/build-cuda-12.4-rocm/bin/llama-server"),
+    exists: only(B("/home/u/llama.cpp/build-cuda-12.4-rocm/bin/llama-server")),
     home: "/home/u",
     listDirs: async () => ["build-cuda-12.4-rocm", "build"],
     probe: async () => true,
   });
-  assert.equal(location?.binPath, "/home/u/llama.cpp/build-cuda-12.4-rocm/bin/llama-server");
+  assert.equal(location?.binPath, B("/home/u/llama.cpp/build-cuda-12.4-rocm/bin/llama-server"));
 });
 
-test("a `make`-built llama.cpp at the repo root is found", { skip: WIN_SKIP }, async () => {
+test("a `make`-built llama.cpp at the repo root is found", async () => {
   // `make` puts the binaries at the checkout root, which is what a first-time
   // user following llama.cpp's own README ends up with. Nothing looked there.
   const { location } = await findLlamaServer({
     env: { PATH: "" },
-    exists: only("/home/u/llama.cpp/llama-server"),
+    exists: only(B("/home/u/llama.cpp/llama-server")),
     home: "/home/u",
     listDirs: async () => [],
     probe: async () => true,
   });
-  assert.equal(location?.binPath, "/home/u/llama.cpp/llama-server");
+  assert.equal(location?.binPath, B("/home/u/llama.cpp/llama-server"));
 });
 
-test("a binary that exists but cannot run is skipped in favour of one that can", { skip: WIN_SKIP }, async () => {
+test("a binary that exists but cannot run is skipped in favour of one that can", async () => {
   // Existence is not usability. A build against an unavailable CUDA version, or
   // one missing its libggml-cuda.so, is present and executable and still fails
   // to start — and accepting it meant the failure surfaced later as an opaque
@@ -178,36 +177,36 @@ test("a binary that exists but cannot run is skipped in favour of one that can",
   // first, has to reject it, and only then fall through.
   const { location, rejected } = await findLlamaServer({
     env: { PATH: "" },
-    exists: only("/home/u/llama.cpp/build/bin/llama-server", "/home/u/llama.cpp/build-opt/bin/llama-server"),
+    exists: only(B("/home/u/llama.cpp/build/bin/llama-server"), B("/home/u/llama.cpp/build-opt/bin/llama-server")),
     home: "/home/u",
     listDirs: async () => ["build", "build-opt"],
     probe: async (p) => !p.includes("build-opt"),
   });
-  assert.equal(location?.binPath, "/home/u/llama.cpp/build/bin/llama-server");
-  assert.deepEqual(rejected, ["/home/u/llama.cpp/build-opt/bin/llama-server"]);
+  assert.equal(location?.binPath, B("/home/u/llama.cpp/build/bin/llama-server"));
+  assert.deepEqual(rejected, [B("/home/u/llama.cpp/build-opt/bin/llama-server")]);
 });
 
-test("when every candidate is broken, the reason is reported instead of 'not installed'", { skip: WIN_SKIP }, async () => {
+test("when every candidate is broken, the reason is reported instead of 'not installed'", async () => {
   const { location, rejected } = await findLlamaServer({
     env: { PATH: "" },
-    exists: only("/home/u/llama.cpp/build/bin/llama-server"),
+    exists: only(B("/home/u/llama.cpp/build/bin/llama-server")),
     home: "/home/u",
     listDirs: async () => ["build"],
     probe: async () => false,
   });
   assert.equal(location, null);
-  assert.deepEqual(rejected, ["/home/u/llama.cpp/build/bin/llama-server"]);
+  assert.deepEqual(rejected, [B("/home/u/llama.cpp/build/bin/llama-server")]);
 });
 
-test("the three real build layouts are all covered", { skip: WIN_SKIP }, () => {
+test("the three real build layouts are all covered", () => {
   const root = "/llama.cpp";
   const paths = candidatePaths(root, ["build"]);
   // cmake, the usual case
-  assert.ok(paths.includes(`${root}/build/bin/llama-server`));
+  assert.ok(paths.includes(B(`${root}/build/bin/llama-server`)));
   // MSVC multi-config generators put the configuration last
-  assert.ok(paths.includes(`${root}/build/bin/Release/llama-server`));
+  assert.ok(paths.includes(B(`${root}/build/bin/Release/llama-server`)));
   // plain `make`, binaries at the checkout root
-  assert.ok(paths.includes(`${root}/llama-server`));
+  assert.ok(paths.includes(B(`${root}/llama-server`)));
   // and nothing invents paths that exist nowhere
   assert.equal(paths.some((p) => p.includes("/bin/bin/")), false);
 });
@@ -343,7 +342,7 @@ test("with the model already on disk, the binary is asked instead of the filenam
     const model = join(root, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
     await writeFile(model, Buffer.alloc(1024));
 
-    const mismatch = await checkBinaryAgainstChosenModel("/stock/llama-server", basename(model), model, {
+    const mismatch = await checkBinaryAgainstChosenModel(B("/stock/llama-server"), basename(model), model, {
       probeModel: async () => ({ ok: false, error: "invalid ggml type 143. should be in [0, 43)" }),
     });
     assert.match(mismatch ?? "", /읽지 못합니다/);
@@ -351,14 +350,14 @@ test("with the model already on disk, the binary is asked instead of the filenam
 
     // A build that CAN read the model says nothing, even though the filename is
     // unsupported-quant — the exact probe decides.
-    const readable = await checkBinaryAgainstChosenModel("/fork/llama-server", basename(model), model, {
+    const readable = await checkBinaryAgainstChosenModel(B("/fork/llama-server"), basename(model), model, {
       probeModel: async () => ({ ok: true }),
     });
     assert.equal(readable, null, "the file is present and readable: no warning is warranted");
 
     // A load failure that is NOT a format mismatch says nothing about the
     // binary either, and must not be turned into a build warning.
-    const corrupt = await checkBinaryAgainstChosenModel("/fork/llama-server", basename(model), model, {
+    const corrupt = await checkBinaryAgainstChosenModel(B("/fork/llama-server"), basename(model), model, {
       probeModel: async () => ({ ok: false, error: "llama_model_loader: failed to load model" }),
     });
     assert.equal(corrupt, null);
@@ -376,7 +375,7 @@ test("ensureLocalStack probes the real model file, kept outside modelsDir", asyn
   const modelsDir = join(projectRoot, "models-dir-with-nothing-in-it");
   const elsewhere = join(projectRoot, "usb", "usb-models");
   const modelFile = join(elsewhere, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
-  const binPath = join(projectRoot, "llama-server");
+  const binPath = join(projectRoot, SRV);
 
   try {
     await mkdir(elsewhere, { recursive: true });
@@ -427,7 +426,7 @@ test("ensureLocalStack probes the real model file, kept outside modelsDir", asyn
 
 test("with no model on disk there is nothing to probe, so no warning is raised", async () => {
   const missing = join(tmpdir(), "definitely-not-here-12345", "model.gguf");
-  assert.equal(await checkBinaryAgainstChosenModel("/build/llama-server", "Ornith-1.5-35B-A3B-Q4_K_M.gguf", missing), null);
+  assert.equal(await checkBinaryAgainstChosenModel(B("/build/llama-server"), "Ornith-1.5-35B-A3B-Q4_K_M.gguf", missing), null);
 });
 
 // ── /reset must not undo a /models selection ────────────────────────────────

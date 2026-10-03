@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { parse } from "yaml";
 import { buildConfig, writeConfig, ensureLocalStack } from "./bootstrap.js";
 import type { LlamaTuning } from "./tuning.js";
+import { SRV, writeFakeExe } from "../testSupport.js";
 
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -19,8 +20,6 @@ const tuning: LlamaTuning = {
   cacheTypeK: "q8_0", cacheTypeV: "q8_0", parallel: 1,
   rationale: [], gpu: null,
 };
-
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("a hand-tuned config survives the bootstrap — the keys a user set by hand are not clobbered", async () => {
   // The bootstrap runs on EVERY launch, so "replace the config" would silently
@@ -120,7 +119,7 @@ test("an existing config is read back and merged, not discarded", async () =>
     assert.equal(report.ports?.llamaPort, 8080);
   }));
 
-test("a bootstrap that cannot fully do its job still returns a report and a usable config", { skip: WIN_SKIP }, async () =>
+test("a bootstrap that cannot fully do its job still returns a report and a usable config", async () =>
   withTempDir(async (dir) => {
     // Offline, so no model can be resolved, and building is forbidden. The point
     // is that this RETURNS rather than throwing: a bootstrap that throws takes
@@ -138,9 +137,8 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
     // failed on a clean CI runner. A fake llama-server and an env that points ONLY at it make both the same.
     const { mkdir: mk, writeFile: wf, chmod: cm } = await import("node:fs/promises");
     await mk(join(dir, "bin"), { recursive: true });
-    const fakeBin = join(dir, "bin", "llama-server");
-    await wf(fakeBin, "#!/bin/sh\necho 'version: 1 (abc)'\n");
-    await cm(fakeBin, 0o755);
+    const fakeBin = join(dir, "bin", SRV);
+    await writeFakeExe(fakeBin, { stdout: "version: 1 (abc)" });
     const report = await ensureLocalStack({
       env: { HOME: join(dir, "home"), PATH: "", LLAMACLI_LLAMA_SERVER: fakeBin } as NodeJS.ProcessEnv,
       projectRoot: dir,
@@ -178,7 +176,7 @@ test("a bootstrap that cannot fully do its job still returns a report and a usab
 // spawn a server with an empty model path and die with "failed to open GGUF
 // file" — a working machine turned into a three-stage failure.
 
-test("a model kept from the existing config never enters the download step", { skip: WIN_SKIP }, async () =>
+test("a model kept from the existing config never enters the download step", async () =>
   withTempDir(async (dir) => {
     await mkdir(join(dir, ".llamacli"), { recursive: true });
     // Outside any models dir, which is the normal case: modelsDir is only a default.
@@ -187,9 +185,8 @@ test("a model kept from the existing config never enters the download step", { s
     // A fake llama-server that prints a version, not /bin/true: coreutils' `true --version` happens to print one on
     // Linux and prints nothing on macOS, so this test passed or failed by the machine it ran on.
     await mkdir(join(dir, "bin"), { recursive: true });
-    const fakeBin = join(dir, "bin", "llama-server");
-    await writeFile(fakeBin, "#!/bin/sh\necho 'version: 1 (abc)'\n");
-    await (await import("node:fs/promises")).chmod(fakeBin, 0o755);
+    const fakeBin = join(dir, "bin", SRV);
+    await writeFakeExe(fakeBin, { stdout: "version: 1 (abc)" });
     await writeFile(
       join(dir, ".llamacli", "config.yaml"),
       `backend: local-llama\nmodel: ${modelPath}\nllama:\n  binPath: ${fakeBin}\n  modelPath: ${modelPath}\n  port: 8080\n`

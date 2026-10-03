@@ -8,6 +8,7 @@ import { resolveBackend, startWithCompatibleFallback, configuredPort } from "./r
 import { DEFAULT_CONFIG, type LlamacliConfig } from "../config.js";
 import { discoverRunningServer, type Discovery } from "./detect.js";
 import type { BootstrapOptions, BootstrapReport } from "../setup/bootstrap.js";
+import { EXE, writeFakeExe } from "../testSupport.js";
 
 
 async function project(): Promise<string> {
@@ -22,8 +23,6 @@ const localConfig = (over: Partial<LlamacliConfig> = {}): LlamacliConfig => ({
 /** A discovery result, defaulted to "nothing is running" so each test states
  *  only the case it is about. */
 const none: Discovery = { kind: "none" };
-
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("case 1: an already-running server is adopted, nothing is installed or spawned", async () => {
   const root = await project();
@@ -364,7 +363,7 @@ test("case 1: an inconclusive probe still adopts — a slow backend is not a bro
   }
 });
 
-test("case 2: a freshly spawned server serving garbage is reported, not handed to the agent loop", { skip: WIN_SKIP }, async () => {
+test("case 2: a freshly spawned server serving garbage is reported, not handed to the agent loop", async () => {
   const root = await project();
   const cleanup: Array<() => void> = [];
   try {
@@ -373,19 +372,8 @@ test("case 2: a freshly spawned server serving garbage is reported, not handed t
     // A real process answering /v1/models, so the spawn genuinely succeeds and
     // the probe is reached — stubbing tryStart's readiness away would test
     // nothing about the path that matters.
-    const fake = join(root, "fake-llama-server");
-    await writeFile(
-      fake,
-      `#!/usr/bin/env node
-const http = require("http");
-const i = process.argv.indexOf("--port");
-http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ data: [{ id: "fake" }] }));
-}).listen(Number(process.argv[i + 1]), "127.0.0.1");
-`
-    );
-    await chmod(fake, 0o755);
+    const fake = join(root, `fake-llama-server${EXE}`);
+    await writeFakeExe(fake, { serve: true });
     const res = await resolveBackend({
       projectRoot: root,
       config: localConfig({ backend: "local-llama", llama: { binPath: fake, modelPath: model, port: 9097 } } as any),

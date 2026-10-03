@@ -8,6 +8,7 @@ import {
   MODEL_RUNTIME_SCAN_DEPTH,
   type ProbeSpawn,
 } from "./llamaCpp.js";
+import { B, P, SRV, PATHS, posix } from "../testSupport.js";
 
 
 // ── a binary that runs but cannot read the model is a different failure ─────
@@ -23,8 +24,6 @@ import {
 // `~/llama.cpp/build-opt` first and returned it, because the only check was
 // `probeLlamaServer`, which runs `--version` — a check that a binary unable to
 // read the weights it is about to be handed passes perfectly.
-
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("an unsupported-format error is recognised as a build mismatch, not a bad file", () => {
   assert.equal(
@@ -44,7 +43,7 @@ test("a generic load failure is NOT claimed to be a build mismatch", () => {
   assert.equal(looksLikeUnsupportedModelFormat(""), false);
 });
 
-test("a build that cannot read the configured model is skipped in favour of the next candidate", { skip: WIN_SKIP }, async () => {
+test("a build that cannot read the configured model is skipped in favour of the next candidate", async () => {
   // The stock build answers `--version` fine and would previously be accepted.
   // With the newer-quant model it must be rejected specifically for the model, and
   // the search must continue to a build that can read it.
@@ -52,7 +51,7 @@ test("a build that cannot read the configured model is skipped in favour of the 
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
+    exists: async (p) => p.endsWith(SRV) && p.includes("llama.cpp"),
     listDirs: async () => ["build-opt"],
     probe: async () => true, // runs fine — that was never the problem
     modelPath: "/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
@@ -70,35 +69,35 @@ test("a build that cannot read the configured model is skipped in favour of the 
   assert.deepEqual(result.rejected, [], "a running binary is not 'rejected: cannot execute'");
 });
 
-test("a build that CAN read the model is accepted", { skip: WIN_SKIP }, async () => {
+test("a build that CAN read the model is accepted", async () => {
   // The other half of the previous test: the check must not reject everything,
   // or a working install would be discarded for a problem it does not have.
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
+    exists: async (p) => p.endsWith(SRV) && p.includes("llama.cpp"),
     listDirs: async () => ["build-opt"],
     probe: async () => true,
     modelPath: "/models/model.gguf",
     probeModel: async () => ({ ok: true }),
   });
   assert.ok(result.location, "a binary that reads the model must be accepted");
-  assert.match(result.location!.binPath, /llama-server$/);
+  assert.match(result.location!.binPath, /llama-server(\.exe)?$/);
   assert.deepEqual(result.rejectedForModel, []);
 });
 
-test("the search proceeds past a mismatched build to one that works", { skip: WIN_SKIP }, async () => {
+test("the search proceeds past a mismatched build to one that works", async () => {
   // The stock `~/llama.cpp` build is ranked FIRST, so this is the real shape of
   // the failure: the wrong build is found before the right one is even looked
   // at, and returning it ends the session. The working build is here on PATH,
   // which is the only route by which a second llama.cpp install is reachable
   // at all — see the test below for what happens when it is not.
-  const stock = "/usr/local/bin/llama-server";
-  const fork = "/opt/alt-runtime/llama-server";
+  const stock = B("/usr/local/bin/llama-server");
+  const fork = B("/opt/alt-runtime/llama-server");
   const seen: string[] = [];
   const result = await findLlamaServer({
     home: "/home/jeano",
-    env: { PATH: "/usr/local/bin:/opt/alt-runtime" },
+    env: { PATH: PATHS("/usr/local/bin", "/opt/alt-runtime") },
     exists: async (p) => p === stock || p === fork,
     listDirs: async () => [],
     probe: async () => true,
@@ -113,7 +112,7 @@ test("the search proceeds past a mismatched build to one that works", { skip: WI
   assert.deepEqual(seen, [stock, fork], "the mismatch must be established before moving on");
 });
 
-test("a working build outside every searched location is genuinely unreachable", { skip: WIN_SKIP }, async () => {
+test("a working build outside every searched location is genuinely unreachable", async () => {
   // Recorded deliberately rather than papered over. The search covers env
   // overrides, PATH, and llama.cpp checkouts under $HOME — and nothing else.
   // The build that reads the model on this machine lives in neither, so
@@ -121,8 +120,8 @@ test("a working build outside every searched location is genuinely unreachable",
   // here is what was checked", and the user's next move is to name the binary
   // in llama.binPath. Widening the search by guessing at directories is not
   // available as a fix here without inventing paths nobody can verify.
-  const stock = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
-  const unreachableFork = "/media/jeano/nvme-usb/alt-runtime/llama-server";
+  const stock = B("/home/jeano/llama.cpp/build-opt/bin/llama-server");
+  const unreachableFork = B("/media/jeano/nvme-usb/alt-runtime/llama-server");
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: { PATH: "/usr/bin" },
@@ -140,13 +139,13 @@ test("a working build outside every searched location is genuinely unreachable",
   );
 });
 
-test("a model-compatibility failure that is NOT a format mismatch keeps the binary", { skip: WIN_SKIP }, async () => {
+test("a model-compatibility failure that is NOT a format mismatch keeps the binary", async () => {
   // A truncated download says nothing about the build. Discarding a working
   // install over it would be worse than the original problem.
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
+    exists: async (p) => p.endsWith(SRV) && p.includes("llama.cpp"),
     listDirs: async () => ["build-opt"],
     probe: async () => true,
     modelPath: "/models/big.gguf",
@@ -156,14 +155,14 @@ test("a model-compatibility failure that is NOT a format mismatch keeps the bina
   assert.deepEqual(result.rejectedForModel, []);
 });
 
-test("model compatibility is not checked when no model is known yet", { skip: WIN_SKIP }, async () => {
+test("model compatibility is not checked when no model is known yet", async () => {
   // A first run has no model. Probing for compatibility with nothing would be
   // both meaningless and a wasted process spawn per candidate.
   let probed = false;
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
+    exists: async (p) => p.endsWith(SRV) && p.includes("llama.cpp"),
     listDirs: async () => ["build-opt"],
     probe: async () => true,
     probeModel: async () => {
@@ -182,7 +181,7 @@ test("checkModel: false skips the pass entirely", async () => {
   await findLlamaServer({
     home: "/home/jeano",
     env: {},
-    exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
+    exists: async (p) => p.endsWith(SRV) && p.includes("llama.cpp"),
     listDirs: async () => ["build-opt"],
     probe: async () => true,
     modelPath: "/models/model.gguf",
@@ -200,18 +199,18 @@ test("probeModelCompatibility resolves ok without a model path", async () => {
   // must not spawn anything.
   // `verdict` is included because it is what callers now branch on, and a
   // no-model probe is genuinely an "ok" rather than an absence of one.
-  assert.deepEqual(await probeModelCompatibility("/nonexistent/llama-server", undefined), {
+  assert.deepEqual(await probeModelCompatibility(B("/nonexistent/llama-server"), undefined), {
     ok: true,
     verdict: "ok",
   });
 });
 
-test("a candidate that cannot even run is reported separately from a model mismatch", { skip: WIN_SKIP }, async () => {
+test("a candidate that cannot even run is reported separately from a model mismatch", async () => {
   // The two lists answer different questions and lead to different fixes, so
   // collapsing them would lose the distinction that makes the message useful:
   // "cannot execute" means a broken install, "cannot read this quant" means the
   // wrong build.
-  const broken = "/home/jeano/llama.cpp/build-x86/bin/llama-server";
+  const broken = B("/home/jeano/llama.cpp/build-x86/bin/llama-server");
   const onlyBroken = await findLlamaServer({
     home: "/home/jeano",
     env: {},
@@ -228,7 +227,7 @@ test("a candidate that cannot even run is reported separately from a model misma
   assert.deepEqual(onlyBroken.rejectedForModel, []);
 
   // And a working build is chosen with both lists empty.
-  const working = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
+  const working = B("/home/jeano/llama.cpp/build-opt/bin/llama-server");
   const chosen = await findLlamaServer({
     home: "/home/jeano",
     env: {},
@@ -243,14 +242,14 @@ test("a candidate that cannot even run is reported separately from a model misma
   assert.deepEqual(chosen.rejectedForModel, []);
 });
 
-test("one binary reachable through several layouts is probed only once", { skip: WIN_SKIP }, async () => {
+test("one binary reachable through several layouts is probed only once", async () => {
   // `candidatePaths` yields the same binary under each of the three real build
   // layouts (bin/, build/bin/, Release/), and the search tries all three. Both
   // probes are process spawns — `--version`, and a GGUF header parse for
   // model compatibility — so without memoisation a single stock build was
   // launched and re-read up to three times, and reported to the user three
   // times over as three different "incompatible" builds.
-  const bin = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
+  const bin = B("/home/jeano/llama.cpp/build-opt/bin/llama-server");
   let modelProbes = 0;
   let versionProbes = 0;
   const result = await findLlamaServer({
@@ -275,8 +274,8 @@ test("one binary reachable through several layouts is probed only once", { skip:
   assert.equal(versionProbes, 1, "the same path must not be executed three times");
 });
 
-test("a binary rejected for the model is listed once however many layouts expose it", { skip: WIN_SKIP }, async () => {
-  const bin = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
+test("a binary rejected for the model is listed once however many layouts expose it", async () => {
+  const bin = B("/home/jeano/llama.cpp/build-opt/bin/llama-server");
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
@@ -304,10 +303,10 @@ test("a binary rejected for the model is listed once however many layouts expose
 //
 // Observed on this machine: the model is at
 // `<drive>/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf` and the only build
-// that can read it is `<drive>/alt-runtime/llama-server` — same disk, two
+// that can read it is <drive>/alt-runtime/llama-server — same disk, two
 // directories away, invisible to every existing rule.
 
-test("a runtime beside the model directory is found", { skip: WIN_SKIP }, async () => {
+test("a runtime beside the model directory is found", async () => {
   const tree: Record<string, string[]> = {
     "/m/models/gguf": [],
     "/m/models": [],
@@ -315,10 +314,10 @@ test("a runtime beside the model directory is found", { skip: WIN_SKIP }, async 
     "/": ["m", "home"],
   };
   const found = await runtimeCandidatesNearModel("/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf", {
-    listDirs: async (dir) => tree[dir] ?? [],
-    exists: async (p) => p === "/m/alt-runtime/llama-server",
+    listDirs: async (dir) => tree[posix(dir)] ?? [],
+    exists: async (p) => p === B("/m/alt-runtime/llama-server"),
   });
-  assert.deepEqual(found, ["/m/alt-runtime/llama-server"]);
+  assert.deepEqual(found, [B("/m/alt-runtime/llama-server")]);
 });
 
 test("the scan is bounded and stops at the filesystem root", async () => {
@@ -352,27 +351,27 @@ test("no model means no adjacent-runtime scan", async () => {
   assert.equal(listed, false, "the filesystem must not be touched");
 });
 
-test("llama-server is never treated as its own parent directory", { skip: WIN_SKIP }, async () => {
-  // Harmless but wrong: `<dir>/llama-server/llama-server` is not a candidate,
+test("llama-server is never treated as its own parent directory", async () => {
+  // Harmless but wrong: <dir>/llama-server/llama-server is not a candidate,
   // and reporting it would put a nonexistent path in front of the user.
   const found = await runtimeCandidatesNearModel("/m/models/m.gguf", {
     listDirs: async () => ["llama-server", "runtime"],
-    exists: async (p) => p === "/m/runtime/llama-server",
+    exists: async (p) => p === B("/m/runtime/llama-server"),
   });
-  assert.deepEqual(found, ["/m/runtime/llama-server"]);
+  assert.deepEqual(found, [B("/m/runtime/llama-server")]);
 });
 
-test("the search prefers a declared location over an adjacent runtime", { skip: WIN_SKIP }, async () => {
+test("the search prefers a declared location over an adjacent runtime", async () => {
   // Ranking matters: a build the user put in PATH is a decision, whereas an
   // adjacent runtime is a guess about where a tarball was unpacked. The guess
   // may be tried, but must never outrank the decision.
-  const inPath = "/usr/local/bin/llama-server";
-  const adjacent = "/m/alt-runtime/llama-server";
+  const inPath = B("/usr/local/bin/llama-server");
+  const adjacent = B("/m/alt-runtime/llama-server");
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: { PATH: "/usr/local/bin" },
     exists: async (p) => p === inPath || p === adjacent,
-    listDirs: async (dir) => (dir === "/m" ? ["alt-runtime"] : dir === "/home/jeano/llama.cpp" ? [] : []),
+    listDirs: async (dir) => (posix(dir) === "/m" ? ["alt-runtime"] : posix(dir) === "/home/jeano/llama.cpp" ? [] : []),
     probe: async () => true,
     modelPath: "/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async () => ({ ok: true }),
@@ -381,16 +380,16 @@ test("the search prefers a declared location over an adjacent runtime", { skip: 
   assert.equal(result.location?.source, "path");
 });
 
-test("an adjacent runtime is used when the declared builds cannot read the model", { skip: WIN_SKIP }, async () => {
+test("an adjacent runtime is used when the declared builds cannot read the model", async () => {
   // The case that was actually dead-ended: a stock build in PATH that runs fine
   // and cannot read the model, and one working runtime beside the model files.
-  const inPath = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
-  const adjacent = "/m/alt-runtime/llama-server";
+  const inPath = B("/home/jeano/llama.cpp/build-opt/bin/llama-server");
+  const adjacent = B("/m/alt-runtime/llama-server");
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
     exists: async (p) => p === inPath || p === adjacent,
-    listDirs: async (dir) => (dir === "/m" ? ["alt-runtime"] : ["build-opt"]),
+    listDirs: async (dir) => (posix(dir) === "/m" ? ["alt-runtime"] : ["build-opt"]),
     probe: async () => true,
     modelPath: "/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async (bin) =>
@@ -401,17 +400,17 @@ test("an adjacent runtime is used when the declared builds cannot read the model
   assert.deepEqual(result.rejectedForModel, [inPath]);
 });
 
-test("an unrelated sibling llama-server is probed and rejected, not launched", { skip: WIN_SKIP }, async () => {
+test("an unrelated sibling llama-server is probed and rejected, not launched", async () => {
   // Widening WHERE we look is only safe because the probe still decides WHAT we
   // accept. A sibling project that happens to contain a llama-server must not
   // be able to talk its way in.
-  const stray = "/m/some-project/llama-server";
-  const good = "/m/alt-runtime/llama-server";
+  const stray = B("/m/some-project/llama-server");
+  const good = B("/m/alt-runtime/llama-server");
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
     exists: async (p) => p === stray || p === good,
-    listDirs: async (dir) => (dir === "/m" ? ["some-project", "alt-runtime"] : []),
+    listDirs: async (dir) => (posix(dir) === "/m" ? ["some-project", "alt-runtime"] : []),
     probe: async () => true,
     modelPath: "/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async (bin) =>
@@ -446,7 +445,7 @@ test("a build that reads the model is killed as soon as the verdict is known", a
   // the probe is back to waiting, and each un-killed probe also leaves a second
   // llama-server on the machine holding the model's VRAM.
   const { spawn, state } = fakeSpawn(["load_model: initializing, n_slots = 4\n"]);
-  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn });
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn });
   assert.equal(r.verdict, "ok");
   assert.equal(state.killed, true, "the process must be killed, not left serving");
 });
@@ -457,7 +456,7 @@ test("an unreadable quant is detected from output, not from the exit code", asyn
   const { spawn, state } = fakeSpawn([
     "gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 143\n",
   ]);
-  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn });
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn });
   assert.equal(r.verdict, "unsupported");
   assert.equal(r.ok, false);
   assert.equal(state.killed, true);
@@ -474,7 +473,7 @@ test("a spawn that cannot start is NOT reported as ok", async () => {
     onError(new Error("spawn ENOENT"));
     return { kill: () => {} };
   };
-  const r = await probeModelCompatibility("/nope/llama-server", "/m.gguf", { spawn });
+  const r = await probeModelCompatibility(B("/nope/llama-server"), "/m.gguf", { spawn });
   assert.equal(r.ok, false);
   assert.notEqual(r.verdict, "ok");
 });
@@ -484,7 +483,7 @@ test("a process that never reports anything is inconclusive, not ok", async () =
   // which is not a format complaint, so the binary was kept and reported as
   // able to read the model. It was only ever "not disproven".
   const spawn: ProbeSpawn = () => ({ kill: () => {} });
-  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 5 });
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn, timeoutMs: 5 });
   assert.equal(r.verdict, "inconclusive");
   assert.equal(r.ok, false);
 });
@@ -494,7 +493,7 @@ test("a non-type load failure is 'other', kept but not blamed on the build", asy
   // a build mismatch -- that would send the user rebuilding a working install
   // over a bad download.
   const { spawn } = fakeSpawn(["llama_model_loader: failed to load model\n"]);
-  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn });
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn });
   assert.equal(r.verdict, "other");
   assert.equal(r.ok, false);
 });
@@ -504,7 +503,7 @@ test("findLlamaServer records a kept-but-unconfirmed build as unverified", async
   // recorded, because "kept" means "not disproven" and presenting that as a
   // positive result is how a wrong build gets reported as usable.
   const r = await findLlamaServer({
-    env: { LLAMACLI_LLAMA_SERVER: "/bin/llama-server" } as NodeJS.ProcessEnv,
+    env: { LLAMACLI_LLAMA_SERVER: B("/bin/llama-server") } as NodeJS.ProcessEnv,
     // modelPath is required: without it the compatibility check is skipped
     // entirely, which is correct behaviour and would make this test vacuous.
     modelPath: "/m.gguf",
@@ -513,8 +512,8 @@ test("findLlamaServer records a kept-but-unconfirmed build as unverified", async
     spawnProbe: () => ({ kill: () => {} }),
     probeModel: async () => ({ ok: false, verdict: "inconclusive" as const }),
   });
-  assert.equal(r.location?.binPath, "/bin/llama-server", "still chosen -- it is the best candidate");
-  assert.deepEqual(r.unverified, ["/bin/llama-server"], "but not presented as confirmed");
+  assert.equal(r.location?.binPath, B("/bin/llama-server"), "still chosen -- it is the best candidate");
+  assert.deepEqual(r.unverified, [B("/bin/llama-server")], "but not presented as confirmed");
   assert.deepEqual(r.rejectedForModel, [], "and not blamed for the model");
 });
 
@@ -526,7 +525,7 @@ test("a process that EXITS is a verdict, not a reason to wait for the timeout", 
   // a minute per probe, which is how this was found.
   const { spawn, state } = fakeSpawn([], 0);
   const t0 = Date.now();
-  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn, timeoutMs: 60_000 });
   assert.equal(r.verdict, "ok", "exit 0 with no complaint means the load was done");
   assert.ok(Date.now() - t0 < 1000, `must not wait for the timeout, took ${Date.now() - t0}ms`);
   assert.equal(state.calls, 1);
@@ -536,7 +535,7 @@ test("a non-zero exit is 'other' — the file failed, not the build", async () =
   // Reporting this as a build mismatch would send the user rebuilding a working
   // install over a bad download.
   const { spawn } = fakeSpawn(["some unrecognised failure\n"], 1);
-  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn, timeoutMs: 60_000 });
   assert.equal(r.verdict, "other");
   assert.equal(r.ok, false);
 });
@@ -545,6 +544,6 @@ test("output that already decided the verdict wins over a later exit", async () 
   // The order the two events arrive in must not change the answer: a build that
   // printed "invalid ggml type" and then exited 0 is still a build mismatch.
   const { spawn } = fakeSpawn(["tensor 'output.weight' has invalid ggml type 143\n"], 0);
-  const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn, timeoutMs: 60_000 });
   assert.equal(r.verdict, "unsupported");
 });

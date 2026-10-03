@@ -8,6 +8,7 @@ import { tuneForHardware } from "./tuning.js";
 import { LlamaServerManager } from "../backend/llamaServer.js";
 import { isKnownDenseFamily } from "./modelCatalog.js";
 import type { Hardware } from "./hardware.js";
+import { EXE, writeFakeExe } from "../testSupport.js";
 
 // ── a minimal GGUF writer, enough to build headers of either kind ───────────
 const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
@@ -23,8 +24,6 @@ function gguf(kvs: Buffer[]) {
 }
 const dense = () => gguf([kvStr("general.architecture", "qwen35"), kvU32("qwen35.block_count", 64), kvStrArr("tokenizer.ggml.tokens", ["a", "b"])]);
 const moe = () => gguf([kvStr("general.architecture", "qwen35moe"), kvU32("qwen35moe.expert_count", 256), kvU32("qwen35moe.block_count", 40), kvStrArr("tokenizer.ggml.tokens", ["a"])]);
-
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("a header with expert_count is MoE", () => {
   assert.deepEqual(parseGgufArchInfo(moe()), { arch: "qwen35moe", expertCount: 256, conclusive: true });
@@ -112,26 +111,25 @@ async function launchedArgs(modelBuf: Buffer, cpuMoeLayers: number): Promise<str
   try {
     const model = join(dir, "m.gguf");
     await writeFile(model, modelBuf);
-    const bin = join(dir, "fake-llama-server");
+    const bin = join(dir, `fake-llama-server${EXE}`);
     // Records its arguments and exits at once: start() then rejects, which is fine here.
-    await writeFile(bin, `#!/bin/sh\necho "$@" > ${join(dir, "args.txt")}\nexit 1\n`);
-    await chmod(bin, 0o755);
+    await writeFakeExe(bin, { argsFile: join(dir, "args.txt"), exit: 1 });
     const m = new LlamaServerManager({ binPath: bin, modelPath: model, host: "127.0.0.1", port: 59123, contextSize: 4096, threads: 2, gpuLayers: 99, cpuMoeLayers });
     await m.start().catch(() => {});
     return (await readFile(join(dir, "args.txt"), "utf8")).trim().split(/\s+/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
-test("launch: a stale cpuMoeLayers is NOT passed to a dense model", { skip: WIN_SKIP }, async () => {
+test("launch: a stale cpuMoeLayers is NOT passed to a dense model", async () => {
   assert.ok(!(await launchedArgs(dense(), 32)).includes("--n-cpu-moe"));
 });
 
-test("launch: a MoE model still gets the flag", { skip: WIN_SKIP }, async () => {
+test("launch: a MoE model still gets the flag", async () => {
   const args = await launchedArgs(moe(), 32);
   assert.equal(args[args.indexOf("--n-cpu-moe") + 1], "32");
 });
 
-test("launch: a file whose header cannot be read is left as configured (unknown ≠ dense)", { skip: WIN_SKIP }, async () => {
+test("launch: a file whose header cannot be read is left as configured (unknown ≠ dense)", async () => {
   assert.ok((await launchedArgs(Buffer.from("garbage"), 32)).includes("--n-cpu-moe"));
 });
 

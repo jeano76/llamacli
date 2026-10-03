@@ -11,14 +11,13 @@ import { windowsAdapterHasVulkanGpu, detectHardware, type Hardware } from "./har
 import { stockRungsFor, type Release } from "./stockRuntime.js";
 import { formatProgress, type TransferProgress } from "./download.js";
 import { ensureLocalStack } from "./bootstrap.js";
+import { B, P, SRV, PATHS, writeFakeExe } from "../testSupport.js";
 
 
 const GiB = 1024 ** 3;
 const tools = (p: string[]) => Object.fromEntries(p.map((t) => [t, true]));
 
 // ── user-space cmake ────────────────────────────────────────────────────────
-
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
 
 test("no root, no sudo, only cmake missing, pip present: install cmake into the user's dir", () => {
   const plan = planBuildEnv({ platform: "linux", tools: tools(["git", "g++", "make", "apt-get", "pip3"]) }, { isRoot: false });
@@ -45,7 +44,7 @@ test("a user-space cmake is verified by its path, not by PATH", async () => {
   assert.ok(ran.includes(plan.cmakeBin!));
 });
 
-test("buildLlamaCpp invokes the user-space cmake by absolute path", { skip: WIN_SKIP || (process.getuid?.() === 0 ? "running as root: no user-space cmake is needed" : false) }, async () => {
+test("buildLlamaCpp invokes the user-space cmake by absolute path", { skip: process.platform === "win32" ? "not applicable on Windows: the user-space (pip --user) cmake is a POSIX install path" : process.getuid?.() === 0 ? "running as root: no user-space cmake is needed" : false }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "llc-"));
   await mkdir(join(dir, ".git"), { recursive: true });
   const calls: string[] = [];
@@ -54,8 +53,8 @@ test("buildLlamaCpp invokes the user-space cmake by absolute path", { skip: WIN_
     if (f === "git" && a[0] === "config") return "https://github.com/ggml-org/llama.cpp";
     if (a.includes("--build")) {
       await mkdir(join(dir, "build-cpu", "bin"), { recursive: true });
-      await writeFile(join(dir, "build-cpu", "bin", "llama-server"), "x");
-      await chmod(join(dir, "build-cpu", "bin", "llama-server"), 0o755);
+      await writeFile(join(dir, "build-cpu", "bin", SRV), "x");
+      await chmod(join(dir, "build-cpu", "bin", SRV), 0o755);
     }
     return "";
   };
@@ -205,7 +204,7 @@ test("the model download starts while the engine is still being acquired", async
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
       fetchImpl: hubStub(4096),
       log: (l) => { if (l.includes("모델 이미 있음")) { events.push("download-seen"); releaseEngine(); } },
-      acquireStock: (async () => { events.push("engine-start"); await engineGate; events.push("engine-end"); return { binPath: "/fake/llama-server", backend: "cuda", source: "downloaded", attempts: [] }; }) as never,
+      acquireStock: (async () => { events.push("engine-start"); await engineGate; events.push("engine-end"); return { binPath: B("/fake/llama-server"), backend: "cuda", source: "downloaded", attempts: [] }; }) as never,
     });
     await p;
     assert.deepEqual(events, ["engine-start", "download-seen", "engine-end"],
@@ -246,14 +245,13 @@ test("if the engine cannot be had, the in-flight model download is aborted and s
 
 // ── second launch with the new install location: no network, no acquisition ──
 
-test("a second launch finds the prebuilt that the first one installed and acquires nothing", { skip: WIN_SKIP }, async () => {
+test("a second launch finds the prebuilt that the first one installed and acquires nothing", async () => {
   const dir = await mkdtemp(join(tmpdir(), "llamacli-again-"));
   try {
     const home = join(dir, "home");
-    const bin = join(home, ".llamacli", "llama.cpp-prebuilt", "cpu", "llama-server");
+    const bin = join(home, ".llamacli", "llama.cpp-prebuilt", "cpu", SRV);
     await mkdir(join(home, ".llamacli", "llama.cpp-prebuilt", "cpu"), { recursive: true });
-    await writeFile(bin, "#!/bin/sh\necho 'version: 1 (abc)'\n");
-    await chmod(bin, 0o755);
+    await writeFakeExe(bin, { stdout: "version: 1 (abc)" });
     const model = join(dir, "a", "b", "c", "d", "Ornith-1.5-9B-Q4_K_M.gguf");
     await mkdir(join(dir, "a", "b", "c", "d"), { recursive: true });
     await writeFile(model, Buffer.alloc(4096));

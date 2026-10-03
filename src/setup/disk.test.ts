@@ -26,8 +26,6 @@ function fakeDisks(map: Record<string, { totalGiB: number; freeGiB: number }>, p
 
 // ── Free space ──────────────────────────────────────────────────────────────
 
-const WIN_SKIP = process.platform === "win32" ? "POSIX fixtures on Windows: shell-script fake binaries without .exe, posix path literals \u2014 needs Windows fixtures (covered by test/windows/run.mjs)" : false;
-
 test("free space is read from the nearest existing ancestor, not just the exact path", async () => {
   // A models directory normally does not exist yet — it is created BY the
   // download. Asking statfs about a missing path throws, and treating that as
@@ -176,11 +174,12 @@ test("an unwritable fallback is skipped rather than failing the whole bootstrap"
   assert.equal(hasRoom(choice, 25 * GiB), true);
 });
 
-test("the candidate list is de-duplicated and honours an explicit override first", { skip: WIN_SKIP }, () => {
+test("the candidate list is de-duplicated and honours an explicit override first", () => {
   const list = candidateDirs({ HOME: "/home/u", LLAMACLI_MODELS_DIR: "/mnt/x/models" } as NodeJS.ProcessEnv);
-  assert.equal(list[0], "/mnt/x/models", "an explicit override is preferred");
+  const norm = list.map((x) => x.replace(/\\/g, "/").replace(/^[A-Za-z]:(?=\/)/, "")); // separators/drive are the OS's, not the logic's
+  assert.equal(norm[0], "/mnt/x/models", "an explicit override is preferred");
   assert.equal(new Set(list).size, list.length, "no duplicates");
-  assert.ok(list.includes("/home/u/models"), "and the conventional path is still considered");
+  assert.ok(norm.includes("/home/u/models"), "and the conventional path is still considered");
 });
 
 test("HOME being unset does not produce a path of 'undefined'", async () => {
@@ -199,7 +198,7 @@ function fakeReaddir(tree: Record<string, string[]>) {
   };
 }
 
-test("mount discovery finds the automount shape /media/<user>/<label>", { skip: WIN_SKIP }, async () => {
+test("mount discovery finds the automount shape /media/<user>/<label>", { skip: process.platform === "win32" ? "not applicable on Windows: /media and /mnt mounts are a Linux/macOS layout" : false }, async () => {
   // The machine that motivated this feature keeps its models on an external
   // drive at /media/<user>/<label>/models, which matched neither /mnt/models
   // nor /media/models — so the "switch to a path with room" logic refused to
@@ -225,7 +224,7 @@ test("mount discovery skips dotfiles and survives a missing /media or /mnt", asy
   assert.deepEqual(await discoverMounts({ readdir: async () => { throw new Error("ENOENT"); } }), []);
 });
 
-test("discovered mounts are consulted when the requested path is too small", { skip: WIN_SKIP }, async () => {
+test("discovered mounts are consulted when the requested path is too small", { skip: process.platform === "win32" ? "not applicable on Windows: /media and /mnt mounts are a Linux/macOS layout" : false }, async () => {
   const mounts = await discoverMounts({
     readdir: fakeReaddir({ "/media": ["jeano"], "/media/jeano": ["nvme-usb"] }),
   });
