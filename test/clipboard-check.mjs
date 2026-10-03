@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 
-const dist = resolve(process.env.LLAMACLI_DIST || new URL("../../dist", import.meta.url).pathname);
+const dist = resolve(process.env.LLAMACLI_DIST || new URL("../dist", import.meta.url).pathname);
 const { copySelection, clipboardTools } = await import(pathToFileURL(join(dist, "tui/selection.js")).href);
 
 
