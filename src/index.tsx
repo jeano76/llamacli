@@ -1314,7 +1314,10 @@ async function main() {
                   // The file is on disk by now, so its KV cost is read from the header. No recorded
                   // context is passed: it belonged to the previous model's KV cost.
                   const kv2 = await readGgufKvShape(modelPath);
-                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes, moe, kvElementsPerToken: kv2?.elementsPerToken, trainedContext: kv2?.contextLength, modelLayers: kv2?.layers });
+                  // What is actually about to be loaded decides MoE-or-dense and the size, not the catalogue row.
+                  const moeNow = await isMoeModel({ path: modelPath, activeParamB: rung.activeParamB, dense: rung.activeParamB === undefined });
+                  const bytesNow = (await (await import("node:fs/promises")).stat(modelPath).catch(() => undefined))?.size || rung.sizeBytes;
+                  const t2 = tuneForHardware(hw2, { modelBytes: bytesNow, moe: moeNow, kvElementsPerToken: kv2?.elementsPerToken, trainedContext: kv2?.contextLength, modelLayers: kv2?.layers });
                   return { tuning: t2, lines: describeGpuPlan(hw2, t2) };
                 },
               });

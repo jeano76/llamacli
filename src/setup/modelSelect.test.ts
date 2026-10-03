@@ -137,6 +137,7 @@ test("when nothing is on disk, the path lands under the configured models direct
     projectRoot: "/p",
     rung: findRung("ornith-9b")!,
     modelsDir: dir,
+    searchDirs: [dir],
     ...h.deps,
     detectRunningPort: async () => null,
   });
@@ -279,7 +280,7 @@ test("/models: the same model on disk in the quant a download would fetch counts
   const eight = findRung("ornith-9b")!;
   const h = harness(undefined, COMPATIBLE);
   const r = await selectModel({
-    projectRoot: "/p", rung: eight, modelsDir: "/models", ...h.deps,
+    projectRoot: "/p", rung: eight, modelsDir: "/models", ...h.deps, searchDirs: ["/models"],
     listLocalModels: async () => [{ path: "/media/disk2/models/Ornith-1.5-9B-Q8_0.gguf", sizeBytes: 2_000_000_000 }],
   });
   assert.equal(r.modelPath, "/media/disk2/models/Ornith-1.5-9B-Q8_0.gguf");
@@ -339,4 +340,21 @@ test("recordServerState is a no-op (no write) when the config already says it", 
   const changed = await recordServerState("/p", { port: 8084, binPath: "/b", modelPath: "/m/a.gguf" }, { read: async () => cfg, write: async () => { writes++; } });
   assert.equal(changed, false);
   assert.equal(writes, 0);
+});
+
+// ── the 35B rung must never record another model's file ─────────────────────
+
+test("selecting the 35B while the config names the 9B records the 35B file, not the 9B", async () => {
+  const h = harness({ model: "/m/Ornith-1.5-9B-Q4_K_M.gguf", llama: { modelPath: "/m/Ornith-1.5-9B-Q4_K_M.gguf", port: 8080 } }, COMPATIBLE);
+  const r = await selectModel({ projectRoot: "/p", rung: findRung("ornith-35b")!, modelsDir: "/models", searchDirs: [], ...h.deps });
+  assert.match(r.modelPath, /Ornith-1\.5-35B/);
+  assert.doesNotMatch(r.modelPath, /9B/);
+  assert.equal(h.written[0].model, h.written[0].llama.modelPath);
+  assert.match(String(h.written[0].model), /35B/);
+});
+
+test("selecting the 35B keeps the spelling of the 35B file the config already uses (the Hub's two names)", async () => {
+  const h = harness({ model: "/m/Ornith-1.5-35B-Q4_K_S.gguf", llama: { modelPath: "/m/Ornith-1.5-35B-Q4_K_S.gguf" } }, COMPATIBLE);
+  const r = await selectModel({ projectRoot: "/p", rung: findRung("ornith-35b")!, modelsDir: "/models", searchDirs: [], ...h.deps });
+  assert.match(r.modelPath, /Ornith-1\.5-35B-Q4_K_S\.gguf$/);
 });

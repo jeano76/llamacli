@@ -85,6 +85,8 @@ export interface SelectOptions {
   findServer?: typeof findLlamaServer;
   /** Injected for tests: the .gguf files on disk, instead of walking the real filesystem. */
   listLocalModels?: (dirs: string[]) => Promise<{ path: string; sizeBytes: number }[]>;
+  /** Directories to search for an existing copy. Injected for tests (the default also walks the machine's real mounts). */
+  searchDirs?: string[];
   /** Do not treat a same-family file in another quant as "already downloaded". */
   noFamilyReuse?: boolean;
   /** Injected for tests; defaults to asking the running server. */
@@ -261,7 +263,7 @@ async function resolveModelPath(
   const configured = configuredModelPath(existing, filename);
   if (configured && (await isFile(configured))) return configured;
 
-  const dirs = await searchDirs(opts.modelsDir);
+  const dirs = opts.searchDirs ?? (await searchDirs(opts.modelsDir));
   for (const dir of dirs) {
     const hit = await findByName(dir, filename, isFile);
     if (hit) return hit;
@@ -441,7 +443,12 @@ async function searchDirs(requested?: string): Promise<string[]> {
 function existingModelFilename(existing: Record<string, any> | undefined): string {
   const p = typeof existing?.llama?.modelPath === "string" ? existing.llama.modelPath
     : typeof existing?.model === "string" ? existing.model : "";
-  return p.split("/").pop() || "Ornith-1.5-35B-A3B-Q4_K_M.gguf";
+  const name = p.split("/").pop() ?? "";
+  // Only a 35B file may stand in for the 35B rung. When the config currently names ANOTHER model (the 9B,
+  // after a switch to it) following "whatever the config used" recorded that other model's file for the
+  // 35B selection — the server then restarted on the 9B with the 35B's MoE flags, and the 35B could no
+  // longer be selected at all.
+  return /35b/i.test(name) ? name : "Ornith-1.5-35B-A3B-Q4_K_M.gguf";
 }
 
 function filenameFor(rung: ModelRung): string {
