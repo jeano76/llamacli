@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -101,7 +102,7 @@ test("copySelection always writes the file, because a refused OSC 52 is silent",
   return copySelection("selected text", {
     path: "/tmp/fake-clip.txt",
     write: () => {},
-    env: {},
+    env: {}, platform: "linux",
     writeFile: async (p, t) => { written[p] = t; },
   }).then((result) => {
     assert.equal(result.via, "osc52");
@@ -116,7 +117,7 @@ test("copySelection falls back to the file alone when the text exceeds the OSC 5
   return copySelection("y".repeat(5000), {
     path: "/tmp/fake2.txt",
     maxOsc52: 100, // deliberately tiny
-    env: {},
+    env: {}, platform: "linux",
     write: (s) => { seqWritten += s; },
     writeFile: async (p, t) => { written[p] = t; },
   }).then((result) => {
@@ -140,7 +141,7 @@ test("an over-cap selection is written to the file IN FULL, never silently trunc
   return copySelection(korean, {
     path: "/tmp/fake3.txt",
     maxOsc52: 1000,
-    env: {},
+    env: {}, platform: "linux",
     write: (s) => { seqWritten += s; },
     writeFile: async (p, t) => { written[p] = t; },
   }).then((result) => {
@@ -153,10 +154,11 @@ test("an over-cap selection is written to the file IN FULL, never silently trunc
   });
 });
 
-test("the default clipboard fallback path is in /tmp, not the project directory", () => {
+test("the default clipboard fallback path is in the temp directory (/tmp, or os.tmpdir() on Windows), not the project directory", () => {
   // A copy is a scratch artifact of a UI action. Writing it into the project
   // would put a file the user never asked for into their git status.
-  assert.ok(CLIPBOARD_FALLBACK_PATH.startsWith("/tmp/"), CLIPBOARD_FALLBACK_PATH);
+  if (process.platform === "win32") assert.ok(CLIPBOARD_FALLBACK_PATH.toLowerCase().startsWith(tmpdir().toLowerCase()), CLIPBOARD_FALLBACK_PATH);
+  else assert.ok(CLIPBOARD_FALLBACK_PATH.startsWith("/tmp/"), CLIPBOARD_FALLBACK_PATH);
 });
 
 // ── ANSI stripping ──────────────────────────────────────────────────────────

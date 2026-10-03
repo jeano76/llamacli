@@ -78,19 +78,25 @@ GPU 는 전부 가짜 주입이므로 컨테이너의 실제 가속은 검증되
 3. 환경별 `/server`·`/models`·`/reset` 화면 단언 pty 시나리오(현재는 기동 스모크까지).
 4. `mock-hub` 를 쓰는 부트스트랩 end-to-end(카탈로그→다운로드→설정) 시나리오 — 지금은 다운로드 함수 단위까지만.
 
-## 6. Windows 워크플로 (`.github/workflows/windows.yml`) — 작성만 했고 **아직 GitHub 에서 실행되지 않았다**
+## 6. Windows 워크플로 (`.github/workflows/windows.yml`) — GitHub 러너에서 **실제로 실행됨**
 
-Windows 는 Linux 컨테이너로 재현할 수 없어 `windows-latest` 러너에서 **배포 산출물(`bin/llamacli-dist.tar.gz` 을 풀어서)** 을 검증한다. 빌드는 하지 않는다(`npm run build` 는 `rm`/`cp`/`chmod` 를 써서 Windows 기본 쉘에서 안 돌아간다 — 개발자용이며 사용자는 타르볼로 설치).
+러너: Windows NT 10.0.26100, 4코어, RAM 16 GiB, 가상 그래픽(Hyper-V, GPU 없음), PowerShell 7.6, Node 22.23, winget 있음. 배포 타르볼(`bin/llamacli-dist.tar.gz`)을 풀어서 검증(빌드 스크립트는 POSIX 도구를 써서 Windows 기본 쉘에서 안 돌아감).
 
-| 단계 | 내용 | 필수? |
-|---|---|---|
-| Unpack the shipped dist | 타르볼 → `$RUNNER_TEMP/llamacli/dist` + `package.json{"type":"module"}` | 필수 |
-| Scenarios | 같은 `probe.mjs` 를 **pwsh / Windows PowerShell / cmd / Git-Bash** 에서 실행해 `platform=win32`, GPU 없음(러너에 GPU 없음; "Microsoft Basic Render Driver" 를 GPU 로 오인하지 않아야 함), CPU 사다리, `gpuLayers=0` 단언 + 다운로드 시나리오 6개(Windows 파일 의미: 열린 파일 위로 rename, 드라이브 문자 경로) | **필수** |
-| Clipboard round trip | 앱의 `copySelection` 으로 **한글+이모지+개행** 복사 → PowerShell `Get-Clipboard` 로 읽어 비교 | 정보용(`continue-on-error`): 호스티드 러너에 클립보드 세션이 있는지 모름 |
-| Unit tests | `npm test` 전체(리눅스에서 작성되어 POSIX 가정이 있을 수 있음) — 어떤 테스트가 Windows 에서 깨지는지 목록을 요약에 출력 | 정보용 |
+| 항목 | 결과 (run 37133397194) |
+|---|---|
+| 탐지 프로브: pwsh / Windows PowerShell / **cmd** / Git-Bash | ✅ 4/4: cpu=4 ram=16G, GPU 없음(Hyper-V 가상 그래픽을 GPU 로 오인하지 않음), 사다리 cpu, 빌드 도구 관리자 winget, 9B |
+| 다운로드 시나리오(재서명 CDN 재개, 해시 판정, 같은 크기·다른 바이트) | ✅ 6/6 (Windows 파일 의미) |
+| **클립보드 왕복** (한글+이모지+개행 41자) | ✅ `powershell` 이 정확히 복사(도구 순서 powershell > pwsh > clip) |
+| 단위 테스트(`npm test`, 정보용) | 1265 중 **1190 통과 / 75 실패** — 분류는 아래 |
 
-이번에 같이 바꾼 코드 (Linux 에서 단위 테스트로 확인, **Windows 에서는 미검증**):
-- Windows 클립보드: `clip.exe`(콘솔 OEM 코드페이지로 stdin 을 읽어 한글이 깨짐 — 알려진 동작이나 이 머신에서 재현하지는 못함)보다 **PowerShell `Set-Clipboard`(UTF-8 stdin)** 를 먼저 시도, `clip` 은 마지막. PowerShell 스니펫의 문법과 UTF-8 stdin 읽기는 이 머신의 `pwsh` 로 확인(한글·이모지 포함 10자 정확).
-- 복사 폴백 파일 경로: Windows 에는 `/tmp` 가 없으므로 `os.tmpdir()`.
+워크플로가 처음 두 번 실패한 원인은 모두 **하네스** 쪽: (1) GNU tar 가 `D:\…` 의 `D:` 를 원격 호스트로 해석 → POSIX 경로로 풀기, (2) cmd.exe 인자 따옴표를 Node 가 이중으로 감쌈 → `windowsVerbatimArguments`.
 
-**검증되지 않은 것(워크플로로도 못 닿는 곳):** GPU(CUDA/Vulkan)가 있는 Windows, `winget` 설치, 실제 `llama-server` 기동, Windows Terminal/conhost 의 대화형 TUI(마우스·OSC 52), macOS.
+### Windows 에서 실패한 단위 테스트 75개 — 아직 분류 전 (제품 결함 vs 테스트의 POSIX 가정)
+샘플 원인으로 본 큰 범주:
+- **테스트 픽스처가 POSIX 쉘 스크립트/실행 권한을 전제**(`#!/bin/sh` 가짜 llama-server, `chmod 755` → Windows 는 666): `llamaCpp`/`resolve`/`tarGz`/`zip`/`llamaServer` 계열.
+- **테스트 헬퍼가 시스템 `tar` 로 아카이브를 만듦**: `selfUpdate`(약 20개)는 같은 `D:` 문제로 헬퍼가 실패 — 제품 코드의 문제인지는 별도 확인 필요(제품은 순수 JS `extractTarGz` 사용).
+- **경로 가정**(`/tmp`, `/` 구분자, 홈 디렉토리 기대값), `run_shell` 의 쉘 가정.
+- 이번에 **내가 추가한 테스트 3개**는 Windows 에서 실제 클립보드 도구를 부르는 비밀폐 결함 → `platform: "linux"` 로 고침(이 커밋).
+제품 결함이 섞여 있을 수 있으므로 **분류가 끝나기 전에는 "Windows 지원 완료"가 아니다.**
+
+**여전히 미검증:** GPU 가 있는 Windows, `winget` 설치 실행, 실제 `llama-server` 기동, Windows Terminal/conhost 의 대화형 TUI(마우스·OSC 52), macOS.
