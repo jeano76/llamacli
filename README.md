@@ -385,7 +385,7 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 
 **2026-10-03 사용자 결정으로 Qwen3.6-35B-A3B (`UD-Q4_K_M`) 를 이 설치의 확정 모델로 한다.**
 비교 대상은 로컬에 있던 Ornith-1.5-35B-A3B 와 Ternary-Bonsai-2 27B 였고, 측정 근거는
-`docs/model-bench-2026-10-03.md`(속도·컴팩션)와 `docs/coding-eval-2026-10-03.md`(코딩)에 있다.
+`docs/model-bench-2026-10-03.md`(속도·컴팩션·컨텍스트 스윕)와 `docs/coding-eval-2026-10-03.md`(코딩)에 있다.
 
 ### 서버 설정 (8 GB RTX 2070 SUPER 기준)
 
@@ -393,11 +393,12 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 |---|---|
 | 모델 | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (20.61 GiB, MoE: 256 experts, 활성 약 3B) |
 | 엔진 | stock llama.cpp (PrismML fork 불필요) |
-| **`--n-cpu-moe`** | **31** |
-| 컨텍스트 | **20,480** (`-c 20480`, `-np 1`, `-no-kvu`) |
+| **`--n-cpu-moe`** | **33** |
+| **컨텍스트** | **98,304** (`-c 98304`, `-np 1`, `-no-kvu`) |
 | 오프로드 / 캐시 | `-ngl 999 -fa on`, KV `q8_0`/`q8_0` |
 | 스레드 / 배치 | `-t 6 -tb 11 -b 2048 -ub 512` |
 | 포트 | 8080 |
+| VRAM | 약 7.3 GiB / 8.0 GiB (사용 가능 상한까지 약 470 MiB 여유) |
 
 ```yaml
 # .llamacli/config.yaml 의 llama 블록
@@ -405,11 +406,11 @@ llama:
   binPath: ~/llama.cpp/build-opt/bin/llama-server
   modelPath: /media/<user>/<disk>/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
   port: 8080
-  contextSize: 20480
+  contextSize: 98304
   threads: 6
   threadsBatch: 11
   gpuLayers: 999
-  cpuMoeLayers: 31
+  cpuMoeLayers: 33
   batchSize: 2048
   ubatchSize: 512
   parallel: 1
@@ -418,15 +419,36 @@ llama:
   cacheTypeV: q8_0
 ```
 
-### 측정된 성능 (이 머신, `llama-bench`, `--n-cpu-moe 31`)
+### 왜 컨텍스트가 98,304 인가 — 이 모델은 KV 캐시가 거의 공짜다
 
-| | 값 |
-|---|---|
-| tg 깊이 8192 / 16384 | **42.35 / 40.14 t/s** |
-| pp 깊이 16384 | 288.3 t/s |
-| 실제 서버에서 생성 속도 | 약 39 t/s |
-| 컨텍스트 / 컴팩션 주기 | 20,480 토큰 / 주기당 약 7,168 토큰(에이전트 스텝으로 약 3스텝) |
-| 컴팩션 1회 지연 | 약 41 s (요약 생성 + 재 prefill) |
+Qwen3.6-35B-A3B 는 **하이브리드 구조**다 (모델 헤더: 40 레이어 중 `full_attention_interval = 4` → 일반 어텐션은 10개뿐,
+나머지 30개는 컨텍스트와 무관한 고정 크기 SSM 상태, KV 헤드 2개 × 256 차원). 그래서 KV 비용이 **토큰당 약 10.6 KB**(q8_0)다.
+
+- 20,480 토큰의 KV 는 212 MiB, 98,304 토큰은 약 1 GiB. 실측으로 컨텍스트 12,288 토큰을 늘리는 데 VRAM 은 138 MiB 만 더 들었다.
+- 튜너(`tuneForHardware`)는 "35B급은 토큰당 0.3 MiB"(모든 레이어가 일반 어텐션인 모델 기준)로 가정해 이 모델의 KV 를 **약 29배
+  과대 추정**했고, 그래서 20,480 으로 묶였다. 컨텍스트를 막던 것은 VRAM 이 아니었다.
+- `--n-cpu-moe` 를 한 칸 올리면 VRAM 이 약 464 MiB 줄어든다. 그 여유를 컨텍스트에 썼다 (31 → 33).
+
+### 측정된 성능 (이 머신)
+
+실제 서버에서 컨텍스트를 채워 가며 잰 값 (프롬프트를 prefix 캐시로 키우며 한 단계씩, 각 깊이 1회):
+
+| 깊이 (토큰) | 8k | 16k | 32k | 64k | 90k |
+|---|---|---|---|---|---|
+| tg (t/s) | 35.3 | 34.7 | 34.2 | 30.2 | 27.2 |
+| pp (t/s) | 364 | 336 | 314 | 300 | 273 |
+
+최대 VRAM 7,310 MiB. 비교 (컴팩션 포함 스텝당 평균 시간, 스텝당 입력 2.5K·출력 400 토큰 가정):
+
+| 설정 | 컴팩션 주기 | 컴팩션 1회 지연 | 스텝당 평균 |
+|---|---|---|---|
+| 이전: 20,480 (`--n-cpu-moe 31`) | 약 2.9스텝 | 35 s | 29.2 s |
+| **현재: 98,304 (`--n-cpu-moe 33`)** | **약 13.8스텝 (4.8배 드묾)** | **130 s** | **30.0 s** |
+
+**얻는 것은 속도가 아니라 작업 연속성이다.** 처리 속도는 약 3 % 느려졌고, 얕은 깊이의 tg 도 39 → 35 t/s 로 내려갔다
+(`--n-cpu-moe` 33). 대신 컴팩션(요약으로 이전 대화 정보가 사라지는 일)이 4.8배 덜 일어난다.
+**컴팩션 한 번이 길어진다** (35 s → 약 2분): 컴팩션 후 새 프롬프트를 다시 prefill 해야 하기 때문이다.
+`compaction.warmTriggerRatio`(응답을 읽는 유휴 시간에 미리 실행)와 `compaction.summaryDeadlineMs`(상한)를 함께 쓰는 것이 좋다.
 
 ### 코딩 평가 (52문제, 코드를 실제로 실행해 채점)
 
@@ -444,21 +466,22 @@ llama:
   Qwen 은 64,127 토큰·1,604 초에 9개를 풀었다(약 3.5배 차이). 같은 구조·크기의 모델이라 tg 는 비슷하다(Ornith 가 약 2~7 % 빠름).
 - 전체 통과 수(48 대 48)와 답을 낸 문제의 정답률(Qwen 96 %)은 Ornith 와 차이가 없다. Qwen 의 직접 만든 문제 실패는 `calc` 오답 1건과
   `dijkstra` 의 12,000 토큰 상한 도달 1건이다.
-- 컨텍스트가 20,480 으로 Bonsai 27B(32,768)보다 작아 컴팩션이 더 자주(약 3스텝마다) 일어난다.
+- **Ornith 도 같은 하이브리드 구조**(헤더 확인)라서 같은 컨텍스트 확장이 가능하다. 이 설정은 모델 간 비교에 쓰인 값(20,480)과 다르다.
 
 ### 운영 메모
 
-- **`--n-cpu-moe 31` 은 8 GB 카드의 VRAM 한계 바로 위다.** 깊이 8192 에서 30 은 동작하지만 16384 에서는 컨텍스트 생성이 실패한다
-  (29 이하는 깊이와 무관하게 실패). 긴 컨텍스트에서 CUDA 메모리 오류로 서버가 중단되면 **32 로 올린다**(32~34 는 여유가 있다).
-- 이 값은 16,384 컨텍스트까지 `llama-bench` 로 검증했고, 서버의 실제 컨텍스트 20,480 에서는 기동과 짧은 생성으로만 확인했다.
-- 튜너(`tuneForHardware`)의 계산값은 32 다. 확정 값 31 은 `.llamacli/config.yaml` 의 `cpuMoeLayers` 에 기록되어 있어야 튜너가 덮어쓰지 않는다
-  (config 에 실측값이 있으면 그 값을 쓴다).
+- **VRAM 여유**: 98,304 / `--n-cpu-moe 33` 은 사용 가능 상한까지 약 470 MiB 여유가 있다. 더 키우려면 `--n-cpu-moe` 를 올리거나 KV 를 q4_0 으로 낮춰야 하는데,
+  q4_0 (131,072, `--n-cpu-moe 32`)은 여유가 약 210 MiB 로 얇고 K 를 4비트로 두는 정확도 영향은 검증하지 않았다.
+- **한계 값**: `--n-cpu-moe 31` 은 컨텍스트 65,536 에서 기동하지 못했다 (32 이상 필요). 32 는 65,536 / 98,304 모두 기동하지만 98,304 에서 VRAM 여유가 44 MiB 로 위험하다.
+- **튜너 값이 아니다**: 튜너(`tuneForHardware`)의 계산값은 `--n-cpu-moe 32`·컨텍스트 20,480 이다. 확정 값은 `.llamacli/config.yaml` 의
+  `contextSize`/`cpuMoeLayers` 에 기록되어 있어야 하고(config 의 실측값이 우선), 튜너의 KV 계산식은 아직 하이브리드 모델을 반영하지 않는다.
+- 측정은 깊이당 1회라 노이즈가 있다. 64k 이후 tg 하락(30 → 27 t/s)은 어텐션 연산량 증가 때문이다.
 - 서버를 직접 띄울 때(독립 프로세스):
 
 ```bash
 cd ~/llama.cpp/build-opt/bin && setsid nohup ./llama-server \
   -m /media/<user>/<disk>/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 8080 -c 20480 -t 6 -tb 11 -ngl 999 --n-cpu-moe 31 \
+  --host 127.0.0.1 --port 8080 -c 98304 -t 6 -tb 11 -ngl 999 --n-cpu-moe 33 \
   -b 2048 -ub 512 -fa on --cache-type-k q8_0 --cache-type-v q8_0 -np 1 -no-kvu \
   > ~/.llamacli/logs/server-8080.log 2>&1 < /dev/null &
 ```
