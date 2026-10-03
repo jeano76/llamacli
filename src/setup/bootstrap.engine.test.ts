@@ -221,3 +221,56 @@ test("R4.2: a running server on the SAME model as the config adds no mismatch no
     });
     assert.equal(report.steps.find((x) => x.name === "서버/설정 불일치"), undefined);
   }));
+
+// ── an existing model under the target name is judged by the Hub's hash ─────
+import { createHash } from "node:crypto";
+
+function hubWithSha(file: string, body: Buffer, resolved: string[]) {
+  return (async (url: any) => {
+    const u = String(url);
+    if (u.includes("/resolve/")) { resolved.push(u); return { ok: false, status: 500, json: async () => ({}), headers: new Headers() } as any; }
+    if (u.includes("Ornith-1.5-9B-GGUF")) {
+      return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: file, size: body.length, lfs: { sha256: createHash("sha256").update(body).digest("hex"), size: body.length } }] }) } as any;
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as any;
+  }) as unknown as typeof fetch;
+}
+
+test("a model already under its name whose SHA-256 matches the Hub's is used as is — no download", () =>
+  withTempDir(async (dir) => {
+    const body = Buffer.alloc(8192, 3);
+    const modelsDir = join(dir, "models");
+    await mkdir(modelsDir, { recursive: true });
+    await writeFile(join(modelsDir, "Ornith-1.5-9B-Q4_K_M.gguf"), body);
+    const resolved: string[] = [];
+    const lines: string[] = [];
+    const s = spies();
+    const report = await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free", log: (l) => lines.push(l),
+      detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
+      modelsDir, fetchImpl: hubWithSha("Ornith-1.5-9B-Q4_K_M.gguf", body, resolved), acquireStock: s.acquireStock,
+      pinModelFilename: "Ornith-1.5-9B-Q4_K_M.gguf",
+    });
+    assert.deepEqual(resolved, [], "nothing was fetched");
+    assert.equal(report.modelPath, join(modelsDir, "Ornith-1.5-9B-Q4_K_M.gguf"));
+    assert.ok(lines.some((l) => /SHA-256 일치/.test(l)), lines.join("\n"));
+  }));
+
+test("a same-size file whose SHA-256 differs is not trusted: the download is attempted", () =>
+  withTempDir(async (dir) => {
+    const good = Buffer.alloc(8192, 3);
+    const modelsDir = join(dir, "models");
+    await mkdir(modelsDir, { recursive: true });
+    await writeFile(join(modelsDir, "Ornith-1.5-9B-Q4_K_M.gguf"), Buffer.alloc(8192, 9));
+    const resolved: string[] = [];
+    const lines: string[] = [];
+    const s = spies();
+    await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free", log: (l) => lines.push(l),
+      detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
+      modelsDir, fetchImpl: hubWithSha("Ornith-1.5-9B-Q4_K_M.gguf", good, resolved), acquireStock: s.acquireStock,
+      pinModelFilename: "Ornith-1.5-9B-Q4_K_M.gguf",
+    });
+    assert.ok(resolved.length > 0, "the hash disagreed, so the weights were requested");
+    assert.ok(lines.some((l) => /해시가 게시된 값과 달라/.test(l)));
+  }));

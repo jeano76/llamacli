@@ -203,3 +203,23 @@ test("forwards every provision line to the caller", async () => {
   assert.ok(seen.includes("llama.cpp: 빌드 중"));
   assert.ok(seen.includes("모델 다운로드 중…"));
 });
+test("a failed model download says WHY (the bootstrap's own error), not just 'check disk and network'", async () => {
+  const r = await provisionForSwitch(base({
+    ensureLocalStack: fakeEnsure({
+      ok: false, modelPath: undefined,
+      errors: ["모델 다운로드: HTTP 403 (서명된 URL 만료)"],
+      steps: [{ name: "모델 다운로드", ok: false, detail: "HTTP 403 (서명된 URL 만료)" }],
+    }),
+  }));
+  assert.equal(r.ok, false);
+  const text = r.lines.join("\n");
+  assert.match(text, /원인: 모델 다운로드: HTTP 403/);
+  assert.match(text, /이어받습니다/);
+});
+
+test("a failed step with no error entry still contributes its detail as the cause", async () => {
+  const r = await provisionForSwitch(base({
+    ensureLocalStack: fakeEnsure({ ok: true, modelPath: undefined, errors: [], steps: [{ name: "모델 다운로드", ok: false, detail: "오프라인이라 건너뜁니다." }] }),
+  }));
+  assert.match(r.lines.join("\n"), /원인: 오프라인이라 건너뜁니다/);
+});

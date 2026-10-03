@@ -98,6 +98,26 @@ export function isComplete(progress: DownloadProgress): boolean {
  * the safe response to an untrustworthy state file is to re-fetch, not to
  * promote bytes of unknown provenance into a model file.
  */
+/** Query parameters that a CDN regenerates on every request (signatures, expiry, session/user ids). */
+const VOLATILE_PARAM = /^(x-amz-.*|x-xet-.*|x-goog-.*|signature|sig|expires|policy|key-pair-id|hash-algorithm|user_id|xip|se|sp|sv|sr|st|token|response-content-disposition)$/i;
+
+/**
+ * Identity of a download source that survives re-signing. The Hub redirects to a CDN URL whose
+ * signature and expiry differ on EVERY request, so comparing the full URL meant a saved resume state
+ * never matched the next run and every interrupted download restarted from zero (observed: a 5.8 GB
+ * model re-fetched from byte 0 on each retry). The host, the path (which carries the object's content
+ * hash on the Hub's CDN) and the non-volatile query identify the object; the totalBytes check still applies.
+ */
+export function stableUrlKey(raw: string): string {
+  try {
+    const u = new URL(raw);
+    const keep = [...u.searchParams.entries()].filter(([k]) => !VOLATILE_PARAM.test(k)).sort(([a], [b]) => a.localeCompare(b));
+    return `${u.origin}${u.pathname}${keep.length ? "?" + keep.map(([k, v]) => `${k}=${v}`).join("&") : ""}`;
+  } catch {
+    return raw;
+  }
+}
+
 export async function loadProgress(
   partPath: string,
   url: string,
@@ -108,7 +128,7 @@ export async function loadProgress(
     const raw = await readFile(progressPathOf(partPath), "utf8");
     const parsed = JSON.parse(raw) as DownloadProgress;
     if (!parsed || typeof parsed !== "object") return null;
-    if (parsed.url !== url) return null;
+    if (stableUrlKey(String(parsed.url)) !== stableUrlKey(url)) return null;
     if (parsed.totalBytes !== totalBytes) return null;
     if (!Array.isArray(parsed.ranges)) return null;
     const ranges = parsed.ranges

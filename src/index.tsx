@@ -31,9 +31,10 @@ import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } f
 import { selectModel, recordServerPort, recordServerState } from "./setup/modelSelect.js";
 import { describeGpuPlan } from "./setup/gpuReport.js";
 import { isMoeModel, readGgufKvShape } from "./setup/ggufMeta.js";
+import { probeModelCompatibility } from "./setup/llamaCpp.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
-import { switchModelAndServer, detectPortOwner, resolveLiveServerPort } from "./setup/modelSwitch.js";
+import { switchModelAndServer, detectPortOwner, resolveLiveServerPort, parseLlamaServerArgs } from "./setup/modelSwitch.js";
 import { reportServer } from "./setup/serverReport.js";
 import { runServerRestart, gateModelSwitch } from "./setup/serverCommand.js";
 import { provisionForSwitch } from "./setup/provision.js";
@@ -1103,13 +1104,28 @@ async function main() {
             // selection — otherwise `/models` and `/models 3` could disagree
             // about whether a model fits.
             const hw = await detectHardware();
-            const reports = evaluateAll(hw);
+            // The verdict is for the model AFTER it replaces the running server (which is stopped and
+            // its VRAM returned), not for the card as the old model leaves it — otherwise a card that
+            // is full only because of the current server reads as "CPU only" for every candidate.
+            const liveNow = await resolveLiveServerPort((config as any)?.llama?.port);
+            const ownVramGiB = await ownLlamaServerVramGiB(liveNow.servers.map((x) => x.pid));
+            const replacing = liveNow.servers.length > 0;
+            const reports = evaluateAll(hw, undefined, { ownServerVramGiB: ownVramGiB });
 
             if (!arg) {
-              const { lines } = formatModelTable(reports);
+              const { lines } = formatModelTable(reports, { afterReplace: replacing });
+              const cur = liveNow.servers[0] ? parseLlamaServerArgs(liveNow.servers[0].cmdline) : undefined;
               ui?.pushStatus(
                 [
-                  `[models] 이 머신 기준 — 사용 가능 VRAM ${usableVramGiB(hw).toFixed(1)} GiB, RAM ${(totalmem() / 1024 ** 3).toFixed(0)} GiB`,
+                  `[models] 이 머신 기준 — 사용 가능 VRAM ${usableVramGiB(hw, ownVramGiB).toFixed(1)} GiB, RAM ${(totalmem() / 1024 ** 3).toFixed(0)} GiB`,
+                  ...(replacing
+                    ? [
+                        `  · 지금 실행 중: ${(cur?.modelPath ?? "?").split("/").pop()} (포트 ${liveNow.servers[0].port}, VRAM ${ownVramGiB.toFixed(1)} GiB 사용` +
+                          `${cur?.gpuLayers !== undefined ? `, -ngl ${cur.gpuLayers}` : ""}${cur?.cpuMoeLayers ? `, --n-cpu-moe ${cur.cpuMoeLayers}` : ""})`,
+                        "  · 아래 판정은 지금 상태가 아니라 **교체 후** 기준입니다: 선택하면 이 서버를 종료(확인 후)하고,",
+                        "    같은 llama.cpp 서버(빌드)로 모델만 바꿔 재시작합니다 — 종료로 돌려받는 VRAM 을 새 모델이 쓸 수 있는 것으로 계산했습니다.",
+                      ]
+                    : []),
                   "",
                   ...lines,
                   "",
@@ -1124,7 +1140,7 @@ async function main() {
             const n = Number(arg);
             const byIndex = Number.isInteger(n) && n >= 1 && n <= reports.length ? reports[n - 1] : null;
             const byName = byIndex ? null : findRung(arg);
-            const report = byIndex ?? (byName ? evaluateFit(byName, hw) : null);
+            const report = byIndex ?? (byName ? evaluateFit(byName, hw, { ownServerVramGiB: ownVramGiB }) : null);
             if (!report) {
               ui?.pushStatus(
                 `[models] '${arg}' 를 찾지 못했습니다. /models 로 목록을 보고 번호나 이름을 입력하세요.`
@@ -1262,6 +1278,22 @@ async function main() {
                 switchTuning = provisioned.tuning ?? tuning;
               }
 
+              // Same llama.cpp, only the model changes: when the server being replaced runs a build that can
+              // read the new model, that build is reused (not whatever discovery happens to rank first).
+              {
+                const live = (await resolveLiveServerPort(result.port)).servers.find((x) => x.port === result.port) ?? (await resolveLiveServerPort(result.port)).servers[0];
+                const liveExe = live?.exe;
+                if (liveExe && liveExe !== binPath) {
+                  const { stat: statFile } = await import("node:fs/promises");
+                  if (await statFile(liveExe).then((st) => st.isFile(), () => false)) {
+                    const compat = await probeModelCompatibility(liveExe, modelPath).catch(() => ({ ok: false }) as { ok: boolean });
+                    if (compat.ok) {
+                      ui?.pushStatus(`  · 실행 중인 서버와 같은 llama.cpp 를 그대로 씁니다 (모델만 교체): ${liveExe}`);
+                      binPath = liveExe;
+                    }
+                  }
+                }
+              }
               ui?.pushStatus(`  · 새 모델을 올리기 위해 기존 서버를 종료하고 VRAM 을 비웁니다 (포트 ${result.port}).`);
               const sw = await switchModelAndServer({
                 modelPath,

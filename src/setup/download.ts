@@ -39,7 +39,7 @@
 
 import { open, rename, rm, stat, writeFile, mkdir, copyFile, rmdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { sha256File, normalizeSha256, ChecksumMismatchError } from "./checksum.js";
+import { sha256File, normalizeSha256, ChecksumMismatchError, fileMatchesSha256 } from "./checksum.js";
 import {
   loadProgress,
   saveProgress,
@@ -452,12 +452,28 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
   const atFinal = await existingSize(path);
   const atPart = await existingSize(partPath);
   const state = await loadProgress(partPath, probe.finalUrl, completeAt);
-  const finished = state !== null && isComplete(state) && atPart >= completeAt;
+  // No usable resume state but a full-length .part beside it: the sidecar was lost (or this is an older
+  // .part). Size cannot vouch for it, but the publisher's hash can — so it is HASHED rather than re-fetched.
+  // (With a sidecar that says "incomplete" the .part is a resume in progress and must not be hashed:
+  // a mismatch discards it, and with it the bytes already fetched.)
+  const hashVouches = Boolean(expected) && state === null && atPart >= completeAt && completeAt > 0;
+  const finished = (state !== null && isComplete(state) && atPart >= completeAt) || hashVouches;
   // A file at the FINAL name is only trustworthy when this run's own state says
   // the same url/size completed, or when the caller vouches for it explicitly
   // (resumeFrom) -- which is how an install that predates the sidecar keeps
   // working without silently re-fetching 22 GB.
-  const finalIsDone = atFinal >= completeAt && (state === null || isComplete(state) || (opts.resumeFrom ?? 0) >= completeAt);
+  let finalIsDone = atFinal >= completeAt && (state === null || isComplete(state) || (opts.resumeFrom ?? 0) >= completeAt);
+  // A file already under its final name: with the publisher's hash in hand, the hash decides — match = nothing
+  // to download; mismatch = it is not the publisher's file, so it is fetched anew (and only replaced once the new
+  // one verifies).
+  if (finalIsDone && expected && completeAt > 0) {
+    const m = await fileMatchesSha256(path, expected, {
+      signal,
+      onProgress: ({ hashedBytes, totalBytes }) =>
+        onProgress?.({ label, receivedBytes: hashedBytes, totalBytes, bytesPerSecond: 0, etaSeconds: -1, percent: totalBytes > 0 ? (hashedBytes / totalBytes) * 100 : -1, phase: "verify" }),
+    });
+    finalIsDone = m.match;
+  }
   if (completeAt > 0 && (finished || finalIsDone)) {
     transfer.setTotal(completeAt);
     transfer.add(completeAt);
@@ -465,7 +481,7 @@ export async function downloadFile(url: string, path: string, opts: DownloadOpti
     // A complete .part from an interrupted run: check it (it was produced by THIS downloader),
     // and only then move it into place. One already complete under its final name is left
     // alone (see `expectedSha256`).
-    if (atPart >= completeAt && atFinal < completeAt) {
+    if (atPart >= completeAt && !finalIsDone) {
       if (expected) {
         const v = await verifyOrDiscard(partPath, expected, label, onProgress, signal);
         if (!v.ok) {

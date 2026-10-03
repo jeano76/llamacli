@@ -154,3 +154,31 @@ test("a synthetic rung is measured the same way as a real one", () => {
   const tinyRung: ModelRung = { ...giant, sizeBytes: 500 * 1024 * 1024 };
   assert.equal(evaluateFit(tinyRung, profileA).fit, "vram");
 });
+// ── the verdict is for the model AFTER it replaces the running server ───────
+
+/** An 8 GiB card that a running llama-server has almost filled (0.8 GiB free). */
+const busyCard = (): Hardware => {
+  const h = hw({ cpus: 12, ramGiB: 32, vramGiB: 8 });
+  (h.gpus[0] as any).vramFreeBytes = 0.8 * GiB;
+  return h;
+};
+
+test("a card that is full only because of the CURRENT server does not read as CPU-only for the new model", () => {
+  const nine = findRung("ornith-9b")!;
+  const before = evaluateFit(nine, busyCard());
+  assert.notEqual(before.fit, "vram", "with the old server still holding the card the 9B cannot be resident");
+  const after = evaluateFit(nine, busyCard(), { ownServerVramGiB: 6.8 });
+  assert.equal(after.fit, "vram", `after replacing the server the 9B fits the card: ${after.verdict}`);
+});
+
+test("the returned VRAM never exceeds the card (an overstated reading cannot inflate the budget)", () => {
+  const huge = evaluateFit(findRung("ornith-35b")!, busyCard(), { ownServerVramGiB: 500 });
+  const capped = evaluateFit(findRung("ornith-35b")!, hw({ cpus: 12, ramGiB: 32, vramGiB: 8 }));
+  assert.equal(huge.fit, capped.fit);
+});
+
+test("the table header says the verdict is for after the replacement when a server is running", () => {
+  const reports = evaluateAll(busyCard(), undefined, { ownServerVramGiB: 6.8 });
+  assert.match(formatModelTable(reports, { afterReplace: true }).lines[0], /판정\(교체 시\)/);
+  assert.doesNotMatch(formatModelTable(reports).lines[0], /교체 시/);
+});

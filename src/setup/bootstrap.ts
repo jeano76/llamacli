@@ -37,6 +37,7 @@ import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } fro
 import { acquireStockLlamaServer } from "./stockRuntime.js";
 import { chooseModel, resolveModel, pickPinnedCandidate, isKnownDenseFamily, type ModelChoice } from "./modelCatalog.js";
 import { isMoeModel, readGgufKvShape } from "./ggufMeta.js";
+import { normalizeSha256, fileMatchesSha256 } from "./checksum.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
 import { scanModels, pickReusable } from "./existingModel.js";
@@ -591,7 +592,20 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       }
       const dest = join(target.dir, model.candidate.filename);
       const already = await fileSize(dest);
-      if (already > 0 && (model.candidate.sizeBytes === 0 || already >= model.candidate.sizeBytes)) {
+      // A file already under the target name is judged by the publisher's HASH when there is one (never by
+      // size alone, and never re-downloaded because of size or timestamp): equal = used as is.
+      let existsAndMatches = already > 0 && (model.candidate.sizeBytes === 0 || already >= model.candidate.sizeBytes);
+      if (existsAndMatches && model.candidate.sha256) {
+        const want = normalizeSha256(model.candidate.sha256);
+        if (want) {
+          log(`이미 받아 둔 ${model.candidate.filename} 의 SHA-256 을 확인합니다 (다시 받지 않습니다)…`);
+          const m = await fileMatchesSha256(dest, want).catch(() => ({ match: false, cached: false }));
+          existsAndMatches = m.match;
+          if (!m.match) log(`해시가 게시된 값과 달라 ${dest} 는 쓰지 않고 새로 받습니다 (기존 파일은 새 파일이 검증된 뒤에만 교체됩니다).`);
+          else log(`SHA-256 일치${m.cached ? " (이전 검증 기록)" : ""} — 그대로 사용합니다.`);
+        }
+      }
+      if (existsAndMatches) {
         modelPath = dest;
         steps.push({ name: "모델 다운로드", ok: true, detail: `이미 있습니다: ${dest}` });
         log(`모델 이미 있음: ${dest}`);

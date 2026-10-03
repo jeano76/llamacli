@@ -194,3 +194,29 @@ test("a state file for a DIFFERENT url is discarded", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ── a re-signed CDN URL is still the same download ──────────────────────────
+import { stableUrlKey } from "./downloadProgress.js";
+import { mkdtemp as mkd, rm as rmd } from "node:fs/promises";
+import { tmpdir as td } from "node:os";
+import { join as jn } from "node:path";
+
+test("stableUrlKey ignores signatures/expiry but not the object", () => {
+  const a = "https://us.aws.cdn.hf.co/xet-bridge-us/abc/def?X-Xet-Cas-Uid=public&Expires=1&Signature=AAA&Key-Pair-Id=K&user_id=public&xip=1";
+  const b = "https://us.aws.cdn.hf.co/xet-bridge-us/abc/def?X-Xet-Cas-Uid=public&Expires=2&Signature=BBB&Key-Pair-Id=K&user_id=public&xip=2";
+  assert.equal(stableUrlKey(a), stableUrlKey(b));
+  assert.notEqual(stableUrlKey(a), stableUrlKey("https://us.aws.cdn.hf.co/xet-bridge-us/abc/OTHER?Expires=1&Signature=AAA"));
+  assert.notEqual(stableUrlKey("http://h/f?file=a"), stableUrlKey("http://h/f?file=b"), "a non-volatile query still identifies the object");
+});
+
+test("saved resume state is honoured after the CDN hands out a freshly signed URL", async () => {
+  const dir = await mkd(jn(td(), "dlr-"));
+  try {
+    const part = jn(dir, "m.part");
+    await saveProgress(part, { url: "https://cdn/x/abc?Expires=1&Signature=OLD", totalBytes: 100, ranges: [{ start: 0, end: 49 }], updatedAt: 1 });
+    const got = await loadProgress(part, "https://cdn/x/abc?Expires=2&Signature=NEW", 100);
+    assert.deepEqual(got?.ranges, [{ start: 0, end: 49 }]);
+    assert.equal(await loadProgress(part, "https://cdn/x/other?Expires=2&Signature=NEW", 100), null);
+    assert.equal(await loadProgress(part, "https://cdn/x/abc?Expires=2&Signature=NEW", 101), null, "a different size is still a different object");
+  } finally { await rmd(dir, { recursive: true, force: true }); }
+});

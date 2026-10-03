@@ -11,7 +11,7 @@
 
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 
 /** "sha256:ABC…" / "ABC…" / 'W/"abc…"' → lowercase 64-hex, or null when it is not one. */
 export function normalizeSha256(raw: string | null | undefined): string | null {
@@ -65,4 +65,31 @@ export class ChecksumMismatchError extends Error {
     );
     this.name = "ChecksumMismatchError";
   }
+}
+
+/**
+ * Is the file at `path` the publisher's bytes? Compared by hash — and by hash ONLY: a model that is
+ * already on disk is never re-downloaded because of its size or timestamp, and never trusted
+ * because of them either.
+ *
+ * `<path>.sha256` (written after a verified download, `sha256sum -c` format) is a cache: it is believed only
+ * while it names `expected` and is not older than the file, so a 20 GiB model is hashed once, not on every run.
+ * Never deletes anything: the caller decides what a mismatch means.
+ */
+export async function fileMatchesSha256(
+  path: string,
+  expected: string,
+  opts: { onProgress?: (p: HashProgress) => void; signal?: AbortSignal } = {}
+): Promise<{ match: boolean; cached: boolean; actual?: string }> {
+  try {
+    const [file, side] = await Promise.all([stat(path), stat(`${path}.sha256`).catch(() => null)]);
+    if (side && side.mtimeMs >= file.mtimeMs) {
+      const recorded = normalizeSha256((await readFile(`${path}.sha256`, "utf8").catch(() => "")).split(/\s+/)[0]);
+      if (recorded === expected) return { match: true, cached: true };
+    }
+  } catch {
+    return { match: false, cached: false };
+  }
+  const actual = await sha256File(path, opts);
+  return { match: actual === expected, cached: false, actual };
 }

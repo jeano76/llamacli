@@ -157,7 +157,12 @@ export async function provisionForSwitch(opts: ProvisionOptions): Promise<Provis
     lines.push("이 모델을 읽을 수 있는 llama-server 를 준비하지 못했습니다. 아래 사유를 확인하세요.");
   }
   if (!modelPath) {
-    lines.push("모델 파일을 확보하지 못했습니다. 디스크 공간과 네트워크를 확인하세요.");
+    // The bootstrap's own errors say WHY (HTTP status, checksum, no space, aborted…). They used to be dropped
+    // here, leaving only a generic "check disk and network" for a failure the user could not diagnose.
+    for (const e of report.errors ?? []) lines.push(`원인: ${e}`);
+    const dl = report.steps.find((x) => x.name === "모델 다운로드" && !x.ok);
+    if (dl && !(report.errors ?? []).some((e) => e.includes(dl.detail))) lines.push(`원인: ${dl.detail}`);
+    lines.push("모델 파일을 확보하지 못했습니다. 위 원인을 확인하세요. 받은 부분은 보존되어 다시 실행하면 이어받습니다.");
   }
 
   const portKept = report.ports?.llamaPort === port;

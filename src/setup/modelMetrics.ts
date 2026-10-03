@@ -103,7 +103,7 @@ export interface FitReport {
 const KV_GIB_PER_TOKEN = 0.3 / (1024 * 1024); // ~0.3 MB/token at q8_0
 
 /** How much VRAM is actually spendable on this machine right now. */
-export function usableVramGiB(hw: Hardware): number {
+export function usableVramGiB(hw: Hardware, ownServerVramGiB = 0): number {
   const gpu = pickPrimaryGpu(hw);
   // ZERO when there is no GPU — deliberately, and this is the fix for a bug the
   // bare-environment harness found.
@@ -124,7 +124,9 @@ export function usableVramGiB(hw: Hardware): number {
   // RAM fallback. With 0 here, every rung correctly falls through to the RAM or
   // CPU tiers, which is the truth on a machine without a GPU.
   if (!gpu) return 0;
-  return budgetVramGiB(hw, gpu);
+  // `ownServerVramGiB`: the running llama-server's share of the card. A model switch stops that server before
+  // loading the new model, so for "will the NEW model fit" its memory counts as spendable.
+  return budgetVramGiB(hw, gpu, ownServerVramGiB * GiB);
 }
 
 /**
@@ -136,8 +138,13 @@ export function usableVramGiB(hw: Hardware): number {
  *   - weights ≤ RAM only        → `-ngl 0`, CPU-only, honest about being slow
  *   - otherwise                 → does not run, and says so
  */
-export function evaluateFit(rung: ModelRung, hw: Hardware): FitReport {
-  const budget = usableVramGiB(hw);
+export interface FitOptions {
+  /** VRAM held by the llama-server that a selection would REPLACE (see usableVramGiB). */
+  ownServerVramGiB?: number;
+}
+
+export function evaluateFit(rung: ModelRung, hw: Hardware, opts: FitOptions = {}): FitReport {
+  const budget = usableVramGiB(hw, opts.ownServerVramGiB ?? 0);
   const ramGiB = hw.ramTotalBytes / GiB;
   const sizeGiB = rung.sizeBytes / GiB;
 
@@ -212,8 +219,8 @@ export function evaluateFit(rung: ModelRung, hw: Hardware): FitReport {
 }
 
 /** Every rung, evaluated against this machine. */
-export function evaluateAll(hw: Hardware, rungs: ModelRung[] = MODEL_RUNGS): FitReport[] {
-  return rungs.map((r) => evaluateFit(r, hw));
+export function evaluateAll(hw: Hardware, rungs: ModelRung[] = MODEL_RUNGS, opts: FitOptions = {}): FitReport[] {
+  return rungs.map((r) => evaluateFit(r, hw, opts));
 }
 
 /** Finds a rung by id, case-insensitively. */
@@ -236,8 +243,10 @@ export function findRung(id: string, rungs: ModelRung[] = MODEL_RUNGS): ModelRun
  * numbering. Deriving them separately is how "/models 3" ends up selecting a
  * different row than the one labelled 3.
  */
-export function formatModelTable(reports: FitReport[]): { lines: string[]; numbers: number[] } {
-  const head = ["#", "모델", "파라미터", "양자화", "크기", "판정"];
+export function formatModelTable(reports: FitReport[], opts: { afterReplace?: boolean } = {}): { lines: string[]; numbers: number[] } {
+  // `afterReplace`: a server is running, so the verdict is for the NEW model after it replaces that server —
+  // not for the card as it is now (which the old model is holding).
+  const head = ["#", "모델", "파라미터", "양자화", "크기", opts.afterReplace ? "판정(교체 시)" : "판정"];
   const rows = reports.map((r, i) => [
     String(i + 1),
     r.rung.label,

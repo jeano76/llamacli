@@ -135,13 +135,13 @@ test("resume that stitched bytes from a CHANGED origin is caught by the hash, no
   });
 });
 
-test("a file that was ALREADY complete when called is left alone — never hashed, never deleted", async () => {
+test("a complete file whose hash disagrees with the (here: bogus) publisher hash is NOT silently trusted, but the working file is never deleted", async () => {
   await tmp(async (dir) => {
     const path = join(dir, "m.gguf");
     await writeFile(path, BODY);
-    // Hash deliberately wrong: if it were checked, the working model would be removed.
-    const r = await downloadFile("http://x/m", path, { fetchImpl: origin(() => BODY).fetchImpl, expectedSha256: "0".repeat(64), resumeFrom: BODY.length });
-    assert.equal(r.sha256Verified, undefined);
+    // The origin serves the same bytes, so a re-fetch cannot satisfy the bogus hash either: it must fail loudly...
+    await assert.rejects(downloadFile("http://x/m", path, { fetchImpl: origin(() => BODY).fetchImpl, expectedSha256: "0".repeat(64), resumeFrom: BODY.length }), ChecksumMismatchError);
+    // ...and the file that was already there is only ever replaced by a VERIFIED download.
     assert.deepEqual(await readFile(path), BODY);
   });
 });
@@ -150,5 +150,76 @@ test("no hash given: behaviour is unchanged and nothing claims to be verified", 
   await tmp(async (dir) => {
     const r = await downloadFile("http://x/m", join(dir, "m.gguf"), { fetchImpl: origin(() => BODY).fetchImpl });
     assert.equal(r.sha256Verified, undefined);
+  });
+});
+
+// ── an already-downloaded model is judged by its HASH, never re-downloaded for size or a lost sidecar ──
+
+const bodyRequests = (o: { requests: { range?: string }[] }) => o.requests.filter((r) => r.range && r.range !== "bytes=0-0");
+
+test("a file already under its final name whose hash matches: nothing is downloaded", async () => {
+  await tmp(async (dir) => {
+    const path = join(dir, "m.gguf");
+    await writeFile(path, BODY);
+    const o = origin(() => BODY);
+    const r = await downloadFile("http://x/m", path, { fetchImpl: o.fetchImpl, expectedSha256: sha(BODY) });
+    assert.equal(bodyRequests(o).length, 0, "only the one-byte probe touched the network");
+    assert.equal(r.bytes, BODY.length);
+  });
+});
+
+test("a same-size file with a DIFFERENT hash is not trusted: it is fetched anew and replaced", async () => {
+  await tmp(async (dir) => {
+    const path = join(dir, "m.gguf");
+    await writeFile(path, Buffer.alloc(BODY.length, 7)); // right size, wrong bytes
+    const o = origin(() => BODY);
+    const r = await downloadFile("http://x/m", path, { fetchImpl: o.fetchImpl, connections: 2, maxPartBytes: 64 * 1024, expectedSha256: sha(BODY), stagingDir: join(dir, "tmp") });
+    assert.equal(r.sha256Verified, true);
+    assert.deepEqual(await readFile(path), BODY);
+  });
+});
+
+test("a full-length .part with NO resume sidecar is hashed and promoted, not re-downloaded", async () => {
+  await tmp(async (dir) => {
+    const path = join(dir, "m.gguf");
+    const staging = join(dir, "tmp");
+    const part = join(staging, "m.gguf.part");
+    await (await import("node:fs/promises")).mkdir(staging, { recursive: true });
+    await writeFile(part, BODY);
+    const o = origin(() => BODY);
+    const r = await downloadFile("http://x/m", path, { fetchImpl: o.fetchImpl, expectedSha256: sha(BODY), stagingDir: staging });
+    assert.equal(bodyRequests(o).length, 0, "the bytes were already there");
+    assert.equal(r.sha256Verified, true);
+    assert.deepEqual(await readFile(path), BODY);
+  });
+});
+
+test("a full-length .part that does NOT hash right (zero-filled regions) is discarded and fetched", async () => {
+  await tmp(async (dir) => {
+    const path = join(dir, "m.gguf");
+    const staging = join(dir, "tmp");
+    await (await import("node:fs/promises")).mkdir(staging, { recursive: true });
+    await writeFile(join(staging, "m.gguf.part"), Buffer.alloc(BODY.length));
+    const o = origin(() => BODY);
+    await downloadFile("http://x/m", path, { fetchImpl: o.fetchImpl, connections: 2, maxPartBytes: 64 * 1024, expectedSha256: sha(BODY), stagingDir: staging });
+    assert.deepEqual(await readFile(path), BODY);
+  });
+});
+
+test("a full-length .part WITH an incomplete sidecar is a resume in progress: it is not hashed and discarded", async () => {
+  await tmp(async (dir) => {
+    const path = join(dir, "m.gguf");
+    const staging = join(dir, "tmp");
+    const part = join(staging, "m.gguf.part");
+    await (await import("node:fs/promises")).mkdir(staging, { recursive: true });
+    const half = BODY.length / 2;
+    const bytes = Buffer.alloc(BODY.length); BODY.copy(bytes, 0, 0, half);
+    await writeFile(part, bytes);
+    await writeFile(`${part}.progress.json`, JSON.stringify({ url: "http://x/m", totalBytes: BODY.length, ranges: [{ start: 0, end: half - 1 }], updatedAt: 1 }));
+    const o = origin(() => BODY);
+    await downloadFile("http://x/m", path, { fetchImpl: o.fetchImpl, connections: 2, maxPartBytes: 64 * 1024, expectedSha256: sha(BODY), stagingDir: staging });
+    assert.deepEqual(await readFile(path), BODY);
+    const starts = bodyRequests(o).map((r) => Number(r.range!.match(/bytes=(\d+)/)![1]));
+    assert.ok(starts.every((s) => s >= half), `only the missing half is requested, got ${starts}`);
   });
 });
