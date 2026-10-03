@@ -102,3 +102,40 @@ test("the failure message shows the user the model's actual words, not just a ve
   assert.match(message, /모델 파일이 손상/);
   assert.match(message, /서버를 종료하고 다시 실행/);
 });
+// ── a busy server is not a broken one: startup must not queue behind someone else's turn ──
+
+const slotsFetch = (body: unknown, ok = true) => (async () => ({ ok, json: async () => body }) as Response) as unknown as typeof fetch;
+
+test("a server whose only slot is processing is skipped (unknown), and the probe is never sent", async () => {
+  const { backend, seen } = replying("anything");
+  (backend as any).baseUrl = "http://127.0.0.1:8080";
+  const h = await probeBackendHealth(backend, { fetchImpl: slotsFetch([{ id: 0, is_processing: true }]) });
+  assert.equal(h.verdict, "unknown");
+  assert.equal(seen.length, 0, "no request queued behind the user's turn");
+});
+
+test("an idle slot is probed as before", async () => {
+  const { backend, seen } = replying("anything");
+  (backend as any).baseUrl = "http://127.0.0.1:8080";
+  await probeBackendHealth(backend, { fetchImpl: slotsFetch([{ id: 0, is_processing: false }]) });
+  assert.equal(seen.length, 1);
+});
+
+test("a server without /slots is probed, but never waited on for longer than the budget", async () => {
+  const slow: ModelBackend = {
+    chat: () => new Promise(() => {}), // never answers: queued behind a long request
+    listModels: async () => ["m"],
+  };
+  const t0 = Date.now();
+  const h = await probeBackendHealth(slow, { waitMs: 80 });
+  assert.equal(h.verdict, "unknown");
+  assert.ok(Date.now() - t0 < 2000);
+  assert.match((h as any).reason, /건강 확인 응답이/);
+});
+
+test("a /slots lookup that fails is treated as not busy", async () => {
+  const { backend, seen } = replying("x");
+  (backend as any).baseUrl = "http://127.0.0.1:1";
+  await probeBackendHealth(backend, { fetchImpl: (async () => { throw new Error("refused"); }) as unknown as typeof fetch });
+  assert.equal(seen.length, 1);
+});

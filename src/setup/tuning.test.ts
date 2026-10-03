@@ -368,3 +368,14 @@ test("R2: a context below 8192 carries an explicit warning", () => {
   assert.ok(t.contextSize < 8192, `ctx ${t.contextSize}`);
   assert.ok(t.rationale.some((r) => /⚠ 컨텍스트/.test(r)));
 });
+
+test("CPU-only: the weights are taken out of RAM before the KV cache is sized (a 4 GiB box with a 5 GiB model is not handed 98k of context)", () => {
+  const G = 1024 ** 3;
+  const cpuBox = (ramGiB: number): any => ({ cpuCount: 4, ramTotalBytes: ramGiB * G, ramAvailableBytes: ramGiB * G * 0.8, gpus: [], gpuBackend: "none", canBuildCuda: false, tools: {}, platform: "linux" });
+  const small = tuneForHardware(cpuBox(4), { modelBytes: 5.1 * G, moe: false, kvElementsPerToken: 10240 });
+  const mid = tuneForHardware(cpuBox(8), { modelBytes: 5.1 * G, moe: false, kvElementsPerToken: 10240 });
+  const big = tuneForHardware(cpuBox(32), { modelBytes: 5.1 * G, moe: false, kvElementsPerToken: 10240 });
+  assert.ok(small.contextSize <= mid.contextSize && mid.contextSize <= big.contextSize, `${small.contextSize} / ${mid.contextSize} / ${big.contextSize}`);
+  assert.ok(small.contextSize < 98304, "a model that does not fit RAM must not get the maximum context");
+  assert.equal(big.contextSize, 98304);
+});

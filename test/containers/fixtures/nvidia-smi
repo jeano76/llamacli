@@ -1,0 +1,13 @@
+#!/bin/sh
+# Fake nvidia-smi. FAKE_NVIDIA="<name>|<total MiB>|<free MiB>|<CUDA version>"; unset = "not installed".
+if [ -z "$FAKE_NVIDIA" ]; then echo "nvidia-smi: command not found" >&2; exit 127; fi
+IFS='|' read -r name total free cuda <<EOF
+$FAKE_NVIDIA
+EOF
+case "$*" in
+  *--query-gpu=index,name*) echo "0, $name, $total, $free" ;;
+  *--query-gpu=compute_cap*) echo "8.6" ;;
+  *--query-compute-apps*) : ;;
+  "") echo "| NVIDIA-SMI 550.54   Driver Version: 550.54   CUDA Version: $cuda |" ;;
+  *) : ;;
+esac

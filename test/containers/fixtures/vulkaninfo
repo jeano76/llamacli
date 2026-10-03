@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fake vulkaninfo. FAKE_VULKAN="<deviceType>|<deviceName>"; unset = "not installed".
+if [ -z "$FAKE_VULKAN" ]; then echo "vulkaninfo: command not found" >&2; exit 127; fi
+IFS='|' read -r type name <<EOF
+$FAKE_VULKAN
+EOF
+printf 'GPU0:\n\tdeviceType = PHYSICAL_DEVICE_TYPE_%s\n\tdeviceName = %s\n' "$type" "$name"

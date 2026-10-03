@@ -261,7 +261,13 @@ export function tuneForHardware(
   if (gpu && exactKv && opts?.moe === false && modelBytes) {
     reserveGiB = Math.max(reserveGiB, Math.min(modelBytes / GiB + 0.5, budgetGiB * 0.9));
   }
-  const kvBudgetGiB = Math.max(0.25, budgetGiB - reserveGiB);
+  let kvBudgetGiB = Math.max(0.25, budgetGiB - reserveGiB);
+  // CPU-only: the "budget" is a fraction of RAM, but the weights live in that same RAM. Without subtracting them
+  // a 4 GiB box holding a 5 GiB model was handed a 98,304-token context (found by the container matrix,
+  // `cpu2-ram4`). The room left for KV is RAM minus the weights (with paging overhead) minus OS headroom.
+  if (!gpu && modelBytes) {
+    kvBudgetGiB = Math.min(kvBudgetGiB, Math.max(0.25, ramBudgetGiB(hw, modelBytes) - 1.0));
+  }
   const kvBudgetTokens = (kvBudgetGiB * GiB) / kvPerToken;
   // 4096-aligned because llama.cpp's practical granularity for a coding
   // agent's prompt shapes is a coarse block, and a round number is legible in

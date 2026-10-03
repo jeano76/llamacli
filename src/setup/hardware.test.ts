@@ -149,3 +149,58 @@ test("findOwnLlamaServerPids is a no-op without a known install dir", async () =
   };
   assert.deepEqual(await findOwnLlamaServerPids(undefined, run), []);
 });
+
+// ── cgroup limits (containers): the host's RAM/CPU must not be believed inside a limited cgroup ──
+import { readCgroupLimits, applyCgroupLimits } from "./hardware.js";
+
+const fsOf = (files: Record<string, string>) => (p: string) => (p in files ? files[p] : null);
+const GiBc = 1024 ** 3;
+
+test("cgroup v2: --memory 4g / --cpus 2 are read from memory.max and cpu.max", () => {
+  const l = readCgroupLimits(fsOf({
+    "/sys/fs/cgroup/memory.max": `${4 * GiBc}\n`, "/sys/fs/cgroup/memory.current": `${GiBc}\n`, "/sys/fs/cgroup/cpu.max": "200000 100000\n",
+  }));
+  assert.equal(l.memoryBytes, 4 * GiBc);
+  assert.equal(l.memoryUsedBytes, GiBc);
+  assert.equal(l.cpuCores, 2);
+});
+
+test("cgroup v2: 'max' means unlimited", () => {
+  const l = readCgroupLimits(fsOf({ "/sys/fs/cgroup/memory.max": "max\n", "/sys/fs/cgroup/cpu.max": "max 100000\n" }));
+  assert.deepEqual(l, {});
+});
+
+test("cgroup v1: limit_in_bytes and cfs quota/period; the ~2^63 'no limit' value is unlimited", () => {
+  const limited = readCgroupLimits(fsOf({
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes": `${8 * GiBc}\n`, "/sys/fs/cgroup/memory/memory.usage_in_bytes": `${2 * GiBc}\n`,
+    "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "150000\n", "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+  }));
+  assert.equal(limited.memoryBytes, 8 * GiBc);
+  assert.equal(limited.cpuCores, 1.5);
+  const none = readCgroupLimits(fsOf({ "/sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712\n", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n", "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n" }));
+  assert.deepEqual(none, {});
+});
+
+test("a slice's own cgroup directory can be stricter than the root, and the tightest limit wins", () => {
+  const l = readCgroupLimits(fsOf({
+    "/proc/self/cgroup": "0::/user.slice/app.slice\n",
+    "/sys/fs/cgroup/user.slice/app.slice/memory.max": `${2 * GiBc}\n`,
+    "/sys/fs/cgroup/memory.max": `${16 * GiBc}\n`,
+  }));
+  assert.equal(l.memoryBytes, 2 * GiBc);
+});
+
+test("applyCgroupLimits clamps the host's figures and never raises them", () => {
+  const host = { ramTotalBytes: 31 * GiBc, ramAvailableBytes: 24 * GiBc, cpuCount: 12 };
+  assert.deepEqual(applyCgroupLimits(host, { memoryBytes: 4 * GiBc, memoryUsedBytes: GiBc, cpuCores: 1.2 }), { ramTotalBytes: 4 * GiBc, ramAvailableBytes: 3 * GiBc, cpuCount: 2 });
+  assert.deepEqual(applyCgroupLimits(host, { memoryBytes: 64 * GiBc, cpuCores: 64 }), host, "a limit above the host changes nothing");
+  assert.deepEqual(applyCgroupLimits(host, {}), host);
+  assert.equal(applyCgroupLimits(host, { cpuCores: 0.2 }).cpuCount, 1, "never below one core");
+});
+
+test("the Hub and release endpoints default to the real services (overrides are opt-in)", async () => {
+  const { HF_ENDPOINT } = await import("./modelCatalog.js");
+  const { STOCK_RELEASES_URL } = await import("./stockRuntime.js");
+  if (!process.env.LLAMACLI_HF_ENDPOINT) assert.equal(HF_ENDPOINT, "https://huggingface.co");
+  if (!process.env.LLAMACLI_RELEASES_URL) assert.match(STOCK_RELEASES_URL, /^https:\/\/api\.github\.com\/repos\/ggml-org\/llama\.cpp\/releases/);
+});

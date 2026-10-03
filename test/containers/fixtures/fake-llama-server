@@ -1,0 +1,4 @@
+#!/bin/bash
+# A throwaway llama-server: argv0 = llama-server, answers /v1/models and /health. Exits with a CUDA OOM
+# message when --n-cpu-moe < FAKE_MIN_MOE, so launch calibration can be exercised without a GPU.
+exec -a llama-server python3 "$(dirname "$0")/fake-llama-server.py" "$@"

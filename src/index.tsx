@@ -40,7 +40,6 @@ import { runServerRestart, gateModelSwitch } from "./setup/serverCommand.js";
 import { provisionForSwitch } from "./setup/provision.js";
 import { transientProgress } from "./tui/transientProgress.js";
 import { formatProgress, type TransferProgress } from "./setup/download.js";
-import { totalmem } from "node:os";
 /** The tuning flags the config already records, for a restart that must NOT
  *  re-derive them.
  *
@@ -1130,7 +1129,7 @@ async function main() {
               const cur = liveNow.servers[0] ? parseLlamaServerArgs(liveNow.servers[0].cmdline) : undefined;
               ui?.pushStatus(
                 [
-                  `[models] 이 머신 기준 — 사용 가능 VRAM ${usableVramGiB(hw, ownVramGiB).toFixed(1)} GiB, RAM ${(totalmem() / 1024 ** 3).toFixed(0)} GiB`,
+                  `[models] 이 머신 기준 — 사용 가능 VRAM ${usableVramGiB(hw, ownVramGiB).toFixed(1)} GiB, RAM ${(hw.ramTotalBytes / 1024 ** 3).toFixed(0)} GiB`,
                   ...(replacing
                     ? [
                         `  · 지금 실행 중: ${(cur?.modelPath ?? "?").split("/").pop()} (포트 ${liveNow.servers[0].port}, VRAM ${ownVramGiB.toFixed(1)} GiB 사용` +

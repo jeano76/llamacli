@@ -1,0 +1,18 @@
+# One image per OS row.   podman build -f test/containers/Containerfile --build-arg BASE=debian:12 --build-arg PKG=apt -t llamacli-matrix-debian12 .
+# The image holds the BUILT dist (bin/llamacli-dist.tar.gz extracted — what a user installs) plus the probe and fixtures.
+ARG BASE=debian:12
+FROM ${BASE}
+ARG PKG=apt
+# Node + python3 (fake llama-server) + the shell under test. Package names differ per family.
+RUN case "$PKG" in \
+      apt)    apt-get update && apt-get install -y --no-install-recommends nodejs ca-certificates python3 zsh fish busybox sudo curl && rm -rf /var/lib/apt/lists/* ;; \
+      dnf)    dnf install -y nodejs python3 zsh fish busybox sudo curl && dnf clean all ;; \
+      pacman) pacman -Sy --noconfirm nodejs python zsh fish busybox sudo curl ;; \
+      apk)    apk add --no-cache nodejs python3 busybox bash curl ;; \
+    esac
+RUN adduser --disabled-password --gecos "" user 2>/dev/null || adduser -D user 2>/dev/null || useradd -m user
+COPY bin/llamacli-dist.tar.gz /tmp/dist.tgz
+RUN mkdir -p /opt/llamacli && tar xzf /tmp/dist.tgz -C /opt/llamacli && ls /opt/llamacli
+COPY test/containers/probe.mjs test/containers/download-scenario.mjs test/containers/mock-hub.mjs /opt/matrix/
+COPY test/containers/fixtures/ /opt/matrix/fixtures/
+ENV LLAMACLI_DIST=/opt/llamacli/dist LLAMACLI_NO_UPDATE=1 PATH=/opt/matrix/fixtures:$PATH

@@ -71,10 +71,34 @@ function summarize(text: string): string {
  *  - `temperature: 0`. Greedy, so the verdict does not flap between runs on
  *    the same broken server, and so a working model's answer is stable.
  */
-export async function probeBackendHealth(backend: ModelBackend): Promise<BackendHealth> {
+/** Max time the startup probe may wait for a busy server before giving up ("unknown", not "garbage"). */
+export const PROBE_BUSY_WAIT_MS = 8000;
+
+/** True when the server says its (only) slot is processing a request right now (`GET /slots`), so a probe
+ *  would queue behind it. Servers without `/slots` answer "not busy" and rely on the timeout below. */
+export async function serverIsBusy(baseUrl: string | undefined, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  if (!baseUrl) return false;
+  try {
+    const res = await fetchImpl(`${baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "")}/slots`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return false;
+    const slots = (await res.json()) as { is_processing?: boolean }[];
+    return Array.isArray(slots) && slots.length > 0 && slots.every((x) => x?.is_processing === true);
+  } catch {
+    return false;
+  }
+}
+
+export async function probeBackendHealth(backend: ModelBackend, opts: { waitMs?: number; fetchImpl?: typeof fetch } = {}): Promise<BackendHealth> {
+  // A single-slot server that is generating for the user answers the probe only AFTER that turn — startup used to stall
+  // 20-30 s behind someone else's request (found by the smoke matrix). A busy server is not a broken one: skip, do not wait.
+  if (await serverIsBusy((backend as { baseUrl?: string }).baseUrl, opts.fetchImpl)) {
+    return { verdict: "unknown", sample: "", reason: "서버가 다른 요청을 처리 중이라 건강 확인을 건너뜁니다." };
+  }
   let text: string;
   try {
-    const res = await backend.chat({
+    const waitMs = opts.waitMs ?? PROBE_BUSY_WAIT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const res = await Promise.race([backend.chat({
       model: "health-probe",
       messages: [{ role: "user", content: `Repeat this exact string and nothing else: ${PROBE_SENTINEL}` }],
       stream: false,
@@ -82,7 +106,8 @@ export async function probeBackendHealth(backend: ModelBackend): Promise<Backend
       max_tokens: PROBE_MAX_TOKENS,
       repeat_penalty: 1.1,
       chat_template_kwargs: { enable_thinking: false },
-    });
+    }), new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error(`건강 확인 응답이 ${Math.round(waitMs / 1000)}초 안에 오지 않았습니다 (서버가 바쁜 것으로 보고 넘어갑니다)`)), waitMs); })])
+      .finally(() => clearTimeout(timer));
     text = res.choices?.[0]?.message?.content ?? "";
   } catch (err: any) {
     return { verdict: "unknown", sample: "", reason: err?.message ?? String(err) };

@@ -38,6 +38,12 @@ for (const vram of [0, 4, 6, 8, 12, 16, 24, 48]) {
       if (vram > 0) assert.ok(t.gpuLayers > 0, "a GPU is used when there is one");
       // A card that holds the whole model needs no expert streaming.
       if (moe && vram >= 24) assert.equal(t.cpuMoeLayers, 0);
+      // R2: CPU-only — KV must fit in what is left of RAM after the weights (floor 0.25 GiB for a model that does not fit).
+      if (vram === 0) {
+        const kvGiB = (t.contextSize * KV * 1.07) / GiB;
+        const room = Math.max(0.25, ram - m.candidate.sizeBytes / GiB * 1.15 - 1.0);
+        assert.ok(kvGiB <= room + 0.3, `CPU-only ctx ${t.contextSize} needs ${kvGiB.toFixed(2)} GiB KV but only ${room.toFixed(2)} GiB is left`);
+      }
       // R2: bounded context, and a stated reason for every non-obvious choice.
       assert.ok(t.contextSize >= 4096 && t.contextSize <= 98304, `ctx ${t.contextSize}`);
       assert.ok(t.rationale.length > 0);

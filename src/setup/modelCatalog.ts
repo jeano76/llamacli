@@ -73,7 +73,8 @@ export interface ModelChoice {
   localPath?: string;
 }
 
-export const HF_ENDPOINT = "https://huggingface.co";
+/** `LLAMACLI_HF_ENDPOINT` points the catalogue and downloads at a mirror (or a test double). Unset = the Hub. */
+export const HF_ENDPOINT = (process.env.LLAMACLI_HF_ENDPOINT || "https://huggingface.co").replace(/\/+$/, "");
 /** The publisher's own repos, namespace included. See the header comment: the
  *  un-namespaced form of these ids is a repo that does not exist. */
 export const ORNITH_35B_REPO = "ornith-ai/Ornith-1.5-35B-A3B-GGUF";

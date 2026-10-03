@@ -1,0 +1,72 @@
+# Environment matrix (docs/container-matrix-validation-prompt.md §4). One row = one environment.
+#   env       environment variables for the run (FAKE_NVIDIA / FAKE_VULKAN select the fixtures' behaviour)
+#   shell     how probe.mjs is launched: bash | dash | busybox | sh
+#   limits    cgroup limits applied for real (host mode: systemd-run --user --scope; container mode: --memory/--cpus)
+#   where     host = runnable by run-host.mjs on a machine with no container runtime;  container = needs run.sh
+#   expect    machine-checked values. Strings are exact; /regex/ strings are patterns; numbers are exact; {max: n} / {min: n}.
+rows:
+  # ── shell axis ────────────────────────────────────────────────────────────
+  - { id: sh-bash,    where: [host, container], shell: bash,    env: {}, expect: { "detected.gpuBackend": none, "tuning.gpuLayers": 0, "tuning.cpuMoeLayers": 0, "model": "/9B/" } }
+  - { id: sh-dash,    where: [host, container], shell: dash,    env: {}, expect: { "detected.gpuBackend": none, "model": "/9B/" } }
+  - { id: sh-busybox, where: [host, container], shell: busybox, env: {}, expect: { "detected.gpuBackend": none, "model": "/9B/" } }
+  # ── CPU / RAM axis (real cgroup limits) ───────────────────────────────────
+  - { id: cpu2-ram4,   where: [host, container], shell: bash, limits: { memory: 4G,  cpus: 2 },  env: {}, expect: { "detected.cpuCount": 2, "detected.ramGiB": 4, "model": "/9B/", "detected.gpuBackend": none } }
+  - { id: cpu4-ram8,   where: [host, container], shell: bash, limits: { memory: 8G,  cpus: 4 },  env: {}, expect: { "detected.cpuCount": 4, "detected.ramGiB": 8, "model": "/9B/" } }
+  - { id: cpu12-ram32, where: [host, container], shell: bash, limits: { memory: 32G, cpus: 12 }, env: {}, expect: { "detected.cpuCount": {max: 12}, "detected.ramGiB": {max: 32} } }
+  # ── GPU axis (fixtures) ───────────────────────────────────────────────────
+  - id: gpu-nv-8g-fake
+    where: [host, container]
+    shell: bash
+    env: { FAKE_NVIDIA: "NVIDIA GeForce RTX 2070 SUPER|8192|7456|12.9" }
+    expect: { "detected.gpuBackend": cuda, "detected.gpus.0.vramGiB": 8, "engineLadder.0": cuda, "engineLadder.1": vulkan, "engineLadder.2": cpu, "tuning.gpuLayers": {min: 1} }
+  - id: gpu-nv-4g-fake
+    where: [host, container]
+    shell: bash
+    limits: { memory: 8G }
+    env: { FAKE_NVIDIA: "NVIDIA GeForce GTX 1650|4096|3800|12.9" }
+    expect: { "detected.gpuBackend": cuda, "model": "/9B/", "tuning.cpuMoeLayers": 0 }
+  - id: gpu-nv-24g-fake
+    where: [host, container]
+    shell: bash
+    limits: { memory: 64G }
+    env: { FAKE_NVIDIA: "NVIDIA GeForce RTX 4090|24564|24000|12.9" }
+    expect: { "detected.gpuBackend": cuda, "model": "/35B/", "tuning.cpuMoeLayers": 0, "tuning.contextSize": {max: 98304} }
+  - id: gpu-nv-driver-old
+    where: [host, container]
+    shell: bash
+    env: { FAKE_NVIDIA: "NVIDIA GeForce GTX 1060|6144|5800|11.4" }
+    expect: { "detected.gpuBackend": cuda, "engineLadder.0": cuda }   # oldest published CUDA build is offered; its run-verification (not the name) decides
+  - id: gpu-none-smi-missing
+    where: [host, container]
+    shell: bash
+    env: {}
+    expect: { "detected.gpuBackend": none, "detected.gpus": [], "engineLadder.0": cpu, "tuning.gpuLayers": 0 }
+  - id: gpu-intel-vulkaninfo
+    where: [host, container]
+    shell: bash
+    env: { FAKE_VULKAN: "DISCRETE_GPU|Intel(R) Arc(tm) A770" }
+    expect: { "detected.gpuBackend": vulkan, "engineLadder.0": vulkan, "model": "/9B/" }
+  - id: gpu-vulkan-software
+    where: [host, container]
+    shell: bash
+    env: { FAKE_VULKAN: "CPU|llvmpipe (LLVM 17.0.6, 256 bits)" }
+    expect: { "detected.gpuBackend": none, "engineLadder.0": cpu }   # a software rasteriser is not a GPU
+  - id: gpu-amd-sysfs
+    where: [host, container]
+    shell: bash
+    drm: { vendor: "0x1002", vramGiB: 16 }
+    limits: { memory: 16G }
+    env: {}
+    expect: { "detected.gpuBackend": vulkan, "detected.gpus.0.vramGiB": 16, "engineLadder.0": vulkan }
+
+# ── OS / distro / libc / privilege axis: container only (needs a runtime — see run-containers.mjs) ──────────────────
+# `image` + `pkg` build the environment; `user` is root | user | user-nosudo; the probe must still produce the same
+# machine-checked facts. These rows have NOT been executed on the author's machine (no container runtime installed).
+os_rows:
+  - { id: os-debian-bash-user,   image: "debian:12",        pkg: apt,    shell: bash,    user: user-nosudo, expect: { "buildPlan.manager": apt, "detected.platform": linux } }
+  - { id: os-ubuntu-bash-sudo,   image: "ubuntu:24.04",     pkg: apt,    shell: bash,    user: user,        expect: { "buildPlan.manager": apt } }
+  - { id: os-ubuntu-root,        image: "ubuntu:24.04",     pkg: apt,    shell: bash,    user: root,        expect: { "buildPlan.manager": apt } }
+  - { id: os-fedora-zsh,         image: "fedora:40",        pkg: dnf,    shell: zsh,     user: user,        expect: { "buildPlan.manager": dnf } }
+  - { id: os-arch-fish,          image: "archlinux:latest", pkg: pacman, shell: fish,    user: user,        expect: { "buildPlan.manager": pacman } }
+  - { id: os-alpine-ash-musl,    image: "alpine:3.20",      pkg: apk,    shell: busybox, user: user,        expect: { "buildPlan.manager": apk, "engineLadder.0": cpu } }   # musl: a glibc prebuilt must not be offered/relied on (H2)
+  - { id: os-debian-dash,        image: "debian:12-slim",   pkg: apt,    shell: dash,    user: user-nosudo, expect: { "detected.platform": linux } }

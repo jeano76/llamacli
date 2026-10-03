@@ -34,7 +34,8 @@ import type { GpuBackend, Hardware, Run } from "./hardware.js";
 import { executableExists } from "./fsUtil.js";
 
 export const STOCK_RUNTIME_HOME = join(homedir(), ".llamacli", "llama.cpp-prebuilt");
-export const STOCK_RELEASES_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5";
+/** `LLAMACLI_RELEASES_URL` points the engine lookup at a mirror (or a test double). Unset = llama.cpp's GitHub releases. */
+export const STOCK_RELEASES_URL = process.env.LLAMACLI_RELEASES_URL || "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5";
 
 export interface ReleaseAsset { name: string; url: string; /** GitHub's own `digest` ("sha256:…") for the asset, when the API gave one. */ sha256?: string }
 export interface Release { tag: string; assets: ReleaseAsset[] }

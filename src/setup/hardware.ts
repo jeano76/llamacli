@@ -13,6 +13,7 @@
  */
 
 import { cpus, totalmem, freemem, platform } from "node:os";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -288,14 +289,82 @@ export interface HostProbe {
   listDir: (path: string) => Promise<string[]>;
 }
 
+/** What a cgroup (a container's `--memory` / `--cpus`, a systemd slice's `MemoryMax`) limits this process to.
+ *  `os.totalmem()` / `os.cpus()` report the HOST, so on a 4 GiB container they said 31 GiB and the tuner
+ *  picked a model the container is OOM-killed on. Undefined fields = unlimited / unreadable. */
+export interface CgroupLimits {
+  memoryBytes?: number;
+  memoryUsedBytes?: number;
+  cpuCores?: number;
+}
+
+/** Reads cgroup v2 (`memory.max`, `memory.current`, `cpu.max`) and v1 (`memory.limit_in_bytes`,
+ *  `cpu.cfs_quota_us`/`cpu.cfs_period_us`). `read` returns a file's text or null. The process's own cgroup
+ *  directory (`/proc/self/cgroup`) is tried before the root, so a limit set on a slice is seen too. */
+export function readCgroupLimits(read: (path: string) => string | null): CgroupLimits {
+  const out: CgroupLimits = {};
+  const own = (read("/proc/self/cgroup") ?? "").split("\n").map((l) => /^0::(\/.*)$/.exec(l)?.[1]).find(Boolean) ?? "";
+  const dirs = [...new Set([own && own !== "/" ? `/sys/fs/cgroup${own}` : "", "/sys/fs/cgroup"].filter(Boolean))];
+  const num = (t: string | null): number | undefined => {
+    const v = t?.trim();
+    return v && /^\d+$/.test(v) ? Number(v) : undefined; // "max" = unlimited
+  };
+  // The tightest limit wins: a slice below the root can be stricter than the root's.
+  let mem: number | undefined;
+  let used: number | undefined;
+  let cpu: number | undefined;
+  for (const d of dirs) {
+    const m = num(read(`${d}/memory.max`)) ?? num(read(`${d}/memory/memory.limit_in_bytes`));
+    // v1 reports "no limit" as a huge number (~2^63); treat anything above 2^60 as unlimited.
+    if (m !== undefined && m < 2 ** 60 && (mem === undefined || m < mem)) {
+      mem = m;
+      used = num(read(`${d}/memory.current`)) ?? num(read(`${d}/memory/memory.usage_in_bytes`));
+    }
+    const cm = (read(`${d}/cpu.max`) ?? "").trim().split(/\s+/);
+    if (cm.length === 2 && /^\d+$/.test(cm[0]) && /^\d+$/.test(cm[1]) && Number(cm[1]) > 0) {
+      const c = Number(cm[0]) / Number(cm[1]);
+      if (cpu === undefined || c < cpu) cpu = c;
+    }
+    const q = Number((read(`${d}/cpu/cpu.cfs_quota_us`) ?? "").trim());
+    const per = Number((read(`${d}/cpu/cpu.cfs_period_us`) ?? "").trim());
+    if (Number.isFinite(q) && q > 0 && Number.isFinite(per) && per > 0) {
+      const c = q / per;
+      if (cpu === undefined || c < cpu) cpu = c;
+    }
+  }
+  if (mem !== undefined) { out.memoryBytes = mem; if (used !== undefined) out.memoryUsedBytes = used; }
+  if (cpu !== undefined) out.cpuCores = cpu;
+  return out;
+}
+
+/** Host figures clamped to the cgroup's limits. Pure so it is testable without a container. */
+export function applyCgroupLimits(
+  host: { ramTotalBytes: number; ramAvailableBytes: number; cpuCount: number },
+  limits: CgroupLimits
+): { ramTotalBytes: number; ramAvailableBytes: number; cpuCount: number } {
+  let { ramTotalBytes, ramAvailableBytes, cpuCount } = host;
+  if (limits.memoryBytes !== undefined && limits.memoryBytes < ramTotalBytes) {
+    ramTotalBytes = limits.memoryBytes;
+    const free = limits.memoryBytes - (limits.memoryUsedBytes ?? 0);
+    ramAvailableBytes = Math.max(0, Math.min(ramAvailableBytes, free));
+  }
+  if (limits.cpuCores !== undefined) cpuCount = Math.max(1, Math.min(cpuCount, Math.ceil(limits.cpuCores)));
+  return { ramTotalBytes, ramAvailableBytes, cpuCount };
+}
+
+const readSyncOrNull = (p: string): string | null => {
+  try { return readFileSync(p, "utf8"); } catch { return null; }
+};
+
 export const realHostProbe = (): HostProbe => ({
   platform: platform(),
   arch: process.arch,
-  ramTotalBytes: totalmem(),
-  ramAvailableBytes: freemem(),
   // os.cpus() returns [] in some container/VM setups, so keep a floor of 1
-  // rather than propagating 0 into every downstream division.
-  cpuCount: Math.max(1, cpus().length || 1),
+  // rather than propagating 0 into every downstream division. Clamped to the cgroup (container) limits.
+  ...applyCgroupLimits(
+    { ramTotalBytes: totalmem(), ramAvailableBytes: freemem(), cpuCount: Math.max(1, cpus().length || 1) },
+    platform() === "linux" ? readCgroupLimits(readSyncOrNull) : {}
+  ),
   readText: async (p) => {
     const { readFile } = await import("node:fs/promises");
     return readFile(p, "utf8").catch(() => null);
@@ -320,9 +389,10 @@ const PCI_VENDORS: Record<string, GpuVendor> = { "0x10de": "nvidia", "0x1002": "
  *  no ROCm userspace installed — which is exactly the machine being provisioned. */
 export async function detectAmdGpus(host: HostProbe): Promise<Gpu[]> {
   const gpus: Gpu[] = [];
-  const cards = (await host.listDir("/sys/class/drm")).filter((n) => /^card\d+$/.test(n)).sort();
+  const drmRoot = process.env.LLAMACLI_DRM_ROOT || "/sys/class/drm";
+  const cards = (await host.listDir(drmRoot)).filter((n) => /^card\d+$/.test(n)).sort();
   for (const card of cards) {
-    const dev = `/sys/class/drm/${card}/device`;
+    const dev = `${drmRoot}/${card}/device`;
     const vendor = (await host.readText(`${dev}/vendor`))?.trim().toLowerCase();
     if (!vendor || PCI_VENDORS[vendor] !== "amd") continue;
     const total = Number((await host.readText(`${dev}/mem_info_vram_total`))?.trim());
