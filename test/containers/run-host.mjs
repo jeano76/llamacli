@@ -17,10 +17,12 @@ const only = new Set(process.argv.slice(2));
 
 const SHELLS = { bash: ["bash", "-c"], dash: ["dash", "-c"], busybox: ["busybox", "sh", "-c"], sh: ["sh", "-c"] };
 
+const hasScope = spawnSync("systemd-run", ["--user", "--scope", "--quiet", "true"]).status === 0;
 const results = [];
 for (const row of rows) {
   if (!(row.where ?? []).includes("host")) continue;
   if (only.size && !only.has(row.id)) continue;
+  if (row.limits && !hasScope) { console.log(`SKIP  ${row.id.padEnd(22)} (no systemd --user cgroup scope on this machine: the limit cannot be applied)`); continue; }
   const work = mkdtempSync(join(tmpdir(), `lc-${row.id}-`));
   try {
     const stubs = join(work, "stubs");

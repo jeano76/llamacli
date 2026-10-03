@@ -106,3 +106,23 @@ GPU 는 전부 가짜 주입이므로 컨테이너의 실제 가속은 검증되
 
 솔직한 상태: **skip 한 41개는 "통과"가 아니라 "Windows 에서는 검증 안 함"** 이다. 그 영역(엔진 탐색 `findLlamaServer`, 빌드 산출물 위치, 설치된 사전빌드 재사용, 부트스트랩 흐름)에서 Windows 고유 결함이 숨어 있을 수 있다.
 **여전히 미검증:** GPU 가 있는 Windows, `winget` 설치 실행, 실제 `llama-server` 기동, Windows Terminal/conhost 의 대화형 TUI(마우스·OSC 52), macOS.
+
+## 7. 검증 수단 총정리 (이 저장소에서 `npm run matrix:all` + CI 3종)
+
+| 수단 | 무엇을 검증 | 실행 위치 | 상태 |
+|---|---|---|---|
+| 단위 테스트 (`npm test`, 1271) | 로직 전반 + Windows 형태 경로(`src/windowsPaths.test.ts`: 드라이브 문자·역슬래시) | 로컬 / Linux CI / Windows CI(정보용) / macOS CI(정보용) | Linux 로컬 전부 통과 |
+| 호스트 모드 매트릭스 (`run-host.mjs`) | 쉘 3종, 진짜 cgroup 한도, 가짜 GPU, 터미널·HOME 변형 | 로컬 (systemd --user 없으면 cgroup 행 SKIP 표시) | 통과 |
+| 컨테이너 매트릭스 (`run-containers.mjs`) | Debian/Ubuntu/Fedora/Arch/Alpine(musl), root·일반·sudo 없음, 한도·가짜 GPU | 로컬 podman / Linux CI(docker) | 로컬 27/27 |
+| TUI 스모크 (`tui-smoke.py`) | 실제 CLI 를 pty 로: `LANG=C`, `TERM=dumb`, 읽기 전용/없는 HOME | 로컬 / Linux CI | 7/7 |
+| 다운로드 시나리오 | 재서명 CDN 재개, 해시 판정, 같은 크기·다른 바이트 | 로컬, 컨테이너 4종, Windows CI | 통과 |
+| 클립보드 왕복 (`test/clipboard-check.mjs`) | 한글+이모지+개행: Windows `powershell`, macOS `pbcopy`, Linux `wl-copy`/`xclip` | 로컬(Wayland) / Windows·macOS·Linux CI | 로컬 Wayland ✅ 실제 클립보드, Windows CI ✅ |
+| 실제 TUI 드래그 → Wayland 클립보드 | Shift 없는 드래그가 `wl-paste` 로 읽힘 | 로컬 (`wl-clipboard` 설치 후) | ✅ (사용자 클립보드는 저장·복원) |
+| Windows 러너 (`windows.yml`) | pwsh/PowerShell/cmd/Git-Bash 프로브, 다운로드, 클립보드, 단위 테스트 | GitHub Actions | 프로브·다운로드·클립보드 ✅, 단위 테스트 1220 통과 / 4 실패(수정함) / 44 skip |
+| macOS 러너 (`macos.yml`) | zsh/bash/sh 프로브(Metal), 다운로드, pbcopy 왕복 | GitHub Actions | **작성만, 아직 실행 전** |
+| Linux 러너 (`linux.yml`) | tsc, 테스트, 빌드, 호스트·컨테이너 매트릭스, Xvfb+xclip 클립보드 | GitHub Actions | **작성만, 아직 실행 전** |
+| Wine (`test/windows/wine-check.sh`) | win32 프로브(Windows 용 node.exe) | 로컬 (wine 설치 필요) | **미실행**(wine 없음) |
+
+이번 라운드에서 시뮬레이션 테스트로 드러난 제품 결함: `pickFamilyMatch` 가 `f.path.endsWith("/"+name)` 로 파일을 찾아 **Windows 경로에서는 같은 모델의 다른 양자화를 재사용하지 못했다**(다운로드 낭비) → 파일명 비교로 수정.
+
+여전히 미검증: GPU 가 있는 Windows, 실제 `llama-server` 기동(Windows/macOS), Windows Terminal·conhost·Terminal.app 의 대화형 TUI, skip 한 POSIX 픽스처 테스트 44개의 Windows 대응.

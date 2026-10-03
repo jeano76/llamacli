@@ -1,3 +1,4 @@
+import { sep } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { selectModel } from "./modelSelect.js";
@@ -141,7 +142,7 @@ test("when nothing is on disk, the path lands under the configured models direct
     ...h.deps,
     detectRunningPort: async () => null,
   });
-  assert.ok(r.modelPath.startsWith(dir + "/"), `should be under modelsDir: ${r.modelPath}`);
+  assert.ok(r.modelPath.startsWith(dir + sep), `should be under modelsDir: ${r.modelPath}`);
   assert.equal(r.presentOnDisk, false, "nothing there means a download, which must be reported as such");
 });
 

@@ -35,7 +35,7 @@ test("neither set does NOT yield /root", () => {
 });
 
 test("the default models dir is under the home dir", () => {
-  assert.equal(defaultModelsDir({ HOME: "/home/jeano" } as any), "/home/jeano/models");
+  assert.equal(defaultModelsDir({ HOME: "/home/jeano" } as any).replace(/\\/g, "/").replace(/^[A-Za-z]:/, ""), "/home/jeano/models"); // separator/drive are the runner's, not the product's
   // Prefix and suffix only, not the separator: `node:path.join` uses the RUNNER's
   // separator, so on Linux it yields "C:\\Users\\jeano/models" where real Windows
   // yields "C:\\Users\\jeano\\models". Asserting the separator here would be

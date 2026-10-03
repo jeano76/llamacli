@@ -104,5 +104,5 @@ export function pickFamilyMatch(filename: string, local: LocalGguf[]): LocalGguf
     .map((f) => ({ repo: "local", filename: baseName(f.path), sizeBytes: f.sizeBytes, url: f.path }));
   const pick = pickPinnedCandidate(asCandidates, filename);
   if (!pick) return null;
-  return local.find((f) => f.path.endsWith(`/${pick.filename}`) && f.sizeBytes === pick.sizeBytes) ?? null;
+  return local.find((f) => baseName(f.path) === pick.filename && f.sizeBytes === pick.sizeBytes) ?? null; // by name, not by "/" suffix: Windows paths use "\\"
 }

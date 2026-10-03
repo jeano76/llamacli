@@ -7,6 +7,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { downloadFile, partPathFor, moveIntoPlace } from "./download.js";
 import { ChecksumMismatchError } from "./checksum.js";
 import { scanModels, pickReusable, pickFamilyMatch, quantTag } from "./existingModel.js";
+import { baseName } from "../util/path.js";
 import { findModelAnywhere } from "./bootstrap.js";
 
 const BODY = randomBytes(192 * 1024);
@@ -157,7 +158,7 @@ test("scanModels finds models in nested folders on another disk, and skips stagi
     await writeFile(join(disk, "x.gguf.part"), Buffer.alloc(5));
     await writeFile(join(dir, "disk2", "models", ".llamacli-tmp", "hidden.gguf"), Buffer.alloc(5));
     const found = await scanModels([join(dir, "disk2", "models")]);
-    assert.deepEqual(found.map((f) => f.path.split("/").pop()), ["Ornith-1.5-35B-A3B-Q4_K_M.gguf"]);
+    assert.deepEqual(found.map((f) => baseName(f.path)), ["Ornith-1.5-35B-A3B-Q4_K_M.gguf"]);
   });
 });
 

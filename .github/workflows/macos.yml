@@ -1,0 +1,64 @@
+# macOS (Apple Silicon) verification of the SHIPPED build: detection says Metal, the single macOS prebuilt is offered,
+# zsh/bash/sh all agree, downloads work on APFS, and pbcopy/pbpaste round-trips Korean + emoji.
+# Not covered: a real llama-server start, the interactive TUI in Terminal.app/iTerm2.
+name: macos
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ["src/**", "test/macos/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "bin/**", ".github/workflows/macos.yml"]
+  push:
+    branches: [main]
+    paths: ["src/**", "test/macos/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "bin/**", ".github/workflows/macos.yml"]
+permissions:
+  contents: read
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Unpack the shipped dist
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/llamacli"
+          mkdir -p "$root/dist"
+          tar xzf bin/llamacli-dist.tar.gz -C "$root/dist"
+          echo '{"type":"module"}' > "$root/package.json"
+          echo "LLAMACLI_DIST=$root/dist" >> "$GITHUB_ENV"
+      - name: Environment
+        run: |
+          uname -a; sw_vers; sysctl -n machdep.cpu.brand_string || true; sysctl -n hw.memsize; node -v; command -v brew zsh bash
+      - run: npm ci
+      - name: Scenarios (zsh, bash, sh, downloads)
+        run: node test/macos/run.mjs
+      - name: Clipboard round trip (pbcopy / pbpaste)
+        if: always()
+        continue-on-error: true
+        run: node test/clipboard-check.mjs
+      - name: Unit tests (informational)
+        id: unit
+        if: always()
+        continue-on-error: true
+        run: npm test 2>&1 | tee unit-tests.log
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## macOS run"
+            [ -f unit-tests.log ] && echo "- unit tests: $(grep -E '^# (pass|fail|skipped)' unit-tests.log | tr '\n' ' ')" && echo && grep -E '^not ok' unit-tests.log | head -40 | sed 's/^/  - /'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-results
+          path: |
+            test/macos/results/
+            unit-tests.log
+          if-no-files-found: ignore

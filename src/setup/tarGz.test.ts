@@ -141,7 +141,7 @@ test("unpacks what GNU tar actually produced", () => {
   extractTarGz(gz, dest, { strip: 1 });
   const bin = join(dest, "llama-server");
   assert.ok(existsSync(bin), "the real archive's binary must be unpacked");
-  assert.ok(statSync(bin).mode & 0o111, "and must be executable");
+  if (process.platform !== "win32") assert.ok(statSync(bin).mode & 0o111, "and must be executable"); // Windows has no exec bit
   assert.ok(existsSync(join(dest, "a-very-long-shared-library-name-to-exceed-the-ustar-field.so")),
     "a GNU long-name entry must be restored under its full name");
 });

@@ -11,10 +11,10 @@ name: windows
 on:
   workflow_dispatch:
   pull_request:
-    paths: ["src/**", "test/windows/**", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
+    paths: ["src/**", "test/windows/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
   push:
     branches: [main]
-    paths: ["src/**", "test/windows/**", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
+    paths: ["src/**", "test/windows/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
 
 permissions:
   contents: read
@@ -71,7 +71,7 @@ jobs:
         id: clipboard
         if: always()
         continue-on-error: true
-        run: node test/windows/clipboard-check.mjs
+        run: node test/clipboard-check.mjs
 
       # Informational: the repository's own unit tests were written on Linux; this shows which ones assume POSIX.
       - name: Unit tests (informational)
