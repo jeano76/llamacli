@@ -77,3 +77,20 @@ GPU 는 전부 가짜 주입이므로 컨테이너의 실제 가속은 검증되
 2. Windows/macOS CI 워크플로 초안, WSL 가짜 주입 seam.
 3. 환경별 `/server`·`/models`·`/reset` 화면 단언 pty 시나리오(현재는 기동 스모크까지).
 4. `mock-hub` 를 쓰는 부트스트랩 end-to-end(카탈로그→다운로드→설정) 시나리오 — 지금은 다운로드 함수 단위까지만.
+
+## 6. Windows 워크플로 (`.github/workflows/windows.yml`) — 작성만 했고 **아직 GitHub 에서 실행되지 않았다**
+
+Windows 는 Linux 컨테이너로 재현할 수 없어 `windows-latest` 러너에서 **배포 산출물(`bin/llamacli-dist.tar.gz` 을 풀어서)** 을 검증한다. 빌드는 하지 않는다(`npm run build` 는 `rm`/`cp`/`chmod` 를 써서 Windows 기본 쉘에서 안 돌아간다 — 개발자용이며 사용자는 타르볼로 설치).
+
+| 단계 | 내용 | 필수? |
+|---|---|---|
+| Unpack the shipped dist | 타르볼 → `$RUNNER_TEMP/llamacli/dist` + `package.json{"type":"module"}` | 필수 |
+| Scenarios | 같은 `probe.mjs` 를 **pwsh / Windows PowerShell / cmd / Git-Bash** 에서 실행해 `platform=win32`, GPU 없음(러너에 GPU 없음; "Microsoft Basic Render Driver" 를 GPU 로 오인하지 않아야 함), CPU 사다리, `gpuLayers=0` 단언 + 다운로드 시나리오 6개(Windows 파일 의미: 열린 파일 위로 rename, 드라이브 문자 경로) | **필수** |
+| Clipboard round trip | 앱의 `copySelection` 으로 **한글+이모지+개행** 복사 → PowerShell `Get-Clipboard` 로 읽어 비교 | 정보용(`continue-on-error`): 호스티드 러너에 클립보드 세션이 있는지 모름 |
+| Unit tests | `npm test` 전체(리눅스에서 작성되어 POSIX 가정이 있을 수 있음) — 어떤 테스트가 Windows 에서 깨지는지 목록을 요약에 출력 | 정보용 |
+
+이번에 같이 바꾼 코드 (Linux 에서 단위 테스트로 확인, **Windows 에서는 미검증**):
+- Windows 클립보드: `clip.exe`(콘솔 OEM 코드페이지로 stdin 을 읽어 한글이 깨짐 — 알려진 동작이나 이 머신에서 재현하지는 못함)보다 **PowerShell `Set-Clipboard`(UTF-8 stdin)** 를 먼저 시도, `clip` 은 마지막. PowerShell 스니펫의 문법과 UTF-8 stdin 읽기는 이 머신의 `pwsh` 로 확인(한글·이모지 포함 10자 정확).
+- 복사 폴백 파일 경로: Windows 에는 `/tmp` 가 없으므로 `os.tmpdir()`.
+
+**검증되지 않은 것(워크플로로도 못 닿는 곳):** GPU(CUDA/Vulkan)가 있는 Windows, `winget` 설치, 실제 `llama-server` 기동, Windows Terminal/conhost 의 대화형 TUI(마우스·OSC 52), macOS.

@@ -179,7 +179,10 @@ import { clipboardTools, describeCopy } from "./selection.js";
 
 test("clipboardTools picks the tools that fit the session", () => {
   assert.deepEqual(clipboardTools({}, "darwin"), [{ cmd: "pbcopy", args: [] }]);
-  assert.deepEqual(clipboardTools({}, "win32"), [{ cmd: "clip", args: [] }]);
+  const win = clipboardTools({}, "win32");
+  assert.deepEqual(win.map((t) => t.cmd), ["powershell", "pwsh", "clip"], "UTF-8-safe PowerShell first; clip.exe (OEM code page) last");
+  assert.match(win[0].args.join(" "), /InputEncoding=\[Text\.Encoding\]::UTF8/);
+  assert.match(win[0].args.join(" "), /Set-Clipboard/);
   assert.deepEqual(clipboardTools({ WAYLAND_DISPLAY: "wayland-0", DISPLAY: ":0" }, "linux").map((t) => t.cmd), ["wl-copy", "xclip", "xsel"]);
   assert.deepEqual(clipboardTools({ DISPLAY: ":0" }, "linux").map((t) => t.cmd), ["xclip", "xsel"]);
   assert.deepEqual(clipboardTools({}, "linux"), [], "a headless box has no clipboard tool to try");

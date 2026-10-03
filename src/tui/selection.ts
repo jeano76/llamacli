@@ -21,6 +21,9 @@
  * this fixes was invisible to every existing test.
  */
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 /** A position in the log's flattened row space. Rows are 0-based indices into
  *  the `allRows` array App builds (see App.tsx), NOT terminal rows — the
  *  mapping from one to the other changes as the log scrolls, and the selection
@@ -169,7 +172,8 @@ export interface CopyResult {
  *  directory: this is a scratch artifact of a UI action, not project state, and
  *  writing it into the project would put a file the user didn't ask for into
  *  their git status. */
-export const CLIPBOARD_FALLBACK_PATH = "/tmp/llamacli-copy.txt";
+export const CLIPBOARD_FALLBACK_PATH =
+  process.platform === "win32" ? join(tmpdir(), "llamacli-copy.txt") : "/tmp/llamacli-copy.txt"; // Windows has no /tmp
 
 /** I/O seam so tests can assert the fallback without touching /tmp. */
 export interface CopyDeps {
@@ -188,7 +192,16 @@ export interface CopyDeps {
  *  success by their exit status. */
 export function clipboardTools(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): { cmd: string; args: string[] }[] {
   if (platform === "darwin") return [{ cmd: "pbcopy", args: [] }];
-  if (platform === "win32") return [{ cmd: "clip", args: [] }];
+  if (platform === "win32") {
+    // `clip.exe` reads stdin in the console's OEM code page, so Korean/emoji text arrives garbled. PowerShell
+    // reading UTF-8 from stdin is tried first; `clip` stays as the last resort (ASCII-safe).
+    const ps = "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())";
+    return [
+      { cmd: "powershell", args: ["-NoProfile", "-NonInteractive", "-Command", ps] },
+      { cmd: "pwsh", args: ["-NoProfile", "-NonInteractive", "-Command", ps] },
+      { cmd: "clip", args: [] },
+    ];
+  }
   const out: { cmd: string; args: string[] }[] = [];
   if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) out.push({ cmd: "clip.exe", args: [] });
   if (env.WAYLAND_DISPLAY) out.push({ cmd: "wl-copy", args: [] });

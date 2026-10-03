@@ -1,0 +1,103 @@
+# Windows verification of the SHIPPED build (bin/llamacli-dist.tar.gz), from every Windows shell.
+#
+# Linux containers cannot reproduce Windows (docs/container-matrix-validation-prompt.md §8), so this runs on a real
+# Windows runner. Hosted runners have no GPU: they exercise detection, the CPU/win-zip ladder, shells (pwsh, Windows
+# PowerShell, cmd, Git-Bash), the download scenarios on real Windows file semantics, and the clipboard round trip.
+#
+# What this does NOT cover (stays "unverified" until someone runs it): CUDA/Vulkan GPUs on Windows, winget installs,
+# a real llama-server start, and the interactive TUI in Windows Terminal / conhost.
+name: windows
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ["src/**", "test/windows/**", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
+  push:
+    branches: [main]
+    paths: ["src/**", "test/windows/**", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The artifact users install, not a fresh build: unpack the committed tarball next to a package.json that makes
+      # it an ES-module tree (the same layout the container matrix uses).
+      - name: Unpack the shipped dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/llamacli"
+          mkdir -p "$root/dist"
+          tar xzf bin/llamacli-dist.tar.gz -C "$root/dist"
+          echo '{"type":"module"}' > "$root/package.json"
+          ls "$root/dist" | head -5
+          echo "LLAMACLI_DIST=$(cygpath -w "$root/dist")" >> "$GITHUB_ENV"
+
+      - name: Environment
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion
+          node -v
+          [System.Environment]::OSVersion.VersionString
+          Get-CimInstance Win32_VideoController | Select-Object Name
+          Get-Command winget -ErrorAction SilentlyContinue | Select-Object Source
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Required: detection and the engine ladder from each shell, then the download scenarios.
+      - name: Scenarios (pwsh, powershell, cmd, git-bash, downloads)
+        run: node test/windows/run.mjs
+
+      # Copy Korean + emoji with the app's own code and read it back. `clip.exe` mangles this text, which is why
+      # PowerShell is tried first. Informational until a hosted runner is known to expose a clipboard session.
+      - name: Clipboard round trip
+        id: clipboard
+        continue-on-error: true
+        run: node test/windows/clipboard-check.mjs
+
+      # Informational: the repository's own unit tests were written on Linux; this shows which ones assume POSIX.
+      - name: Unit tests (informational)
+        id: unit
+        continue-on-error: true
+        shell: bash
+        run: npm test 2>&1 | tee unit-tests.log
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Windows run"
+            echo "- scenarios: see the step log (required)"
+            echo "- clipboard round trip: ${{ steps.clipboard.outcome }}"
+            echo "- unit tests (informational): ${{ steps.unit.outcome }}"
+            if [ -f unit-tests.log ]; then
+              echo "- unit tests: $(grep -E '^# (pass|fail)' unit-tests.log | tr '\n' ' ')"
+              echo; echo "Failing tests:"; grep -E '^not ok' unit-tests.log | head -40 | sed 's/^/  - /'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-results
+          path: |
+            test/windows/results/
+            unit-tests.log
+          if-no-files-found: ignore
