@@ -112,3 +112,45 @@ test("the OOM pattern recognises the CUDA, Vulkan and generic phrasings", () => 
   }
   assert.doesNotMatch("address already in use", OOM_PATTERN);
 });
+
+test("thin margin: a load that leaves less than the safety margin gets enough more CPU layers to restore it", async () => {
+  const r = rig(() => "ok", 394); // (394 - 600) / 458 -> raise by 1
+  const lines: string[] = [];
+  const out = await startCalibrated(cfg({ cpuMoeLayers: 32 }), { make: r.make, say: (l) => lines.push(l), calibrate: true, ...r.base });
+  assert.equal(out.cfg.cpuMoeLayers, 33);
+  assert.equal(out.calibration?.outcome, "margin-raised");
+  assert.deepEqual(r.events, ["start:32:ok", "stop:32", "start:33:ok"]);
+  assert.ok(lines.some((l) => /얇아/.test(l)));
+});
+
+test("thin margin: a bigger deficit raises by more than one layer", async () => {
+  const r = rig(() => "ok", 100); // (100 - 600) / 458 -> raise by 2
+  const out = await startCalibrated(cfg({ cpuMoeLayers: 32 }), { make: r.make, calibrate: true, ...r.base });
+  assert.equal(out.cfg.cpuMoeLayers, 34);
+});
+
+test("thin margin: if the raised launch does not load, the one that worked is restored", async () => {
+  const r = rig((m) => (m > 32 ? "other" : "ok"), 394);
+  const out = await startCalibrated(cfg({ cpuMoeLayers: 32 }), { make: r.make, calibrate: true, ...r.base });
+  assert.equal(out.cfg.cpuMoeLayers, 32);
+  assert.equal(out.calibration?.outcome, "margin-raise-rejected");
+  assert.deepEqual(r.events, ["start:32:ok", "stop:32", "start:33:other", "stop:33", "start:32:ok"]);
+});
+
+test("thin margin with no experts on the CPU yet: starts moving them, never above the layer count", async () => {
+  const r = rig(() => "ok", 100);
+  const out = await startCalibrated(cfg({ cpuMoeLayers: 0 }), { make: r.make, calibrate: true, ...r.base });
+  assert.equal(out.cfg.cpuMoeLayers, 2);
+  const capped = rig(() => "ok", -5000);
+  const out2 = await startCalibrated(cfg({ cpuMoeLayers: 39 }), { make: capped.make, calibrate: true, ...capped.base });
+  assert.equal(out2.cfg.cpuMoeLayers, 40);
+});
+
+test("thin margin is not trialled when already calibrated or when calibrate is off", async () => {
+  const a = rig(() => "ok", 100);
+  await startCalibrated(cfg({ calibratedFor: calibrationKey(cfg(), "GPU") }), { make: a.make, calibrate: true, ...a.base });
+  const b = rig(() => "ok", 100);
+  await startCalibrated(cfg(), { make: b.make, calibrate: false, ...b.base });
+  assert.deepEqual(a.events, ["start:32:ok"]);
+  assert.deepEqual(b.events, ["start:32:ok"]);
+});
