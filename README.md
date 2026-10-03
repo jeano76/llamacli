@@ -233,7 +233,7 @@ browser: { debugPort: 9222 }
 
 | 워크플로 | 러너 | 검증 | 최근 결과 |
 |---|---|---|---|
-| `windows.yml` | `windows-latest` (NT 10.0.26100, 4코어, 16 GiB) | 배포 `bin/` 을 pwsh·Windows PowerShell·cmd·Git-Bash 에서: GPU 없음, CPU 사다리, `winget`; 다운로드; PowerShell 클립보드; 단위 테스트(정보용) | 프로브 4/4, 다운로드 6/6, 클립보드 ✅, 단위 1,233 통과 / 44 건너뜀 / 0 실패 (총 1,277) |
+| `windows.yml` | `windows-latest` (NT 10.0.26100, 4코어, 16 GiB) | 배포 `bin/` 을 pwsh·Windows PowerShell·cmd·Git-Bash 에서: GPU 없음, CPU 사다리, `winget`; 다운로드; PowerShell 클립보드; 단위 테스트(정보용) | 프로브 4/4, 다운로드 6/6, 클립보드 ✅, 단위 **1,271 통과 / 6 건너뜀(Windows 에 해당 없음) / 0 실패** (총 1,277) |
 | `macos.yml` | `macos-14` (Apple M1, 가상) | zsh·bash·sh 프로브 → **Metal**, `brew`, `-ngl > 0`; 다운로드; `pbcopy` | 프로브 3/3, 다운로드 6/6, `pbcopy` ✅ |
 | `linux.yml` | `ubuntu-latest` | `tsc`, 단위 테스트, 빌드, 호스트·컨테이너 매트릭스, TUI 스모크(`CI=true` 변형 포함), Xvfb+`xclip` | **전 단계 통과** — 단위 1,277 / 1,277, 호스트 매트릭스, 다운로드, TUI 스모크, 컨테이너, X11 클립보드 |
 
@@ -244,7 +244,7 @@ Apple Silicon 이 `-ngl 0`(CPU 전용)으로 튜닝되고 있었습니다. 둘 �
 
 - Windows·macOS 에서 **실제 llama-server 기동**, Windows 의 GPU, 실제 GPU 는 로컬의 한 장(RTX 2070 SUPER)만.
 - Windows Terminal·conhost·Terminal.app·iTerm2 에서의 대화형 TUI(마우스, OSC 52), `winget` 설치.
-- Windows 에서 **건너뛴 단위 테스트 44개**(POSIX 쉘 스크립트 픽스처, `.exe` 없는 가짜 바이너리, `/media` 마운트) — "건너뜀" 은 "통과" 가 아니며, 엔진 탐색·빌드 산출물 위치·설치된 사전빌드 재사용에 Windows 고유 결함이 숨어 있을 수 있습니다.
+- Windows 에서 건너뛰는 단위 테스트 6개는 해당 없는 동작입니다(`/media`·`/mnt` 마운트 2, POSIX 사용자 공간 cmake 1, 실행 권한 비트 2, 심볼릭 링크 1). 예전에 건너뛰던 44개는 이제 실행됩니다 — 경로·`.exe` 이름을 OS 에 맞게 정규화하고(`src/testSupport.ts`), Windows 에서도 실제로 실행되는 가짜 llama-server(Node 단일 실행 파일, `postject`)를 써서.
 - 컨테이너 이미지에는 설정 모듈만 있고 TUI 의존성은 없습니다(TUI 는 호스트 pty 로만 검증). WSL, Wine(`test/windows/wine-check.sh` 는 있으나 미실행), 실제 Vulkan/ROCm 하드웨어.
 
 ## 제거된 기능

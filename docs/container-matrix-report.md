@@ -126,3 +126,12 @@ GPU 는 전부 가짜 주입이므로 컨테이너의 실제 가속은 검증되
 이번 라운드에서 시뮬레이션 테스트로 드러난 제품 결함: `pickFamilyMatch` 가 `f.path.endsWith("/"+name)` 로 파일을 찾아 **Windows 경로에서는 같은 모델의 다른 양자화를 재사용하지 못했다**(다운로드 낭비) → 파일명 비교로 수정.
 
 여전히 미검증: GPU 가 있는 Windows, 실제 `llama-server` 기동(Windows/macOS), Windows Terminal·conhost·Terminal.app 의 대화형 TUI, skip 한 POSIX 픽스처 테스트 44개의 Windows 대응.
+
+## 8. Windows 단위 테스트: 건너뛰던 44개를 실행 (2026-10-04)
+
+`src/testSupport.ts` 도입: `P`/`B`/`SRV`/`PATHS`/`posix`(POSIX 리터럴을 OS 구분자·`llama-server.exe` 로 정규화, POSIX 에서는 항등) + `writeFakeExe`(Windows 에서 실제로 실행되는 가짜 서버:
+Node 단일 실행 파일 = `node.exe` + `postject` 블롭, 동작은 옆의 JSON; POSIX 는 기존 스크립트). SEA 경로는 공식 node 바이너리로 Linux 에서도 강제로 확인.
+
+Windows 러너 결과: 처음 실행 1,268 통과 / 3 실패 / 6 건너뜀 → 3건 수정(경로 단언의 `posix()`, 방금 종료한 가짜 `.exe` 삭제 재시도) 후 **1,271 통과 / 0 실패 / 6 건너뜀**.
+남은 6개는 Windows 에 해당 없음: `/media`·`/mnt` 마운트(2), POSIX 사용자 공간 cmake(1), 실행 권한 비트(2), 심볼릭 링크(1).
+macOS·Linux 는 1,277 / 1,277.
