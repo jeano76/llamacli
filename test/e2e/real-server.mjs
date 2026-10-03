@@ -97,8 +97,9 @@ try {
     for (let i = 0; i < 50 && (await portOpen(port)); i++) await new Promise((r) => setTimeout(r, 200));
     if (await portOpen(port)) throw new Error("port still open after stop()");
   });
-} catch {
-  /* reported by step() */
+} catch (e) {
+  // A step() failure is already printed; anything else (an import error, a missing dependency) must not vanish.
+  if (!steps.some((x) => !x.ok)) console.log(`FAIL  before the first step  — ${e?.stack ?? e}`);
 } finally {
   try { server?.stop(); } catch { /* already stopped */ }
   await new Promise((r) => setTimeout(r, 500));

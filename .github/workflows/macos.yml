@@ -36,10 +36,6 @@ jobs:
         run: |
           uname -a; sw_vers; sysctl -n machdep.cpu.brand_string || true; sysctl -n hw.memsize; node -v; command -v brew zsh bash
       - run: npm ci
-      - name: Real llama-server end to end
-        run: node test/e2e/real-server.mjs
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Scenarios (zsh, bash, sh, downloads)
         run: node test/macos/run.mjs
       - name: Clipboard round trip (pbcopy / pbpaste)
@@ -51,6 +47,15 @@ jobs:
         run: |
           npm run build
           pip3 install --break-system-packages pyte || pip3 install pyte
+      # END-TO-END with the real thing, on the app BUILT in this checkout (the shipped dist lives outside node_modules):
+      # a tiny GGUF from the Hub, the real stock llama.cpp prebuilt for this OS from GitHub (found by the engine ladder,
+      # run-verified), a real llama-server on a free port, a real chat completion.
+      - name: Real llama-server end to end
+        if: always()
+        run: node test/e2e/real-server.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLAMACLI_DIST: ${{ github.workspace }}/dist
       - name: TUI smoke in a pty
         if: always()
         continue-on-error: true

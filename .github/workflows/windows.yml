@@ -61,13 +61,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # END-TO-END with the real thing: a tiny GGUF from the Hub, the real stock llama.cpp Windows prebuilt from GitHub
-      # (found by the engine ladder, run-verified), a real llama-server started on a free port, a real chat completion.
-      - name: Real llama-server end to end
-        run: node test/e2e/real-server.mjs
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       # Required: detection and the engine ladder from each shell, then the download scenarios.
       - name: Scenarios (pwsh, powershell, cmd, git-bash, downloads)
         run: node test/windows/run.mjs
@@ -90,6 +83,15 @@ jobs:
           npx tsc -p tsconfig.json --outDir dist
           mkdir -p dist/skills/builtin && cp src/skills/builtin/*.md dist/skills/builtin/
           pip install pyte pywinpty
+      # END-TO-END with the real thing, on the app BUILT in this checkout (the shipped dist lives outside node_modules):
+      # a tiny GGUF from the Hub, the real stock llama.cpp prebuilt for this OS from GitHub (found by the engine ladder,
+      # run-verified), a real llama-server on a free port, a real chat completion.
+      - name: Real llama-server end to end
+        if: always()
+        run: node test/e2e/real-server.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLAMACLI_DIST: ${{ github.workspace }}/dist
       - name: TUI smoke in ConPTY
         if: always()
         continue-on-error: true
