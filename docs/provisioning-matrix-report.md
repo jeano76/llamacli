@@ -25,15 +25,25 @@
 - `serverCommand.test.ts` (8): C4(확인 없으면 `stop` 0), C5(확인 시 switch→record→sync 한 번, 라이브 포트), 빈 포트 무확인 시작, C10(foreign), C14(다중), C11(못 읽는 빌드), 모델 없음, 시작 실패 시 record/sync 생략.
 - `bootstrap.test.ts` (3): `/reset` 이 선택 모델을 유지 / 파일 없으면 폐기 / 구동 불가 카탈로그 모델 폐기.
 
-## 4. 합성으로만 검증했고 실환경에서는 하지 않은 것
+## 4. 2차 구현 (남은 일 처리)
 
-- 위 시퀀스는 가짜 `switchServer`/`PortOwner` 주입 테스트다. **실제 llama-server 를 띄워 pty+pyte 로 `/server restart` → `confirm` 을 돌려보지 않았다.** (사용자의 8084 서버를 건드리지 않기 위해 별도 포트 테스트 서버가 필요하며, 이번 턴에서는 하지 않았다.)
-- `/models <n>` 의 게이트 **배선**은 `index.tsx` 안에 인라인이라 명령 시퀀스 테스트(C2, C3, C8, C12, C13)가 없다. 게이트 함수 자체만 테스트됨.
+| 항목 | 처리 |
+|---|---|
+| 시작 시 서버/설정 모델 불일치 (R4.2) | `bootstrap.ts` 연결(adopt) 분기에서 모델이 다르면 서버는 건드리지 않고 `서버/설정 불일치` 단계로 알림 (`/server`→`/server restart` 안내). 테스트 2개 |
+| `/reset` 사전 미리보기 (R6) | `resetPreview.ts`: 같은 `tuneForHardware`+`describeReset` 로 **적용 전** 바뀔 항목을 표시(아무것도 쓰지 않음). 테스트 2개 |
+| `/reset` 이 직접 키운 컨텍스트를 32,768 로 깎는 문제 (미리보기로 발견) | 이 머신 KV 예산이 지원하면 이전 컨텍스트 유지, 못 버티면 줄이고 이유 표시 (`reapplyContext`). 테스트 3개. 사용자 머신(8 GiB, Ornith) 계산: 기본 상한 32,768 vs KV 예산 ≈ 471k |
+| `/models` 게이트 배선 테스트 | `gateModelSwitch` 를 `serverCommand.ts` 로 추출 → C2·C3·C4·C5(선택→불일치→미확정 무변경→확정 반영) 시퀀스 테스트, C15(쓰기 실패 전파) |
+| §5 프로파일 확장 | `profiles.test.ts` +8행(4GB, 24GB/RAM 8, AMD 16, Intel Arc(vulkaninfo), Windows CPU, Windows 8GB, Mac 16, sudo 없음) — 총 16행. `matrix.test.ts`: VRAM{0,4,6,8,12,16,24,48}×RAM{4,8,16,32,64} 40셀 불변식(밀집엔 `--n-cpu-moe` 없음, 35B 는 RAM≥24, GPU 없으면 CPU, 컨텍스트 4096~32768, 큰 모델엔 경고) |
+| R1: 가속 빌드가 실행 안 될 때 이유 안내 | 사다리 중간 실패를 **그 시점에** 로그(전부 실패할 때만 나오던 것을 수정). 테스트 1개 |
+| R2: 컨텍스트 하한 경고 | 8192 미만이면 `⚠` 사유 추가. 테스트 1개 |
+| 실환경 검증 | `scripts/live_single_server_check.ts`: 실제 프로세스(가짜 llama-server, argv0=llama-server)로 미확정 재시작=pid 유지 / 확정=같은 포트에서 새 pid·새 모델·옛 pid 종료 / foreign 리스너는 확정에도 생존. **통과** (사용자의 8080 서버는 목록에 넣지 않았고 그대로임을 확인) |
 
-## 5. 남은 일 (미완)
+발견된 사실: Intel Arc 는 sysfs VRAM 카운터가 없어 `vulkaninfo` 로만 발견되며 VRAM 을 모른다(0) — 그래서 모델은 9B 로 보수적으로 고른다. 현재 동작을 프로파일 행으로 고정했다.
 
-1. §5 의 24행 프로파일 중 `profiles.test.ts` 가 다루는 것은 기존 8행뿐 — 나머지 확장 안 함.
-2. 시작 시(bootstrap) 실행 중 서버가 설정과 다른 모델일 때: 현재는 **그냥 연결(adopt)** 하고 차이를 알리지 않는다(R4.2 의 "다르면 확인" 미구현). `/server` 에서 불일치는 보이지만 시작 시 안내는 없다.
-3. `/reset confirm` 은 적용 **후**에 diff 를 보여준다(사전 미리보기 없음). 서버는 건드리지 않으므로 안전하지만 R6 의 "diff 후 확인"과는 다르다.
-4. R1(실행 검증 사다리, CUDA 불가 시 이유 안내), R2(최소 컨텍스트 경고), R3(바꿔치기 금지 표시), R5 는 전수 감사 미실시.
-5. `/models` 로 서버를 교체하는 도중 실패 시 config 부분 기록(C15) 점검 안 함.
+## 5. 아직 하지 않은 것 (정직하게)
+
+1. **실제 llama.cpp 바이너리 + 실제 GPU 모델로 한 end-to-end 는 안 했다.** 실환경 검증은 가짜 llama-server 로 프로세스 정책(종료·교체·포트·foreign)만 확인했다. 사용자 8080 서버가 8 GiB GPU 를 쓰고 있어 실제 모델을 별도로 띄울 수 없었다.
+2. **TUI(pty+pyte) 에서 슬래시 명령을 직접 친 검증은 안 했다.** 명령 로직은 함수로 추출해 테스트했지만 `index.tsx` 의 연결부(문자열 파싱 `restart confirm`, 출력)는 타입 검사와 코드 리뷰로만 확인했다.
+3. §5 의 24행 중 Windows/WSL **쉘(PowerShell/cmd/Git-Bash/WSL) 구분** 은 `platform` 수준만 검증 — 쉘별 경로·따옴표 처리는 이 머신에서 실행할 수 없어 합성 근거도 약하다. WSL 은 별도 분류가 없다(linux 로 취급).
+4. 디스크 부족/해시 불일치/이어받기(§5 #20~22)는 기존 `disk`·`downloadVerify`·`downloadResume` 테스트가 다루며 이번에 새로 감사하지 않았다.
+5. 최초 구동(bootstrap)에서 24GB 카드의 컨텍스트 상한은 여전히 32,768 이다(KV 예산은 훨씬 큼). `/reset` 은 이제 이전 값을 유지하지만, 신규 설치의 기본 상한을 올릴지는 정책 결정이라 건드리지 않았다.

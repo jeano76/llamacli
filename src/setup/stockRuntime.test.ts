@@ -242,3 +242,17 @@ test("acceptableStockBackends: the machine's own accelerator, then its fallbacks
   assert.deepEqual(acceptableStockBackends("none", "linux", "x64"), ["cpu"]);
   assert.deepEqual(acceptableStockBackends("metal", "darwin", "arm64"), ["metal"]);
 });
+
+test("R1: when the accelerated prebuilt fails and a later rung works, the reason is TOLD at that moment (not only on total failure)", async () => {
+  const lines: string[] = [];
+  const got = await acquireStockLlamaServer({
+    hardware: hw({ gpuBackend: "cuda" }), installedRoot: "/nonexistent-llamacli", run: (async (f: string) => (f === "nvidia-smi" ? "CUDA Version: 12.9" : "")) as never,
+    releases: async () => [release], log: (l) => lines.push(l),
+    install: async (r) => `/x/${r.subdir}/llama-server`,
+    verify: async (bin) => (bin.includes("cuda") ? { ok: false, detail: "CUDA driver version is insufficient" } : { ok: true }),
+    build: (async () => { throw new Error("must not build"); }) as never,
+  });
+  assert.equal(got?.backend, "vulkan");
+  const told = lines.find((l) => /실행되지 않습니다/.test(l));
+  assert.ok(told && /insufficient/.test(told) && /다음 후보/.test(told), lines.join("\n"));
+});

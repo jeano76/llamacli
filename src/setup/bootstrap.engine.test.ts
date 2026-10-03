@@ -190,3 +190,34 @@ test("a FAILED download leaves modelPath unset — it must not point at a file t
     assert.equal(step?.ok, false);
     assert.equal(report.modelPath ?? "", "", `modelPath must stay empty, got ${report.modelPath}`);
   }));
+
+test("R4.2: a running server on a DIFFERENT model than the config is adopted untouched, and the mismatch is said out loud", () =>
+  withTempDir(async (dir) => {
+    await mkdir(join(dir, ".llamacli"), { recursive: true });
+    await writeFile(join(dir, ".llamacli", "config.yaml"), "llama:\n  modelPath: /m/B-Q4_K_M.gguf\n");
+    const s = spies();
+    const lines: string[] = [];
+    const report = await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free", log: (l) => lines.push(l),
+      detectServer: async () => ({ kind: "found" as const, server: { baseUrl: "http://127.0.0.1:8084", model: "/m/A-Q4_K_M.gguf" } }),
+      listExistingModels: async () => [], acquireStock: s.acquireStock,
+    });
+    assert.deepEqual(s.calls, { stock: 0 }, "nothing is acquired, nothing is stopped");
+    const step = report.steps.find((x) => x.name === "서버/설정 불일치");
+    assert.match(step?.detail ?? "", /A-Q4_K_M\.gguf.*B-Q4_K_M\.gguf/);
+    assert.match(step?.detail ?? "", /\/server restart/);
+    assert.ok(lines.some((l) => /다릅니다/.test(l)));
+  }));
+
+test("R4.2: a running server on the SAME model as the config adds no mismatch note", () =>
+  withTempDir(async (dir) => {
+    await mkdir(join(dir, ".llamacli"), { recursive: true });
+    await writeFile(join(dir, ".llamacli", "config.yaml"), "llama:\n  modelPath: /other/disk/A-Q4_K_M.gguf\n");
+    const s = spies();
+    const report = await ensureLocalStack({
+      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
+      detectServer: async () => ({ kind: "found" as const, server: { baseUrl: "http://127.0.0.1:8084", model: "/m/A-Q4_K_M.gguf" } }),
+      listExistingModels: async () => [], acquireStock: s.acquireStock,
+    });
+    assert.equal(report.steps.find((x) => x.name === "서버/설정 불일치"), undefined);
+  }));

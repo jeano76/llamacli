@@ -4,8 +4,8 @@
  * prints the lines.
  */
 import type { ServerReport } from "./serverReport.js";
-import type { SwitchOptions, SwitchResult } from "./modelSwitch.js";
-import { diffServer, gateServerReplacement } from "./serverPolicy.js";
+import { parseLlamaServerArgs, type PortOwner, type ResolvedServerPort, type SwitchOptions, type SwitchResult } from "./modelSwitch.js";
+import { diffServer, gateServerReplacement, type ServerGate } from "./serverPolicy.js";
 
 export interface RestartDeps {
   switchServer: (opts: SwitchOptions) => Promise<SwitchResult>;
@@ -65,4 +65,24 @@ export async function runServerRestart(input: RestartInput, deps: RestartDeps): 
   }
   const synced = sw.ok ? await deps.sync(report.configuredModel, { contextSize: tuning.contextSize }) : [];
   return { restarted: sw.ok, lines: [...sw.lines, ...synced] };
+}
+
+/**
+ * The `/models <n> [confirm]` side of the policy: may the switch to `modelPath` replace
+ * whatever is serving on `port`? Same gate `/server restart` uses; the selection itself is
+ * already recorded by the caller, so a refusal here loses nothing.
+ */
+export async function gateModelSwitch(
+  input: { port: number; modelPath: string; tuning: SwitchOptions["tuning"]; arg: string; confirmed: boolean },
+  deps: { resolvePort: (recorded: number) => Promise<ResolvedServerPort>; detectOwner: (port: number) => Promise<PortOwner> }
+): Promise<ServerGate> {
+  const resolved = await deps.resolvePort(input.port);
+  const owner = await deps.detectOwner(resolved.port);
+  const live = resolved.servers.find((x) => x.port === resolved.port);
+  return gateServerReplacement({
+    owner, port: resolved.port, servers: resolved.servers,
+    changes: diffServer(live ? parseLlamaServerArgs(live.cmdline) : undefined, undefined, { modelPath: input.modelPath, tuning: input.tuning as never }),
+    confirmed: input.confirmed,
+    confirmCommand: `/models ${input.arg} confirm`,
+  });
 }

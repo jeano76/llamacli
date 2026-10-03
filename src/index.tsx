@@ -26,16 +26,16 @@ import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
 import { installCrashHandlers } from "./crashHandler.js";
 import { ensureLocalStack } from "./setup/bootstrap.js";
 import { describeReset, describeInForce } from "./setup/resetDiff.js";
+import { previewReset } from "./setup/resetPreview.js";
 import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } from "./setup/modelMetrics.js";
 import { selectModel, recordServerPort, recordServerState } from "./setup/modelSelect.js";
 import { describeGpuPlan } from "./setup/gpuReport.js";
 import { isMoeModel, readGgufKvShape } from "./setup/ggufMeta.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
-import { switchModelAndServer, detectPortOwner, resolveLiveServerPort, parseLlamaServerArgs } from "./setup/modelSwitch.js";
-import { gateServerReplacement, diffServer } from "./setup/serverPolicy.js";
+import { switchModelAndServer, detectPortOwner, resolveLiveServerPort } from "./setup/modelSwitch.js";
 import { reportServer } from "./setup/serverReport.js";
-import { runServerRestart } from "./setup/serverCommand.js";
+import { runServerRestart, gateModelSwitch } from "./setup/serverCommand.js";
 import { provisionForSwitch } from "./setup/provision.js";
 import { transientProgress } from "./tui/transientProgress.js";
 import { totalmem } from "node:os";
@@ -1191,15 +1191,10 @@ async function main() {
               // Single-server policy: replacing a LIVE server needs an explicit `confirm`
               // (the selection itself is already recorded above, so declining loses nothing).
               {
-                const resolvedPort = await resolveLiveServerPort(result.port);
-                const owner = await detectPortOwner(resolvedPort.port);
-                const live = resolvedPort.servers.find((x) => x.port === resolvedPort.port);
-                const gate = gateServerReplacement({
-                  owner, port: resolvedPort.port, servers: resolvedPort.servers,
-                  changes: diffServer(live ? parseLlamaServerArgs(live.cmdline) : undefined, undefined, { modelPath: result.modelPath, tuning: tuning as never }),
-                  confirmed,
-                  confirmCommand: `/models ${arg} confirm`,
-                });
+                const gate = await gateModelSwitch(
+                  { port: result.port, modelPath: result.modelPath, tuning, arg, confirmed },
+                  { resolvePort: (r) => resolveLiveServerPort(r), detectOwner: (p) => detectPortOwner(p) }
+                );
                 if (!gate.proceed) {
                   ui?.pushStatus([...head, ...gate.lines.map((l) => `  · ${l}`), "  · 선택은 config 에 기록되어 있습니다."].join("\n"));
                   break;
@@ -1377,12 +1372,23 @@ async function main() {
             const arg = (argument ?? "").trim().toLowerCase();
             if (arg !== "confirm") {
               const llama = (config as any)?.llama ?? {};
+              const hwNow = await detectHardware();
+              const binDirNow = llama.binPath ? dirname(String(llama.binPath)) : undefined;
+              const preview = await previewReset({
+                config: config as any, hardware: hwNow,
+                ownServerVramGiB: await ownLlamaServerVramGiB(await findOwnLlamaServerPids(binDirNow)),
+              }).catch(() => undefined);
               ui?.pushStatus(
                 [
-                  "[reset] 현재 GPU·VRAM·RAM 기준으로 모델과 llama 설정을 다시 계산합니다.",
+                  "[reset] 현재 GPU·VRAM·RAM 기준으로 llama 설정을 다시 계산합니다 (미리보기 — 아직 아무것도 바꾸지 않았습니다).",
                   "  · 지금 설정: 모델 " + String((config as any)?.model ?? "(없음)"),
                   "  ·           컨텍스트 " + Number(llama.contextSize ?? 0).toLocaleString() +
                     " 토큰, 스레드 " + String(llama.threads ?? "?"),
+                  preview && !preview.repicksModel
+                    ? preview.changes.length > 0
+                      ? "  · 적용하면 바뀔 항목:\n" + preview.changes.map((c) => `      - ${c}`).join("\n")
+                      : "  · 적용해도 바뀔 항목이 없습니다 (이미 이 머신에 맞는 값)."
+                    : "  · 설정된 모델 파일이 없어 적용 시 이 머신에 맞는 모델을 새로 고릅니다.",
                   "  · 직접 입력한 값(apiKey·verify·browser·compaction)은 그대로 유지됩니다.",
                   "  · /models 로 직접 고른 모델은, 파일이 있고 이 머신에서 구동 가능하면 유지됩니다.",
                   "  · 실행 중인 서버는 건드리지 않습니다 — 적용은 /server restart (확인 후).",

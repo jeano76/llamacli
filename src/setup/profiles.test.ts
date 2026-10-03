@@ -51,6 +51,26 @@ const rows: Row[] = [
     expectBackend: "none", expectRungs: ["cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "manual" },
   { name: "win-nvidia", platform: "win32", ramGiB: 32, tools: ["winget", "git", "cmake"], cmds: { "nvidia-smi": "0, RTX 3060, 12288, 11000\n" },
     expectBackend: "cuda", expectRungs: ["cuda", "cpu"], expectModel: /Ornith-1.5-35B-A3B/, expectPlan: "winget" },
+  // ── §5 matrix rows (docs/provisioning-matrix-and-single-server-prompt.md) ──
+  { name: "nvidia-4gb-ram8", platform: "linux", ramGiB: 8, tools: [...base, "apt-get", "sudo"], cmds: { "nvidia-smi": "0, GTX 1650, 4096, 3800\n" },
+    expectBackend: "cuda", expectRungs: ["cuda", "vulkan", "cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "none" },
+  { name: "nvidia-24gb-ram8", platform: "linux", ramGiB: 8, tools: [...base, "apt-get", "sudo"], cmds: { "nvidia-smi": "0, RTX 4090, 24564, 24000\n" },
+    expectBackend: "cuda", expectRungs: ["cuda", "vulkan", "cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "none" },
+  { name: "amd-16gb-ram16", platform: "linux", ramGiB: 16, tools: [...base, "dnf", "sudo"], drm: { vendor: "0x1002", vramGiB: 16 },
+    expectBackend: "vulkan", expectRungs: ["vulkan", "cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "none" },
+  // Intel Arc exposes no sysfs VRAM counter, so it is found through `vulkaninfo`. VRAM is then unknown
+  // (0), and the model choice must therefore be the one that does not assume a GPU's memory.
+  { name: "intel-arc-vulkaninfo", platform: "linux", ramGiB: 32, tools: [...base, "apt-get", "sudo", "vulkaninfo"],
+    cmds: { vulkaninfo: "GPU0:\n\tdeviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\n\tdeviceName = Intel(R) Arc(tm) A770\n" },
+    expectBackend: "vulkan", expectRungs: ["vulkan", "cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "none" },
+  { name: "win-cpu-only", platform: "win32", ramGiB: 16, tools: ["winget", "git", "cmake"],
+    expectBackend: "none", expectRungs: ["cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "winget" },
+  { name: "win-nvidia-8gb-ram16", platform: "win32", ramGiB: 16, tools: ["winget", "git", "cmake"], cmds: { "nvidia-smi": "0, RTX 2070, 8192, 7400\n" },
+    expectBackend: "cuda", expectRungs: ["cuda", "cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "winget" },
+  { name: "mac-16gb", platform: "darwin", arch: "arm64", ramGiB: 16, tools: [...base, "brew"],
+    expectBackend: "metal", expectRungs: ["metal"], expectModel: /Ornith-1.5-9B/, expectPlan: "none" },
+  { name: "sudoless-nodeps", platform: "linux", ramGiB: 16, tools: ["apt-get"],
+    expectBackend: "none", expectRungs: ["cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "manual" },
 ];
 
 for (const r of rows) {

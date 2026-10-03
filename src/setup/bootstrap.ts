@@ -412,6 +412,15 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
       detail: `이미 실행 중인 서버를 사용합니다: ${running.baseUrl} (${running.model})`,
     });
     log(`이미 실행 중인 llama-server 에 연결합니다: ${running.baseUrl}`);
+    // Connecting is the safe default, but the user must not be left believing the server is
+    // serving what the config names. The adopt rewrites `model`, so compare BEFORE it does.
+    const configuredModel = typeof existing?.llama?.modelPath === "string" && existing.llama.modelPath ? existing.llama.modelPath : undefined;
+    if (configuredModel && running.model && basename(configuredModel) !== basename(running.model)) {
+      const note = `실행 중인 서버의 모델(${basename(running.model)})이 config 의 모델(${basename(configuredModel)})과 다릅니다 — ` +
+        "서버는 건드리지 않고 그대로 연결했습니다. 바꾸려면 /server 로 차이를 확인하고 /server restart 를 실행하세요.";
+      steps.push({ name: "서버/설정 불일치", ok: true, detail: note });
+      log(note);
+    }
     steps.push({ name: "포트 결정", ok: true, detail: `llama ${adoptedPort} (기존 서버)` });
     const adopted: Record<string, unknown> = {
       ...(existing ?? {}),
@@ -744,6 +753,10 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     moe,
     kvElementsPerToken: kvShape?.elementsPerToken,
     contextSize: pinnedContext,
+    reapplyContext:
+      opts.force && typeof before?.llama?.contextSize === "number" && before?.llama?.modelPath === modelPath
+        ? before.llama.contextSize
+        : undefined,
   });
   for (const r of tuning.rationale) log(r);
 

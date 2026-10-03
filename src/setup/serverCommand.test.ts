@@ -96,3 +96,74 @@ test("a failed start is reported and the record/sync steps are skipped", async (
   assert.deepEqual(calls, ["switch"]);
   assert.match(out.lines.join("\n"), /띄우지 못/);
 });
+
+// ── /models side + the cross-command sequence (C2, C3, C5, C15) ─────────────
+import { gateModelSwitch } from "./serverCommand.js";
+import { selectModel } from "./modelSelect.js";
+import { findRung } from "./modelMetrics.js";
+import { reportServer } from "./serverReport.js";
+
+const liveA = { pid: 42, port: 8084, cmdline: "llama-server -m /m/A-Q4_K_M.gguf --port 8084 -c 32768 -np 1" };
+const modelsDeps = (owner: PortOwner, servers = [liveA]) => ({
+  resolvePort: async (r: number) => ({ port: servers[0]?.port ?? r, source: "live" as const, servers }),
+  detectOwner: async () => owner,
+});
+
+test("gateModelSwitch: a live own server needs confirm; the command to run names the selection", async () => {
+  const g = await gateModelSwitch({ port: 8080, modelPath: "/m/B.gguf", tuning: {}, arg: "ornith-9b", confirmed: false }, modelsDeps({ kind: "ours", pid: 42 }));
+  assert.equal(g.proceed, false);
+  assert.match(g.lines.join("\n"), /A-Q4_K_M\.gguf → B\.gguf/);
+  assert.match(g.lines.join("\n"), /\/models ornith-9b confirm/);
+  const ok = await gateModelSwitch({ port: 8080, modelPath: "/m/B.gguf", tuning: {}, arg: "ornith-9b", confirmed: true }, modelsDeps({ kind: "ours", pid: 42 }));
+  assert.equal(ok.proceed, true);
+});
+
+test("gateModelSwitch: acts on the LIVE port, not the stale recorded one, and an idle machine needs no confirm", async () => {
+  const idle = await gateModelSwitch({ port: 8080, modelPath: "/m/B.gguf", tuning: {}, arg: "x", confirmed: false }, modelsDeps({ kind: "none" }, []));
+  assert.equal(idle.proceed, true);
+  const foreign = await gateModelSwitch({ port: 8080, modelPath: "/m/B.gguf", tuning: {}, arg: "x", confirmed: true }, modelsDeps({ kind: "foreign", pid: 3 }));
+  assert.equal(foreign.proceed, false);
+});
+
+test("C2→C3→C4→C5: select records only; /server shows the mismatch; restart needs confirm, then reflects it", async () => {
+  // In-memory config, as the harness in modelSelect.test does.
+  let cfg: Record<string, any> = { model: "/m/A-Q4_K_M.gguf", llama: { modelPath: "/m/A-Q4_K_M.gguf", port: 8084, contextSize: 32768, threads: 6, gpuLayers: 99 } };
+  const COMPAT = { location: { binPath: "/bin/llama-server", source: "path", backend: "cuda" }, rejected: [] };
+  const sel = await selectModel({
+    projectRoot: "/p", rung: findRung("ornith-9b")!, modelsDir: "/models",
+    readConfigFile: async () => cfg, writeConfigFile: async (_r: string, c: Record<string, unknown>) => { cfg = c as any; },
+    findServer: async () => COMPAT as any, detectRunningPort: async () => 8084, listLocalModels: async () => [],
+  } as never);
+  assert.match(String(cfg.model), /Ornith-1\.5-9B/, "C2: the selection is recorded");
+  assert.equal(cfg.model, cfg.llama.modelPath);
+  assert.equal(sel.requiresRestart, true);
+
+  // C3: /server sees the running server (still A) disagree with the config.
+  const rep = await reportServer({
+    config: cfg, projectRoot: "/p", detectOwner: async () => ({ kind: "ours", pid: 42 }),
+    resolvePort: async () => ({ port: 8084, source: "recorded", servers: [liveA] }),
+    findServer: async () => COMPAT as any,
+  });
+  assert.ok(rep.modelMismatch, "C3: the mismatch is visible");
+  assert.match(rep.restartPlan, /A-Q4_K_M\.gguf → Ornith-1\.5-9B/);
+
+  // C4 / C5
+  const { calls, d } = deps();
+  const tuning = { contextSize: 32768, threads: 6, gpuLayers: 99 };
+  await runServerRestart({ report: rep, tuning, confirmed: false }, d);
+  assert.deepEqual(calls, [], "C4: unconfirmed restart stops nothing");
+  const out = await runServerRestart({ report: rep, tuning, confirmed: true }, d);
+  assert.equal(out.restarted, true);
+  assert.equal(calls[0], `switch:8084:${cfg.llama.modelPath}`, "C5: the NEW model on the live port");
+});
+
+test("C15: a failing config write leaves no partial record", async () => {
+  const written: unknown[] = [];
+  await assert.rejects(selectModel({
+    projectRoot: "/p", rung: findRung("ornith-9b")!, modelsDir: "/models",
+    readConfigFile: async () => ({ model: "/m/A.gguf", llama: { modelPath: "/m/A.gguf" } }),
+    writeConfigFile: async () => { throw new Error("EROFS"); },
+    findServer: async () => ({ location: null, rejected: [] }) as any, detectRunningPort: async () => null, listLocalModels: async () => [],
+  } as never), /EROFS/);
+  assert.deepEqual(written, []);
+});

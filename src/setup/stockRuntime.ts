@@ -332,12 +332,15 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
       try {
         bin = await install(rung);
       } catch (err) {
-        attempts.push({ label: rung.label, ok: false, detail: err instanceof Error ? err.message : String(err) });
+        const why = err instanceof Error ? err.message : String(err);
+        attempts.push({ label: rung.label, ok: false, detail: why });
+        log(`${rung.label} 를 받지 못했습니다 (${why}) — 다음 후보로 넘어갑니다.`);
         continue;
       }
       const verdict = await verify(bin, rung.backend !== "cpu");
       if (!verdict.ok) {
         attempts.push({ label: rung.label, ok: false, binPath: bin, detail: `받았지만 실행되지 않음: ${verdict.detail ?? "알 수 없음"}` });
+        log(`${rung.label} 는 받았지만 이 머신에서 실행되지 않습니다 (${verdict.detail ?? "알 수 없음"}) — 다음 후보로 넘어갑니다.`);
         continue;
       }
       attempts.push({ label: rung.label, ok: true, binPath: bin });

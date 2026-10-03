@@ -152,6 +152,14 @@ export function tuneForHardware(
      * Hardware that shrank since is `/reset`'s job, which drops recorded llama values.
      */
     contextSize?: number;
+    /**
+     * `/reset` path: the context the user had before the reset. Unlike `contextSize` it is NOT trusted
+     * blindly — the hardware may have shrunk, which is what a reset is for — so it is re-applied only
+     * when the KV budget of THIS machine still supports it. (The ceiling below is a default for models
+     * whose KV cost is a guess; a 98,304-token context that was benchmarked on this card is not
+     * something a reset should quietly cut to 32,768.)
+     */
+    reapplyContext?: number;
   }
 ): LlamaTuning {
   const rationale: string[] = [];
@@ -257,6 +265,25 @@ export function tuneForHardware(
         `(직접 키운 값은 덮어쓰지 않습니다. 하드웨어가 바뀌었다면 /reset 으로 다시 계산하세요).`
     );
     contextSize = opts.contextSize;
+  }
+
+  if (contextSize < 8192) {
+    rationale.push(
+      `⚠ 컨텍스트가 ${contextSize} 토큰으로 매우 작습니다. 시스템 프롬프트와 도구 결과만으로 금방 차서 컴팩션이 잦아집니다 — ` +
+        "VRAM/RAM 이 더 큰 머신이나 더 작은 모델을 권장합니다."
+    );
+  }
+  if (opts?.reapplyContext !== undefined && opts.reapplyContext > contextSize) {
+    if (opts.reapplyContext <= kvBudgetTokens) {
+      rationale.push(
+        `이전 컨텍스트 ${opts.reapplyContext} 이(가) 이 머신의 KV 예산(${Math.floor(kvBudgetTokens)} 토큰) 안이라 유지합니다.`
+      );
+      contextSize = opts.reapplyContext;
+    } else {
+      rationale.push(
+        `이전 컨텍스트 ${opts.reapplyContext} 은(는) 이 머신의 KV 예산(${Math.floor(kvBudgetTokens)} 토큰)을 넘어 ${contextSize} 로 줄입니다.`
+      );
+    }
   }
 
   // --- KV cache precision -------------------------------------------------- //

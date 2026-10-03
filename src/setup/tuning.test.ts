@@ -328,3 +328,43 @@ test("budgetVramGiB never invents memory beyond the card", () => {
   // And a negative/garbage one cannot reduce the budget below the floor.
   assert.ok(budgetVramGiB(hw, gpu, -5 * GiB) >= 0.5);
 });
+
+// ── /reset re-applies a context this machine's KV budget still supports ─────
+{
+  const GiB2 = 1024 ** 3;
+  const hw8: any = {
+    cpuCount: 12, ramTotalBytes: 30 * GiB2, ramAvailableBytes: 24 * GiB2,
+    gpus: [{ index: 0, name: "NVIDIA RTX 2070 SUPER", vramTotalBytes: 8 * GiB2, vramFreeBytes: 7.4 * GiB2 }],
+    gpuBackend: "cuda", canBuildCuda: true, tools: {}, platform: "linux",
+  };
+  const base = { modelBytes: 20.36 * GiB2, moe: true, kvElementsPerToken: 10240 };
+
+  test("reapplyContext: a previous 98,304 that the KV budget supports survives the reset", () => {
+    const t = tuneForHardware(hw8, { ...base, reapplyContext: 98304 });
+    assert.equal(t.contextSize, 98304);
+    assert.ok(t.rationale.some((r) => /유지합니다/.test(r)));
+  });
+
+  test("reapplyContext: a previous value the shrunken card cannot hold is cut, with the reason", () => {
+    const tiny: any = { ...hw8, gpus: [{ ...hw8.gpus[0], vramTotalBytes: 4 * GiB2, vramFreeBytes: 3.2 * GiB2 }] };
+    const t = tuneForHardware(tiny, { ...base, reapplyContext: 4_000_000 });
+    assert.ok(t.contextSize < 4_000_000);
+    assert.ok(t.rationale.some((r) => /KV 예산/.test(r) && /줄입니다/.test(r)));
+  });
+
+  test("reapplyContext: absent, the default ceiling still applies", () => {
+    assert.equal(tuneForHardware(hw8, base).contextSize, 32768);
+  });
+}
+
+test("R2: a context below 8192 carries an explicit warning", () => {
+  const GiB3 = 1024 ** 3;
+  const tiny: any = {
+    cpuCount: 4, ramTotalBytes: 2 * GiB3, ramAvailableBytes: 1 * GiB3,
+    gpus: [{ index: 0, name: "NVIDIA GT 1030", vramTotalBytes: 2 * GiB3, vramFreeBytes: 1.6 * GiB3 }],
+    gpuBackend: "cuda", canBuildCuda: true, tools: {}, platform: "linux",
+  };
+  const t = tuneForHardware(tiny, { modelBytes: 5.1 * GiB3, moe: false, kvElementsPerToken: 131072 });
+  assert.ok(t.contextSize < 8192, `ctx ${t.contextSize}`);
+  assert.ok(t.rationale.some((r) => /⚠ 컨텍스트/.test(r)));
+});
