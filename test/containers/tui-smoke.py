@@ -21,10 +21,23 @@ def variants(tmp):
         "no-home":       dict(env={}, unset=["HOME"]),
         "bad-home":      dict(env={"HOME": "/nonexistent/home"}),
         "no-mouse":      dict(env={"LLAMACLI_MOUSE": "0"}),
+        # The unwritable-HOME cases are only meaningful WITHOUT a config: they exercise the first-run path that wants to
+        # create ~/models and ~/.llamacli. On a clean machine that path also reaches out to the internet, so these run only
+        # when SMOKE_FRESH=1 (locally, where a running server is adopted and the attempt fails fast with a warning).
+        **({
+            "ro-home-fresh":  dict(env={"HOME": ro_home}, fresh=True),
+            "bad-home-fresh": dict(env={"HOME": "/nonexistent/home"}, fresh=True),
+        } if os.environ.get("SMOKE_FRESH") == "1" else {}),
     }
 
 def run_variant(name, spec, tmp):
     proj = tempfile.mkdtemp(prefix=f"smoke-{name}-", dir=tmp)
+    # A configured, unreachable endpoint: without it a CLEAN machine starts the first-run provisioning (engine and model
+    # downloads from the internet), which is a different scenario and takes minutes. This test is about the terminal.
+    if not spec.get("fresh"):
+        os.makedirs(os.path.join(proj, ".llamacli"), exist_ok=True)
+        with open(os.path.join(proj, ".llamacli", "config.yaml"), "w") as f:
+            f.write("backend: openai-compatible\nbaseUrl: http://127.0.0.1:9/v1\nmodel: smoke\n")
     env = dict(os.environ, TERM="xterm-256color", LLAMACLI_NO_UPDATE="1", COLUMNS=str(COLS), LINES=str(ROWS))
     env.update(spec.get("env", {}))
     for k in spec.get("unset", []): env.pop(k, None)
@@ -65,7 +78,9 @@ def run_variant(name, spec, tmp):
             break
     try: os.close(fd)
     except Exception: pass
-    bad = [w for w in ("TypeError", "ReferenceError", "ENOENT", "EACCES", "EROFS", "Unhandled", "    at ") if w in text]
+    # A "[설정 경고]" line is the app DEGRADING GRACEFULLY (e.g. cannot create ~/models): reported, not a crash.
+    shown = "\n".join(l for l in text.splitlines() if "[설정 경고]" not in l)
+    bad = [w for w in ("TypeError", "ReferenceError", "ENOENT", "EACCES", "EROFS", "Unhandled", "    at ") if w in shown]
     banner = ready_at is not None  # the TUI frame itself, not merely a startup notice that mentions "llamacli"
     ok = alive and banner and not bad
     return dict(id=name, ok=ok, ready_seconds=ready_at, alive=alive, exit=exited, banner=banner, errors_on_screen=bad, screen_tail=text.splitlines()[-6:])
