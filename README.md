@@ -213,7 +213,7 @@ browser: { debugPort: 9222 }
 
 ## 테스트와 검증
 
-단위 테스트 **1,277개**(`npm test`, `node:test` + `tsx`, 추가 프레임워크 없음; Linux 전부 통과). 그 위에 환경별 검증을 얹었습니다. 아래 표의 결과는 **실제로 실행한 값**이고, 실행하지 못한 것은 따로 적었습니다.
+단위 테스트 **1,283개**(`npm test`, `node:test` + `tsx`, 추가 프레임워크 없음; Linux 전부 통과). 그 위에 환경별 검증을 얹었습니다. 아래 표의 결과는 **실제로 실행한 값**이고, 실행하지 못한 것은 따로 적었습니다.
 `npm run matrix:all` 이 로컬에서 가능한 것을 한꺼번에 돌립니다.
 
 | 방법 | 검증 대상 | 명령 | 결과 |
@@ -227,14 +227,15 @@ browser: { debugPort: 9222 }
 | 서버 정책, 실제 프로세스 | 미확정 재시작은 pid 유지, 확정은 같은 포트에서 교체, 외부 리스너 보존, 실제 CUDA-OOM 메시지로 보정 재시도 | `npx tsx scripts/live_single_server_check.ts` | 통과 |
 | 클립보드 왕복 | 한글+이모지+개행을 앱의 복사 코드로 복사 후 다시 읽기 (개발 머신에서는 클립보드를 저장·복원) | `npm run matrix:clipboard` | Linux·macOS·Windows ✅ |
 | 실제 TUI 드래그 | Shift 없는 드래그가 `wl-paste` 로 읽힘 | pty | ✅ |
+| **실제 llama-server end-to-end** | Hub 의 1.1 MB GGUF(해시 검증) → GitHub 의 stock 사전빌드를 엔진 사다리로 받아 실행 검증 → 실제 llama-server 기동 → `/health` → 채팅 응답 → 종료·포트 해제 | `node test/e2e/real-server.mjs` | Linux(CPU) 7/7 (로컬·CI) · Windows(CPU) 7/7 · macOS(**Metal**) 7/7 (CI) |
 | 실제 GPU·모델 | RTX 2070 SUPER + Ornith-35B, `-c 98304` 에서 보정(36→33, 33 유지, 32→33, 31 은 OOM 후 재시도) | 수동 | ✅ (사용자 서버를 허락받고 내렸다가 복구) |
 
 ### CI (GitHub Actions)
 
 | 워크플로 | 러너 | 검증 | 최근 결과 |
 |---|---|---|---|
-| `windows.yml` | `windows-latest` (NT 10.0.26100, 4코어, 16 GiB) | 배포 `bin/` 을 pwsh·Windows PowerShell·cmd·Git-Bash 에서: GPU 없음, CPU 사다리, `winget`; 다운로드; PowerShell 클립보드; 단위 테스트(정보용) | 프로브 4/4, 다운로드 6/6, 클립보드 ✅, 단위 **1,271 통과 / 6 건너뜀(Windows 에 해당 없음) / 0 실패** (총 1,277) |
-| `macos.yml` | `macos-14` (Apple M1, 가상) | zsh·bash·sh 프로브 → **Metal**, `brew`, `-ngl > 0`; 다운로드; `pbcopy` | 프로브 3/3, 다운로드 6/6, `pbcopy` ✅ |
+| `windows.yml` | `windows-latest` (NT 10.0.26100, 4코어, 16 GiB) | 배포 `bin/` 을 pwsh·Windows PowerShell·cmd·Git-Bash 에서: GPU 없음, CPU 사다리, `winget`; 다운로드; PowerShell 클립보드; **실제 llama-server e2e**; **ConPTY 에서 실제 TUI 스모크 4/4**; 단위 테스트 | 프로브 4/4, 다운로드 6/6, 클립보드 ✅, 단위 **1,271 통과 / 6 건너뜀(Windows 에 해당 없음) / 0 실패** (총 1,277) |
+| `macos.yml` | `macos-14` (Apple M1, 가상) | zsh·bash·sh 프로브 → **Metal**, `brew`, `-ngl > 0`; 다운로드; `pbcopy`; **실제 llama-server(Metal) e2e**; **pty 에서 실제 TUI 스모크 4/4**; 드래그 복사 | 프로브 3/3, 다운로드 6/6, `pbcopy` ✅ |
 | `linux.yml` | `ubuntu-latest` | `tsc`, 단위 테스트, 빌드, 호스트·컨테이너 매트릭스, TUI 스모크(`CI=true` 변형 포함), Xvfb+`xclip` | **전 단계 통과** — 단위 1,277 / 1,277, 호스트 매트릭스, 다운로드, TUI 스모크, 컨테이너, X11 클립보드 |
 
 CI 가 찾은 결함은 Linux 단위 테스트로는 볼 수 없던 것들입니다: `CI=true` 환경에서 TUI 가 아예 그려지지 않던 것(Ink 의 CI 모드), Windows 에서 모델 경로를 `/` 로만 잘라 이름이 전체 경로로 나오고 같은 모델의 다른 양자화 재사용이 실패했고,
@@ -242,8 +243,8 @@ Apple Silicon 이 `-ngl 0`(CPU 전용)으로 튜닝되고 있었습니다. 둘 �
 
 ### 검증하지 못한 것
 
-- Windows·macOS 에서 **실제 llama-server 기동**, Windows 의 GPU, 실제 GPU 는 로컬의 한 장(RTX 2070 SUPER)만.
-- Windows Terminal·conhost·Terminal.app·iTerm2 에서의 대화형 TUI(마우스, OSC 52), `winget` 설치.
+- Windows 의 **GPU**(CUDA/Vulkan)와 로컬 한 장(RTX 2070 SUPER) 외의 실제 GPU. Windows·macOS 의 실제 llama-server 기동은 이제 CPU/Metal 빌드로 확인됨(위 표) — 큰 모델·GPU 오프로드는 아님.
+- Windows Terminal·conhost·Terminal.app·iTerm2 **앱 자체**에서의 TUI(러너는 ConPTY/pty 로 구동하므로 그 아래층까지만), `winget` 설치.
 - Windows 에서 건너뛰는 단위 테스트 6개는 해당 없는 동작입니다(`/media`·`/mnt` 마운트 2, POSIX 사용자 공간 cmake 1, 실행 권한 비트 2, 심볼릭 링크 1). 예전에 건너뛰던 44개는 이제 실행됩니다 — 경로·`.exe` 이름을 OS 에 맞게 정규화하고(`src/testSupport.ts`), Windows 에서도 실제로 실행되는 가짜 llama-server(Node 단일 실행 파일, `postject`)를 써서.
 - 컨테이너 이미지에는 설정 모듈만 있고 TUI 의존성은 없습니다(TUI 는 호스트 pty 로만 검증). WSL, Wine(`test/windows/wine-check.sh` 는 있으나 미실행), 실제 Vulkan/ROCm 하드웨어.
 

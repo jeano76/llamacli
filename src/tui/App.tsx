@@ -16,7 +16,7 @@ import { setCursorPlacement, clearCursorPlacement } from "./cursorPlacement.js";
 import { existsSync } from "node:fs";
 import { isLikelyPaste, looksLikePastedFilePath, formatPasteLabel, findTrailingPlaceholder, substitutePlaceholders } from "./pasteChip.js";
 import {
-  rowRange, selectionText, copySelection, describeCopy, isSelectionEmpty, stripAnsiForCopy,
+  rowRange, selectionText, selectionBetweenCells, copySelection, describeCopy, isSelectionEmpty, stripAnsiForCopy,
   type Selection, type LogPoint,
 } from "./selection.js";
 
@@ -1147,7 +1147,7 @@ export function App({
    *  a press, several motion reports and the release together, and by the time
    *  the state update for the press had been applied the release handler would
    *  still have read `drag === null` and thrown the gesture away. */
-  const dragRef = useRef<{ moved: boolean; sel: Selection } | null>(null);
+  const dragRef = useRef<{ moved: boolean; sel: Selection; cell?: LogPoint } | null>(null);
   const rowCacheRef = useRef(new Map<number, { text: string; width: number; rows: string[] }>());
   // The terminal row of the input box's top border, from the PREVIOUS
   // render — see the cursor-positioning effect below for why this exists.
@@ -1443,7 +1443,7 @@ export function App({
           for (const { row, col } of parseMouseClicks(char)) {
             if (!isLogBodyRow(row, firstRow, entries.length)) continue;
             const sel: Selection = { anchor: { row: sliceStart + (row - firstRow), col: col - 1 }, head: { row: sliceStart + (row - firstRow), col: col - 1 } };
-            dragRef.current = { moved: false, sel };
+            dragRef.current = { moved: false, sel, cell: sel.anchor };
             setDrag({ anchor: sel.anchor, pointerRow: row, pointerCol: col, moved: false });
             setStickySelection(null);
             break;
@@ -1456,14 +1456,15 @@ export function App({
           const current = dragRef.current;
           const last = drags[drags.length - 1];
           if (current) {
-            const head = { row: sliceStart + (last.row - firstRow), col: Math.max(0, last.col - 1) };
-            const sel: Selection = { anchor: current.sel.anchor, head };
+            const cell = current.cell ?? current.sel.anchor; // the cell the button went down on (the selection's own anchor shifts with direction)
+            const pointerCell = { row: sliceStart + (last.row - firstRow), col: Math.max(0, last.col - 1) };
+            const sel: Selection = selectionBetweenCells(cell, pointerCell);
             // A motion with the button held is a drag even if the pointer
             // landed back on the same row/col — the user moved the mouse, and
             // the release is what actually decides. `moved` only has to be true
             // here so the release is not mistaken for a click.
-            dragRef.current = { moved: true, sel };
-            setDrag({ anchor: current.sel.anchor, pointerRow: last.row, pointerCol: last.col, moved: true });
+            dragRef.current = { moved: true, sel, cell };
+            setDrag({ anchor: cell, pointerRow: last.row, pointerCol: last.col, moved: true });
           } else {
             // Motion with no press tracked (e.g. the press was swallowed as a
             // paste/multi-byte read, or the app started mid-gesture). Nothing to extend.
@@ -2449,13 +2450,10 @@ export function App({
     drag !== null && !drag.moved
       ? { anchor: drag.anchor, head: drag.anchor }
       : drag !== null
-        ? {
-            anchor: drag.anchor,
-            head: {
-              row: clickMapRef.current.sliceStart + (drag.pointerRow - clickMapRef.current.firstRow),
-              col: Math.max(0, drag.pointerCol - 1),
-            },
-          }
+        ? selectionBetweenCells(drag.anchor, {
+            row: clickMapRef.current.sliceStart + (drag.pointerRow - clickMapRef.current.firstRow),
+            col: Math.max(0, drag.pointerCol - 1),
+          })
         : stickySelection;
 
   const inputBorderColor = quitting || quitConfirmPending || resumeConfirmPending

@@ -41,6 +41,21 @@ export interface Selection {
 
 export const EMPTY_SELECTION: Selection | null = null;
 
+/**
+ * The selection for a drag from the cell where the button went down (`anchorCell`) to the cell the pointer is on now
+ * (`pointerCell`), BOTH cells included — what every terminal does, and what `Selection` (whose end is exclusive) needs
+ * a +1 to express. Dragging across "[server]" from its `[` to its `]` used to copy "[server": the cell under the pointer
+ * at release was left out. A backward drag keeps the anchor cell by moving the anchor to the cell's far boundary.
+ * Cells are 0-based log columns.
+ */
+export function selectionBetweenCells(anchorCell: LogPoint, pointerCell: LogPoint): Selection {
+  const forward =
+    pointerCell.row > anchorCell.row || (pointerCell.row === anchorCell.row && pointerCell.col >= anchorCell.col);
+  return forward
+    ? { anchor: anchorCell, head: { row: pointerCell.row, col: pointerCell.col + 1 } }
+    : { anchor: { row: anchorCell.row, col: anchorCell.col + 1 }, head: pointerCell };
+}
+
 /** Normalizes a selection so it runs from the earlier point to the later one,
  *  in reading order. Dragging up and to the right of the start must select the
  *  same text as dragging down and to the left — the single most common way a

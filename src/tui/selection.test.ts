@@ -235,3 +235,31 @@ test("a tool that throws is treated as unavailable, never as a failed copy", asy
   });
   assert.notEqual(r.via, "system");
 });
+
+// ── a drag includes the cell under the pointer at BOTH ends ─────────────────
+import { selectionBetweenCells } from "./selection.js";
+
+const LINE = [{ text: "[server] 포트 8080 · 실행 중" }];
+
+test("dragging from the first cell of a word to its last copies the whole word (the last cell is included)", () => {
+  // `[` is cell 0, `]` is cell 7 of "[server]".
+  assert.equal(selectionText(selectionBetweenCells({ row: 0, col: 0 }, { row: 0, col: 7 }), LINE), "[server]");
+});
+
+test("a backward drag selects the same text, anchor cell included", () => {
+  assert.equal(selectionText(selectionBetweenCells({ row: 0, col: 7 }, { row: 0, col: 0 }), LINE), "[server]");
+});
+
+test("a drag that moves but stays on the press cell selects exactly that one cell", () => {
+  assert.equal(selectionText(selectionBetweenCells({ row: 0, col: 3 }, { row: 0, col: 3 }), LINE), "r");
+});
+
+test("multi-row: both end cells are included, the rows between in full", () => {
+  const rows = [{ text: "abcdef" }, { text: "ghijkl" }, { text: "mnopqr" }];
+  assert.equal(selectionText(selectionBetweenCells({ row: 0, col: 4 }, { row: 2, col: 1 }), rows), "ef\nghijkl\nmn");
+  assert.equal(selectionText(selectionBetweenCells({ row: 2, col: 1 }, { row: 0, col: 4 }), rows), "ef\nghijkl\nmn");
+});
+
+test("the pointer past the end of a short row still selects only what exists", () => {
+  assert.equal(selectionText(selectionBetweenCells({ row: 0, col: 0 }, { row: 0, col: 90 }), [{ text: "abc" }]), "abc");
+});

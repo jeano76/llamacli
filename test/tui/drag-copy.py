@@ -7,6 +7,8 @@ Locally it saves and restores the developer's clipboard; in CI it just checks.
     python3 test/tui/drag-copy.py            (env: LLAMACLI_DIST_INDEX to point at another dist/index.js)
 """
 import os, re, subprocess, sys, tempfile, time, shutil, pyte
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows consoles default to cp1252; the screen text is Korean
+except Exception: pass
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from term import Term, IS_WIN
 from stub import ensure_server
@@ -70,8 +72,10 @@ try:
         print("FAIL: /server printed nothing to drag over"); print("\n".join(l.rstrip() for l in screen.display if l.strip())[-600:]); raise SystemExit(1)
     line = screen.display[target - 1]
     c0 = line.index("[server]") + 1
-    c1 = c0 + 20
-    expected = line[c0 - 1:c1].rstrip()
+    # Only the ASCII label: a wide (Korean) character occupies two terminal cells, and how a screen model indexes those
+    # differs between terminals/libraries — this test is about the clipboard, not about cell arithmetic.
+    c1 = c0 + len("[server]") - 1
+    expected = "[server]"
     term.write(f"\x1b[<0;{c0};{target}M"); pump(0.4)
     for c in range(c0 + 1, c1 + 1, 4):
         term.write(f"\x1b[<32;{c};{target}M"); pump(0.12)

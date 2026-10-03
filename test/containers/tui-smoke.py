@@ -6,6 +6,8 @@ resume prompt and never touches a real project.
     python3 test/containers/tui-smoke.py [variant ...]   (needs `pip install pyte`)
 """
 import re, os, pyte, time, sys, tempfile, shutil, json, stat
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows consoles default to cp1252; the screen text is Korean
+except Exception: pass
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tui"))
 from term import Term, IS_WIN
 from stub import ensure_server
@@ -81,5 +83,5 @@ if __name__ == "__main__":
         print(("PASS" if r["ok"] else "FAIL"), r["id"].ljust(14), f"alive={r['alive']} tui_ready_after={r['ready_seconds']}s errors={r['errors_on_screen']}")
         if not r["ok"]: print("      screen tail:", " | ".join(r["screen_tail"]))
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"); os.makedirs(out, exist_ok=True)
-    json.dump(results, open(os.path.join(out, "tui-smoke.json"), "w"), ensure_ascii=False, indent=2)
+    json.dump(results, open(os.path.join(out, "tui-smoke.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     sys.exit(0 if all(r["ok"] for r in results) else 1)
