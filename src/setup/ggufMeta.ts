@@ -100,6 +100,8 @@ export interface KvShape {
   layers: number;
   /** True for hybrids: only every Nth layer is full attention, the rest keep a fixed-size state. */
   hybrid: boolean;
+  /** The context length the model was trained for (`<arch>.context_length`), when the header says. */
+  contextLength?: number;
 }
 
 const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined);
@@ -143,7 +145,7 @@ export function kvShapeFromKeys(keys: Record<string, number | string | number[]>
   } else if (kvHeads) {
     elements = attentionLayers * kvHeads * (keyLen + valLen);
   } else return undefined;
-  return { elementsPerToken: elements, attentionLayers, layers, hybrid };
+  return { elementsPerToken: elements, attentionLayers, layers, hybrid, contextLength: num(k("context_length")) };
 }
 
 /** Bytes per element of a llama.cpp KV cache type (block-quantized types amortize their scales). */

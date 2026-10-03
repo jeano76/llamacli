@@ -352,8 +352,8 @@ test("budgetVramGiB never invents memory beyond the card", () => {
     assert.ok(t.rationale.some((r) => /KV 예산/.test(r) && /줄입니다/.test(r)));
   });
 
-  test("reapplyContext: absent, the default ceiling still applies", () => {
-    assert.equal(tuneForHardware(hw8, base).contextSize, 32768);
+  test("reapplyContext: absent, the exact-KV ceiling (98,304) applies", () => {
+    assert.equal(tuneForHardware(hw8, base).contextSize, 98304);
   });
 }
 

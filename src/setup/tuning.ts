@@ -74,6 +74,11 @@ const MAX_CPU_MOE_FRACTION = 0.4;
  *  real limit is RAM (CPU-only inference pays the same KV cost, just slower). */
 const MIN_CONTEXT = 4096;
 const MAX_CONTEXT = 32768;
+/** Ceiling when the KV cost is EXACT (read from the model header) rather than a size guess: the largest
+ *  context benchmarked end-to-end on this project's reference box (docs/model-bench-2026-10-03.md —
+ *  98,304 tokens, 8 GiB card, compaction at 70% / re-prefill included). Beyond it the KV budget may allow
+ *  more, but the prefill cost of a compaction is unmeasured, so it is not claimed. */
+const EXACT_KV_MAX_CONTEXT = 98304;
 
 /**
  * Bytes of KV cache per token of context, from the model file size alone.
@@ -144,6 +149,10 @@ export function tuneForHardware(
      * Absent (model not downloaded yet, header unreadable) keeps the old estimate.
      */
     kvElementsPerToken?: number;
+    /** The model's trained context length from its header; the exact-KV ceiling never exceeds it. */
+    trainedContext?: number;
+    /** Transformer block count from the header; lets a dense model that exceeds VRAM be offloaded partially. */
+    modelLayers?: number;
     /**
      * A context size already chosen — in config.yaml, or measured. It is honoured when it is LARGER
      * than the one derived here: a person who raised it did so on purpose (the derived value is a
@@ -245,14 +254,23 @@ export function tuneForHardware(
   // inventing a setting nobody has ever run.
   const RESERVE_FRACTION = 0.25;
   const RESERVE_FLOOR_GIB = 0.5;
-  const reserveGiB = gpu ? Math.max(RESERVE_FLOOR_GIB, budgetGiB * RESERVE_FRACTION) : 0;
+  let reserveGiB = gpu ? Math.max(RESERVE_FLOOR_GIB, budgetGiB * RESERVE_FRACTION) : 0;
+  // A DENSE model keeps every weight resident, so the 25% fraction (calibrated on a MoE whose experts
+  // stream from RAM) under-reserves it. That was hidden while the context was capped at 32,768; with the
+  // larger exact-KV ceiling the KV term can otherwise claim the room the weights need.
+  if (gpu && exactKv && opts?.moe === false && modelBytes) {
+    reserveGiB = Math.max(reserveGiB, Math.min(modelBytes / GiB + 0.5, budgetGiB * 0.9));
+  }
   const kvBudgetGiB = Math.max(0.25, budgetGiB - reserveGiB);
   const kvBudgetTokens = (kvBudgetGiB * GiB) / kvPerToken;
   // 4096-aligned because llama.cpp's practical granularity for a coding
   // agent's prompt shapes is a coarse block, and a round number is legible in
   // /props and the logs when diagnosing "why did compaction fire".
   let contextSize = Math.floor(kvBudgetTokens / 4096) * 4096;
-  contextSize = Math.max(MIN_CONTEXT, Math.min(MAX_CONTEXT, contextSize));
+  const ceiling = exactKv
+    ? Math.min(EXACT_KV_MAX_CONTEXT, opts?.trainedContext ? Math.floor(opts.trainedContext / 4096) * 4096 : Infinity)
+    : MAX_CONTEXT;
+  contextSize = Math.max(MIN_CONTEXT, Math.min(ceiling, contextSize));
   rationale.push(
     `컨텍스트는 ${contextSize} 토큰으로 설정했습니다 (사용 가능 VRAM ≈ ${budgetGiB.toFixed(1)} GiB, ` +
       `KV 예산 ≈ ${kvBudgetGiB.toFixed(1)} GiB ÷ ${(kvPerToken / 1024).toFixed(1)} KiB/토큰` +
@@ -282,6 +300,23 @@ export function tuneForHardware(
     } else {
       rationale.push(
         `이전 컨텍스트 ${opts.reapplyContext} 은(는) 이 머신의 KV 예산(${Math.floor(kvBudgetTokens)} 토큰)을 넘어 ${contextSize} 로 줄입니다.`
+      );
+    }
+  }
+
+  // A DENSE model has no experts to stream: the weights either fit on the card or the layers that do not
+  // fit run on the CPU. `-ngl 999` on a 5.1 GiB model and a 4 GiB card is a load-time OOM, not an
+  // optimisation, so offload only the share of layers the card can hold beside the KV cache.
+  if (gpu && opts?.moe === false && modelBytes && opts.modelLayers && opts.modelLayers > 0) {
+    const modelGiB = modelBytes / GiB;
+    const kvGiB = (contextSize * kvPerToken) / GiB;
+    const room = budgetGiB - 0.5 - kvGiB;
+    if (room < modelGiB) {
+      const share = Math.max(0, room / modelGiB);
+      gpuLayers = Math.floor(opts.modelLayers * share);
+      rationale.push(
+        `밀집 모델(${modelGiB.toFixed(1)} GiB)이 VRAM 여유(${Math.max(0, room).toFixed(1)} GiB)보다 커서 ` +
+          `${opts.modelLayers}층 중 ${gpuLayers}층만 GPU 로 올립니다 (나머지는 CPU) — -ngl 999 는 로드 시 메모리 부족이 됩니다.`
       );
     }
   }

@@ -26,7 +26,9 @@ for (const vram of [0, 4, 6, 8, 12, 16, 24, 48]) {
       const hw = hwOf(vram, ram);
       const m = chooseModel({ vramTotalBytes: vram * GiB, vramFreeBytes: vram * GiB * 0.92, ramTotalBytes: ram * GiB, candidates35b: C35, candidates9b: C9 });
       const moe = /35B/.test(m.candidate.filename);
-      const t = tuneForHardware(hw, { modelBytes: m.candidate.sizeBytes, moe, kvElementsPerToken: KV });
+      const t = tuneForHardware(hw, { modelBytes: m.candidate.sizeBytes, moe, kvElementsPerToken: KV, modelLayers: 32 });
+      // R2: a dense model larger than the card is offloaded partially, never with -ngl 999.
+      if (!moe && vram > 0 && vram * 0.92 - 0.5 < 5.1) assert.ok(t.gpuLayers < 999, `dense ${5.1} GiB on ${vram} GiB got -ngl ${t.gpuLayers}`);
 
       // R3: the 35B (20.4 GiB) is only chosen where its weights fit in RAM+VRAM-ish terms.
       if (moe) assert.ok(ram >= 24, `35B chosen with only ${ram} GiB RAM`);
@@ -37,7 +39,7 @@ for (const vram of [0, 4, 6, 8, 12, 16, 24, 48]) {
       // A card that holds the whole model needs no expert streaming.
       if (moe && vram >= 24) assert.equal(t.cpuMoeLayers, 0);
       // R2: bounded context, and a stated reason for every non-obvious choice.
-      assert.ok(t.contextSize >= 4096 && t.contextSize <= 32768, `ctx ${t.contextSize}`);
+      assert.ok(t.contextSize >= 4096 && t.contextSize <= 98304, `ctx ${t.contextSize}`);
       assert.ok(t.rationale.length > 0);
       // R3: a model larger than the machine's RAM must be warned about, never chosen silently.
       if (m.candidate.sizeBytes > ram * GiB * 0.9) assert.match(m.reason, /부족|느릴|메모리|RAM/, `no warning: ${m.reason}`);

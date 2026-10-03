@@ -40,7 +40,7 @@ export async function previewReset(opts: {
   const moe = await isMoeModel({ path: modelPath, filename: modelPath.split("/").pop() }).catch(() => undefined);
   const kv = await readGgufKvShape(modelPath).catch(() => undefined);
   const t = tuneForHardware(hardware, {
-    modelBytes: size, moe, kvElementsPerToken: kv?.elementsPerToken, ownServerVramGiB: opts.ownServerVramGiB,
+    modelBytes: size, moe, kvElementsPerToken: kv?.elementsPerToken, trainedContext: kv?.contextLength, modelLayers: kv?.layers, ownServerVramGiB: opts.ownServerVramGiB,
     reapplyContext: typeof config?.llama?.contextSize === "number" ? config.llama.contextSize : undefined,
   });
   const after = {

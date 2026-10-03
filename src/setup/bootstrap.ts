@@ -752,6 +752,8 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     ownServerVramGiB,
     moe,
     kvElementsPerToken: kvShape?.elementsPerToken,
+    trainedContext: kvShape?.contextLength,
+    modelLayers: kvShape?.layers,
     contextSize: pinnedContext,
     reapplyContext:
       opts.force && typeof before?.llama?.contextSize === "number" && before?.llama?.modelPath === modelPath

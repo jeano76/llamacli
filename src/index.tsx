@@ -1280,7 +1280,7 @@ async function main() {
                   // The file is on disk by now, so its KV cost is read from the header. No recorded
                   // context is passed: it belonged to the previous model's KV cost.
                   const kv2 = await readGgufKvShape(modelPath);
-                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes, moe, kvElementsPerToken: kv2?.elementsPerToken });
+                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes, moe, kvElementsPerToken: kv2?.elementsPerToken, trainedContext: kv2?.contextLength, modelLayers: kv2?.layers });
                   return { tuning: t2, lines: describeGpuPlan(hw2, t2) };
                 },
               });

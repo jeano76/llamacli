@@ -200,16 +200,18 @@ test("readGgufKvShape on a missing file is undefined, not a throw", async () => 
 // ── the tuner ───────────────────────────────────────────────────────────────
 const QWEN_ELEMENTS = 10240, DENSE_ELEMENTS = 32768;
 
-test("tuner: Qwen3.6's real KV cost lifts the context from the size-guess's 20,480 to the 32,768 ceiling", () => {
+test("tuner: Qwen3.6's real KV cost lifts the context from the size-guess's 20,480 to the 98,304 exact-KV ceiling", () => {
   const guessed = tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true });
   const exact = tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true, kvElementsPerToken: QWEN_ELEMENTS });
   assert.equal(guessed.contextSize, 20480, "the old behaviour (what the field config had)");
-  assert.equal(exact.contextSize, 32768);
+  assert.equal(exact.contextSize, 98304);
   assert.ok(exact.rationale.some((r) => /모델 헤더에서 읽은 실제 값/.test(r)));
 });
 
-test("tuner: the exact path does not change what a dense model gets, and expert streaming stays at the cap", () => {
-  assert.equal(tuneForHardware(hw, { modelBytes: 5.54 * GiB, moe: false, kvElementsPerToken: DENSE_ELEMENTS }).contextSize, 32768);
+test("tuner: a dense model's weights are reserved before the (now larger) KV term, and expert streaming stays at the cap", () => {
+  // 5.54 GiB resident + 98,304 tokens of a 32k-element KV (~3.4 GiB) would not fit this card; the weights come first.
+  const dense = tuneForHardware(hw, { modelBytes: 5.54 * GiB, moe: false, kvElementsPerToken: DENSE_ELEMENTS }).contextSize;
+  assert.ok(dense >= 4096 && dense < 98304, `dense ctx ${dense}`);
   assert.equal(tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true, kvElementsPerToken: QWEN_ELEMENTS }).cpuMoeLayers, 32);
 });
 
@@ -220,14 +222,14 @@ test("tuner: without a header nothing changes (legacy estimate and legacy cpu-mo
 });
 
 test("tuner: a recorded context LARGER than the derived one is kept (the measured 98,304)", () => {
-  const t = tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true, kvElementsPerToken: QWEN_ELEMENTS, contextSize: 98304 });
-  assert.equal(t.contextSize, 98304);
-  assert.ok(t.rationale.some((r) => /98304.*그대로 유지/.test(r)));
+  const t = tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true, kvElementsPerToken: QWEN_ELEMENTS, contextSize: 131072 });
+  assert.equal(t.contextSize, 131072);
+  assert.ok(t.rationale.some((r) => /131072.*그대로 유지/.test(r)));
 });
 
 test("tuner: a recorded context SMALLER than the derived one is just an old derivation and is replaced", () => {
   const t = tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true, kvElementsPerToken: QWEN_ELEMENTS, contextSize: 20480 });
-  assert.equal(t.contextSize, 32768);
+  assert.equal(t.contextSize, 98304);
 });
 
 test("tuner: a MoE that barely overflows the card needs far fewer CPU experts once the KV term is exact", () => {
@@ -241,4 +243,23 @@ test("tuner: the KV precision still follows the budget, and q4_0 halves the exac
   const small: Hardware = { ...hw, gpus: [{ index: 0, name: "tiny", vramTotalBytes: 3.5 * GiB, vramFreeBytes: 3.5 * GiB }] };
   const t = tuneForHardware(small, { modelBytes: 2 * GiB, moe: false, kvElementsPerToken: 20000 });
   assert.equal(t.cacheTypeK, "q4_0");
+});
+
+test("tuner: the exact-KV ceiling never exceeds the context the model was trained for", () => {
+  const t = tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true, kvElementsPerToken: QWEN_ELEMENTS, trainedContext: 40960 });
+  assert.equal(t.contextSize, 40960);
+});
+
+test("tuner: without exact KV (no header) the conservative 32,768 ceiling still applies", () => {
+  assert.ok(tuneForHardware(hw, { modelBytes: 20.4 * GiB }).contextSize <= 32768);
+});
+
+test("tuner: a dense model bigger than the card is offloaded partially, not with -ngl 999", () => {
+  const card: Hardware = { ...hw, gpus: [{ index: 0, name: "NVIDIA small", vramTotalBytes: 4 * GiB, vramFreeBytes: 3.7 * GiB }] };
+  const t = tuneForHardware(card, { modelBytes: 5.1 * GiB, moe: false, kvElementsPerToken: QWEN_ELEMENTS, modelLayers: 32 });
+  assert.ok(t.gpuLayers > 0 && t.gpuLayers < 32, `ngl ${t.gpuLayers}`);
+  assert.ok(t.rationale.some((r) => /층만 GPU/.test(r)));
+  // A model that fits keeps the full offload.
+  const fits = tuneForHardware(hw, { modelBytes: 5.1 * GiB, moe: false, kvElementsPerToken: QWEN_ELEMENTS, modelLayers: 32 });
+  assert.equal(fits.gpuLayers, 999);
 });
