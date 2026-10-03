@@ -69,12 +69,14 @@ jobs:
       # PowerShell is tried first. Informational until a hosted runner is known to expose a clipboard session.
       - name: Clipboard round trip
         id: clipboard
+        if: always()
         continue-on-error: true
         run: node test/windows/clipboard-check.mjs
 
       # Informational: the repository's own unit tests were written on Linux; this shows which ones assume POSIX.
       - name: Unit tests (informational)
         id: unit
+        if: always()
         continue-on-error: true
         shell: bash
         run: npm test 2>&1 | tee unit-tests.log

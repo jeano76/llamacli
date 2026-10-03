@@ -22,12 +22,13 @@ const expect = {
 const shells = [
   ["pwsh", ["pwsh", "-NoProfile", "-Command", `node "${probe}"`]],
   ["powershell", ["powershell", "-NoProfile", "-Command", `node "${probe}"`]],
-  ["cmd", ["cmd", "/d", "/s", "/c", `node "${probe}"`]],
+  ["cmd", ["cmd", "/d", "/s", "/c", `"node "${probe}""`]],
   ["git-bash", ["bash", "-c", `node "${probe.replace(/\\/g, "/")}"`]],
 ];
 const results = [];
 for (const [name, cmd] of shells) {
-  const p = spawnSync(cmd[0], cmd.slice(1), { env, encoding: "utf8", timeout: 120000 });
+  // cmd.exe parses its own command line: Node must not re-quote it (it would double the quotes around the path).
+  const p = spawnSync(cmd[0], cmd.slice(1), { env, encoding: "utf8", timeout: 120000, windowsVerbatimArguments: cmd[0] === "cmd" });
   const failures = [];
   let out;
   if (p.error) failures.push(`${cmd[0]} not runnable: ${p.error.message}`);
