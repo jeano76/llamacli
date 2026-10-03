@@ -1,42 +1,19 @@
 /**
- * Mouse selection, edge auto-scroll, and copy — the app's own replacement for
- * the terminal's native text selection.
+ * Mouse selection and copy — the app's own replacement for the terminal's
+ * native text selection.
  *
  * ── Why this has to exist ────────────────────────────────────────────────────
- * Reported directly: "마우스로 드레그 하면 화면 영역 밖에까지 복사할 수 있게
- * 스크롤 업 또는 다운이 되어야 해" — dragging with the mouse must scroll so you
- * can copy content that is off-screen.
+ * llamacli draws on the **alternate screen buffer** (index.tsx's enterAltScreen), which has no
+ * scrollback, and the log lives in `App`'s React state — the terminal only ever saw frames. So
+ * with mouse reporting ON (the app sees the pointer), plain-drag native selection is gone
+ * (Shift+drag still reaches the terminal; the runHintText hint says so) and the app selects
+ * itself, which is what the Selection/LogPoint model below is, and what `copySelection` hands to
+ * the system: press, drag, release, and the text is on the clipboard — plus the file fallback,
+ * because OSC 52 is refused outright by most Wayland terminals and losing a selection silently is
+ * worse than the feature being absent.
  *
- * The obvious answer is "let the terminal do it", and for a normal program that
- * is correct. It is impossible here, for one structural reason: llamacli draws
- * on the **alternate screen buffer** (index.tsx's enterAltScreen). The alt
- * screen has no scrollback at all — when it fills, the top line is simply
- * overwritten. So a drag that runs off the top edge has nothing to scroll to,
- * and the long-standing behaviour every other terminal has (drag past the edge,
- * the view scrolls, your selection keeps extending) does not exist on this
- * screen.
- *
- * And the app cannot simply keep mouse reporting off and let the terminal
- * select, because the terminal cannot see history either. The log lives in
- * `App`'s React state; the terminal only ever saw the frames. Two ways out,
- * and we took both:
- *
- *   1. The app scrolls its OWN log (this file's edge auto-scroll + the existing
- *      PageUp/wheel paths), so off-screen content can be brought back on
- *      screen. That requires mouse reporting to be ON, because only then does
- *      the app see the pointer.
- *   2. With the mouse claimed by the app, plain-drag native selection is gone
- *      (Shift+drag still reaches the terminal, and is what the runHintText
- *      hint tells the user). So the app selects too — which is what the
- *      SelectionAnchor/SelectionRange below model, and what
- *      `clipboardWrite` in this file hands to the system.
- *
- * Net effect, which is the thing that has to be true: press, drag off the top
- * or bottom edge, keep holding — the log scrolls under the pointer and the
- * selection keeps growing — release, and the text is on the clipboard. Plus
- * the file fallback in `copySelection`, because OSC 52 is refused outright by
- * most Wayland terminals and losing a selection silently is worse than the
- * feature being absent.
+ * There is no edge auto-scroll (it was removed on request): the wheel and PageUp/PageDn scroll the
+ * log, and a selection is made within what is on screen.
  *
  * Everything here is pure except the two explicitly-marked I/O functions, and
  * the row maths is a plain function of (row, col) pairs, so the whole
@@ -60,56 +37,6 @@ export interface Selection {
 }
 
 export const EMPTY_SELECTION: Selection | null = null;
-
-/** Which edge (if any) a drag is currently pushing against, and therefore
- *  which way the log should scroll. Up = toward older output (larger
- *  scrollOffset), down = toward the live tail. */
-export type EdgeDirection = "up" | "down" | null;
-
-/** How many rows from the top/bottom of the log box count as "the edge".
- *
- *  Two rows, not one: with a one-row band, holding the pointer exactly on the
- *  last row (which is where it naturally rests after a drag) would scroll, and
- *  a user trying to select the final line of the transcript could never stop.
- *  Two rows also matches how a native terminal's edge-drag feels — you have to
- *  be *past* the content, not on it. */
-export const EDGE_ROWS = 2;
-
-/** Decides whether a drag at terminal row `row` should scroll the log.
- *
- *  `logFirstRow`/`logLastRow` are the absolute terminal rows the log occupies
- *  (App computes these for the click map — see clickMapRef). The slash menu
- *  overlays the log when open, and scrolling then would move content under a
- *  popup the user is reading, so `menuOpen` disables it outright.
- *
- *  Returns null when the pointer is in the body, or outside the log entirely
- *  (e.g. over the input box) — a drag that wandered off the log must not keep
- *  the view moving. */
-export function edgeDirection(
-  row: number,
-  logFirstRow: number,
-  logLastRow: number,
-  opts?: { menuOpen?: boolean; edgeRows?: number }
-): EdgeDirection {
-  if (opts?.menuOpen) return null;
-  const edge = opts?.edgeRows ?? EDGE_ROWS;
-  if (!Number.isFinite(row) || row < logFirstRow || row > logLastRow) return null;
-  if (row - logFirstRow < edge) return "up";
-  if (logLastRow - row < edge) return "down";
-  return null;
-}
-
-/** Scroll rows applied per auto-scroll tick while a drag sits on an edge.
- *
- *  Deliberately a constant rather than something proportional to how far past
- *  the edge the pointer is: this runs on a timer, and a rate that depends on
- *  pointer position makes the scroll speed change under the user mid-selection,
- *  which is exactly when they are trying to land on a specific line. */
-export const EDGE_SCROLL_STEP = 1;
-/** Auto-scroll tick interval. ~14 rows/s at EDGE_SCROLL_STEP — fast enough to
- *  cross a 30-row screen in about two seconds, slow enough to stop on the right
- *  line without overshooting. */
-export const EDGE_SCROLL_INTERVAL_MS = 70;
 
 /** Normalizes a selection so it runs from the earlier point to the later one,
  *  in reading order. Dragging up and to the right of the start must select the
@@ -152,9 +79,8 @@ export function rowRange(
  *
  *  `rows` is the visible slice (already scrolled into place by App) — the
  *  selection can therefore only be copied for content that is currently on
- *  screen. That is not a limitation in practice: auto-scroll exists precisely so
- *  the user can bring any part of the transcript on screen before releasing,
- *  and it is the same constraint every terminal has when the buffer is finite.
+ *  screen. To take in more than one screen, scroll with the wheel while the
+ *  button is held (the anchor is kept in log-row space, so it survives that).
  *  Trailing whitespace per row is stripped and the rows joined with "\n" so the
  *  copied text is pasteable rather than a ragged block. */
 export function selectionText(sel: Selection | null, rows: { text: string }[]): string {

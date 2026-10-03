@@ -377,9 +377,8 @@ export function detectTerminal(
   //      other terminal has was impossible. So "let the terminal select" never
   //      actually delivered the thing it was protecting.
   //
-  // The app now implements selection itself (selection.ts): press, drag off
-  // the edge, the log auto-scrolls and the selection keeps growing, release
-  // copies to the clipboard with a file fallback. Shift+drag still reaches the
+  // The app now implements selection itself (selection.ts): press, drag,
+  // release copies to the clipboard with a file fallback. Shift+drag still reaches the
   // terminal for native selection — runHintText tells the user so — and
   // `/mouse` (or LLAMACLI_MOUSE=0) turns this back off for anyone who prefers
   // to keep every mouse gesture for the terminal.

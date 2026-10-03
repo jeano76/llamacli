@@ -159,10 +159,10 @@ test("parseMouseWheel consumes clicks without scrolling, and ignores ordinary in
 test("the running-state key hint teaches the app's own drag-to-select, and never overflows the input box", () => {
   // With the mouse default back ON (see terminal.ts for why it was flipped
   // back), a plain drag is now the app's own selection — the user has to be
-  // told that dragging copies, and that the log auto-scrolls at the edges,
-  // because the alt screen has no native scrollback to discover that from.
+  // told that dragging copies, because the alt screen has no native
+  // scrollback to discover that from.
   assert.match(runHintText(100), /드래그: 선택·복사/);
-  assert.match(runHintText(100), /가장자리: 자동 스크롤/);
+  assert.doesNotMatch(runHintText(100), /자동 스크롤/);
   // Narrow terminals fall back to progressively shorter forms rather than
   // clipping mid-word; the last form is deliberately the most compact one.
   assert.equal(runHintText(40), "  Esc: 강제종료 · 드래그: 선택·복사");

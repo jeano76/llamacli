@@ -1,9 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  edgeDirection, normalizeSelection, rowRange, selectionText, isSelectionEmpty,
+  normalizeSelection, rowRange, selectionText, isSelectionEmpty,
   buildOsc52, copySelection, stripAnsiForCopy, CLIPBOARD_FALLBACK_PATH,
-  EDGE_SCROLL_STEP, EDGE_SCROLL_INTERVAL_MS, EDGE_ROWS,
   type Selection,
 } from "./selection.js";
 
@@ -11,55 +10,6 @@ const rows = (lines: string[]) => lines.map((text) => ({ text }));
 const sel = (ar: number, ac: number, hr: number, hc: number): Selection => ({
   anchor: { row: ar, col: ac },
   head: { row: hr, col: hc },
-});
-
-// ── Edge detection ──────────────────────────────────────────────────────────
-// The log occupies terminal rows 5..20 in a 30-row terminal (banner gap above,
-// input box below), which is the realistic shape — an earlier version of this
-// logic compared against the window height and would have treated row 29 (the
-// input box) as the bottom of the log.
-
-test("a drag on the top rows of the log scrolls toward older output", () => {
-  assert.equal(edgeDirection(5, 5, 20), "up");
-  assert.equal(edgeDirection(6, 5, 20), "up");
-});
-
-test("a drag on the bottom rows of the log scrolls toward the live tail", () => {
-  assert.equal(edgeDirection(20, 5, 20), "down");
-  assert.equal(edgeDirection(19, 5, 20), "down");
-});
-
-test("a drag in the middle of the log does not scroll", () => {
-  // The gap between the two edge bands is where a user selects an ordinary
-  // line, and scrolling there instead would make that impossible.
-  for (let row = 5 + EDGE_ROWS; row <= 20 - EDGE_ROWS; row++) {
-    assert.equal(edgeDirection(row, 5, 20), null, `row ${row} must not auto-scroll`);
-  }
-});
-
-test("a drag outside the log — e.g. over the input box — does not scroll", () => {
-  assert.equal(edgeDirection(4, 5, 20), null, "one row above the log");
-  assert.equal(edgeDirection(21, 5, 20), null, "below the log (the input box)");
-  assert.equal(edgeDirection(29, 5, 20), null, "the very bottom of the terminal");
-});
-
-test("auto-scroll is disabled while the slash menu overlays the log", () => {
-  assert.equal(edgeDirection(5, 5, 20, { menuOpen: true }), null);
-});
-
-test("the edge band is more than one row, so a drag resting on the last line can still stop", () => {
-  // With a one-row band, holding the pointer on the final row of the log (where
-  // it naturally rests) would keep scrolling forever, and a user trying to
-  // select that last line could never stop.
-  assert.equal(edgeDirection(20, 5, 20, { edgeRows: 1 }), "down");
-  assert.equal(edgeDirection(19, 5, 20, { edgeRows: 1 }), null, "one row of slack is not enough");
-});
-
-test("edge auto-scroll is tuned to a readable speed, not a teleport", () => {
-  assert.ok(EDGE_SCROLL_INTERVAL_MS > 0 && EDGE_SCROLL_STEP > 0);
-  const rowsPerSecond = (EDGE_SCROLL_STEP * 1000) / EDGE_SCROLL_INTERVAL_MS;
-  assert.ok(rowsPerSecond >= 5 && rowsPerSecond <= 40,
-    `${rowsPerSecond.toFixed(0)} rows/s should be slow enough to stop on a line`);
 });
 
 // ── Normalization ───────────────────────────────────────────────────────────

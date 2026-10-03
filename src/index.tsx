@@ -1071,7 +1071,7 @@ async function main() {
             process.stdout.write(next.mouse ? seq.mouseOn : seq.mouseOff);
             ui?.pushStatus(
               next.mouse
-                ? "[mouse] 켜짐 — 휠 스크롤 · 클릭으로 접힌 블록 토글 · 드래그로 선택 후 놓으면 복사(가장자리에서 자동 스크롤). " +
+                ? "[mouse] 켜짐 — 휠 스크롤 · 클릭으로 접힌 블록 토글 · 드래그로 선택 후 놓으면 복사. " +
                   "네이티브 선택이 필요하면 Shift 를 누른 상태로 드래그하세요."
                 : "[mouse] 꺼짐 — Shift 없이 드래그해 텍스트를 선택할 수 있습니다. 단, 이 화면은 alt screen 이라 " +
                   "터미널 스크롤백이 없어 화면 위로 드래그해도 과거 출력까지 이어지지 않습니다."
