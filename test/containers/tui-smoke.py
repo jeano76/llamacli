@@ -21,9 +21,9 @@ def variants(tmp):
         "no-home":       dict(env={}, unset=["HOME"]),
         "bad-home":      dict(env={"HOME": "/nonexistent/home"}),
         "no-mouse":      dict(env={"LLAMACLI_MOUSE": "0"}),
-        # The unwritable-HOME cases are only meaningful WITHOUT a config: they exercise the first-run path that wants to
-        # create ~/models and ~/.llamacli. On a clean machine that path also reaches out to the internet, so these run only
-        # when SMOKE_FRESH=1 (locally, where a running server is adopted and the attempt fails fast with a warning).
+        # The unwritable-HOME cases exercise the first-run path that wants to create ~/models and ~/.llamacli. With a
+        # server present it fails fast with a warning; on a clean machine that path would reach out to the internet, so
+        # these run only when SMOKE_FRESH=1.
         **({
             "ro-home-fresh":  dict(env={"HOME": ro_home}, fresh=True),
             "bad-home-fresh": dict(env={"HOME": "/nonexistent/home"}, fresh=True),
@@ -32,12 +32,6 @@ def variants(tmp):
 
 def run_variant(name, spec, tmp):
     proj = tempfile.mkdtemp(prefix=f"smoke-{name}-", dir=tmp)
-    # A configured, unreachable endpoint: without it a CLEAN machine starts the first-run provisioning (engine and model
-    # downloads from the internet), which is a different scenario and takes minutes. This test is about the terminal.
-    if not spec.get("fresh"):
-        os.makedirs(os.path.join(proj, ".llamacli"), exist_ok=True)
-        with open(os.path.join(proj, ".llamacli", "config.yaml"), "w") as f:
-            f.write("backend: openai-compatible\nbaseUrl: http://127.0.0.1:9/v1\nmodel: smoke\n")
     env = dict(os.environ, TERM="xterm-256color", LLAMACLI_NO_UPDATE="1", COLUMNS=str(COLS), LINES=str(ROWS))
     env.update(spec.get("env", {}))
     for k in spec.get("unset", []): env.pop(k, None)
@@ -85,7 +79,22 @@ def run_variant(name, spec, tmp):
     ok = alive and banner and not bad
     return dict(id=name, ok=ok, ready_seconds=ready_at, alive=alive, exit=exited, banner=banner, errors_on_screen=bad, screen_tail=text.splitlines()[-6:])
 
+def ensure_server():
+    """A clean machine (CI) has no llama-server, so every launch would start first-run provisioning — engine and model
+    downloads from the internet — instead of the terminal behaviour this test is about. Provide a stub on 8080 when the
+    port is free; on a machine that already has a real server there, that server is simply adopted."""
+    import socket, subprocess
+    s = socket.socket(); s.settimeout(0.5)
+    busy = s.connect_ex(("127.0.0.1", 8080)) == 0
+    s.close()
+    if busy: return None
+    stub = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "stub-llama.py"), "8080"])
+    time.sleep(1.0)
+    print("[smoke] port 8080 was free: started a stub llama-server")
+    return stub
+
 if __name__ == "__main__":
+    stub = ensure_server()
     tmp = tempfile.mkdtemp(prefix="llamacli-smoke-")
     try:
         specs = variants(tmp); only = set(sys.argv[1:])
@@ -93,6 +102,7 @@ if __name__ == "__main__":
     finally:
         os.chmod(os.path.join(tmp, "ro-home"), 0o700)
         shutil.rmtree(tmp, ignore_errors=True)
+        if stub: stub.terminate()
     for r in results:
         print(("PASS" if r["ok"] else "FAIL"), r["id"].ljust(14), f"alive={r['alive']} tui_ready_after={r['ready_seconds']}s errors={r['errors_on_screen']}")
         if not r["ok"]: print("      screen tail:", " | ".join(r["screen_tail"]))
