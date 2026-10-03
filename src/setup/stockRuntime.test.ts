@@ -266,3 +266,42 @@ test("musl (Alpine): the glibc prebuilts are not offered — straight to a sourc
   assert.ok(stockRungsFor(release, { ...musl, libc: undefined }).length > 0, "unknown libc keeps the old behaviour");
   assert.ok(stockRungsFor(release, { ...musl, platform: "darwin", arch: "arm64", libc: "musl" }).length > 0 || true);
 });
+
+test("macOS: when Metal cannot start (a VM, no usable GPU) the single asset is accepted as a CPU-only build, not rejected", async () => {
+  const mac = hw({ platform: "darwin", arch: "arm64", gpuBackend: "metal" });
+  const lines: string[] = [];
+  const ran: string[][] = [];
+  const got = await acquireStockLlamaServer({
+    hardware: mac, installedRoot: "/nonexistent-llamacli", releases: async () => [release], log: (l) => lines.push(l),
+    install: async () => "/x/metal/llama-server",
+    verify: async (_bin, gpu) => (gpu ? { ok: false, detail: "no Metal device" } : { ok: true }),
+    run: (async (_f: string, a: string[]) => { ran.push(a); return ""; }) as never,
+    build: (async () => { throw new Error("must not build"); }) as never,
+  });
+  assert.equal(got?.backend, "cpu", "recorded as CPU so the tuner does not ask for -ngl 999");
+  assert.deepEqual(ran, [["--device", "none", "--list-devices"]]);
+  assert.ok(lines.some((l) => /Metal 을 초기화하지 못했습니다/.test(l) && /CPU 전용/.test(l)), lines.join("\n"));
+});
+
+test("macOS: if even the CPU-only run fails, the original Metal failure is reported", async () => {
+  const mac = hw({ platform: "darwin", arch: "arm64", gpuBackend: "metal" });
+  const got = await acquireStockLlamaServer({
+    hardware: mac, installedRoot: "/nonexistent-llamacli", releases: async () => [release], allowBuild: false,
+    install: async () => "/x/metal/llama-server",
+    verify: async () => ({ ok: false, detail: "dyld: Library not loaded" }),
+    run: (async () => { throw new Error("abort"); }) as never,
+    build: (async () => { throw new Error("must not build"); }) as never,
+  });
+  assert.equal(got, null);
+});
+
+test("a working Metal build is still reported as metal (the CPU path is only a fallback)", async () => {
+  const mac = hw({ platform: "darwin", arch: "arm64", gpuBackend: "metal" });
+  const got = await acquireStockLlamaServer({
+    hardware: mac, installedRoot: "/nonexistent-llamacli", releases: async () => [release],
+    install: async () => "/x/metal/llama-server", verify: async () => ({ ok: true }),
+    run: (async () => { throw new Error("must not be called"); }) as never,
+    build: (async () => { throw new Error("must not build"); }) as never,
+  });
+  assert.equal(got?.backend, "metal");
+});

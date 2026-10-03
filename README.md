@@ -213,7 +213,7 @@ browser: { debugPort: 9222 }
 
 ## 테스트와 검증
 
-단위 테스트 **1,283개**(`npm test`, `node:test` + `tsx`, 추가 프레임워크 없음; Linux 전부 통과). 그 위에 환경별 검증을 얹었습니다. 아래 표의 결과는 **실제로 실행한 값**이고, 실행하지 못한 것은 따로 적었습니다.
+단위 테스트 **1,286개**(`npm test`, `node:test` + `tsx`, 추가 프레임워크 없음; Linux 전부 통과). 그 위에 환경별 검증을 얹었습니다. 아래 표의 결과는 **실제로 실행한 값**이고, 실행하지 못한 것은 따로 적었습니다.
 `npm run matrix:all` 이 로컬에서 가능한 것을 한꺼번에 돌립니다.
 
 | 방법 | 검증 대상 | 명령 | 결과 |
@@ -237,6 +237,9 @@ browser: { debugPort: 9222 }
 | `windows.yml` | `windows-latest` (NT 10.0.26100, 4코어, 16 GiB) | 배포 `bin/` 을 pwsh·Windows PowerShell·cmd·Git-Bash 에서: GPU 없음, CPU 사다리, `winget`; 다운로드; PowerShell 클립보드; **실제 llama-server e2e**; **ConPTY 에서 실제 TUI 스모크 4/4**; 단위 테스트 | 프로브 4/4, 다운로드 6/6, 클립보드 ✅, 단위 **1,271 통과 / 6 건너뜀(Windows 에 해당 없음) / 0 실패** (총 1,277) |
 | `macos.yml` | `macos-14` (Apple M1, 가상) | zsh·bash·sh 프로브 → **Metal**, `brew`, `-ngl > 0`; 다운로드; `pbcopy`; **실제 llama-server(Metal) e2e**; **pty 에서 실제 TUI 스모크 4/4**; 드래그 복사 | 프로브 3/3, 다운로드 6/6, `pbcopy` ✅ |
 | `linux.yml` | `ubuntu-latest` | `tsc`, 단위 테스트, 빌드, 호스트·컨테이너 매트릭스, TUI 스모크(`CI=true` 변형 포함), Xvfb+`xclip` | **전 단계 통과** — 단위 1,277 / 1,277, 호스트 매트릭스, 다운로드, TUI 스모크, 컨테이너, X11 클립보드 |
+
+macOS 러너(가상 머신)는 실행마다 Metal 이 있기도 없기도 했습니다. Metal 이 없으면 단일 macOS 자산이 "실행되지 않음" 으로 거절되어 사다리가 비던 문제를 찾았고,
+같은 바이너리를 `--device none` 으로 CPU 전용 확인한 뒤 CPU 빌드로 받아들이도록 고쳤습니다(튜너는 `-ngl 0`).
 
 CI 가 찾은 결함은 Linux 단위 테스트로는 볼 수 없던 것들입니다: `CI=true` 환경에서 TUI 가 아예 그려지지 않던 것(Ink 의 CI 모드), Windows 에서 모델 경로를 `/` 로만 잘라 이름이 전체 경로로 나오고 같은 모델의 다른 양자화 재사용이 실패했고,
 Apple Silicon 이 `-ngl 0`(CPU 전용)으로 튜닝되고 있었습니다. 둘 다 수정했고 테스트가 있습니다.

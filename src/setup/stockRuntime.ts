@@ -291,6 +291,21 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
   const attempts: AcquireAttempt[] = [];
   const hw = opts.hardware;
   const verify = opts.verify ?? ((bin, gpu) => verifyLlamaServer(bin, opts.run, opts.modelPath, gpu));
+  // macOS ships ONE asset (Metal + CPU in the same binary), so when Metal cannot start — a virtual machine, a Mac with no usable
+  // GPU — there is no CPU rung to fall to and the whole ladder used to fail. The same binary runs CPU-only (`--device none`),
+  // so on a Metal failure that is checked and, if it works, accepted AS A CPU BUILD (the tuner then sets -ngl 0).
+  const verifyOrCpu = async (bin: string, backend: LlamaLocation["backend"]): Promise<{ ok: boolean; backend: LlamaLocation["backend"]; detail?: string }> => {
+    const v = await verify(bin, backend !== "cpu");
+    if (v.ok) return { ok: true, backend };
+    if (backend === "metal") {
+      try {
+        await (opts.run as Run)(bin, ["--device", "none", "--list-devices"], { timeout: 30_000 });
+        log(`Metal 을 초기화하지 못했습니다 (${v.detail ?? "알 수 없음"}) — 같은 바이너리를 CPU 전용으로 사용합니다.`);
+        return { ok: true, backend: "cpu" };
+      } catch { /* not even CPU-only: report the original failure */ }
+    }
+    return { ok: false, backend, detail: v.detail };
+  };
   const install = opts.install ?? ((r) => installStockRung(r, { destRoot: opts.destRoot, fetchImpl: opts.fetchImpl, onProgress: opts.onProgress, log }));
 
   // 0. Already installed → verify and use; no network, no download.
@@ -298,11 +313,11 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
     { gpuBackend: hw.gpuBackend, platform: hw.platform, arch: hw.arch ?? process.arch },
     opts.installedRoot
   )) {
-    const verdict = await verify(have.binPath, have.backend !== "cpu");
+    const verdict = await verifyOrCpu(have.binPath, have.backend);
     if (verdict.ok) {
       log(`이미 설치된 llama-server 를 사용합니다 (다시 받지 않음): ${have.binPath}`);
       attempts.push({ label: `설치됨 (${have.subdir})`, ok: true, binPath: have.binPath });
-      return { binPath: have.binPath, backend: have.backend, source: "downloaded", attempts };
+      return { binPath: have.binPath, backend: verdict.backend, source: "downloaded", attempts };
     }
     attempts.push({ label: `설치됨 (${have.subdir})`, ok: false, binPath: have.binPath, detail: `실행되지 않음: ${verdict.detail ?? "알 수 없음"}` });
   }
@@ -342,14 +357,14 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
         log(`${rung.label} 를 받지 못했습니다 (${why}) — 다음 후보로 넘어갑니다.`);
         continue;
       }
-      const verdict = await verify(bin, rung.backend !== "cpu");
+      const verdict = await verifyOrCpu(bin, rung.backend);
       if (!verdict.ok) {
         attempts.push({ label: rung.label, ok: false, binPath: bin, detail: `받았지만 실행되지 않음: ${verdict.detail ?? "알 수 없음"}` });
         log(`${rung.label} 는 받았지만 이 머신에서 실행되지 않습니다 (${verdict.detail ?? "알 수 없음"}) — 다음 후보로 넘어갑니다.`);
         continue;
       }
       attempts.push({ label: rung.label, ok: true, binPath: bin });
-      return { binPath: bin, backend: rung.backend, source: "downloaded", attempts };
+      return { binPath: bin, backend: verdict.backend, source: "downloaded", attempts };
     }
   }
 
