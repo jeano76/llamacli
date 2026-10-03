@@ -1,0 +1,330 @@
+{
+  "_comment": [
+    "§3.5 labeled corpus, built from REAL user prompts, not invented ones.",
+    "Source: .llamacli/state/prompt-history.json (50 entries, this machine, 2026-09~10).",
+    "That file was the only session-derived record of what the user actually typed; there is",
+    "no transcript of assistant replies or tool calls on this box, so every label below is a",
+    "judgment about the REQUEST, made without seeing the answer.",
+    "",
+    "TEXTS ARE BYTE-EXACT from the source file. An earlier hand-transcribed version had",
+    "collapsed whitespace AND silently repaired the user's typos (깋 푸시 멎 -> 깃 푸시 머지,",
+    "llama.x\\x7fcpp -> llama.cpp). That is the worst possible drift for this corpus: the",
+    "typos and the stray control byte are exactly what the model receives, so 'fixing' them",
+    "measures a different input than the one that occurs. `text` must always be regenerated",
+    "from the source by index, never retyped. Verified byte-exact by corpus_verify.",
+    "",
+    "Labels are POLICY, not 'the answer I would give':",
+    "  kind:  slash = a UI command, never a task",
+    "         ack   = a menu pick / one-word acknowledgement / continuation with no task content",
+    "         status= 'is X working / did it apply' — answerable by inspection, no reasoning",
+    "         task  = a real request",
+    "  deep:  for kind=task only. true = needs code reading, multi-step work, or judgement",
+    "         false = a lookup or a single mechanical action",
+    "Class balance is deliberately NOT rebalanced: deep 19 / shallow 3 is the real shape of",
+    "this machine's usage, and that imbalance is itself the finding (see report §2.4)."
+  ],
+  "source_file": ".llamacli/state/prompt-history.json",
+  "n": 50,
+  "items": [
+    {
+      "i": 0,
+      "text": "결과 레포트 생성해줘",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 1,
+      "text": "토큰 결과 보고서에 llama.cpp 사용시에는 추론 시간이 소요가 되는데 추가해야 되는 부분은 전체 시간에 대한 효율 그리고 메모리 컴팩션 등의 효율등을 추가로 해서 보고서 업데이트 해줘\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 2,
+      "text": "laya 가 지금 llamacli에서 모든 프롬프트에서 함께 동작을 하고 있는지 확인해줘 ",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 3,
+      "text": "지금 laya 적용된거지?",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 4,
+      "text": "지금 fastcheck on했어 확인해봐\r",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 5,
+      "text": "메뉴에서 fastcheck on 하면 yamal에 반영이 되어야지\r",
+      "kind": "task",
+      "deep": false
+    },
+    {
+      "i": 6,
+      "text": "권장으로 해줘\r",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 7,
+      "text": "fastcheck on / off  하면 실제 laya 서버 기능도 on( 미설치시 설치포함)  되고 off 되는거지?",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 8,
+      "text": "on 되면 laya  관련 패키지와 서버설치 그리고 연결까지 되는거고 off  하면 서버 중지까지이지\r",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 9,
+      "text": "맞아 laya url 은 8099를 이야기 한거야  off 하면 laya 서버를 중지 시키는 것까지 해야 될거 같아 ",
+      "kind": "task",
+      "deep": false
+    },
+    {
+      "i": 10,
+      "text": "뭐해?",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 11,
+      "text": "좀 전에  llamacli 수행시 가상 터미널이 많은 메모리 사용한다고 강제 종료가 되었어 프로그램 재현구동은 하지 말고 원인 분석을 해줘",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 12,
+      "text": "계속 리눅스 시스템의 메모리가 가득 찼다고 터미널 쉘이 중지가 되는데?",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 13,
+      "text": "그렇게 설정해줘\r",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 14,
+      "text": "다음\r",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 15,
+      "text": "다음",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 16,
+      "text": "다음\r",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 17,
+      "text": "/help",
+      "kind": "slash",
+      "deep": false
+    },
+    {
+      "i": 18,
+      "text": "/keys",
+      "kind": "slash",
+      "deep": false
+    },
+    {
+      "i": 19,
+      "text": "/term",
+      "kind": "slash",
+      "deep": false
+    },
+    {
+      "i": 20,
+      "text": "/keys",
+      "kind": "slash",
+      "deep": false
+    },
+    {
+      "i": 21,
+      "text": "/term",
+      "kind": "slash",
+      "deep": false
+    },
+    {
+      "i": 22,
+      "text": "/home/jeano/projects/list.usefulinfoapp.com 폴더에 있는 웹페이지에서 설명하는 웹 프로젝트들을 브라우져로 접속을 해서 문제있는 부분을 찾고 로컬의 해당 디렉토리에서 수정을 하고 개별 과제별로 git push 와 머지를 해야해\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 23,
+      "text": "작업한 결과를 한글 레포트로 보여줘 ",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 24,
+      "text": "git push 와 머지를 각 프로젝트 디렉토리 별로 수행해죠\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 25,
+      "text": "모ㅜ  반영 ",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 26,
+      "text": " A",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 27,
+      "text": "carerx",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 28,
+      "text": "이 디렉토리 프로젝트를 이해해줘\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 29,
+      "text": "프로젝트를 처음 부터 다시 분석해줘\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 30,
+      "text": "r",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 31,
+      "text": "안녕?",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 32,
+      "text": "git push 하고 머지해줘\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 33,
+      "text": "llama.cpp 를 멈춰줘",
+      "kind": "task",
+      "deep": false
+    },
+    {
+      "i": 34,
+      "text": "초초구동시에 lama.cpp 없는경우 설치 및 빌드하는데 동기가 아니라 비동기로 그냥 종료되는거 같아 ",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 35,
+      "text": "llama.xcpp 를 다운르드하고 빌드하는 과정에  tui화면으로 진입해서 프롬프트 대기하는 문제 때문이야\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 36,
+      "text": "초초설정되는 컨텍스트 사이즈가 너무작은데 측정된 가능한 수치로 적용하야해\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 37,
+      "text": "메시지창의 펼치기가 작업중에는 불가능 한데 상시 펼침 닫힘 가능해야됨\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 38,
+      "text": "셀프프개선은  룰 처렁 매번 컨텍스트에누적이되나?",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 39,
+      "text": "1",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 40,
+      "text": "c",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 41,
+      "text": "깃 푸쉬 머지 바이너리 배포까지 해죠\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 42,
+      "text": "깃 푸시 멎 배포 까지한건가?mm",
+      "kind": "status",
+      "deep": false
+    },
+    {
+      "i": 43,
+      "text": "킴ㅅ 푸시 머지 와 빌드후 바이너리 배포  해쉬값 포함\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 44,
+      "text": "llamacli 가 멎가 되어야 배포가되는  건데 업데이트로직 봐봐\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 45,
+      "text": "윈도우  cmd 에서는 업데이트 및 설치가  안되는거 같은데",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 46,
+      "text": "권장 방식으로\r",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 47,
+      "text": "안녕\r",
+      "kind": "ack",
+      "deep": false
+    },
+    {
+      "i": 48,
+      "text": "이 코드를 분석해줘\r",
+      "kind": "task",
+      "deep": true
+    },
+    {
+      "i": 49,
+      "text": "클릭해서 펼치기가 동작하지 안ㅅ않네",
+      "kind": "task",
+      "deep": true
+    }
+  ]
+}
