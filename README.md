@@ -213,13 +213,13 @@ browser: { debugPort: 9222 }
 
 ## 테스트와 검증
 
-단위 테스트 **1,272개**(`npm test`, `node:test` + `tsx`, 추가 프레임워크 없음; Linux 전부 통과). 그 위에 환경별 검증을 얹었습니다. 아래 표의 결과는 **실제로 실행한 값**이고, 실행하지 못한 것은 따로 적었습니다.
+단위 테스트 **1,277개**(`npm test`, `node:test` + `tsx`, 추가 프레임워크 없음; Linux 전부 통과). 그 위에 환경별 검증을 얹었습니다. 아래 표의 결과는 **실제로 실행한 값**이고, 실행하지 못한 것은 따로 적었습니다.
 `npm run matrix:all` 이 로컬에서 가능한 것을 한꺼번에 돌립니다.
 
 | 방법 | 검증 대상 | 명령 | 결과 |
 |---|---|---|---|
-| 단위 테스트 | 튜너 불변식, VRAM×RAM 40칸 격자, 카탈로그, 다운로드(재개·해시), 서버 정책, 슬래시 명령 시퀀스, 보정, 클립보드, Windows 형태 경로 | `npm test` | 1,272 / 1,272 |
-| **깨끗한 컨테이너 단위 테스트** | llama.cpp·모델·`~/.llamacli` 가 없는 root 컨테이너에서 전체 스위트(내 머신에서만 통과하던 테스트 4개를 찾음) | `npm run matrix:clean-unit` | 1,270 통과, 2 건너뜀 |
+| 단위 테스트 | 튜너 불변식, VRAM×RAM 40칸 격자, 카탈로그, 다운로드(재개·해시), 서버 정책, 슬래시 명령 시퀀스, 보정, 클립보드, Windows 형태 경로, CI 환경 처리 | `npm test` | 1,277 / 1,277 |
+| **깨끗한 컨테이너 단위 테스트** | llama.cpp·모델·`~/.llamacli` 가 없는 root 컨테이너에서 전체 스위트(내 머신에서만 통과하던 테스트 4개를 찾음) | `npm run matrix:clean-unit` | 1,270 통과, 2 건너뜀 (1,272개 시점) |
 | 호스트 매트릭스 | 쉘(bash·dash·busybox), **진짜 cgroup 한도**, 가짜 NVIDIA 4/8/24 GiB·오래된 드라이버·없음, AMD sysfs, Intel(vulkaninfo), 소프트웨어 Vulkan | `node test/containers/run-host.mjs` | 14 / 14 |
 | **컨테이너 매트릭스** (podman/docker) | Debian·Ubuntu(일반/sudo/root)·Fedora(zsh)·Arch(fish)·**Alpine(musl)**·dash, `--memory/--cpus`, 가짜 GPU | `npm run matrix:containers` | 21 / 21 |
 | 다운로드 시나리오 | 서명이 바뀌는 CDN 모의 서버에서 중단→이어받기, 해시 판정, 같은 크기·다른 바이트 교체 (수정 전 빌드로 돌리면 실패함을 확인) | `node test/containers/download-scenario.mjs` | 6 / 6 (컨테이너 4종·Windows·macOS 에서도) |
@@ -233,9 +233,9 @@ browser: { debugPort: 9222 }
 
 | 워크플로 | 러너 | 검증 | 최근 결과 |
 |---|---|---|---|
-| `windows.yml` | `windows-latest` (NT 10.0.26100, 4코어, 16 GiB) | 배포 `bin/` 을 pwsh·Windows PowerShell·cmd·Git-Bash 에서: GPU 없음, CPU 사다리, `winget`; 다운로드; PowerShell 클립보드; 단위 테스트(정보용) | 프로브 4/4, 다운로드 6/6, 클립보드 ✅, 단위 1,228 통과 / 44 건너뜀 / 0 실패 |
+| `windows.yml` | `windows-latest` (NT 10.0.26100, 4코어, 16 GiB) | 배포 `bin/` 을 pwsh·Windows PowerShell·cmd·Git-Bash 에서: GPU 없음, CPU 사다리, `winget`; 다운로드; PowerShell 클립보드; 단위 테스트(정보용) | 프로브 4/4, 다운로드 6/6, 클립보드 ✅, 단위 1,233 통과 / 44 건너뜀 / 0 실패 (총 1,277) |
 | `macos.yml` | `macos-14` (Apple M1, 가상) | zsh·bash·sh 프로브 → **Metal**, `brew`, `-ngl > 0`; 다운로드; `pbcopy` | 프로브 3/3, 다운로드 6/6, `pbcopy` ✅ |
-| `linux.yml` | `ubuntu-latest` | `tsc`, 단위 테스트, 빌드, 호스트·컨테이너 매트릭스, TUI 스모크, Xvfb+`xclip` | 단위 1,272 / 1,272, 호스트·다운로드 통과; TUI 스모크는 깨끗한 러너에서 서버가 없어 첫 실행 다운로드로 들어가던 문제를 가짜 서버로 수정(재실행 대기) |
+| `linux.yml` | `ubuntu-latest` | `tsc`, 단위 테스트, 빌드, 호스트·컨테이너 매트릭스, TUI 스모크(`CI=true` 변형 포함), Xvfb+`xclip` | **전 단계 통과** — 단위 1,277 / 1,277, 호스트 매트릭스, 다운로드, TUI 스모크, 컨테이너, X11 클립보드 |
 
 CI 가 찾은 결함은 Linux 단위 테스트로는 볼 수 없던 것들입니다: `CI=true` 환경에서 TUI 가 아예 그려지지 않던 것(Ink 의 CI 모드), Windows 에서 모델 경로를 `/` 로만 잘라 이름이 전체 경로로 나오고 같은 모델의 다른 양자화 재사용이 실패했고,
 Apple Silicon 이 `-ngl 0`(CPU 전용)으로 튜닝되고 있었습니다. 둘 다 수정했고 테스트가 있습니다.
