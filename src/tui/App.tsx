@@ -16,7 +16,7 @@ import { setCursorPlacement, clearCursorPlacement } from "./cursorPlacement.js";
 import { existsSync } from "node:fs";
 import { isLikelyPaste, looksLikePastedFilePath, formatPasteLabel, findTrailingPlaceholder, substitutePlaceholders } from "./pasteChip.js";
 import {
-  rowRange, selectionText, copySelection, isSelectionEmpty, stripAnsiForCopy,
+  rowRange, selectionText, copySelection, describeCopy, isSelectionEmpty, stripAnsiForCopy,
   type Selection, type LogPoint,
 } from "./selection.js";
 
@@ -1431,8 +1431,7 @@ export function App({
               // by most Wayland terminals and the user is told where the text
               // is either way — so the message never claims a copy succeeded
               // when all it can honestly say is "here it is, in a file".
-              const via = result.via === "osc52" ? "클립보드에 넣고" : "클립보드가 거부해서 파일로";
-              pushLine(`[복사] ${text.length}자를 ${via} 저장했습니다 → ${result.path}`, "status");
+              pushLine(describeCopy(result, text.length), "status");
             })
             .catch((err: any) => pushLine(`[복사 실패] ${err?.message ?? err}`, "status"));
         }

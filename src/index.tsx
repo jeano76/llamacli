@@ -19,7 +19,7 @@ import { buildVersionString } from "./tui/banner.js";
 import { checkAndApplyUpdate, spawnRestart, UPDATE_STAGE_LABEL, type UpdateStage } from "./selfUpdate.js";
 import { checkBuildFreshness, stalenessMessage, readLocalVersion } from "./buildStamp.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth, stripAnsi } from "./tui/terminal.js";
-import { copySelection, stripAnsiForCopy } from "./tui/selection.js";
+import { copySelection, describeCopy, stripAnsiForCopy } from "./tui/selection.js";
 import { execFileSync } from "node:child_process";
 import { getCursorPlacement } from "./tui/cursorPlacement.js";
 import { KEY_BINDINGS, formatKeyRow } from "./tui/keybindings.js";
@@ -1511,9 +1511,7 @@ async function main() {
             const text = stripAnsiForCopy(picked.join("\n"));
             void copySelection(text)
               .then((result) => {
-                ui?.pushStatus(
-                  `[복사] ${text.length}자를 ${result.via === "osc52" ? "클립보드에 넣고" : "클립보드가 거부해서 파일로"} 저장했습니다 → ${result.path}`
-                );
+                ui?.pushStatus(describeCopy(result, text.length));
               })
               .catch((err: any) => ui?.pushStatus(`[복사 실패] ${summarizeErrorForDisplay(err.message)}`));
             break;

@@ -101,6 +101,7 @@ test("copySelection always writes the file, because a refused OSC 52 is silent",
   return copySelection("selected text", {
     path: "/tmp/fake-clip.txt",
     write: () => {},
+    env: {},
     writeFile: async (p, t) => { written[p] = t; },
   }).then((result) => {
     assert.equal(result.via, "osc52");
@@ -115,6 +116,7 @@ test("copySelection falls back to the file alone when the text exceeds the OSC 5
   return copySelection("y".repeat(5000), {
     path: "/tmp/fake2.txt",
     maxOsc52: 100, // deliberately tiny
+    env: {},
     write: (s) => { seqWritten += s; },
     writeFile: async (p, t) => { written[p] = t; },
   }).then((result) => {
@@ -138,6 +140,7 @@ test("an over-cap selection is written to the file IN FULL, never silently trunc
   return copySelection(korean, {
     path: "/tmp/fake3.txt",
     maxOsc52: 1000,
+    env: {},
     write: (s) => { seqWritten += s; },
     writeFile: async (p, t) => { written[p] = t; },
   }).then((result) => {
@@ -168,4 +171,62 @@ test("stripAnsiForCopy removes colour codes, the way the banner and status lines
 test("stripAnsiForCopy also removes OSC hyperlinks, not just SGR", () => {
   const raw = "\x1b]8;;https://example.com\x07link text\x1b]8;;\x07";
   assert.equal(stripAnsiForCopy(raw), "link text");
+});
+
+// ── system clipboard tools: a plain drag must reach the clipboard on terminals that ignore OSC 52 ──
+
+import { clipboardTools, describeCopy } from "./selection.js";
+
+test("clipboardTools picks the tools that fit the session", () => {
+  assert.deepEqual(clipboardTools({}, "darwin"), [{ cmd: "pbcopy", args: [] }]);
+  assert.deepEqual(clipboardTools({}, "win32"), [{ cmd: "clip", args: [] }]);
+  assert.deepEqual(clipboardTools({ WAYLAND_DISPLAY: "wayland-0", DISPLAY: ":0" }, "linux").map((t) => t.cmd), ["wl-copy", "xclip", "xsel"]);
+  assert.deepEqual(clipboardTools({ DISPLAY: ":0" }, "linux").map((t) => t.cmd), ["xclip", "xsel"]);
+  assert.deepEqual(clipboardTools({}, "linux"), [], "a headless box has no clipboard tool to try");
+  assert.equal(clipboardTools({ WSL_DISTRO_NAME: "Ubuntu" }, "linux")[0].cmd, "clip.exe");
+});
+
+test("a working clipboard tool is used, receives the exact text, and is reported by name", async () => {
+  const calls: { cmd: string; input: string }[] = [];
+  const r = await copySelection("한글 선택", {
+    path: "/tmp/x1.txt", write: () => {}, writeFile: async () => {}, env: { WAYLAND_DISPLAY: "w", VTE_VERSION: "8400" }, platform: "linux",
+    run: async (cmd, _a, input) => { calls.push({ cmd, input }); return true; },
+  });
+  assert.equal(r.via, "system");
+  assert.equal(r.tool, "wl-copy");
+  assert.deepEqual(calls, [{ cmd: "wl-copy", input: "한글 선택" }], "the first tool that works ends the search");
+  assert.equal(r.advice, undefined);
+  assert.match(describeCopy(r, 5), /클립보드에 복사했습니다 \(wl-copy\)/);
+});
+
+test("when a tool is missing the next one is tried", async () => {
+  const tried: string[] = [];
+  const r = await copySelection("t", {
+    path: "/tmp/x2.txt", write: () => {}, writeFile: async () => {}, env: { WAYLAND_DISPLAY: "w", DISPLAY: ":0" }, platform: "linux",
+    run: async (cmd) => { tried.push(cmd); return cmd === "xclip"; },
+  });
+  assert.deepEqual(tried, ["wl-copy", "xclip"]);
+  assert.equal(r.tool, "xclip");
+});
+
+test("GNOME VTE with no clipboard tool: the file still has the text, and the user is told how to make a plain drag work", async () => {
+  const written: Record<string, string> = {};
+  const r = await copySelection("본문", {
+    path: "/tmp/x3.txt", write: () => {}, writeFile: async (p, t) => { written[p] = t; },
+    env: { WAYLAND_DISPLAY: "w", VTE_VERSION: "8400" }, platform: "linux", run: async () => false,
+  });
+  assert.equal(r.via, "osc52");
+  assert.equal(written["/tmp/x3.txt"], "본문");
+  assert.match(r.advice ?? "", /OSC 52 를 지원하지 않아/);
+  assert.match(r.advice ?? "", /wl-clipboard/);
+  assert.match(r.advice ?? "", /Shift 없이/);
+  assert.match(describeCopy(r, 2), /\n  · /);
+});
+
+test("a tool that throws is treated as unavailable, never as a failed copy", async () => {
+  const r = await copySelection("t", {
+    path: "/tmp/x4.txt", write: () => {}, writeFile: async () => {}, env: { DISPLAY: ":0" }, platform: "linux",
+    run: async () => { throw new Error("spawn xclip ENOENT"); },
+  });
+  assert.notEqual(r.via, "system");
 });

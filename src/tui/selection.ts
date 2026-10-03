@@ -153,8 +153,12 @@ export function osc52Terminator(): string {
 }
 
 export interface CopyResult {
-  /** What actually happened, for an honest status line. */
-  via: "osc52" | "file";
+  /** What actually happened, for an honest status line. "system": the OS clipboard tool took it (confirmed by its exit). */
+  via: "osc52" | "system" | "file";
+  /** The tool that confirmed it, when via === "system". */
+  tool?: string;
+  /** Set when the text probably did NOT reach the clipboard and what would fix it. */
+  advice?: string;
   /** Where a file fallback wrote it, when via === "file". */
   path?: string;
   /** True when the text had to be cut to fit the OSC 52 payload cap. */
@@ -173,6 +177,51 @@ export interface CopyDeps {
   writeFile?: (path: string, text: string) => Promise<void>;
   path?: string;
   maxOsc52?: number;
+  /** Injected for tests: runs `cmd args` feeding `input` on stdin; true when it exited 0. */
+  run?: (cmd: string, args: string[], input: string) => Promise<boolean>;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+}
+
+/** The OS clipboard tools to try, best first. OSC 52 cannot be confirmed and several terminals (GNOME's VTE, many
+ *  Wayland setups) ignore it, so a drag-copy that only emitted OSC 52 silently copied nothing; these tools report
+ *  success by their exit status. */
+export function clipboardTools(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): { cmd: string; args: string[] }[] {
+  if (platform === "darwin") return [{ cmd: "pbcopy", args: [] }];
+  if (platform === "win32") return [{ cmd: "clip", args: [] }];
+  const out: { cmd: string; args: string[] }[] = [];
+  if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) out.push({ cmd: "clip.exe", args: [] });
+  if (env.WAYLAND_DISPLAY) out.push({ cmd: "wl-copy", args: [] });
+  if (env.DISPLAY) out.push({ cmd: "xclip", args: ["-selection", "clipboard"] }, { cmd: "xsel", args: ["--clipboard", "--input"] });
+  return out;
+}
+
+async function defaultRun(cmd: string, args: string[], input: string): Promise<boolean> {
+  const { spawn } = await import("node:child_process");
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => { if (!settled) { settled = true; resolve(ok); } };
+    try {
+      const p = spawn(cmd, args, { stdio: ["pipe", "ignore", "ignore"] });
+      p.on("error", () => done(false));
+      p.on("exit", (code) => done(code === 0));
+      p.stdin.on("error", () => {});
+      p.stdin.end(input);
+      setTimeout(() => done(false), 2500).unref?.();
+    } catch {
+      done(false);
+    }
+  });
+}
+
+/** The status line for a finished copy — one place, so the drag handler and `/copy` cannot disagree. */
+export function describeCopy(r: CopyResult, chars: number): string {
+  if (r.via === "system") return `[복사] ${chars}자를 클립보드에 복사했습니다 (${r.tool}) — 파일에도 저장: ${r.path}`;
+  const base =
+    r.via === "osc52"
+      ? `[복사] ${chars}자를 터미널 클립보드(OSC 52)로 보냈고 파일에도 저장했습니다 → ${r.path}`
+      : `[복사] ${chars}자를 파일로 저장했습니다 → ${r.path}`;
+  return r.advice ? `${base}\n  · ${r.advice}` : base;
 }
 
 /**
@@ -205,14 +254,25 @@ export async function copySelection(text: string, deps: CopyDeps = {}): Promise<
   // everything. Sending nothing costs one extra paste-from-file, and the file
   // is the lossless copy either way.
   const seq = buildOsc52(text, cap);
-  if (seq) {
-    write(seq);
-    // Still write the file: we cannot observe whether the terminal honoured
-    // the sequence, and a path to the text is the only thing that makes a
-    // refused OSC 52 recoverable.
-    await writeFile(path, text);
-    return { via: "osc52", path, truncated: false };
-  }
+  if (seq) write(seq);
+  // Still write the file: we cannot observe whether the terminal honoured the sequence, and a path to the text is the
+  // only thing that makes a refused OSC 52 recoverable.
   await writeFile(path, text);
-  return { via: "file", path, truncated: false };
+
+  // The OS clipboard tool, whose success IS observable. This is what makes a plain drag (no Shift) land in the system
+  // clipboard on terminals that ignore OSC 52 — GNOME's VTE does, which is why people fell back to Shift+drag.
+  const env = deps.env ?? process.env;
+  const run = deps.run ?? defaultRun;
+  for (const t of clipboardTools(env, deps.platform ?? process.platform)) {
+    if (await run(t.cmd, t.args, text).catch(() => false)) return { via: "system", tool: t.cmd, path, truncated: false };
+  }
+
+  const vte = Boolean(env.VTE_VERSION);
+  const wayland = Boolean(env.WAYLAND_DISPLAY);
+  const advice = vte || !seq
+    ? `이 터미널${vte ? "(GNOME VTE)" : ""}은 OSC 52 를 지원하지 않아 시스템 클립보드로는 가지 않았을 수 있습니다. ` +
+      `${wayland ? "wl-clipboard" : "xclip"} 를 설치하면 Shift 없이 드래그만으로 복사됩니다 (예: sudo apt install ${wayland ? "wl-clipboard" : "xclip"}). ` +
+      `지금은 ${path} 에서 가져올 수 있습니다.`
+    : undefined;
+  return { via: seq ? "osc52" : "file", path, truncated: false, ...(advice ? { advice } : {}) };
 }
