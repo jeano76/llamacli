@@ -21,6 +21,8 @@ def variants(tmp):
         "no-home":       dict(env={}, unset=["HOME"]),
         "bad-home":      dict(env={"HOME": "/nonexistent/home"}),
         "no-mouse":      dict(env={"LLAMACLI_MOUSE": "0"}),
+        # Ink stops redrawing when CI is set; CI is also set by dev containers and harnesses, not just build servers.
+        "ci-env":        dict(env={"CI": "true", "GITHUB_ACTIONS": "true"}),
         # The unwritable-HOME cases exercise the first-run path that wants to create ~/models and ~/.llamacli. With a
         # server present it fails fast with a warning; on a clean machine that path would reach out to the internet, so
         # these run only when SMOKE_FRESH=1.

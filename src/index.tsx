@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { restoreCi } from "./util/ciEnv.js"; // MUST stay the first import: it runs before `ink` is evaluated
 import React from "react";
 import { render } from "ink";
 import { App } from "./tui/App.js";
@@ -69,6 +70,9 @@ function recordedTuning(config: unknown) {
 import { join } from "node:path";
 import { baseName } from "./util/path.js";
 
+
+// Every import (including ink) has been evaluated by now: give the agent's child processes the user's real CI value.
+restoreCi();
 
 const BASE_SYSTEM_PROMPT = `You are llamacli, a coding agent running on a local llama.cpp backend.
 Always follow the fundamentals of a strong software architect: minimal diffs, respect existing

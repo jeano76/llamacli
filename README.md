@@ -58,6 +58,7 @@ cd ~/my-project && llamacli
 - **터미널 능력 감지**: `src/tui/terminal.ts` 가 색 깊이, 유니코드, 대체 화면, SGR 마우스, 동기 출력, 멀티플렉서를 감지하고 모든 이스케이프 시퀀스를 그 기록을 거쳐
   만듭니다(미지원이면 빈 문자열). `LANG=C`/`TERM=dumb` 에서는 ASCII 로 대체됩니다. 환경변수: `LLAMACLI_ASCII`, `LLAMACLI_COLOR_DEPTH`, `LLAMACLI_NO_ANSI`,
   `LLAMACLI_FORCE_ANSI`, `LLAMACLI_MOUSE=0|1`, `LLAMACLI_ALT_SCREEN`, `LLAMACLI_NO_SMOOTH`.
+  `CI=true`(dev 컨테이너·하네스에서도 설정됨)에서도 화면이 그려집니다 — Ink 는 CI 로 보이면 마지막 프레임만 출력하므로, 터미널일 때는 Ink 를 불러오기 전에 `CI=false` 로 두었다가 시작 후 원래 값을 되돌립니다(자식 프로세스에는 영향 없음).
 - 화면 캡처는 모두 실제 바이너리를 pty 로 구동해 만든 것입니다(`scripts/capture_screens.py`, [`docs/screenshots/`](./docs/screenshots/)).
 
 ## 구조
@@ -236,7 +237,7 @@ browser: { debugPort: 9222 }
 | `macos.yml` | `macos-14` (Apple M1, 가상) | zsh·bash·sh 프로브 → **Metal**, `brew`, `-ngl > 0`; 다운로드; `pbcopy` | 프로브 3/3, 다운로드 6/6, `pbcopy` ✅ |
 | `linux.yml` | `ubuntu-latest` | `tsc`, 단위 테스트, 빌드, 호스트·컨테이너 매트릭스, TUI 스모크, Xvfb+`xclip` | 단위 1,272 / 1,272, 호스트·다운로드 통과; TUI 스모크는 깨끗한 러너에서 서버가 없어 첫 실행 다운로드로 들어가던 문제를 가짜 서버로 수정(재실행 대기) |
 
-CI 가 찾은 결함은 Linux 단위 테스트로는 볼 수 없던 것들입니다: Windows 에서 모델 경로를 `/` 로만 잘라 이름이 전체 경로로 나오고 같은 모델의 다른 양자화 재사용이 실패했고,
+CI 가 찾은 결함은 Linux 단위 테스트로는 볼 수 없던 것들입니다: `CI=true` 환경에서 TUI 가 아예 그려지지 않던 것(Ink 의 CI 모드), Windows 에서 모델 경로를 `/` 로만 잘라 이름이 전체 경로로 나오고 같은 모델의 다른 양자화 재사용이 실패했고,
 Apple Silicon 이 `-ngl 0`(CPU 전용)으로 튜닝되고 있었습니다. 둘 다 수정했고 테스트가 있습니다.
 
 ### 검증하지 못한 것

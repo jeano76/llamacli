@@ -102,8 +102,50 @@ function toolResultCharCap(contextWindowTokens: number): number {
 function capToolResult(content: string, contextWindowTokens: number): string {
   const cap = toolResultCharCap(contextWindowTokens);
   if (content.length <= cap) return content;
-  const omitted = content.length - cap;
-  return `${content.slice(0, cap)}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane]`;
+  // HEAD + TAIL inside the SAME cap, because this path has no recovery route.
+  //
+  // capReadFileResult() below truncates head-only and is fine doing it: it ends
+  // with "call read_file with start_line=N to continue", so the model can get
+  // the rest in one more call. This function has no such pointer — it is what
+  // caps `run_shell`, whose output on a non-zero exit arrives here whole (the
+  // exec throws, and tools/index.ts has no output budget of its own beyond a
+  // 10 MB maxBuffer). Measured, this box, ctx 98,304 (cap 24,000 chars ~4,626
+  // real tokens, 63.9% of a measured 7,244-token turn): on every one of seven
+  // real payloads over the cap (README.md, loop.ts, a 900-line npm-warn dump, a
+  // 700-frame traceback) the tail was 0 characters — always. The end of a shell
+  // result is where the exit status, the error and the summary are, so the part
+  // that gets cut is the part the model needed most, and its only recourse is
+  // to re-run the command — another full turn (~76 s at the measured 7,244-token
+  // prompt). Same defect, already paid for once in a live session: a 19,304-byte
+  // file whose last ~4,500 characters never reached the model, re-read after
+  // every compaction, stalling about an hour (see capReadFileResult below).
+  //
+  // Cost: nothing. The character budget is unchanged, so the token cost is
+  // unchanged — this buys tail visibility for free, which is why it needs no
+  // decision model.
+  const TAIL_FRACTION = 0.4;
+  // Reserved so head + marker + tail never exceeds `cap`. Without this the
+  // marker alone would push the result ~140 chars over a budget whose whole
+  // purpose is to stay under it.
+  const MARKER_RESERVE = 160;
+  const tailChars = Math.floor(Math.max(0, cap - MARKER_RESERVE) * TAIL_FRACTION);
+  const headBudget = Math.max(0, cap - MARKER_RESERVE - tailChars);
+  // Cut at a line boundary so the head never ends mid-line.
+  const cut = content.lastIndexOf("\n", headBudget);
+  const head = cut > 0 ? content.slice(0, cut) : content.slice(0, headBudget);
+  // And so the TAIL starts at a line boundary too. Slicing at a fixed offset
+  // lands mid-word — measured, the tail's first line arrived as `ckpoint,` out
+  // of `checkpoint,` — which spends tokens on a broken fragment and reads to
+  // the model like corruption. Costs a few characters of the budget.
+  let tailStart = content.length - tailChars;
+  const tailNl = content.indexOf("\n", tailStart);
+  if (tailStart < content.length && tailNl >= 0 && tailNl < content.length - 1) tailStart = tailNl + 1;
+  const tail = content.slice(Math.max(head.length, tailStart));
+  const omitted = content.length - head.length - tail.length;
+  return (
+    `${head}\n\n[...truncated: ${omitted} more characters omitted to keep the request size sane ` +
+    `— the END of the output follows, which is where errors and summaries are:]\n${tail}`
+  );
 }
 
 /** capToolResult() for a read_file result: cuts at a line boundary rather

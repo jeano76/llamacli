@@ -3051,3 +3051,71 @@ test("reasoning from the backend reaches the log even when thinking is off", () 
     await loop.send("hi");
     assert.deepEqual(reasoning, ["let me think"], "reasoning must be surfaced regardless of the setting");
   }));
+
+test("a capped run_shell error result shows its END — the exit status and error — inside the same cap", () =>
+  withTempProject(async (dir) => {
+    // Shaped like the real thing: hundreds of lines of output, then the error
+    // at the very end. capToolResult() keeps the head only, and this path has
+    // no "call read_file with start_line=" to recover with — so before this the
+    // end of every FAILING command was invisible, and the model's only recourse
+    // was to re-run it (another full turn).
+    const script = join(dir, "noisy.js");
+    await writeFile(
+      script,
+      [
+        "const L = [];",
+        "for (let i = 0; i < 900; i++) L.push('log line ' + i);",
+        "console.log(L.join('\\n'));",
+        "console.error('SyntaxError: invalid syntax (build.js, line 900)');",
+        "process.exit(1);",
+      ].join("\n")
+    );
+    const call = {
+      id: "e1",
+      type: "function" as const,
+      function: { name: "run_shell", arguments: JSON.stringify({ command: `node ${JSON.stringify(script)}` }) },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 4096 },
+    });
+    await loop.send("run it");
+    const toolMsg = String(turnRequests[1].messages.find((m) => m.role === "tool")!.content);
+    assert.match(toolMsg, /^ERROR:/);
+    assert.ok(
+      toolMsg.includes("SyntaxError: invalid syntax (build.js, line 900)"),
+      `the end of the output must survive the cap; got tail: ${toolMsg.slice(-200)}`
+    );
+    assert.match(toolMsg, /truncated: \d+ more characters omitted/);
+  }));
+
+test("a tool result under the cap reaches the model untouched", () =>
+  withTempProject(async (dir) => {
+    const call = {
+      id: "s1",
+      type: "function" as const,
+      function: { name: "run_shell", arguments: JSON.stringify({ command: "echo small-output" }) },
+    };
+    const { backend, turnRequests } = scriptedBackend({
+      turnResponses: [assistantMessage(null, [call]), assistantMessage("done")],
+      tokenCounts: [1],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 4096 },
+    });
+    await loop.send("run it");
+    const toolMsg = String(turnRequests[1].messages.find((m) => m.role === "tool")!.content);
+    assert.match(toolMsg, /small-output/);
+    assert.doesNotMatch(toolMsg, /truncated/);
+  }));
