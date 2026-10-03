@@ -29,6 +29,11 @@ jobs:
         run: npm test
       - name: Build (verifies the committed bin matches the source)
         run: npm run build && git diff --stat -- bin | tail -3
+      - name: Real llama-server end to end
+        run: node test/e2e/real-server.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLAMACLI_DIST: ${{ github.workspace }}/dist
       - name: System packages for the pty smoke test and the X11 clipboard
         run: |
           sudo apt-get update
@@ -44,6 +49,8 @@ jobs:
         run: node test/containers/run-containers.mjs
       - name: X11 clipboard round trip
         run: xvfb-run -a node test/clipboard-check.mjs
+      - name: Plain drag copies to the clipboard (X11, xclip)
+        run: xvfb-run -a python3 test/tui/drag-copy.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:

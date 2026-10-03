@@ -724,6 +724,12 @@ export async function probeModelCompatibility(
     // already holding VRAM we are about to need.
     "-ngl", "0",
     "--no-warmup",
+    // An OS-assigned loopback port. Current llama.cpp binds the HTTP socket BEFORE it loads the model, so the default
+    // 8080 made the probe die with "couldn't bind" (verdict "other") on exactly the machines that matter — the ones
+    // that already run a server there — and could briefly grab 8080 on the ones that do not. (Found by the real-server
+    // e2e on a machine with a server on 8080.)
+    "--host", "127.0.0.1",
+    "--port", "0",
   ];
 
   return new Promise<CompatResult>((resolve) => {

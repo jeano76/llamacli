@@ -547,3 +547,17 @@ test("output that already decided the verdict wins over a later exit", async () 
   const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn, timeoutMs: 60_000 });
   assert.equal(r.verdict, "unsupported");
 });
+
+test("the compatibility probe never uses the default port: it asks for an OS-assigned loopback port", async () => {
+  let seen: string[] = [];
+  const spawn: ProbeSpawn = (_bin, args, { onOutput }) => {
+    seen = args;
+    onOutput("srv  llama_server: model loaded\n");
+    return { kill: () => {} };
+  };
+  const r = await probeModelCompatibility(B("/bin/llama-server"), "/m.gguf", { spawn });
+  assert.equal(r.ok, true);
+  assert.equal(seen[seen.indexOf("--port") + 1], "0", "port 0: another server on 8080 must not break the probe");
+  assert.equal(seen[seen.indexOf("--host") + 1], "127.0.0.1");
+  assert.ok(seen.includes("-ngl") && seen[seen.indexOf("-ngl") + 1] === "0", "still off the GPU");
+});

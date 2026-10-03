@@ -11,10 +11,10 @@ name: windows
 on:
   workflow_dispatch:
   pull_request:
-    paths: ["src/**", "test/windows/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
+    paths: ["src/**", "test/windows/**", "test/tui/**", "test/e2e/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
   push:
     branches: [main]
-    paths: ["src/**", "test/windows/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
+    paths: ["src/**", "test/windows/**", "test/tui/**", "test/e2e/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "test/containers/mock-hub.mjs", "bin/**", ".github/workflows/windows.yml"]
 
 permissions:
   contents: read
@@ -61,6 +61,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # END-TO-END with the real thing: a tiny GGUF from the Hub, the real stock llama.cpp Windows prebuilt from GitHub
+      # (found by the engine ladder, run-verified), a real llama-server started on a free port, a real chat completion.
+      - name: Real llama-server end to end
+        run: node test/e2e/real-server.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # Required: detection and the engine ladder from each shell, then the download scenarios.
       - name: Scenarios (pwsh, powershell, cmd, git-bash, downloads)
         run: node test/windows/run.mjs
@@ -74,6 +81,24 @@ jobs:
         run: node test/clipboard-check.mjs
 
       # Informational: the repository's own unit tests were written on Linux; this shows which ones assume POSIX.
+      # The interactive TUI in a real ConPTY (the console Windows Terminal and conhost build on), driven by pywinpty.
+      # `npm run build` uses POSIX tools, so compile with tsc and copy the skills by hand.
+      - name: Build the app for the UI tests
+        if: always()
+        shell: bash
+        run: |
+          npx tsc -p tsconfig.json --outDir dist
+          mkdir -p dist/skills/builtin && cp src/skills/builtin/*.md dist/skills/builtin/
+          pip install pyte pywinpty
+      - name: TUI smoke in ConPTY
+        if: always()
+        continue-on-error: true
+        run: python test/containers/tui-smoke.py
+      - name: Plain drag copies to the clipboard (ConPTY)
+        if: always()
+        continue-on-error: true
+        run: python test/tui/drag-copy.py
+
       - name: Unit tests (informational)
         id: unit
         if: always()

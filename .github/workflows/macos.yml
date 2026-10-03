@@ -5,10 +5,10 @@ name: macos
 on:
   workflow_dispatch:
   pull_request:
-    paths: ["src/**", "test/macos/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "bin/**", ".github/workflows/macos.yml"]
+    paths: ["src/**", "test/macos/**", "test/tui/**", "test/e2e/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "bin/**", ".github/workflows/macos.yml"]
   push:
     branches: [main]
-    paths: ["src/**", "test/macos/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "bin/**", ".github/workflows/macos.yml"]
+    paths: ["src/**", "test/macos/**", "test/tui/**", "test/e2e/**", "test/clipboard-check.mjs", "test/containers/probe.mjs", "test/containers/download-scenario.mjs", "bin/**", ".github/workflows/macos.yml"]
 permissions:
   contents: read
 concurrency:
@@ -36,12 +36,30 @@ jobs:
         run: |
           uname -a; sw_vers; sysctl -n machdep.cpu.brand_string || true; sysctl -n hw.memsize; node -v; command -v brew zsh bash
       - run: npm ci
+      - name: Real llama-server end to end
+        run: node test/e2e/real-server.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Scenarios (zsh, bash, sh, downloads)
         run: node test/macos/run.mjs
       - name: Clipboard round trip (pbcopy / pbpaste)
         if: always()
         continue-on-error: true
         run: node test/clipboard-check.mjs
+      - name: Build the app for the UI tests
+        if: always()
+        run: |
+          npm run build
+          pip3 install --break-system-packages pyte || pip3 install pyte
+      - name: TUI smoke in a pty
+        if: always()
+        continue-on-error: true
+        run: python3 test/containers/tui-smoke.py
+      - name: Plain drag copies to the clipboard (pbcopy)
+        if: always()
+        continue-on-error: true
+        run: python3 test/tui/drag-copy.py
+
       - name: Unit tests (informational)
         id: unit
         if: always()
