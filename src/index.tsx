@@ -711,6 +711,11 @@ async function main() {
     // idle gap between turns instead of letting it interrupt a live one.
     // Undefined by default — a latency/quality trade, not a free win.
     warmTriggerRatio: config.compaction.warmTriggerRatio,
+    // See CompactionThresholds.warmPrefill: after that idle-gap compaction,
+    // warm the prompt cache too, so the next turn skips the full re-prefill.
+    // Off unless explicitly enabled — it occupies the single slot the way
+    // any long request would, which matters on a shared server.
+    warmPrefill: config.compaction.warmPrefill,
   };
   const ui = () => (globalThis as any).__llamacli_ui;
 

@@ -951,6 +951,7 @@ export function keepUserOwnedKeys(config: Record<string, any> | undefined): Reco
       ...(config.compaction.summaryMaxTokens !== undefined
         ? { summaryMaxTokens: config.compaction.summaryMaxTokens }
         : {}),
+      ...(config.compaction.warmPrefill !== undefined ? { warmPrefill: config.compaction.warmPrefill } : {}),
     };
   }
   return kept;

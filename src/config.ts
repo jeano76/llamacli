@@ -149,6 +149,29 @@ export interface LlamacliConfig {
      * is opt-in and why the number belongs in config rather than in code.
      */
     warmTriggerRatio?: number;
+    /**
+     * Warm-prefill the prompt cache after an idle-gap (warm) compaction.
+     * Unset/false = off, which is the historical behavior.
+     *
+     * What it does: a compaction rewrites the system message, so the next
+     * turn's whole context misses the server's prompt cache and pays a full
+     * re-prefill (tens of seconds on a large window — the larger half of what
+     * a compaction actually costs the user; see
+     * docs/compaction-invisibility-investigation.md §2). When this is on, the
+     * idle gap that just ran a warm compaction also sends the compacted
+     * conversation once with `max_tokens: 1`, so the next real turn only
+     * prefills its own new message. The request is cancelled the moment new
+     * input arrives, and any failure is swallowed — the fallback is exactly
+     * today's behavior.
+     *
+     * Two honest caveats. First, it occupies the single inference slot for
+     * the length of that prefill, so on a server shared with other sessions
+     * or processes it can delay someone else's turn the way any long request
+     * would — leave it off there. Second, like warmTriggerRatio itself, this
+     * moves cost rather than removing it; what it removes is the user's wait,
+     * not the work.
+     */
+    warmPrefill?: boolean;
   };
   /** Remote debugging (Chrome DevTools Protocol) for the browser tools —
    *  connects to an already-running Chrome/Chromium started with

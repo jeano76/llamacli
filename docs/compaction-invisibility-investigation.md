@@ -130,6 +130,27 @@ does not remove it"라고 적고 있다.
 **기대 효과 (모델 기준):** critical path의 컴팩션 비용 S+R ≈ 130초 → **≈0초**
 (둘 다 idle + 취소 가능). 컴팩션이 사용자에게 "없는 것"이 된다.
 
+### 구현됨 (2026-10-04, 기본값 OFF)
+
+`compaction.warmPrefill` 노브로 구현했다. warm 컴팩션 직후 idle-gap에서 compact된
+대화를 `max_tokens: 1`·`stream: false`로 1회 전송하고, `send()`·`compact()` 진입 시
+취소한다. 실패·취소는 무음 swallow (fallback = 현재 동작). 취소 불가 백엔드에서는
+시작조차 안 한다.
+
+- `src/agent/loop.ts` — `warmPrefill` 필드, `startWarmPrefill()`/`stopWarmPrefill()`,
+  `maybeWarmCompact` 양 분기 후 호출, `send()`·`compact()` 진입 시 중단.
+  메인 턴과 요청 형태를 일치시킴 (messages 스냅샷 + `activeToolDefs()` + thinking 플래그).
+- `src/config.ts` / `src/compaction/compactor.ts` (`CompactionThresholds`) /
+  `src/index.tsx` / `src/setup/bootstrap.ts` — 노브 선언·배선·유지.
+- 회귀 테스트 5개 (`src/agent/loop.test.ts`): 발화 조건·미설정 시 무동작·전송 중
+  취소 후 턴 정상 진행·실패 swallow·취소 불가 백엔드에서 미시작.
+- `npm test` 1291/1291, `tsc` 클린.
+
+**효과 입증은 라이브에서만 가능**하므로 기본값 OFF를 유지한다. 시험하려면 라이브
+설정에 `warmTriggerRatio` (예: 0.5)와 `warmPrefill: true`를 함께 넣고,
+`[compaction] prompt cache warmed in Xs` 상태줄과 다음 턴 체감을 보고할 것.
+공유 서버에서는 끄고 쓸 것 (단일 슬롯 점유 — 노브 주석에 명시).
+
 ### O2 warmTriggerRatio 시험 운용 (코드 변경 없음)
 
 `warmTriggerRatio: 0.5`를 라이브 설정에 넣어 보고 체감만 본다. 단, §2.3의 수식대로

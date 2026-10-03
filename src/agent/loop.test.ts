@@ -3119,3 +3119,243 @@ test("a tool result under the cap reaches the model untouched", () =>
     assert.match(toolMsg, /small-output/);
     assert.doesNotMatch(toolMsg, /truncated/);
   }));
+
+/* ------------------------------------------------------------------ *
+ * O1 warm prefill — prefill the prompt cache in the idle gap after a
+ * warm compaction, so the next turn skips the full re-prefill.
+ * (docs/compaction-invisibility-investigation.md section 5/O1)
+ * ------------------------------------------------------------------ */
+
+/** A backend that can tell the three request shapes apart: summary requests
+ *  carry no tools (compactor.ts's internal request), warm prefills carry
+ *  tools with a 1-token budget and no streaming, everything else is a turn.
+ *  The prefill can be left hanging so a test can prove send() cancels it. */
+function prefillBackend(opts: {
+  turnResponses: ChatCompletionResponse[];
+  tokenCounts: number[];
+  summaryText?: string;
+  /** Leave the prefill unresolved until cancel() is called. */
+  hangPrefill?: boolean;
+  /** Omit cancel() entirely — the loop must then never start a prefill. */
+  noCancel?: boolean;
+}): {
+  backend: ModelBackend;
+  calls: ChatCompletionRequest[];
+  cancelled: () => boolean;
+  releasePrefill: () => void;
+} {
+  let turnIndex = 0;
+  let tokenizeIndex = 0;
+  let wasCancelled = false;
+  let settlePrefill: { resolve: () => void; reject: (e: Error) => void } | null = null;
+  const calls: ChatCompletionRequest[] = [];
+  const backend: ModelBackend = {
+    async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+      calls.push(req);
+      if (!req.tools) {
+        return {
+          choices: [{ message: { role: "assistant", content: opts.summaryText ?? "summary" }, finish_reason: "stop" }],
+        };
+      }
+      if (req.max_tokens === 1 && req.stream === false) {
+        if (opts.hangPrefill) {
+          // A cancelled hang rejects here (like a real abort); an uncancelled
+          // one resolves when the test releases it. Either way the loop must
+          // survive.
+          await new Promise<void>((resolve, reject) => {
+            settlePrefill = { resolve, reject };
+          });
+        }
+        return { choices: [{ message: { role: "assistant", content: "x" }, finish_reason: "length" }] };
+      }
+      const res = opts.turnResponses[turnIndex];
+      turnIndex++;
+      if (!res) throw new Error(`prefillBackend: no turn response scripted for call ${turnIndex}`);
+      return res;
+    },
+    async listModels() {
+      return ["fake-model"];
+    },
+    async tokenize() {
+      const count = opts.tokenCounts[tokenizeIndex] ?? opts.tokenCounts[opts.tokenCounts.length - 1];
+      tokenizeIndex++;
+      return count;
+    },
+    ...(opts.noCancel
+      ? {}
+      : {
+          cancel() {
+            wasCancelled = true;
+            // Abort rejects the in-flight request — it never resolves it.
+            // (Resolving here would fake a completed warming the loop never
+            // earned, and the "stays silent" assertion below would lie.)
+            settlePrefill?.reject(new Error("cancelled by user"));
+            settlePrefill = null;
+          },
+        }),
+  };
+  return {
+    backend,
+    calls,
+    cancelled: () => wasCancelled,
+    releasePrefill: () => settlePrefill?.resolve(),
+  };
+}
+
+/** Waits until `cond()` is true or fails after a bounded wait. The warm path
+ *  is fire-and-forget by design, so there is no promise to await — poll. */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+test("warm prefill sends the compacted conversation with a 1-token budget after an idle-gap compaction, when enabled", () =>
+  withTempProject(async (dir) => {
+    const { backend, calls } = prefillBackend({
+      turnResponses: [assistantMessage("done")],
+      // send()'s own check -> low, no compact; warm check -> high, compacts.
+      tokenCounts: [100, 3000],
+    });
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.7, contextWindowTokens: 4000, warmPrefill: true },
+      onStatus: (s) => statusMessages.push(s),
+    });
+    await loop.send("do the thing");
+    assert.ok(!calls.some((c) => c.max_tokens === 1), "no prefill before any compaction");
+
+    loop.warmCompactIfNeeded();
+    await waitFor(
+      () => statusMessages.some((s) => s.includes("prompt cache warmed")),
+      "the warm-prefill completion status"
+    );
+
+    const prefill = calls.find((c) => c.max_tokens === 1);
+    assert.ok(prefill, "a prefill request must have been sent after the warm compaction");
+    assert.equal(prefill!.stream, false, "prefill is one JSON document, not a stream to process");
+    assert.ok(prefill!.tools && prefill!.tools.length > 0, "prefill mirrors the turn's tool schema so the cached prefix matches");
+    const firstSystem = prefill!.messages.find((m) => m.role === "system");
+    assert.ok(
+      String(firstSystem?.content).includes("summary"),
+      "prefill warms the COMPACTED conversation, not the pre-compaction one"
+    );
+  }));
+
+test("warm prefill does not fire when the knob is off", () =>
+  withTempProject(async (dir) => {
+    const { backend, calls } = prefillBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [100, 3000],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      // warmPrefill unset: historical behavior, byte-for-byte.
+      thresholds: { autoTriggerRatio: 0.7, contextWindowTokens: 4000 },
+    });
+    await loop.send("do the thing");
+    loop.warmCompactIfNeeded();
+    // Give the fire-and-forget chain a chance to run to completion.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(!calls.some((c) => c.max_tokens === 1), "knob off must mean no prefill request at all");
+  }));
+
+test("a new turn cancels an in-flight warm prefill and proceeds normally", () =>
+  withTempProject(async (dir) => {
+    const { backend, calls, cancelled } = prefillBackend({
+      turnResponses: [assistantMessage("done"), assistantMessage("next done")],
+      tokenCounts: [100, 3000, 100],
+      hangPrefill: true,
+    });
+    const statusMessages: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.7, contextWindowTokens: 4000, warmPrefill: true },
+      onStatus: (s) => statusMessages.push(s),
+    });
+    await loop.send("do the thing");
+    loop.warmCompactIfNeeded();
+    await waitFor(
+      () => calls.some((c) => c.max_tokens === 1),
+      "the hanging prefill request"
+    );
+
+    // The user types fast: this send() must stop the prefill, not queue a
+    // ~100 s wait behind it.
+    await loop.send("typed fast");
+    assert.ok(cancelled(), "send() must cancel the in-flight prefill first");
+    assert.ok(
+      !statusMessages.some((s) => s.includes("prompt cache warmed")),
+      "a cancelled prefill must stay silent — the user typing fast is the expected race, not an error"
+    );
+  }));
+
+test("a failing warm prefill is swallowed and the next turn behaves as if it never ran", () =>
+  withTempProject(async (dir) => {
+    let prefillCalls = 0;
+    const { backend } = prefillBackend({
+      turnResponses: [assistantMessage("done"), assistantMessage("recovered")],
+      tokenCounts: [100, 3000, 100],
+    });
+    const inner = backend.chat.bind(backend);
+    let failNext = false;
+    const failing: ModelBackend = {
+      ...backend,
+      async chat(req: ChatCompletionRequest) {
+        if (req.tools && req.max_tokens === 1) {
+          prefillCalls++;
+          if (failNext) throw new Error("boom: slot went away mid-prefill");
+        }
+        return inner(req);
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend: failing,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.7, contextWindowTokens: 4000, warmPrefill: true },
+    });
+    await loop.send("do the thing");
+    failNext = true;
+    loop.warmCompactIfNeeded();
+    await waitFor(() => prefillCalls > 0, "the failing prefill attempt");
+    // Let the rejection settle through the swallow path.
+    await new Promise((r) => setTimeout(r, 200));
+    failNext = false;
+    // Must not have crashed, poisoned the chain, or left a stale flag that
+    // blocks the next prefill or turn.
+    await loop.send("are you still there");
+  }));
+
+test("warm prefill never starts against a backend that cannot cancel it", () =>
+  withTempProject(async (dir) => {
+    const { backend, calls } = prefillBackend({
+      turnResponses: [assistantMessage("done")],
+      tokenCounts: [100, 3000],
+      noCancel: true,
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.7, contextWindowTokens: 4000, warmPrefill: true },
+    });
+    await loop.send("do the thing");
+    loop.warmCompactIfNeeded();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(!calls.some((c) => c.max_tokens === 1), "a prefill that cannot be stopped must never be launched");
+  }));

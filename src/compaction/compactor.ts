@@ -33,6 +33,16 @@ export interface CompactionThresholds {
    * Hence a config knob and disabled-by-default.
    */
   warmTriggerRatio?: number;
+  /** Re-prefill the prompt cache after an idle-gap (warm) compaction, so the
+   *  next turn skips the full re-prefill a rewritten system message would
+   *  otherwise force (see docs/compaction-invisibility-investigation.md §2:
+   *  that re-prefill is the larger half of what a compaction costs the user).
+   *  Unset/false = off. Only ever fires in the idle gap after a warm
+   *  compaction, never on the critical path; cancelled the moment new input
+   *  arrives, failures swallowed. Opt-in like warmTriggerRatio, for the same
+   *  reason: on a server shared with other sessions it occupies the single
+   *  slot the way any long request would. */
+  warmPrefill?: boolean;
 }
 
 /** What a compaction actually did to the conversation — requested directly

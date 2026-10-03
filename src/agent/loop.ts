@@ -574,6 +574,15 @@ export class AgentLoop {
     this.opts.onQueueChange?.(this.queuedMessages.slice());
   }
 
+  /** A warm-prefill request launched by startWarmPrefill(), or null when none
+   *  is running. Tracked so a new turn (or a further compaction) can cancel
+   *  exactly this request — never anything else — via stopWarmPrefill().
+   *  Deliberately OUTSIDE the enqueue chain: chaining it would serialize the
+   *  user's next send() behind up to ~100 s of background prefill, which is
+   *  the exact wait this exists to remove. */
+  private warmPrefill: Promise<void> | null = null;
+
+
   /** Reported directly: "컴팩션 하고나면 왜 다음 프롬프트시 시간이 소요가 되지?"
    *  — even with the cache-prefix fix (runCompaction keeping the original
    *  system message verbatim), the turn AFTER a compaction still opens with
@@ -650,7 +659,8 @@ export class AgentLoop {
     if (!warmRatio || warmRatio <= 0) {
       // Not configured — fall back to the ordinary threshold check, which is
       // exactly what this method did before the warm ladder existed.
-      await this.maybeCompact();
+      const { compacted } = await this.maybeCompact();
+      if (compacted) this.startWarmPrefill();
       return;
     }
     const window = this.opts.thresholds.contextWindowTokens;
@@ -666,11 +676,100 @@ export class AgentLoop {
     this.opts.onContextUsage?.(used, window);
     if (used >= window * warmRatio) {
       await this.compact("auto-threshold", null);
+      this.startWarmPrefill();
     }
   }
 
+  /** O1 warm prefill — docs/compaction-invisibility-investigation.md section 5/O1.
+   *
+   *  A compaction rewrites the system message, so the next turn's whole context
+   *  misses the server's prompt cache and pays a full re-prefill (tens of
+   *  seconds on a large window — the larger half of what a compaction actually
+   *  costs; the summary everyone optimized is the smaller half). Called after
+   *  an IDLE-gap (warm) compaction only, never on the critical path: it sends
+   *  the compacted conversation once with `max_tokens: 1`, so the slot's KV
+   *  cache already holds it when the next real turn appends its message and
+   *  only pays the incremental prefill.
+   *
+   *  Mirrors the main turn's request shape on purpose — same messages, same
+   *  tool schema, same thinking flag: the server reuses KV by longest common
+   *  prefix (server-context.cpp: `get_common_prefix`), so anything the prefill
+   *  renders differently (missing tools section, different thinking flag)
+   *  shortens the shared prefix and throws away part of the warming.
+   *
+   *  Safety, in order:
+   *  - Opt-in (`compaction.warmPrefill`), off by default. On a server shared
+   *    with other sessions it occupies the single slot like any long request.
+   *  - Cancelled the moment new input arrives (stopWarmPrefill at the top of
+   *    send() and compact()): a fast typist never waits for it.
+   *  - Failures (including the cancellation itself) are swallowed: the
+   *    fallback is exactly today's behavior, a cold re-prefill on next turn.
+   *  - Never started without a cancellable backend: a prefill that cannot be
+   *    stopped must never be launched, or a quick next message would queue
+   *    behind ~100 s of background work with no recourse.
+   *  - At most one in flight: a second warm compaction stops the previous
+   *    prefill (its history is stale anyway) before compacting. */
+  private startWarmPrefill(): void {
+    if (!this.opts.thresholds.warmPrefill) return;
+    if (this.warmPrefill) return;
+    const backend = this.opts.backend;
+    if (typeof backend.cancel !== "function") return;
+    const startedAt = Date.now();
+    const run = backend
+      .chat({
+        model: this.opts.model,
+        messages: [...this.messages],
+        // Same tool schema the real turn sends (see the main chat() call):
+        // the template renders it into the prompt, so omitting it here would
+        // shorten the cached prefix by ~700 tokens for nothing.
+        tools: activeToolDefs(),
+        // One JSON document, no deltas to process — the point is the prefill,
+        // not the token. A single decode step costs ~26 ms on top of it.
+        stream: false,
+        max_tokens: 1,
+        repeat_penalty: this.opts.repeatPenalty ?? DEFAULT_REPEAT_PENALTY,
+        ...(this.opts.enableThinking ? {} : { chat_template_kwargs: { enable_thinking: false } }),
+      })
+      .then(
+        () => {
+          this.opts.onStatus?.(
+            `[compaction] prompt cache warmed in ${((Date.now() - startedAt) / 1000).toFixed(1)}s — the next turn skips the full re-prefill.`
+          );
+        },
+        () => {
+          // Cancelled by new input, or the backend failed: silent either way.
+          // Surfacing it would report an expected race (user typed fast) or a
+          // transient backend blip as an error, and the fallback needs no
+          // announcement — it is what every turn already does today.
+        }
+      );
+    this.warmPrefill = run;
+    run.finally(() => {
+      if (this.warmPrefill === run) this.warmPrefill = null;
+    });
+  }
+
+  /** Stops the in-flight warm prefill, if any. Safe to call anywhere: when no
+   *  prefill is running it is a no-op, and when one is, the in-flight request
+   *  can only be the prefill — every other chat() call in this class runs
+   *  inside the serialized enqueue chain, while the prefill deliberately runs
+   *  outside it, so the two can never overlap. */
+  private stopWarmPrefill(): void {
+    const run = this.warmPrefill;
+    if (!run) return;
+    this.warmPrefill = null;
+    this.opts.backend.cancel?.();
+  }
+
+
   async send(userText: string): Promise<void> {
     await this.enqueue(async () => {
+      // A warm prefill from the last idle gap must never delay this turn:
+      // stop it first. Abort is local and fast; the server drops the slot's
+      // abandoned work when it notices, and this turn's prompt is still a
+      // prefix-match on whatever prefix got warmed, so even a partially
+      // warmed cache helps the prefill this turn is about to pay.
+      this.stopWarmPrefill();
       // The circuit breaker is created once per AgentLoop (i.e. once per
       // process) and never reset anywhere before this — its 30-minute
       // "hard timeout" was measured from PROCESS STARTUP, not from the
@@ -1751,6 +1850,10 @@ export class AgentLoop {
     // tail itself, not just old history, was the thing too large to fit.
     tailBudgetFraction: number = DEFAULT_TAIL_BUDGET_FRACTION
   ): Promise<void> {
+    // A prefill left over from an earlier warm compaction is warming the very
+    // history this call is about to replace — and worse, it holds the single
+    // slot the summary request below needs. Stop it before doing anything.
+    this.stopWarmPrefill();
     this.opts.onCompactionStatus?.("running", new Date().toISOString());
     // Requested directly: "컴팩션을 수행하는 경우 출력창에 친절하게 ...
     // 안내가 되면 좋겠어" — a plain-language heads-up the moment
