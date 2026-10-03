@@ -151,7 +151,7 @@ test("findOwnLlamaServerPids is a no-op without a known install dir", async () =
 });
 
 // ── cgroup limits (containers): the host's RAM/CPU must not be believed inside a limited cgroup ──
-import { readCgroupLimits, applyCgroupLimits } from "./hardware.js";
+import { readCgroupLimits, applyCgroupLimits, detectHardware } from "./hardware.js";
 
 const fsOf = (files: Record<string, string>) => (p: string) => (p in files ? files[p] : null);
 const GiBc = 1024 ** 3;
@@ -203,4 +203,12 @@ test("the Hub and release endpoints default to the real services (overrides are 
   const { STOCK_RELEASES_URL } = await import("./stockRuntime.js");
   if (!process.env.LLAMACLI_HF_ENDPOINT) assert.equal(HF_ENDPOINT, "https://huggingface.co");
   if (!process.env.LLAMACLI_RELEASES_URL) assert.match(STOCK_RELEASES_URL, /^https:\/\/api\.github\.com\/repos\/ggml-org\/llama\.cpp\/releases/);
+});
+
+test("libc is detected from the dynamic loader on Linux (musl vs glibc) and left unset elsewhere", async () => {
+  const run = (async () => { throw new Error("nf"); }) as never;
+  const host = (platform: string, lib: string[]) => ({ platform, arch: "x64", ramTotalBytes: 8 * 1024 ** 3, ramAvailableBytes: 4 * 1024 ** 3, cpuCount: 4, readText: async () => null, listDir: async (p: string) => (p === "/lib" ? lib : []) });
+  assert.equal((await detectHardware(run, host("linux", ["ld-musl-x86_64.so.1", "libc.musl-x86_64.so.1"]))).libc, "musl");
+  assert.equal((await detectHardware(run, host("linux", ["x86_64-linux-gnu", "ld-linux-x86-64.so.2"]))).libc, "glibc");
+  assert.equal((await detectHardware(run, host("darwin", []))).libc, undefined);
 });

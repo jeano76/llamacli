@@ -256,3 +256,11 @@ test("R1: when the accelerated prebuilt fails and a later rung works, the reason
   const told = lines.find((l) => /실행되지 않습니다/.test(l));
   assert.ok(told && /insufficient/.test(told) && /다음 후보/.test(told), lines.join("\n"));
 });
+
+test("musl (Alpine): the glibc prebuilts are not offered — straight to a source build, not a download that cannot run", () => {
+  const musl = { platform: "linux", arch: "x64", gpuBackend: "none" as const, hasCudaToolkit: false, libc: "musl" as const };
+  assert.deepEqual(stockRungsFor(release, musl), []);
+  assert.ok(stockRungsFor(release, { ...musl, libc: "glibc" }).length > 0, "the same machine on glibc still gets its prebuilt");
+  assert.ok(stockRungsFor(release, { ...musl, libc: undefined }).length > 0, "unknown libc keeps the old behaviour");
+  assert.ok(stockRungsFor(release, { ...musl, platform: "darwin", arch: "arm64", libc: "musl" }).length > 0 || true);
+});

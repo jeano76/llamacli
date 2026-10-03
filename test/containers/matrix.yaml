@@ -63,10 +63,10 @@ rows:
 # `image` + `pkg` build the environment; `user` is root | user | user-nosudo; the probe must still produce the same
 # machine-checked facts. These rows have NOT been executed on the author's machine (no container runtime installed).
 os_rows:
-  - { id: os-debian-bash-user,   image: "debian:12",        pkg: apt,    shell: bash,    user: user-nosudo, expect: { "buildPlan.manager": apt, "detected.platform": linux } }
+  - { id: os-debian-bash-user,   image: "debian:12",        pkg: apt,    shell: bash,    user: user-nosudo, expect: { "buildPlan.manager": apt, "detected.platform": linux, "detected.libc": glibc, "engineLadder.0": cpu } }
   - { id: os-ubuntu-bash-sudo,   image: "ubuntu:24.04",     pkg: apt,    shell: bash,    user: user,        expect: { "buildPlan.manager": apt } }
   - { id: os-ubuntu-root,        image: "ubuntu:24.04",     pkg: apt,    shell: bash,    user: root,        expect: { "buildPlan.manager": apt } }
   - { id: os-fedora-zsh,         image: "fedora:40",        pkg: dnf,    shell: zsh,     user: user,        expect: { "buildPlan.manager": dnf } }
   - { id: os-arch-fish,          image: "archlinux:latest", pkg: pacman, shell: fish,    user: user,        expect: { "buildPlan.manager": pacman } }
-  - { id: os-alpine-ash-musl,    image: "alpine:3.20",      pkg: apk,    shell: busybox, user: user,        expect: { "buildPlan.manager": apk, "engineLadder.0": cpu } }   # musl: a glibc prebuilt must not be offered/relied on (H2)
+  - { id: os-alpine-ash-musl,    image: "alpine:3.20",      pkg: apk,    shell: busybox, user: user,        expect: { "buildPlan.manager": apk, "detected.libc": musl, "engineLadder": [] } }   # musl: the glibc prebuilts are not offered; source build (H2)
   - { id: os-debian-dash,        image: "debian:12-slim",   pkg: apt,    shell: dash,    user: user-nosudo, expect: { "detected.platform": linux } }

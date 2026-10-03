@@ -34,7 +34,7 @@ const assets = [
 ];
 const release = { tag: TAG, assets: assets.map((name) => ({ name, url: name })) };
 const cudaVersion = hw.gpuBackend === "cuda" ? await detectCudaVersion(run).catch(() => null) : null;
-const rungs = stockRungsFor(release, { platform: hw.platform, arch: hw.arch ?? process.arch, gpuBackend: hw.gpuBackend, cudaVersion, hasCudaToolkit: Boolean(hw.tools.nvcc) });
+const rungs = stockRungsFor(release, { platform: hw.platform, arch: hw.arch ?? process.arch, gpuBackend: hw.gpuBackend, cudaVersion, hasCudaToolkit: Boolean(hw.tools.nvcc), libc: hw.libc });
 
 const cand = (filename, gib) => ({ repo: "r", filename, sizeBytes: gib * GiB, url: "u" });
 const choice = chooseModel({
@@ -47,7 +47,7 @@ const plan = planBuildEnv(hw, { isRoot: process.getuid?.() === 0 });
 
 console.log(JSON.stringify({
   detected: {
-    platform: hw.platform, arch: hw.arch, cpuCount: hw.cpuCount, ramGiB: Math.round((hw.ramTotalBytes / GiB) * 10) / 10,
+    platform: hw.platform, arch: hw.arch, libc: hw.libc ?? null, cpuCount: hw.cpuCount, ramGiB: Math.round((hw.ramTotalBytes / GiB) * 10) / 10,
     gpuBackend: hw.gpuBackend, gpus: hw.gpus.map((g) => ({ name: g.name, vramGiB: Math.round((g.vramTotalBytes / GiB) * 10) / 10 })),
     tools: Object.keys(hw.tools).filter((k) => hw.tools[k]).sort(),
   },

@@ -62,6 +62,9 @@ export interface Hardware {
   /** Build toolchain availability, as found on PATH. */
   tools: Record<string, boolean>;
   platform: string;
+  /** Linux C library. The published llama.cpp prebuilts are glibc builds: on musl (Alpine) they download fine and
+   *  then fail to run, so the ladder skips them instead of fetching a binary that cannot start. */
+  libc?: "glibc" | "musl";
 }
 
 /** Command runner seam. `run("nvidia-smi", [...])` resolves with stdout, or
@@ -514,6 +517,9 @@ export async function detectHardware(
     arch: host.arch,
     tools,
     platform: host.platform,
+    ...(host.platform === "linux"
+      ? { libc: ((await host.listDir("/lib").catch(() => [])) as string[]).some((n) => /^ld-musl-/.test(n)) ? ("musl" as const) : ("glibc" as const) }
+      : {}),
   };
 }
 

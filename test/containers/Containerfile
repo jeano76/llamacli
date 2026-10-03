@@ -12,7 +12,8 @@ RUN case "$PKG" in \
     esac
 RUN adduser --disabled-password --gecos "" user 2>/dev/null || adduser -D user 2>/dev/null || useradd -m user
 COPY bin/llamacli-dist.tar.gz /tmp/dist.tgz
-RUN mkdir -p /opt/llamacli && tar xzf /tmp/dist.tgz -C /opt/llamacli && ls /opt/llamacli
+RUN echo '{"type":"module"}' > /opt/llamacli/package.json 2>/dev/null || (mkdir -p /opt/llamacli && echo '{"type":"module"}' > /opt/llamacli/package.json)
+RUN mkdir -p /opt/llamacli/dist && tar xzf /tmp/dist.tgz -C /opt/llamacli/dist && ls /opt/llamacli/dist | head -3
 COPY test/containers/probe.mjs test/containers/download-scenario.mjs test/containers/mock-hub.mjs /opt/matrix/
 COPY test/containers/fixtures/ /opt/matrix/fixtures/
 ENV LLAMACLI_DIST=/opt/llamacli/dist LLAMACLI_NO_UPDATE=1 PATH=/opt/matrix/fixtures:$PATH

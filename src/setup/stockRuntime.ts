@@ -81,6 +81,8 @@ export interface StockMachine {
   cudaVersion?: string | null;
   /** A CUDA toolkit is installed, so the CUDA runtime bundle is not needed. */
   hasCudaToolkit: boolean;
+  /** Linux libc; "musl" has no published prebuilt (they are glibc builds). */
+  libc?: "glibc" | "musl";
 }
 
 /**
@@ -93,6 +95,7 @@ export interface StockMachine {
 export function stockRungsFor(release: Release, m: StockMachine): StockRung[] {
   const a = archTag(m.arch);
   if (!a) return [];
+  if (m.platform === "linux" && m.libc === "musl") return []; // glibc-only prebuilts: go straight to a source build
   const byName = new Map(release.assets.map((x) => [x.name, x]));
   const tag = release.tag;
   const rungs: StockRung[] = [];
@@ -320,6 +323,7 @@ export async function acquireStockLlamaServer(opts: AcquireStockOptions): Promis
     gpuBackend: hw.gpuBackend,
     cudaVersion: hw.gpuBackend === "cuda" ? await detectCudaVersion(opts.run as never) : null,
     hasCudaToolkit: Boolean(hw.tools.nvcc),
+    libc: hw.libc,
   };
 
   // Newest release that offers a rung; an in-flight release can be missing assets.
