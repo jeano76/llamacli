@@ -41,7 +41,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/llamacli"
+          # GNU tar reads "D:\a\_temp" as host "D" + path, so work in POSIX form and convert back only for the env var.
+          root="$(cygpath -u "$RUNNER_TEMP")/llamacli"
           mkdir -p "$root/dist"
           tar xzf bin/llamacli-dist.tar.gz -C "$root/dist"
           echo '{"type":"module"}' > "$root/package.json"
