@@ -166,7 +166,7 @@ export class OpenAICompatibleClient implements ModelBackend {
 
    *  Tries `/config` first (`model_info.n_ctx`), then `/props`
    *  (`default_generation_settings.n_ctx`). Neither endpoint is present in every
-   *  build: the PrismML fork answers `/props` but 404s `/config`, and the stock
+   *  build: one llama.cpp variant answers `/props` but 404s `/config`, and the
    *  build here registers `/props` with no `/config` route at all.
    *
    *  Getting this wrong is not cosmetic. When both lookups fail, callers fall
@@ -178,7 +178,7 @@ export class OpenAICompatibleClient implements ModelBackend {
   async getContextSize(): Promise<number> {
     // Every failure mode here means "this endpoint did not tell us", never "stop".
     // A reverse proxy that answers `/config` with an HTML login page, a build
-    // that 404s it, a fork that serves a different shape — all are answers, and
+    // that 404s it, a variant that serves a different shape — all are answers, and
     // the other endpoint is still worth asking. Letting any of them escape threw
     // out of the `??` chain before the fallback ran, so a server whose `/props`
     // would have reported 40960 instead raised a JSON parse error and the caller

@@ -40,7 +40,7 @@ test("the 35B MoE rung runs on an 8 GB card by streaming experts from RAM", () =
 });
 
 test("a small dense rung fits entirely in VRAM and gets a context estimate", () => {
-  const r = evaluateFit(findRung("bonsai-4b")!, profileA);
+  const r = evaluateFit(findRung("ornith-9b")!, profileA);
   assert.equal(r.fit, "vram", `expected vram, got ${r.fit}: ${r.verdict}`);
   assert.ok(r.maxContext! >= 4096, `context ${r.maxContext} should be usable`);
   assert.ok(r.maxContext! <= 32768, `context ${r.maxContext} must stay inside llama.cpp's range`);
@@ -55,15 +55,15 @@ test("an 80 GB card fully offloads the 35B", () => {
 test("MoE residency saves VRAM but never invents RAM", () => {
   // The MoE advantage is real but it is bounded, and the bound is RAM: streaming
   // experts still needs somewhere to stream them FROM. On a 4 GB card with 8 GB
-  // of RAM the 21.9 GiB 35B-A3B does NOT run, while the 5.5 GiB dense 27B
+  // of RAM the 21.9 GiB 35B-A3B does NOT run, while the 5.5 GiB dense 9B
   // does — smaller wins, which is the correct and slightly counter-intuitive
   // answer. An earlier version of this test assumed MoE always survives.
   const small = hw({ cpus: 4, ramGiB: 8, vramGiB: 4 });
   const fits = evaluateAll(small);
   const moe = fits.find((f) => f.rung.id === "ornith-35b")!;
-  const dense27 = fits.find((f) => f.rung.id === "bonsai-27b")!;
+  const dense9 = fits.find((f) => f.rung.id === "ornith-9b")!;
   assert.equal(moe.fit, "no", "20.4 GiB of weights cannot stream from 8 GiB of RAM");
-  assert.equal(dense27.fit, "ram", "the smaller dense model fits in RAM even though the MoE one does not");
+  assert.equal(dense9.fit, "ram", "the smaller dense model fits in RAM even though the MoE one does not");
 
   // And with RAM to match, the MoE rung is back — that is the case it is for.
   const roomy = hw({ cpus: 8, ramGiB: 32, vramGiB: 4 });
@@ -103,7 +103,7 @@ test("every rung evaluates to a verdict with real words, never an empty one", ()
 
 test("findRung accepts the id or the label, case-insensitively", () => {
   assert.equal(findRung("ORNITH-35B")?.id, "ornith-35b");
-  assert.equal(findRung("  bonsai-4b  ")?.id, "bonsai-4b");
+  assert.equal(findRung("  ornith-9b  ")?.id, "ornith-9b");
   assert.equal(findRung("ornith-1.5-35b-a3b")?.id, "ornith-35b");
   assert.equal(findRung("nope"), undefined);
 });

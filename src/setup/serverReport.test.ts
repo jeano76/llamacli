@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { reportServer } from "./serverReport.js";
-import { findRung } from "./modelMetrics.js";
 
 /**
  * `/server` exists because "what is running right now, on which port, with
@@ -10,8 +9,7 @@ import { findRung } from "./modelMetrics.js";
  * and a restart must never quietly become a model switch.
  */
 
-const bonsai = findRung("bonsai-27b")!;
-const MODEL = "/media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+const MODEL = "/media/jeano/nvme-usb/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf";
 
 const cfg = (llama: Record<string, any> = {}) => ({ llama }) as Record<string, any>;
 
@@ -35,7 +33,7 @@ test("reports the configured port, model and who holds it", async () => {
   );
   assert.equal(r.configuredPort, 8084);
   assert.match(r.summary, /8084/);
-  assert.match(r.summary, /Ternary-Bonsai-2-27B/, "the model must be named, not just its path");
+  assert.match(r.summary, /Ornith-1.5-35B-A3B/, "the model must be named, not just its path");
   assert.match(r.summary, /실행 중/, "and the owner must be stated");
 });
 
@@ -79,7 +77,6 @@ test("a build that cannot read the quant is surfaced, not glossed", async () => 
   assert.ok(r.build, "discovery ran, so a build section is expected");
   assert.equal(r.build!.canReadModel, false);
   assert.match(r.restartPlan, /읽지 못/, "and the plan must refuse to restart onto it");
-  void bonsai;
 });
 
 test("a compatible build is reported as usable", async () => {
@@ -87,7 +84,7 @@ test("a compatible build is reported as usable", async () => {
     deps({
       config: cfg({ port: 8084, modelPath: MODEL }),
       detectOwner: async () => ({ kind: "ours", pid: 1 }),
-      findServer: async () => ({ location: { binPath: "/opt/bonsai2-runtime/llama-server", source: "model-adjacent", backend: "cuda" }, rejected: [] }) as any,
+      findServer: async () => ({ location: { binPath: "/opt/alt-runtime/llama-server", source: "model-adjacent", backend: "cuda" }, rejected: [] }) as any,
     })
   );
   assert.equal(r.build!.canReadModel, true);
@@ -219,11 +216,11 @@ test("the stale-config case from the field: config says 8080, the server is on 8
 
 import { parseLlamaServerArgs } from "./modelSwitch.js";
 
-const HAND = "./llama-server -m /media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf --host 127.0.0.1 --port 8084 -ngl 999 -c 40960 -np 2 --cache-type-k q8_0 --cache-type-v q8_0 -fa on -t 6 -tb 11 -b 2048 -ub 256 --n-cpu-moe 32";
+const HAND = "./llama-server -m /media/jeano/nvme-usb/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf --host 127.0.0.1 --port 8084 -ngl 999 -c 40960 -np 2 --cache-type-k q8_0 --cache-type-v q8_0 -fa on -t 6 -tb 11 -b 2048 -ub 256 --n-cpu-moe 32";
 
 test("parseLlamaServerArgs reads the model, port and tuning back from a command line", () => {
   const a = parseLlamaServerArgs(HAND);
-  assert.equal(a.modelPath, "/media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+  assert.equal(a.modelPath, "/media/jeano/nvme-usb/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf");
   assert.equal(a.port, 8084);
   assert.equal(a.gpuLayers, 999);
   assert.equal(a.contextSize, 20480, "-c is the TOTAL across slots; the per-slot value is c / np");
@@ -250,14 +247,14 @@ test("a hand-started server with NO llama block is still reported with its model
     deps({
       config: { backend: "openai-compatible", baseUrl: "http://127.0.0.1:8084" },
       resolvePort: async (rec) => (await import("./modelSwitch.js")).resolveLiveServerPort(rec, {
-        servers: [{ pid: 128976, port: 8084, cmdline: HAND, exe: "/media/jeano/nvme-usb/bonsai2-runtime/llama-server" }],
+        servers: [{ pid: 128976, port: 8084, cmdline: HAND, exe: "/media/jeano/nvme-usb/alt-runtime/llama-server" }],
       }),
       detectOwner: async () => ({ kind: "ours", pid: 128976 }),
     })
   );
   assert.equal(r.fromRunningServer, true);
-  assert.equal(r.configuredModel, "/media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
-  assert.equal(r.configuredBin, "/media/jeano/nvme-usb/bonsai2-runtime/llama-server");
+  assert.equal(r.configuredModel, "/media/jeano/nvme-usb/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf");
+  assert.equal(r.configuredBin, "/media/jeano/nvme-usb/alt-runtime/llama-server");
   assert.doesNotMatch(r.restartPlan, /모델이 없습니다/);
   assert.match(r.restartPlan, /8084/);
   assert.equal(r.serverArgs?.gpuLayers, 999);
@@ -284,7 +281,7 @@ test("the config names one model but the running server loaded another: both are
   // said the opposite of what is answering.
   const r = await reportServer(
     deps({
-      config: cfg({ port: 8084, modelPath: "/home/jeano/models/Ternary-Bonsai-8B-PTQ1_0.gguf" }),
+      config: cfg({ port: 8084, modelPath: "/home/jeano/models/Ornith-1.5-9B-Q4_K_M.gguf" }),
       resolvePort: async (rec) => (await import("./modelSwitch.js")).resolveLiveServerPort(rec, {
         servers: [{ pid: 128976, port: 8084, cmdline: HAND }],
       }),
@@ -292,18 +289,18 @@ test("the config names one model but the running server loaded another: both are
     })
   );
   assert.deepEqual(r.modelMismatch, {
-    serving: "/media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-    configured: "/home/jeano/models/Ternary-Bonsai-8B-PTQ1_0.gguf",
+    serving: "/media/jeano/nvme-usb/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
+    configured: "/home/jeano/models/Ornith-1.5-9B-Q4_K_M.gguf",
   });
-  assert.match(r.summary, /실행 중인 서버의 모델 Ternary-Bonsai-2-27B/);
-  assert.match(r.summary, /config 의 모델 Ternary-Bonsai-8B.*서버와 다름/);
-  assert.match(r.restartPlan, /Ternary-Bonsai-2-27B-PTQ1_0\.gguf → Ternary-Bonsai-8B-PTQ1_0\.gguf 로 바뀝니다/);
+  assert.match(r.summary, /실행 중인 서버의 모델 Ornith-1.5-35B-A3B/);
+  assert.match(r.summary, /config 의 모델 Ornith-1.5-9B.*서버와 다름/);
+  assert.match(r.restartPlan, /Ornith-1.5-35B-A3B-Q4_K_M\.gguf → Ornith-1.5-9B-Q4_K_M\.gguf 로 바뀝니다/);
 });
 
 test("same model, no mismatch noise", async () => {
   const r = await reportServer(
     deps({
-      config: cfg({ port: 8084, modelPath: "/elsewhere/Ternary-Bonsai-2-27B-PTQ1_0.gguf" }),
+      config: cfg({ port: 8084, modelPath: "/elsewhere/Ornith-1.5-35B-A3B-Q4_K_M.gguf" }),
       resolvePort: async (rec) => (await import("./modelSwitch.js")).resolveLiveServerPort(rec, { servers: [{ pid: 1, port: 8084, cmdline: HAND }] }),
       detectOwner: async () => ({ kind: "ours", pid: 1 }),
     })

@@ -3,9 +3,8 @@
  * one exists, and from source only when none works.
  *
  * ── Why this exists ─────────────────────────────────────────────────────────
- * The fork's runtime had a verified ladder (GPU prebuilt → CPU prebuilt → source);
- * stock llama.cpp had only "compile it", 10 to 40 minutes, on every machine without
- * a binary — even though ggml-org publishes prebuilts for CUDA, ROCm, Vulkan, Metal
+ * llama.cpp used to be only compiled (10 to 40 minutes) on every machine without a
+ * binary — even though ggml-org publishes prebuilts for CUDA, ROCm, Vulkan, Metal
  * and CPU on Linux, macOS and Windows.
  *
  * ── Assets are DISCOVERED, not hardcoded ────────────────────────────────────
@@ -17,7 +16,7 @@
  * patterns below were taken from a real release listing, not from memory.
  *
  * ── Every rung is verified by running it ────────────────────────────────────
- * Same rule as the fork ladder: a download that unpacks is not a working server. The
+ * Rule: a download that unpacks is not a working server. The
  * binary must start, initialise its accelerator, and — when a model is known — read
  * it. Anything less reports a broken install as a working one.
  */
@@ -29,7 +28,7 @@ import { extractTarGz } from "./tarGz.js";
 import { extractZip } from "./zip.js";
 import { normalizeSha256 } from "./checksum.js";
 import { downloadFile, type TransferProgress } from "./download.js";
-import { pickPublishedCudaTag, detectCudaVersion, archTag, verifyLlamaServer, type AcquireAttempt } from "./ternaryRuntime.js";
+import { pickPublishedCudaTag, detectCudaVersion, archTag, verifyLlamaServer, type AcquireAttempt } from "./engineCommon.js";
 import { binNameFor, buildLlamaCpp, LLAMA_CPP_REPO, type LlamaLocation } from "./llamaCpp.js";
 import type { GpuBackend, Hardware, Run } from "./hardware.js";
 import { executableExists } from "./fsUtil.js";

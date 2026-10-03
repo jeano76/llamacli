@@ -28,7 +28,7 @@
 import stringWidth from "string-width";
 import { pickPrimaryGpu, type Hardware } from "./hardware.js";
 import { budgetVramGiB } from "./tuning.js";
-import { APPROX_SIZES, BONSAI_27B_REPO, BONSAI_8B_REPO, BONSAI_4B_REPO, ORNITH_35B_REPO, ORNITH_9B_REPO } from "./modelCatalog.js";
+import { APPROX_SIZES, ORNITH_35B_REPO, ORNITH_9B_REPO } from "./modelCatalog.js";
 
 const GiB = 1024 ** 3;
 
@@ -60,8 +60,7 @@ export interface ModelRung {
 
 /** The rungs offered, largest first — the order a user scans when deciding what
  *  they can trade away. Sizes are the measured files where this machine has
- *  them; the 27B figure is the PTQ1_0 quant's, which is why that rung is small
- *  for its parameter count. */
+ *  them. */
 export const MODEL_RUNGS: ModelRung[] = [
   {
     id: "ornith-35b",
@@ -74,16 +73,6 @@ export const MODEL_RUNGS: ModelRung[] = [
     repo: ORNITH_35B_REPO,
   },
   {
-    id: "bonsai-27b",
-    label: "Ternary-Bonsai-2-27B",
-    params: "27B (밀집)",
-    quant: "PTQ1_0",
-    // PTQ1_0: ~5.5 GiB, which is the whole reason this rung exists.
-    sizeBytes: Math.round(5.5 * GiB),
-    approximate: true,
-    repo: BONSAI_27B_REPO,
-  },
-  {
     id: "ornith-9b",
     label: "Ornith-1.5-9B",
     params: "9B",
@@ -91,24 +80,6 @@ export const MODEL_RUNGS: ModelRung[] = [
     sizeBytes: APPROX_SIZES["9b"],
     approximate: true,
     repo: ORNITH_9B_REPO,
-  },
-  {
-    id: "bonsai-8b",
-    label: "Ternary-Bonsai-8B",
-    params: "8B (밀집)",
-    quant: "PTQ1_0",
-    sizeBytes: Math.round(1.9 * GiB),
-    approximate: true,
-    repo: BONSAI_8B_REPO,
-  },
-  {
-    id: "bonsai-4b",
-    label: "Ternary-Bonsai-4B",
-    params: "4B (밀집)",
-    quant: "PTQ1_0",
-    sizeBytes: Math.round(1.0 * GiB),
-    approximate: true,
-    repo: BONSAI_4B_REPO,
   },
 ];
 

@@ -15,15 +15,13 @@
  * ends up pointing at a model the server is not serving.
  *
  * ── The llama.cpp question, answered at selection time ──────────────────────
- * Some quantizations need a build that can read them. `PTQ1_0` and `PQ2_0`
- * are the two that a stock llama.cpp cannot (measured on this machine by
- * diffing `llama-quantize`'s supported list between two builds), and `PTQ1_0`
- * is precisely the quant the Bonsai family is chosen for — so picking a Bonsai
-   model is the common case for hitting this, not an edge case.
+ * Some quantizations need a build that can read them: a llama.cpp whose type
+ * table predates the model's quant rejects the file with an "invalid ggml type"
+ * error that reads like a corrupt download.
  *
  * `findLlamaServer` already arbitrates this on the next launch: it executes
  * each candidate binary against the configured model and rejects one that
-   reports an unknown tensor type. That work is not duplicated here. What IS
+ * reports an unknown tensor type. That work is not duplicated here. What IS
  * done here is reporting it, at the moment the user decides — so a selection
  * that would need a different (or newly built) llama.cpp says so immediately,
  * rather than the failure surfacing on the next launch as a load error.
@@ -239,8 +237,8 @@ export async function selectModel(opts: SelectOptions): Promise<SelectResult> {
  * Order matters and the first entry is the one that was missing:
  *
  *  1. The file ALREADY on disk. A previous version of this guessed
- *     `$HOME/models` and wrote that, so selecting Bonsai on a machine that
- *     already had Bonsai at `/media/<user>/<label>/models/bonsai2/` recorded a
+ *     `$HOME/models` and wrote that, so selecting a model on a machine that
+ *     already had it at `/media/<user>/<label>/models/<family>/` recorded a
  *     path that did not exist — which reports "not downloaded yet" and then
  *     re-downloads several GiB of a file the user is already sitting on. The
  *     search covers `discoverMounts` as well as the fixed candidates, because
@@ -269,8 +267,8 @@ async function resolveModelPath(
     if (hit) return hit;
   }
 
-  // The table's quant is an estimate (the 8B has no PTQ1_0 on the Hub; PQ2_0 is what a
-  // download would fetch), so the exact name can be absent while the same MODEL is on disk
+  // The table's quant is an estimate (a rung can name a quant the Hub does not publish; the
+  // downloader fetches the best one it has), so the exact name can be absent while the same MODEL is on disk
   // in the quant the downloader would have chosen. That copy is reused rather than fetched.
   if (!opts.noFamilyReuse) {
     const { scanModels, pickFamilyMatch } = await import("./existingModel.js");
@@ -386,7 +384,7 @@ function configuredModelPath(existing: Record<string, any> | undefined, filename
 /** Depth-first search for an already-downloaded file.
  *
  *  Recurses because the real layout puts models in per-family subdirectories
- *  (`.../models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf`) while others sit at
+ *  (`.../models/<family>/<model>.gguf`) while others sit at
  *  the top of the same directory, so a flat check found neither reliably.
  *
  *  Bounded on both axes — depth and directories visited — because this runs

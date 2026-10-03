@@ -59,10 +59,10 @@ export async function scanModels(
   return out;
 }
 
-/** The quant tag of a filename (`Q4_K_M`, `PTQ1_0`, …), or null. */
+/** The quant tag of a filename (`Q4_K_M`, `Q2_K`, …), or null. */
 export function quantTag(filename: string): string | null {
   const base = filename.replace(/\.gguf$/i, "").replace(/-\d{5}-of-\d{5}$/, "");
-  const m = /-(PTQ1_0|PQ2_0|Q\d_0(?:_g\d+)?|Q\d_K(?:_[SML]|_XL)?|IQ\d_\w+|BF16|F16|F32)$/i.exec(base);
+  const m = /-(Q\d_0(?:_g\d+)?|Q\d_K(?:_[SML]|_XL)?|IQ\d_\w+|BF16|F16|F32)$/i.exec(base);
   return m ? m[1].toUpperCase() : null;
 }
 

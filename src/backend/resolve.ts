@@ -281,7 +281,7 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
   // empty string while the model the user was actually running lived in the
   // top-level `model` key — a shape seen live on a project whose config said
   // `backend: openai-compatible`, `llama.modelPath: ""` and a real
-  // `model: /media/.../Ternary-Bonsai-2-27B-PTQ1_0.gguf`. Because the gate also
+  // `model: /media/.../<model>.gguf`. Because the gate also
   // required `backend === "local-llama"`, neither the running server nor the
   // recorded weights were consulted: it announced "llama.cpp is not installed",
   // ran the installer, failed, and then spawned a server with an empty model
@@ -345,14 +345,14 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
     // A build mismatch is NOT a port problem. Telling that user the port might
     // be busy sends them to edit a setting that was never involved, which is
     // exactly what happened here: the real cause was a stock llama.cpp build
-    // (ggml types 0-42) being handed a ternary 1-bit model, and it was reported
-    // as "the port may be in use" while a working fork sat on the same disk.
+    // (ggml types 0-42) being handed a model in a newer quant, and it was reported
+    // as "the port may be in use" while a build that reads it sat on the same disk.
     // The binary that ACTUALLY failed, which is not necessarily the one in the
     // config. On a build mismatch the fallback may have substituted a different
     // llama-server, and if that one then failed — a full card, say — reporting
     // the configured path describes a binary that never ran. Observed directly:
-    // the substitution found a working fork, the fork then hit
-    // "cudaMalloc failed: out of memory", and the message named the stock build
+    // the substitution found a build that could read the model, it then hit
+    // "cudaMalloc failed: out of memory", and the message named the build
     // that had been rejected two steps earlier.
     const failedBin = started.ok ? recorded.binPath : started.binary;
     const substituted = failedBin !== recorded.binPath;
@@ -361,7 +361,7 @@ export async function resolveBackend(opts: ResolveOptions): Promise<Resolution> 
       started.kind === "build-mismatch"
         ? `설정된 llama-server 가 이 모델의 양자화 형식을 읽지 못합니다 (${started.detail}). ` +
           `이것은 포트나 GPU 메모리 문제가 아니며, 모델도 손상되지 않았습니다. ` +
-          `.llamacli/config.yaml 의 llama.binPath 를 ternary/1-bit 를 지원하는 빌드로 바꾸세요. `
+          `.llamacli/config.yaml 의 llama.binPath 를 이 양자화를 지원하는 (더 새로운) llama.cpp 빌드로 바꾸세요. `
         : binIsBare
         ? `경로에 있는 이름이라 PATH에서 찾지 못한 것 같습니다. .llamacli/config.yaml 의 llama.binPath 에 전체 경로(예: /home/.../llama-server)를 적으세요. `
         : `포트(${port})가 사용 중이거나 GPU 메모리가 부족할 수 있습니다. ` +
@@ -490,9 +490,9 @@ async function tryStart(
   probeModel: typeof probeModelCompatibility = probeModelCompatibility
 ): Promise<StartOutcome> {
   // A recorded binPath is trusted until it proves otherwise, and this is where
-  // it is proved. Two llama.cpp builds coexist on this machine — a stock one
-  // whose ggml type registry stops at 42, and a fork that reads ternary 1-bit
-  // quants — and a config recorded against the wrong one produced:
+  // it is proved. Two llama.cpp builds can coexist on a machine — an older one
+  // whose ggml type registry stops at 42, and a newer one that knows more quants —
+  // and a config recorded against the wrong one produced:
   //
   //   tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)
   //
@@ -528,9 +528,9 @@ async function tryStart(
  * that can actually read the model before giving up.
  *
  * The fallback is the difference between a dead end and a working session. The
- * machine this was written for has both builds on disk: a stock `~/llama.cpp`
- * whose ggml type registry stops at 42, and a fork that reads ternary 1-bit
- * quants and was serving the same model on another port at the time. A config
+ * machine this was written for had both builds on disk: an older `~/llama.cpp`
+ * whose ggml type registry stops at 42, and a newer build that reads the quant
+ * and was serving the same model on another port at the time. A config
  * recorded against the wrong one could only report "this binary is wrong" —
  * true, and not actionable, when the working binary is one search away.
  *

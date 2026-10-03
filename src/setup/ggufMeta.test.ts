@@ -72,7 +72,6 @@ test("isMoeModel: header beats catalogue; catalogue beats name; unknown stays un
 });
 
 test("known dense families", () => {
-  assert.equal(isKnownDenseFamily("Ternary-Bonsai-2-27B-PTQ1_0.gguf"), true);
   assert.equal(isKnownDenseFamily("Ornith-1.5-9B-Q4_K_M.gguf"), true);
   assert.equal(isKnownDenseFamily("Ornith-1.5-35B-A3B-Q4_K_M.gguf"), false);
 });
@@ -199,7 +198,7 @@ test("readGgufKvShape on a missing file is undefined, not a throw", async () => 
 });
 
 // ── the tuner ───────────────────────────────────────────────────────────────
-const QWEN_ELEMENTS = 10240, BONSAI_ELEMENTS = 32768;
+const QWEN_ELEMENTS = 10240, DENSE_ELEMENTS = 32768;
 
 test("tuner: Qwen3.6's real KV cost lifts the context from the size-guess's 20,480 to the 32,768 ceiling", () => {
   const guessed = tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true });
@@ -210,7 +209,7 @@ test("tuner: Qwen3.6's real KV cost lifts the context from the size-guess's 20,4
 });
 
 test("tuner: the exact path does not change what a dense model gets, and expert streaming stays at the cap", () => {
-  assert.equal(tuneForHardware(hw, { modelBytes: 5.54 * GiB, moe: false, kvElementsPerToken: BONSAI_ELEMENTS }).contextSize, 32768);
+  assert.equal(tuneForHardware(hw, { modelBytes: 5.54 * GiB, moe: false, kvElementsPerToken: DENSE_ELEMENTS }).contextSize, 32768);
   assert.equal(tuneForHardware(hw, { modelBytes: 20.61 * GiB, moe: true, kvElementsPerToken: QWEN_ELEMENTS }).cpuMoeLayers, 32);
 });
 

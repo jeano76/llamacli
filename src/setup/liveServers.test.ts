@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { detectRunningServerPorts, detectRunningServerPort } from "./modelSwitch.js";
 
-// The reported failure: a Bonsai llama-server started by hand on 8084 held 7.3 GB of an
+// The reported failure: a hand-started llama-server started by hand on 8084 held 7.3 GB of an
 // 8 GB card; discovery only knew 8080/8081/11434, saw nothing, and spawned a second
 // server that died with cudaMalloc out of memory.
 const ss = [
@@ -12,7 +12,7 @@ const ss = [
   'LISTEN 0 4096 127.0.0.1:9090 0.0.0.0:* users:(("llama-server",pid=777,fd=3))',
 ].join("\n");
 const cmdlines: Record<number, string> = {
-  128976: "./llama-server -m /m/Ternary-Bonsai-2-27B-PTQ1_0.gguf --port 8084",
+  128976: "./llama-server -m /m/Ornith-1.5-35B-A3B-Q4_K_M.gguf --port 8084",
   4242: "node server.js",
   777: "/opt/llama-server --port 9090",
 };

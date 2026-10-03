@@ -506,7 +506,7 @@ test("a healthy adopted server is not unresolved at all", async () => {
 // ── the recorded model path is found wherever the config kept it ────────────
 //
 // Seen live on a project whose config said `backend: openai-compatible`,
-// `llama.modelPath: ""`, and a real `model: /media/.../Ternary-Bonsai-2-27B...gguf`.
+// `llama.modelPath: ""`, and a real `model: /media/.../Ornith-1.5-35B-A3B...gguf`.
 // Requiring a non-empty `llama.modelPath` (and the `local-llama` backend) sent
 // it to the installer, which announced "llama.cpp is not installed", ran, failed,
 // and then spawned a server against an empty model path — so a machine with both
@@ -600,8 +600,8 @@ test("the installer is still reached when no model path points at a real file", 
 //   [설정 실패] ... 포트(8080)가 사용 중이거나 GPU 메모리가 부족할 수 있습니다.
 //
 // None of those three lines was the cause. Two llama.cpp builds coexist on this
-// machine — a stock one whose ggml type registry stops at 42, and a PrismML
-// fork that reads ternary 1-bit quants. The config named the stock build, and
+// machine — a stock one whose ggml type registry stops at 42, and a newer
+// build that reads more quant types. The config named the stock build, and
 // the stock build cannot read the model. Type 143 is neither a busy port nor a
 // corrupt download, and saying so sent the user after a setting that was never
 // involved.
@@ -848,7 +848,7 @@ test("no replacement build means the user is told where the search actually look
 
 const SPAWN_CFG = {
   binPath: "/stock/llama-server",
-  modelPath: "/m/bonsai.gguf",
+  modelPath: "/m/model.gguf",
   host: "127.0.0.1",
   port: 8080,
   contextSize: 4096,
@@ -971,7 +971,7 @@ test("the model path reaches the search even when the binary came from env", asy
       ok: false, kind: "build-mismatch", binary: cfg.binPath, detail: "invalid ggml type 143",
     })) as never,
   });
-  assert.equal(searchedFor, "/m/bonsai.gguf");
+  assert.equal(searchedFor, "/m/model.gguf");
 });
 
 test("configuredPort reads the recorded llama port", () => {

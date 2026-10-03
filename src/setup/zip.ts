@@ -1,8 +1,8 @@
 /**
  * Pure-stdlib `.zip` extraction.
  *
- * Exists because the ternary-capable llama.cpp release ships Windows builds as
- * `.zip`, not `.tar.gz` (see setup/ternaryRuntime.ts), and Windows is a supported
+ * Exists because the llama.cpp releases ship Windows builds as
+ * `.zip`, not `.tar.gz` (see setup/stockRuntime.ts), and Windows is a supported
  * platform here — not an afterthought. The alternatives were both unacceptable:
  * shelling out to `tar` is not dependable across Windows versions, and PowerShell's
  * `Expand-Archive` is slower, writes BOM surprises on some files, and is absent

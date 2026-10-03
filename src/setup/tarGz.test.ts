@@ -60,19 +60,19 @@ test("extracts files and PRESERVES THE EXECUTABLE BIT", () => {
 });
 
 test("strip drops the single leading directory a release archive adds", () => {
-  // Every entry in the PrismML release lives under `llama-<tag>/`, and the caller
+  // Every entry in the release lives under `llama-<tag>/`, and the caller
   // wants the binaries in its own runtime dir with the .so files beside them.
   const root = mkdtempSync(join(tmpdir(), "targz-strip-"));
   const gz = makeArchive(root, [
-    { name: "llama-prism-abc/llama-server", body: "x", mode: 0o755 },
-    { name: "llama-prism-abc/libllama.so", body: "y", mode: 0o644 },
+    { name: "llama-b1-abc/llama-server", body: "x", mode: 0o755 },
+    { name: "llama-b1-abc/libllama.so", body: "y", mode: 0o644 },
   ]);
   const dest = join(root, "out");
   mkdirSync(dest, { recursive: true });
   extractTarGz(gz, dest, { strip: 1 });
   assert.ok(existsSync(join(dest, "llama-server")));
   assert.ok(existsSync(join(dest, "libllama.so")));
-  assert.ok(!existsSync(join(dest, "llama-prism-abc")), "the wrapper directory must be gone");
+  assert.ok(!existsSync(join(dest, "llama-b1-abc")), "the wrapper directory must be gone");
 });
 
 test("creates directory entries", () => {
@@ -127,9 +127,9 @@ test("unpacks what GNU tar actually produced", () => {
 
   const root = mkdtempSync(join(tmpdir(), "targz-real-"));
   const stage = join(root, "stage");
-  mkdirSync(join(stage, "llama-prism-real"), { recursive: true });
-  const longName = join(stage, "llama-prism-real", "a-very-long-shared-library-name-to-exceed-the-ustar-field.so");
-  writeFileSync(join(stage, "llama-prism-real", "llama-server"), "#!/bin/sh\n", { mode: 0o755 });
+  mkdirSync(join(stage, "llama-b1-real"), { recursive: true });
+  const longName = join(stage, "llama-b1-real", "a-very-long-shared-library-name-to-exceed-the-ustar-field.so");
+  writeFileSync(join(stage, "llama-b1-real", "llama-server"), "#!/bin/sh\n", { mode: 0o755 });
   writeFileSync(longName, "ELF");
   const gz = join(root, "real.tar.gz");
   execFileSync("tar", ["czf", gz, "-C", stage, "."]);

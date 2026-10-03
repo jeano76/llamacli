@@ -5,7 +5,7 @@
  *
  *  - Windows has no `tar` by default, and a missing executable that gets caught
  *    and swallowed looks exactly like "the archive contained nothing".
- *  - The archives llamacli unpacks (a ternary-capable llama.cpp release) must
+ *  - The archives llamacli unpacks (a llama.cpp release) must
  *    keep their EXECUTABLE BIT. A build that unpacks into a tree of
  *    non-executable files produces a llama-server that cannot be run, which
  *    reads as a corrupt download.

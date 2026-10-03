@@ -369,7 +369,7 @@ export function spawnRestart(entryPath: string, args: string[] = process.argv.sl
 // fix targets (the exec threw, got swallowed by checkAndApplyUpdate's try/
 // catch, and dist/ was left untouched). The pure-Node path is
 // setup/tarGz.ts's `extractTarGz` — stdlib only, zero new dependencies, and
-// shared with the ternary-runtime installer so there is one implementation to be
+// shared with the engine installers so there is one implementation to be
 // right.
 
 /** Extract a `.tar.gz` into `destDir`, pure stdlib fallback for `tar` on

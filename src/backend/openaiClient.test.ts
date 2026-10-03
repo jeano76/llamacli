@@ -30,7 +30,7 @@ async function withFakeServer(
 // exists so the real value can be pulled from the backend instead.
 // Neither endpoint exists in every build, which is why both are tried:
 // modern llama-server reports the launched context window via
-// GET /config -> model_info.n_ctx, while the PrismML fork answers /props but
+// GET /config -> model_info.n_ctx, while other builds answer /props but
 // 404s /config. Reporting the server's true limit (rather than a hard-coded
 // fallback) is the whole point, and this matters far more than it looks: when
 // both lookups fail, callers fall back to config.llama.contextSize ?? 8192, so a
@@ -594,12 +594,12 @@ test("each request gets its own connection — the client never reuses a socket 
 
 // ── the two-endpoint fallback ────────────────────────────────────────────────
 // getContextSize() tries /config then /props, because no single endpoint exists
-// across the builds in use: the PrismML fork 404s /config and answers /props,
+// across the builds in use: some builds 404 /config and answers /props,
 // while the stock build here registers /props and no /config route at all.
 // These cover each half, because a regression here silently degrades to an 8192
 // budget — which is the config-drift bug above, wearing a different hat.
 
-test("getContextSize falls back to /props when /config 404s (the PrismML fork's shape)", () =>
+test("getContextSize falls back to /props when /config 404s (the shape some builds use)", () =>
   withFakeServer(
     (path) =>
       path === "/props"

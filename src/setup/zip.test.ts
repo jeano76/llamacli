@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { extractZip } from "./zip.js";
 
-// ZIP is not optional on Windows: the ternary-capable llama.cpp release publishes
+// ZIP is not optional on Windows: the stock llama.cpp release publishes
 // .zip for win32 and .tar.gz everywhere else, so this is the path a Windows user
 // actually takes.
 

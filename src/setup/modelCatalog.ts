@@ -79,95 +79,9 @@ export const HF_ENDPOINT = "https://huggingface.co";
 export const ORNITH_35B_REPO = "ornith-ai/Ornith-1.5-35B-A3B-GGUF";
 export const ORNITH_9B_REPO = "ornith-ai/Ornith-1.5-9B-GGUF";
 
-/**
- * The Bonsai family — the size ladder for machines the Ornith pair does not
- * serve.
- *
- * These matter on this class of box because they invert the usual trade. The
- * Ornith 35B-A3B is a MoE whose 20.4 GB file only fits because experts are
- * paged from RAM, so its cost is bounded by the *active* 3B rather than the
- * file. Bonsai 27B is DENSE at a 1-bit quant: 5.5 GB on disk, the whole thing
- * resident on an 8 GB card, and measured here running `-c 40960` with no
- * `--n-cpu-moe` at all (see the tuning notes). So on a small card the bigger
- * model is not the expensive one — it is the cheap one, and choosing by
- * parameter count alone would pick wrong in both directions.
- *
- * Sizes verified against the Hub's file listing, not estimated.
- */
-export const BONSAI_27B_REPO = "prism-ml/Ternary-Bonsai-2-27B-gguf";
-export const BONSAI_8B_REPO = "prism-ml/Ternary-Bonsai-8B-gguf";
-export const BONSAI_4B_REPO = "prism-ml/Ternary-Bonsai-4B-gguf";
-
 /** The quant the request named explicitly. Preferred when present. */
 export const PREFERRED_35B_QUANT = "Q4_K_M";
 export const PREFERRED_9B_QUANT = "Q4_K_M";
-/** Bonsai ships 1/2-bit quants; the 1-bit is the reason to use this family. */
-export const PREFERRED_BONSAI_QUANT = "PTQ1_0";
-
-/** The Bonsai size ladder, largest first — the order `chooseModel` prefers. */
-export const BONSAI_SIZES = ["27B", "8B", "4B"] as const;
-export type BonsaiSize = (typeof BONSAI_SIZES)[number];
-/** size → repo, used as the default for each rung. */
-const BONSAI_REPOS: Record<BonsaiSize, string> = {
-  "27B": BONSAI_27B_REPO,
-  "8B": BONSAI_8B_REPO,
-  "4B": BONSAI_4B_REPO,
-};
-
-/** Parses `BONSAI_REPOS="27B=owner/repo,8B=owner/repo"`.
- *
- *  Sizes arrive in any case ("27b") and entries may be given without one
- *  (`=owner/repo` applies to whichever rung is being read), because a partial
- *  override is the common case — mirroring one size, keeping the rest. An
- *  unparseable entry is ignored rather than fatal, so a typo degrades to the
- *  default repo instead of stopping the bootstrap. */
-function parseBonsaiRepoOverrides(raw: string | undefined): Partial<Record<BonsaiSize, string>> {
-  const out: Partial<Record<BonsaiSize, string>> = {};
-  if (!raw) return out;
-  for (const part of raw.split(",")) {
-    const [key, value] = part.split("=").map((s) => s.trim());
-    if (!value) continue;
-    const size = key.toUpperCase().replace(/^BONSAI/, "") as BonsaiSize;
-    if ((BONSAI_SIZES as readonly string[]).includes(size)) out[size] = value;
-  }
-  return out;
-}
-
-/** Quant ordering for the Bonsai family, best-first.
- *
- *  Separate from QUANT_PREFERENCE because none of its entries appear in these
- *  filenames: `QUANT_PREFERENCE.findIndex` would rank every Bonsai file
- *  equally last, making `best()` arbitrary rather than deliberate.
- *
- *  PTQ1_0 leads on purpose. This family exists for the quant — a 27B dense in
- *  5.5 GB is what lets it stay resident on a small card — and it is also the
- *  smallest option available, so nothing is traded away by ranking it first.
- *
- *  `PQ2_0` is ranked BELOW `Q2_0` even though it sorts earlier alphabetically,
- *  because it is one of only two quants in this family that a stock llama.cpp
- *  cannot read (measured: diffing `llama-quantize`'s supported list between the
- *  two builds on this machine leaves exactly `PTQ1_0` and `PQ2_0`). On the 4B
- *  rung the two are the same size on disk — 1.00 GiB either way — so preferring
- *  the fork-only one would cost a working install for nothing. Where the two
- *  differ in size, PTQ1_0 already wins above both.
- *
- *  F16 stays last regardless of size: it is the one quant here that is
- *  unambiguously the largest, and choosing it for quality would turn a 1 GB
- *  download into a 7.5 GB one on a card that cannot hold the result. */
-const BONSAI_QUANT_PREFERENCE = ["PTQ1_0", "Q2_0", "Q2_0_g64", "PQ2_0", "F16"];
-
-/** The `best()` variant for Bonsai: same contract, Bonsai's own quant order. */
-function bestBonsai(list: ModelCandidate[]): ModelCandidate | null {
-  if (list.length === 0) return null;
-  const rank = (f: string) => {
-    const i = BONSAI_QUANT_PREFERENCE.findIndex((q) => f.includes(q));
-    // Unknown quants sort after every known one, then alphabetically so the
-    // choice is at least deterministic.
-    return i === -1 ? BONSAI_QUANT_PREFERENCE.length : i;
-  };
-  return [...list].sort((a, b) => rank(a.filename) - rank(b.filename) || a.filename.localeCompare(b.filename))[0];
-}
-
 /** Approximate on-disk sizes, used to plan BEFORE the Hub answers (and as the
  *  fallback when it can't). Close enough to size a download, not to be relied on
  *  for correctness. */
@@ -182,27 +96,26 @@ const GiB = 1024 ** 3;
  *  request named; the others are only reached if it is absent from a repo. */
 const QUANT_PREFERENCE = ["Q4_K_M", "Q5_K_M", "Q6_K", "Q4_K_S", "Q3_K_XL", "Q3_K_M", "Q2_K"];
 
-/** Families this project ships that are DENSE (no experts): the Bonsai ladder and the 9B. */
+/** Families this project ships that are DENSE (no experts): the Ornith 9B. */
 export function isKnownDenseFamily(filename: string): boolean {
-  return /Ternary-Bonsai/i.test(filename) || /Ornith-1\.5-9B/i.test(filename);
+  return /Ornith-1\.5-9B/i.test(filename);
 }
 
-/** `Ternary-Bonsai-8B-PTQ1_0.gguf` → `Ternary-Bonsai-8B`; the model family without its quant. */
+/** `Ornith-1.5-9B-Q4_K_M.gguf` → `Ornith-1.5-9B`; the model family without its quant. */
 export function modelFamilyOf(filename: string): string {
   const base = filename.replace(/\.gguf$/i, "").replace(/-\d{5}-of-\d{5}$/, "");
-  const quant = /-(PTQ1_0|PQ2_0|Q\d_0(?:_g\d+)?|Q\d_K(?:_[SML]|_XL)?|IQ\d_\w+|BF16|F16|F32)$/i.exec(base);
+  const quant = /-(Q\d_0(?:_g\d+)?|Q\d_K(?:_[SML]|_XL)?|UD-Q\d_K(?:_[SML]|_XL)?|IQ\d_\w+|BF16|F16|F32)$/i.exec(base);
   return quant ? base.slice(0, quant.index) : base;
 }
 
 /**
  * The candidate that IS the model the user selected, out of everything the Hub lists.
  *
- * An exact filename wins. Failing that, the same family (`Ternary-Bonsai-8B`) in the best
- * available quant: the model table estimates a quant per rung from a catalogue that is
- * not always what the repo publishes (the 8B has no PTQ1_0 file; its smallest are PQ2_0
- * and Q2_0), and refusing there would make a valid selection undownloadable. Anything
- * outside the family is NEVER returned — substituting a different model for the chosen one
- * is the bug this exists to prevent (a selected 8B downloaded a 27B).
+ * An exact filename wins. Failing that, the same family (`Ornith-1.5-9B`) in the best available quant:
+ * the model table names one quant per rung, which is not always what the repo publishes, and refusing
+ * there would make a valid selection undownloadable. Anything outside the family is NEVER returned —
+ * substituting a different model for the chosen one is the bug this exists to prevent (a selected
+ * small model once downloaded a much larger one).
  */
 export function pickPinnedCandidate(candidates: ModelCandidate[], filename: string): ModelCandidate | null {
   const exact = candidates.find((c) => c.filename.toLowerCase() === filename.toLowerCase());
@@ -212,12 +125,7 @@ export function pickPinnedCandidate(candidates: ModelCandidate[], filename: stri
     (c) => !/mmproj/i.test(c.filename) && modelFamilyOf(c.filename).toLowerCase() === family
   );
   if (sameFamily.length === 0) return null;
-  const rank = (f: string) => {
-    const b = BONSAI_QUANT_PREFERENCE.findIndex((q) => f.includes(q));
-    if (b !== -1) return b;
-    return BONSAI_QUANT_PREFERENCE.length + quantRank(f);
-  };
-  return [...sameFamily].sort((a, b) => rank(a.filename) - rank(b.filename) || a.filename.localeCompare(b.filename))[0];
+  return [...sameFamily].sort((a, b) => quantRank(a.filename) - quantRank(b.filename) || a.filename.localeCompare(b.filename))[0];
 }
 
 function quantRank(filename: string): number {
@@ -241,10 +149,6 @@ export function chooseModel(opts: {
   ramTotalBytes: number;
   candidates35b: ModelCandidate[];
   candidates9b: ModelCandidate[];
-  /** Optional. Absent (or an all-empty map) leaves the original Ornith-only
-   *  decision untouched, so a caller that never resolves Bonsai keeps the
-   *  behaviour it had. */
-  bonsai?: Partial<Record<BonsaiSize, ModelCandidate[]>>;
 }): ModelChoice {
   const { vramTotalBytes, vramFreeBytes, ramTotalBytes } = opts;
   const pick35 = best(opts.candidates35b);
@@ -274,48 +178,6 @@ export function chooseModel(opts: {
   const ramOk = ramGiB * GiB >= size35 * MIN_RAM_MULTIPLE;
   const canUse35b = Boolean(pick35) && vramOk && ramOk;
 
-  // ── Bonsai, before the Ornith pair ────────────────────────────────────────
-  // Checked FIRST, and that ordering is the whole reason this exists.
-  //
-  // The 35B test above asks "is there 6 GiB of VRAM for a 3B active set?" —
-  // correct for a MoE whose file is irrelevant to what stays resident. Bonsai
-  // 27B is DENSE: all 27B must fit, so the question is the file size, and a
-  // 5.5 GB 1-bit model fits an 8 GB card outright. Running the MoE test on it
-  // would admit a 50 GB F16 on any 6 GiB card, and running the dense test on
-  // the Ornith pair would reject a model that demonstrably runs here.
-  //
-  // So each rung is tested on its own terms, largest first, and the first one
-  // that genuinely fits wins. A box with room for the 27B gets the 27B — not
-  // the 4B, which "fits" everywhere and would otherwise win by default.
-  const bonsaiPicks = BONSAI_SIZES.map((size) => ({
-    size,
-    pick: bestBonsai(opts.bonsai?.[size] ?? []),
-  }));
-  for (const { size, pick } of bonsaiPicks) {
-    if (!pick) continue;
-    const sizeGiB = pick.sizeBytes / GiB;
-    // Dense, so the whole file has to be resident: no partial offload exists.
-    // The 1 GiB is the KV cache and load-time allocations, matching RESERVE_GIB.
-    const fitsVram = vramGiB >= sizeGiB + RESERVE_GIB;
-    const fitsRam = ramGiB >= sizeGiB * MIN_RAM_MULTIPLE;
-    if (!fitsVram || !fitsRam) continue;
-    return {
-      candidate: pick,
-      reason:
-        `Ternary-Bonsai-${size} ${pick.filename} 을 선택했습니다. ${reasons[0]}. ` +
-        `GPU에 전량 올라갑니다 (${sizeGiB.toFixed(1)} GiB). ` +
-        `이 모델은 dense 라 MoE 와 달리 파일 전체가 VRAM 에 있어야 하므로, ` +
-        `은은 1-bit 양자화 덕분에 ${size} 급 파라미터가 ${sizeGiB.toFixed(1)} GiB 에 들어갑니다. ` +
-        (pick.filename.includes(PREFERRED_BONSAI_QUANT)
-          ? `참고: 1-bit/ternary 형식이라 llama-server 빌드가 이를 지원해야 합니다.`
-          : ``),
-      alternatives: bonsaiPicks
-        .filter((b) => b.pick && b.pick.filename !== pick.filename)
-        .map((b) => b.pick!)
-        .concat(pick35 ? [pick35] : []),
-    };
-  }
-
   if (canUse35b) {
     const how = vramGiB >= size35 / GiB
       ? "전량 오프로드"
@@ -335,34 +197,21 @@ export function chooseModel(opts: {
   if (!ramOk) why.push(`RAM ${ramGiB.toFixed(1)} GiB < 모델의 ${(size35 * MIN_RAM_MULTIPLE / GiB).toFixed(1)} GiB`);
   reasons.push(`35B 대신 9B 선택: ${why.join(", ")}`);
 
-  // ── A box too small even for the 9B ───────────────────────────────────────
-  // The 9B was returned unconditionally, so a 4 GB machine was handed a 5.4 GiB file
-  // that cannot be resident. The same 1.4x rule the 35B uses applies here: below it
-  // the model pages from disk and the box becomes unusable. A dense Bonsai is sized
-  // by RAM alone on such a machine (no VRAM is involved), and its 1-bit files are a
-  // fraction of the 9B's.
+  // Nothing smaller than the 9B is offered. A machine that cannot hold it comfortably is told so in the
+  // reason instead of being handed something else: the same 1.4x-RAM rule the 35B uses applies, and below
+  // it the model pages from disk and the box becomes slow.
   const size9 = pick9?.sizeBytes || APPROX_SIZES["9b"];
-  if (pick9 && ramGiB * GiB < size9 * MIN_RAM_MULTIPLE) {
-    for (const { size, pick } of bonsaiPicks) {
-      if (!pick) continue;
-      if (ramGiB * GiB < pick.sizeBytes * MIN_RAM_MULTIPLE) continue;
-      return {
-        candidate: pick,
-        reason:
-          `Ternary-Bonsai-${size} ${pick.filename} 을 선택했습니다. ${reasons.join(". ")}. ` +
-          `RAM ${ramGiB.toFixed(1)} GiB 로는 9B(${(size9 / GiB).toFixed(1)} GiB × ${MIN_RAM_MULTIPLE})가 상주할 수 없어, ` +
-          `파일이 ${(pick.sizeBytes / GiB).toFixed(1)} GiB 인 1-bit 모델로 CPU 실행합니다.`,
-        alternatives: [pick9],
-      };
-    }
-  }
+  const tooSmallFor9b = ramGiB * GiB < size9 * MIN_RAM_MULTIPLE;
 
   if (pick9) {
     return {
       candidate: pick9,
       reason:
         `Ornith-1.5-9B ${pick9.filename} 을 선택했습니다. ${reasons.join(". ")}. ` +
-        `약 ${((pick9.sizeBytes || APPROX_SIZES["9b"]) / GiB).toFixed(1)} GiB 이며 GPU에 전량 올라갑니다.`,
+        `약 ${((pick9.sizeBytes || APPROX_SIZES["9b"]) / GiB).toFixed(1)} GiB 이며 GPU에 전량 올라갑니다.` +
+        (tooSmallFor9b
+          ? ` 주의: RAM ${ramGiB.toFixed(1)} GiB 는 이 모델 크기의 ${MIN_RAM_MULTIPLE}배(${((size9 * MIN_RAM_MULTIPLE) / GiB).toFixed(1)} GiB)에 못 미쳐 느릴 수 있습니다.`
+          : ""),
       alternatives: pick35 ? [pick35] : [],
     };
   }
@@ -428,7 +277,7 @@ export async function resolveModel(
     signal?: AbortSignal;
     log?: (line: string) => void;
   } = {}
-): Promise<{ c35: ModelCandidate[]; c9: ModelCandidate[]; bonsai: Record<BonsaiSize, ModelCandidate[]> }> {
+): Promise<{ c35: ModelCandidate[]; c9: ModelCandidate[] }> {
   const env = opts.env ?? process.env;
   const log = opts.log ?? (() => {});
 
@@ -444,28 +293,7 @@ export async function resolveModel(
     pinned9 ?? ORNITH_9B_REPO, ["Ornith-1.5-9B", "Ornith-1.5"], opts, log, "9B", Boolean(pinned9)
   ).catch(() => [] as ModelCandidate[]);
 
-  // Bonsai, largest first. `env.BONSAI_REPOS` overrides all three in one go
-  // ("27B=repoA,8B=repoB,4B=repoC") for a mirror or a local fork, rather than
-  // adding a third env var per size — the family is a set, not a scalar.
-  const pinnedBonsai = parseBonsaiRepoOverrides(env.BONSAI_REPOS);
-  const sizes: BonsaiSize[] = ["27B", "8B", "4B"];
-  const bonsai = {} as Record<BonsaiSize, ModelCandidate[]>;
-  await Promise.all(
-    sizes.map(async (size) => {
-      const pinned = pinnedBonsai[size];
-      const repo = pinned ?? BONSAI_REPOS[size];
-      bonsai[size] = await resolveOne(
-        repo,
-        [`Ternary-Bonsai-${size === "27B" ? "2-" : ""}${size}`],
-        opts,
-        log,
-        size,
-        Boolean(pinned)
-      ).catch(() => [] as ModelCandidate[]);
-    })
-  );
-
-  return { c35, c9, bonsai };
+  return { c35, c9 };
 }
 
 /** The pinned repo when it answers, a repository search when it does not.

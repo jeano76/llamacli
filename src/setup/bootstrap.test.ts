@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { planPorts, COMMON_PORTS, LLAMA_PORT, type PortState } from "./ports.js";
 import { findLlamaServer, installBuildPackages, candidatePaths } from "./llamaCpp.js";
-import { needsTernaryBuild, quantSuffixOf, checkBinaryAgainstChosenModel, ensureLocalStack } from "./bootstrap.js";
+import { checkBinaryAgainstChosenModel, ensureLocalStack } from "./bootstrap.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
 const GiB = 1024 ** 3;
@@ -332,59 +332,13 @@ test("the VRAM budget holds back a reserve for the compositor and load-time allo
 });
 
 
-// ── telling a fork-only quant from a family name ─────────────────────────────
-//
-// The binary is settled in bootstrap step 2 and the model in step 3, so a fresh
-// install never sees them together. That gap cost this machine a 5.5 GB
-// download before failing, and it fails at server start in terms that blame
-// the port. So the quant is read off the filename — the only thing available
-// before a download.
-//
-// The set is MEASURED, not assumed: diffing `llama-quantize`'s supported list
-// between this machine's stock build and its PrismML fork leaves exactly two
-// names, `PTQ1_0` and `PQ2_0`. Everything else is shared.
-
-test("the quant suffix is the token after the last dash", () => {
-  assert.equal(quantSuffixOf("Ternary-Bonsai-2-27B-PTQ1_0.gguf"), "PTQ1_0");
-  assert.equal(quantSuffixOf("Ornith-1.5-35B-A3B-Q4_K_M.gguf"), "Q4_K_M");
-  assert.equal(quantSuffixOf("gemma-2-9b-it-Q8_0.gguf"), "Q8_0");
-});
-
-test("a shard tag is stripped before the quant is read", () => {
-  // Without this the quant reads as `00002` and the model silently looks
-  // stock-compatible — the one direction that lets a doomed download start.
-  assert.equal(quantSuffixOf("Ternary-Bonsai-2-27B-PTQ1_0-00001-of-00002.gguf"), "PTQ1_0");
-  assert.equal(needsTernaryBuild("Ternary-Bonsai-2-27B-PTQ1_0-00001-of-00002.gguf"), true);
-});
-
-test("the fork-only quants are recognised", () => {
-  for (const f of ["Ternary-Bonsai-2-27B-PTQ1_0.gguf", "Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-8B-PQ2_0.gguf"]) {
-    assert.equal(needsTernaryBuild(f), true, f);
-  }
-});
-
-test("a model whose FAMILY name contains 'Ternary' is not called fork-only", () => {
-  // The false positive that motivated anchoring to the suffix: this is the real
-  // filename of a Bonsai 4B at Q2_0, and Q2_0 is in stock llama.cpp. Telling
-  // that user their build is wrong when it is not is worse than saying nothing.
-  assert.equal(needsTernaryBuild("Ternary-Bonsai-4B-Q2_0.gguf"), false);
-  assert.equal(needsTernaryBuild("Ternary-Bonsai-4B-Q2_0_g64.gguf"), false);
-  assert.equal(needsTernaryBuild("Ternary-Bonsai-4B-F16.gguf"), false);
-});
-
-test("every stock quant llamacli offers is not called fork-only", () => {
-  for (const f of ["Ornith-1.5-35B-A3B-Q4_K_M.gguf", "gemma-2-9b-it-Q8_0.gguf", "m-Q6_K.gguf", "m-F16.gguf", ""]) {
-    assert.equal(needsTernaryBuild(f), false, f);
-  }
-});
-
 test("with the model already on disk, the binary is asked instead of the filename", async () => {
   // The definitive branch. It is worth a seam: without one this can only be
   // exercised against whatever llama-server the test machine happens to have,
   // and the branch that produces a certain verdict would be the one untested.
   const root = await mkdtemp(join(tmpdir(), "llamacli-compat-"));
   try {
-    const model = join(root, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+    const model = join(root, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
     await writeFile(model, Buffer.alloc(1024));
 
     const mismatch = await checkBinaryAgainstChosenModel("/stock/llama-server", basename(model), model, {
@@ -394,7 +348,7 @@ test("with the model already on disk, the binary is asked instead of the filenam
     assert.match(mismatch ?? "", /143/, "the actual reason must be quoted, not paraphrased");
 
     // A build that CAN read the model says nothing, even though the filename is
-    // fork-only — the exact probe outranks the filename heuristic.
+    // unsupported-quant — the exact probe decides.
     const readable = await checkBinaryAgainstChosenModel("/fork/llama-server", basename(model), model, {
       probeModel: async () => ({ ok: true }),
     });
@@ -411,39 +365,15 @@ test("with the model already on disk, the binary is asked instead of the filenam
   }
 });
 
-test("with no model on disk, a fork-only model warns and a stock model does not", async () => {
-  const missing = join(tmpdir(), "definitely-not-here-12345", "model.gguf");
-  const ternary = await checkBinaryAgainstChosenModel("/build/llama-server", "Ternary-Bonsai-2-27B-PTQ1_0.gguf", missing);
-  assert.match(ternary ?? "", /ternary/);
-  assert.match(ternary ?? "", /필요합니다/, "it must say what is required, not merely complain");
-
-  const stock = await checkBinaryAgainstChosenModel("/build/llama-server", "Ornith-1.5-35B-A3B-Q4_K_M.gguf", missing);
-  assert.equal(stock, null, "an ordinary quant must not raise a warning nobody can act on");
-});
-
-test("the warning never claims the build is incompatible when it was not asked", async () => {
-  // Level-2 evidence (filename only) proves a fork is REQUIRED, not that the
-  // selected build is wrong. Saying "this will fail" from a filename guess
-  // would be false for every user whose build does support it.
-  const msg = (await checkBinaryAgainstChosenModel(
-    "/opt/fork/llama-server",
-    "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-    join(tmpdir(), "nope-98765", "m.gguf")
-  )) ?? "";
-  assert.doesNotMatch(msg, /읽지 못합니다/);
-  assert.doesNotMatch(msg, / 실패|불가능합니다/);
-});
-
-
-// The ternary warning was a false positive on a machine whose build reads the
+// A compatibility warning was a false positive on a machine whose build reads the
 // model perfectly well, and the cause was a path, not a quantisation. These two
 // drive the real bootstrap rather than the extracted helper, because the bug was
 // never in the helper: it was the caller handing it a reconstructed path.
 test("ensureLocalStack probes the real model file, kept outside modelsDir", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "llamacli-bs-"));
   const modelsDir = join(projectRoot, "models-dir-with-nothing-in-it");
-  const elsewhere = join(projectRoot, "usb", "bonsai2");
-  const modelFile = join(elsewhere, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+  const elsewhere = join(projectRoot, "usb", "usb-models");
+  const modelFile = join(elsewhere, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
   const binPath = join(projectRoot, "llama-server");
 
   try {
@@ -487,102 +417,13 @@ test("ensureLocalStack probes the real model file, kept outside modelsDir", asyn
       undefined,
       `the model is on disk and the build reads it, so no compatibility step should have failed: ${JSON.stringify(compat)}`
     );
-    assert.doesNotMatch(lines.join("\n"), /ternary\(3값\)/, "no invented incompatibility");
+    assert.doesNotMatch(lines.join("\n"), /읽지 못합니다/, "no invented incompatibility");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("ensureLocalStack still warns when the model is absent and the build is a guess", async () => {
-  // The warning is not wrong in general — only when a file was available to ask
-  // about and nobody asked. Keep it for the case that justifies it.
-  const projectRoot = await mkdtemp(join(tmpdir(), "llamacli-bs-"));
-  try {
-    const missing = join(projectRoot, "not-here", "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
-    const warn = await checkBinaryAgainstChosenModel("/build/llama-server", basename(missing), missing, {
-      probeModel: async () => ({ ok: true }),
-    });
-    // No file → filename heuristic may speak, so confirm it is not silent.
-    assert.notEqual(warn, null);
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-  }
-});
-
-// A FIRST launch on a clean machine is the one state the user cannot recover from by
-// doing anything: step 2 picks the binary BEFORE step 3 picks the model, so with no
-// config there is nothing to know a fork was needed, stock llama.cpp gets installed,
-// and it rejects the Bonsai quant with "invalid ggml type 143". The user was told to
-// edit `llama.binPath` themselves, having never been told which build would work.
-test("a fresh install that picks a ternary model acquires a capable binary", async () => {
-  const projectRoot = await mkdtemp(join(tmpdir(), "llamacli-first-"));
-  const modelsDir = join(projectRoot, "models");
-  try {
-    await mkdir(modelsDir, { recursive: true });
-    let acquired = 0;
-    const lines: string[] = [];
-    const report = await ensureLocalStack({
-      projectRoot,
-      modelsDir,
-      // NOT offline: step 3 resolves the model from the catalogue, and step 3.5 is
-      // the code under test — offline skips model resolution entirely, which is
-      // itself the reason this path had no coverage.
-      offline: false,
-      allowBuild: true,
-      log: (l: string) => lines.push(l),
-      run: async () => "",
-      probe: async () => "free",
-      detectServer: async () => ({ kind: "none" }),
-      listExistingModels: async () => [],
-      serverPids: [],
-      // An 8 GiB card, i.e. the class of machine the Bonsai ladder is chosen FOR.
-      // Without a GPU the ladder rejects every rung and no model is chosen at all,
-      // which would leave the code under test unexercised.
-      hardware: {
-        cpuCount: 12,
-        ramTotalBytes: 32 * 1024 ** 3,
-        ramAvailableBytes: 24 * 1024 ** 3,
-        gpus: [{ index: 0, name: "NVIDIA GeForce RTX 2070 SUPER", vramTotalBytes: 8 * 1024 ** 3, vramFreeBytes: 7 * 1024 ** 3 }],
-        gpuBackend: "cuda",
-        canBuildCuda: true,
-        tools: {},
-        platform: "linux",
-      } as never,
-      env: { ...process.env, BONSAI_REPOS: "27B=prism-ml/Ternary-Bonsai-2-27B-gguf", MODEL_REPO_35B: "", MODEL_REPO_9B: "" },
-      // The catalogue must actually resolve a Bonsai file, or this test asserts
-      // nothing — which is exactly what a conditional assertion on the outcome does.
-      fetchImpl: (async (url: string) => {
-        const u = String(url);
-        if (u.includes("Ternary-Bonsai-2-27B-gguf")) {
-          return {
-            ok: true,
-            json: async () => ({
-              siblings: [{ rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", size: 5946648928 }],
-            }),
-          };
-        }
-        // No other family resolves, so the ladder's only candidate is the Bonsai.
-        if (u.includes("api/models/")) return { ok: true, json: async () => ({ siblings: [] }) };
-        // The weight transfer is not what this test is about; fail it fast so the
-        // bootstrap reports rather than hanging.
-        if (u.includes("/resolve/main/")) return { ok: false, status: 404, text: async () => "no" };
-        return { ok: true, json: async () => ([]) };
-      }) as never,
-      acquireTernary: async () => {
-        acquired++;
-        return { binPath: "/opt/prism/llama-server", backend: "cuda" as const };
-      },
-    } as never);
-
-    // Unconditional: prove the setup reached the state the rule is about.
-    const chosen = report.model?.candidate.filename ?? "";
-    assert.equal(chosen, "Ternary-Bonsai-2-27B-PTQ1_0.gguf", `catalogue did not resolve a Bonsai: ${JSON.stringify(report.model)}`);
-    assert.ok(acquired > 0, "a ternary model on a fresh install must acquire a capable binary, not merely warn");
-    assert.equal(report.llama?.binPath, "/opt/prism/llama-server", "the acquired binary must be the one recorded");
-    const compat = report.steps.find((st) => st.name === "모델/빌드 호환성");
-    assert.equal(compat?.ok, true, `the compatibility step must now pass: ${JSON.stringify(compat)}`);
-    assert.doesNotMatch(lines.join("\n"), /llama\.binPath 를 ternary/, "and must not tell the user to edit the path by hand");
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-  }
+test("with no model on disk there is nothing to probe, so no warning is raised", async () => {
+  const missing = join(tmpdir(), "definitely-not-here-12345", "model.gguf");
+  assert.equal(await checkBinaryAgainstChosenModel("/build/llama-server", "Ornith-1.5-35B-A3B-Q4_K_M.gguf", missing), null);
 });

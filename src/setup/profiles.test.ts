@@ -26,11 +26,6 @@ const cand = (filename: string, gib: number): ModelCandidate => ({ repo: "r", fi
 const catalog = {
   candidates35b: [cand("Ornith-1.5-35B-A3B-Q4_K_M.gguf", 21.4)],
   candidates9b: [cand("Ornith-1.5-9B-Q4_K_M.gguf", 5.4)],
-  bonsai: {
-    "27B": [cand("Ternary-Bonsai-2-27B-PTQ1_0.gguf", 5.5)],
-    "8B": [cand("Ternary-Bonsai-8B-PQ2_0.gguf", 2.0)],
-    "4B": [cand("Ternary-Bonsai-4B-PQ2_0.gguf", 1.0)],
-  },
 };
 
 interface Row {
@@ -41,21 +36,21 @@ interface Row {
 const base = ["git", "cmake", "g++", "make"];
 const rows: Row[] = [
   { name: "nvidia-small", platform: "linux", ramGiB: 30, tools: [...base, "apt-get", "sudo"], cmds: { "nvidia-smi": "0, RTX 2070 SUPER, 8192, 7456\n" },
-    expectBackend: "cuda", expectRungs: ["cuda", "vulkan", "cpu"], expectModel: /Bonsai-2-27B/, expectPlan: "none" },
+    expectBackend: "cuda", expectRungs: ["cuda", "vulkan", "cpu"], expectModel: /Ornith-1.5-35B-A3B/, expectPlan: "none" },
   { name: "nvidia-large", platform: "linux", ramGiB: 64, tools: [...base, "apt-get", "sudo"], cmds: { "nvidia-smi": "0, RTX 4090, 24564, 24000\n" },
-    expectBackend: "cuda", expectRungs: ["cuda", "vulkan", "cpu"], expectModel: /Bonsai-2-27B/, expectPlan: "none" },
+    expectBackend: "cuda", expectRungs: ["cuda", "vulkan", "cpu"], expectModel: /Ornith-1.5-35B-A3B/, expectPlan: "none" },
   { name: "cpu-only", platform: "linux", ramGiB: 16, tools: [...base, "apt-get"],
     expectBackend: "none", expectRungs: ["cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "none" },
   { name: "amd", platform: "linux", ramGiB: 32, tools: [...base, "dnf", "sudo"], drm: { vendor: "0x1002", vramGiB: 20 },
-    expectBackend: "vulkan", expectRungs: ["vulkan", "cpu"], expectModel: /Bonsai-2-27B/, expectPlan: "none" },
+    expectBackend: "vulkan", expectRungs: ["vulkan", "cpu"], expectModel: /Ornith-1.5-35B-A3B/, expectPlan: "none" },
   { name: "apple", platform: "darwin", arch: "arm64", ramGiB: 24, tools: [...base, "brew"],
-    expectBackend: "metal", expectRungs: ["metal"], expectModel: /Bonsai-2-27B/, expectPlan: "none" },
+    expectBackend: "metal", expectRungs: ["metal"], expectModel: /Ornith-1.5-9B/, expectPlan: "none" },
   { name: "fedora-nodeps", platform: "linux", ramGiB: 16, tools: ["dnf", "sudo"],
     expectBackend: "none", expectRungs: ["cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "dnf" },
   { name: "alpine-min", platform: "linux", ramGiB: 4, tools: ["apk"],
-    expectBackend: "none", expectRungs: ["cpu"], expectModel: /Bonsai-8B/, expectPlan: "manual" },
+    expectBackend: "none", expectRungs: ["cpu"], expectModel: /Ornith-1.5-9B/, expectPlan: "manual" },
   { name: "win-nvidia", platform: "win32", ramGiB: 32, tools: ["winget", "git", "cmake"], cmds: { "nvidia-smi": "0, RTX 3060, 12288, 11000\n" },
-    expectBackend: "cuda", expectRungs: ["cuda", "cpu"], expectModel: /Bonsai-2-27B/, expectPlan: "winget" },
+    expectBackend: "cuda", expectRungs: ["cuda", "cpu"], expectModel: /Ornith-1.5-35B-A3B/, expectPlan: "winget" },
 ];
 
 for (const r of rows) {

@@ -180,8 +180,8 @@ const hw = {
 const emptyEnv = (dir: string) => ({ HOME: join(dir, "home"), PATH: "" }) as NodeJS.ProcessEnv;
 const hubStub = (fileSize: number) => (async (url: any, init?: any) => {
   const u = String(url);
-  if (u.includes("/api/models/prism-ml/Ternary-Bonsai-2-27B-gguf")) {
-    return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", size: fileSize }] }) } as any;
+  if (u.includes("/api/models/ornith-ai/Ornith-1.5-35B-A3B-GGUF")) {
+    return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ornith-1.5-35B-A3B-Q4_K_M.gguf", size: fileSize }] }) } as any;
   }
   return { ok: false, status: 404, json: async () => ({}), headers: new Headers() } as any;
 }) as unknown as typeof fetch;
@@ -196,13 +196,13 @@ test("the model download starts while the engine is still being acquired", async
     await mkdir(modelsDir, { recursive: true });
     // The model is already on disk, so the "download" step is a no-op — what is being
     // asserted is ordering: the download part must not wait for the engine to finish.
-    await writeFile(join(modelsDir, "Ternary-Bonsai-2-27B-PTQ1_0.gguf"), Buffer.alloc(4096));
+    await writeFile(join(modelsDir, "Ornith-1.5-35B-A3B-Q4_K_M.gguf"), Buffer.alloc(4096));
     const p = ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free", modelsDir,
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
       fetchImpl: hubStub(4096),
       log: (l) => { if (l.includes("모델 이미 있음")) { events.push("download-seen"); releaseEngine(); } },
-      acquireTernary: (async () => { events.push("engine-start"); await engineGate; events.push("engine-end"); return { binPath: "/fake/llama-server", backend: "cuda", attempts: [] }; }) as never,
+      acquireStock: (async () => { events.push("engine-start"); await engineGate; events.push("engine-end"); return { binPath: "/fake/llama-server", backend: "cuda", source: "downloaded", attempts: [] }; }) as never,
     });
     await p;
     assert.deepEqual(events, ["engine-start", "download-seen", "engine-end"],
@@ -217,8 +217,8 @@ test("if the engine cannot be had, the in-flight model download is aborted and s
     let sawSignal: AbortSignal | undefined;
     const fetchImpl = (async (url: any, init?: any) => {
       const u = String(url);
-      if (u.includes("/api/models/prism-ml/Ternary-Bonsai-2-27B-gguf")) {
-        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", size: 5_000_000 }] }) } as any;
+      if (u.includes("/api/models/ornith-ai/Ornith-1.5-35B-A3B-GGUF")) {
+        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ornith-1.5-35B-A3B-Q4_K_M.gguf", size: 5_000_000 }] }) } as any;
       }
       if (u.includes("/resolve/main/")) {
         sawSignal = init?.signal;
@@ -232,7 +232,7 @@ test("if the engine cannot be had, the in-flight model download is aborted and s
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free", modelsDir,
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
       fetchImpl,
-      acquireTernary: (async () => null) as never,
+      acquireStock: (async () => null) as never,
     });
     assert.ok(sawSignal, "the download was started with an abort signal");
     const dl = report.steps.find((s) => s.name === "모델 다운로드");
@@ -262,7 +262,6 @@ test("a second launch finds the prebuilt that the first one installed and acquir
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
       fetchImpl: (async () => { throw new Error("must not touch the network"); }) as never,
       acquireStock: (async () => { acquired++; return null; }) as never,
-      acquireTernary: (async () => { acquired++; return null; }) as never,
     });
     assert.equal(acquired, 0);
     assert.equal(report.llama?.binPath, bin);

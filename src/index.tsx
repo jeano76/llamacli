@@ -1117,7 +1117,7 @@ async function main() {
             }
 
             // A number picks a row; anything else is treated as a name, so
-            // `/models bonsai-27b` works without looking up an index first.
+            // `/models ornith-9b` works without looking up an index first.
             const n = Number(arg);
             const byIndex = Number.isInteger(n) && n >= 1 && n <= reports.length ? reports[n - 1] : null;
             const byName = byIndex ? null : findRung(arg);
@@ -1192,7 +1192,7 @@ async function main() {
 
               if (!binPath || !result.presentOnDisk) {
                 // Weights are the one step big enough to warrant a second look:
-                // Bonsai is 5.5 GiB and Ornith is over 20 GiB, fetched while the
+                // The 9B is about 5 GiB and the 35B is over 20 GiB, fetched while the
                 // user waits. `ba0243c` removed the transfer from /reset for
                 // exactly this reason. So the size is stated and confirmed; a
                 // build, by contrast, is requested by the selection itself and

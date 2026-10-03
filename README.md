@@ -385,7 +385,7 @@ to them the same way as any other `.llamacli/skills/*.md` file.
 
 **2026-10-03 사용자 결정으로 Ornith-1.5-35B-A3B (`Q4_K_M`) 를 이 설치의 확정 모델로 한다.**
 같은 날 먼저 Qwen3.6-35B-A3B 로 확정했다가 Ornith 로 바꿨다. 비교 대상은 로컬에 있던 Qwen3.6-35B-A3B 와
-Ternary-Bonsai-2 27B 였고, 측정 근거는 `docs/model-bench-2026-10-03.md`(속도·컴팩션·컨텍스트 스윕)와
+Bonsai-2 27B 였고, 측정 근거는 `docs/model-bench-2026-10-03.md`(속도·컴팩션·컨텍스트 스윕)와
 `docs/coding-eval-2026-10-03.md`(코딩)에 있다.
 
 ### 서버 설정 (8 GB RTX 2070 SUPER 기준)
@@ -393,7 +393,7 @@ Ternary-Bonsai-2 27B 였고, 측정 근거는 `docs/model-bench-2026-10-03.md`(�
 | 항목 | 값 |
 |---|---|
 | 모델 | `Ornith-1.5-35B-A3B-Q4_K_M.gguf` (20.36 GiB, MoE: 256 experts, 활성 약 3B) |
-| 엔진 | stock llama.cpp (PrismML fork 불필요) |
+| 엔진 | stock llama.cpp |
 | **`--n-cpu-moe`** | **33** |
 | **컨텍스트** | **98,304** (`-c 98304`, `-np 1`, `-no-kvu`) |
 | 오프로드 / 캐시 | `-ngl 999 -fa on`, KV `q8_0`/`q8_0` |
@@ -662,8 +662,7 @@ they actually run here, and `/models <번호|이름>` selects one.
 #  모델                  파라미터       양자화  크기         판정
 ─  ────────────────────  ─────────────  ──────  ──────────  ──────────────
 1  Ornith-1.5-35B-A3B    3B 활성 (MoE)  Q4_K_M   20.4 GiB    ⚠️ RAM 스트리밍
-2  Ternary-Bonsai-2-27B  27B (밀집)     PTQ1_0  5.5 GiB     ✅ VRAM
-3  Ornith-1.5-9B         9B             Q4_K_M   5.1 GiB     ✅ VRAM
+2  Ornith-1.5-9B         9B             Q4_K_M   5.1 GiB     ✅ VRAM
 ```
 
 **"Will it run" is not a size question.** Three things decide it, and the table
@@ -698,7 +697,7 @@ model?* — which comes up on its own after a crash or after something else took
 the port.
 
 ```
-[server] 포트 8084 (실행 중인 서버에서 확인) · 실행 중 (pid 128976, 이 설치 소유) · 빌드 bonsai2-runtime/llama-server
+[server] 포트 8084 (실행 중인 서버에서 확인) · 실행 중 (pid 128976, 이 설치 소유) · 빌드 llama.cpp/build-opt/bin/llama-server
 [server] 재시작 시: 기존 서버를 종료하고 같은 포트(8084)에서 …로 다시 올립니다.
   · 지금 재시작하려면  /server restart
 ```
@@ -788,14 +787,13 @@ finds `/media/$USER/<label>/models` — which no fixed candidate list matches, a
 which is where this machine's models are — and the search **recurses**, because
 the real layout has some models at the top of that directory
 (`Ornith-1.5-35B-A3B-Q4_K_M.gguf`) and some in per-family subdirectories
-(`bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf`). A flat check found one and missed
+(`<family>/<model>.gguf`). A flat check found one and missed
 the other. Bounded on depth and directories visited, because this runs inside a
 slash command on a real filesystem.
 
 Verified live against this machine's actual disk:
 
 ```
-bonsai-27b    86ms  port=8084  5.5 GiB   /media/jeano/nvme-usb/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf
 ornith-35b    30ms  port=8084  20.4 GiB  /media/jeano/nvme-usb/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf
 ornith-9b     32ms  port=8084  not on disk → would download
 ```
@@ -812,7 +810,7 @@ then serves forever.
 |---|---|---|
 | build that CAN read the model | always burned the full 60 s timeout — measured **180 s** when raised, model loaded by ~3 s | **~3.3 s**, killed on a post-load marker |
 | build that CANNOT | 178 ms | **98 ms** |
-| `findLlamaServer`, real Bonsai | **60 784 ms** | **3 316 ms** |
+| `findLlamaServer`, real model | **60 784 ms** | **3 316 ms** |
 
 So the expensive case was the *successful* one, on every `/models` and every
 `/reset`.
@@ -841,7 +839,7 @@ itself and caught only because the probe was measured on real binaries:
 
 1. A lazy `require` in an ESM module threw, so every probe returned a non-format
    error and every candidate was kept — silently reporting the **stock build as
-   able to read a ternary quant**. A probe that cannot start must never look like
+   able to read a newer quant**. A probe that cannot start must never look like
    one that passed.
 2. A binary that could not be executed emitted an unhandled `error` event, which
    Node turned into an **uncaught exception** that killed the caller.
@@ -867,20 +865,18 @@ entirely on what it is:
 Verified live on this machine: port 8084 (the running `llama-server`) → `ours`;
 8080 and 9999 → `none`; a real `node` process on 7317 → `foreign`, refused.
 
-### The llama.cpp half — and why Bonsai is the case that matters
+### The llama.cpp half
 
-Some quantizations need a build that can read them. `PTQ1_0` and `PQ2_0` are
-the two a stock llama.cpp cannot, and **`PTQ1_0` is exactly the quant the Bonsai
-family is chosen for** — so picking Bonsai is the common case for hitting this,
-not an edge case.
+Some quantizations need a build that can read them: a llama.cpp whose type table
+predates the model's quant rejects the file with an `invalid ggml type` error.
 
 Selecting reports it at the moment you decide, rather than letting it surface on
 the next launch as a load error:
 
 ```
-[models] Ternary-Bonsai-2-27B (PTQ1_0) 로 교체했습니다.
-  · 기록된 경로: /mnt/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
-  · llama-server 가 이 모델을 읽을 수 있습니다 (…/bonsai2-runtime/llama-server, cuda 빌드).
+[models] Ornith-1.5-9B (Q4_K_M) 로 교체했습니다.
+  · 기록된 경로: /mnt/models/Ornith-1.5-9B-Q4_K_M.gguf
+  · llama-server 가 이 모델을 읽을 수 있습니다 (…/llama.cpp/build-opt/bin/llama-server, cuda 빌드).
   · 새 모델은 재시작 후 적용됩니다.
 ```
 

@@ -119,16 +119,16 @@ test("moveIntoPlace renames within a filesystem and never exposes a half-written
 const GiB = 1024 ** 3;
 
 test("quantTag", () => {
-  assert.equal(quantTag("Ternary-Bonsai-8B-PQ2_0.gguf"), "PQ2_0");
+  assert.equal(quantTag("Ornith-1.5-9B-Q8_0.gguf"), "Q8_0");
   assert.equal(quantTag("Ornith-1.5-9B-Q4_K_M.gguf"), "Q4_K_M");
   assert.equal(quantTag("weird.gguf"), null);
 });
 
 test("pickReusable: same name at the published size is reused; a SMALLER copy (incomplete) is not", () => {
-  const cand = { filename: "Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 2 * GiB };
-  assert.equal(pickReusable(cand, [{ path: "/d2/models/Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 2 * GiB }])?.path, "/d2/models/Ternary-Bonsai-8B-PQ2_0.gguf");
-  assert.equal(pickReusable(cand, [{ path: "/d/Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 1 * GiB }]), null);
-  assert.ok(pickReusable(cand, [{ path: "/d/Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 2 * GiB + 5 }]), "a republished, slightly larger copy still works");
+  const cand = { filename: "Ornith-1.5-9B-Q8_0.gguf", sizeBytes: 2 * GiB };
+  assert.equal(pickReusable(cand, [{ path: "/d2/models/Ornith-1.5-9B-Q8_0.gguf", sizeBytes: 2 * GiB }])?.path, "/d2/models/Ornith-1.5-9B-Q8_0.gguf");
+  assert.equal(pickReusable(cand, [{ path: "/d/Ornith-1.5-9B-Q8_0.gguf", sizeBytes: 1 * GiB }]), null);
+  assert.ok(pickReusable(cand, [{ path: "/d/Ornith-1.5-9B-Q8_0.gguf", sizeBytes: 2 * GiB + 5 }]), "a republished, slightly larger copy still works");
 });
 
 test("pickReusable: a differently NAMED file is reused only on exact size + same quant", () => {
@@ -140,24 +140,24 @@ test("pickReusable: a differently NAMED file is reused only on exact size + same
 
 test("pickFamilyMatch: the same model in the quant a download would fetch, never another family", () => {
   const local = [
-    { path: "/disk/models/Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 2 * GiB },
-    { path: "/disk/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf", sizeBytes: 5.5 * GiB },
+    { path: "/disk/models/Ornith-1.5-9B-Q8_0.gguf", sizeBytes: 2 * GiB },
+    { path: "/disk/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf", sizeBytes: 5.5 * GiB },
   ];
-  assert.equal(pickFamilyMatch("Ternary-Bonsai-8B-PTQ1_0.gguf", local)?.path, "/disk/models/Ternary-Bonsai-8B-PQ2_0.gguf");
-  assert.equal(pickFamilyMatch("Ternary-Bonsai-4B-PTQ1_0.gguf", local), null);
+  assert.equal(pickFamilyMatch("Ornith-1.5-9B-Q4_K_M.gguf", local)?.path, "/disk/models/Ornith-1.5-9B-Q8_0.gguf");
+  assert.equal(pickFamilyMatch("Ornith-1.5-4B-Q4_K_M.gguf", local), null);
 });
 
 test("scanModels finds models in nested folders on another disk, and skips staging folders and non-ggufs", async () => {
   await tmp(async (dir) => {
-    const disk = join(dir, "disk2", "models", "bonsai2");
+    const disk = join(dir, "disk2", "models", "gguf");
     await mkdir(disk, { recursive: true });
     await mkdir(join(dir, "disk2", "models", ".llamacli-tmp"), { recursive: true });
-    await writeFile(join(disk, "Ternary-Bonsai-2-27B-PTQ1_0.gguf"), Buffer.alloc(100));
+    await writeFile(join(disk, "Ornith-1.5-35B-A3B-Q4_K_M.gguf"), Buffer.alloc(100));
     await writeFile(join(disk, "notes.txt"), "x");
     await writeFile(join(disk, "x.gguf.part"), Buffer.alloc(5));
     await writeFile(join(dir, "disk2", "models", ".llamacli-tmp", "hidden.gguf"), Buffer.alloc(5));
     const found = await scanModels([join(dir, "disk2", "models")]);
-    assert.deepEqual(found.map((f) => f.path.split("/").pop()), ["Ternary-Bonsai-2-27B-PTQ1_0.gguf"]);
+    assert.deepEqual(found.map((f) => f.path.split("/").pop()), ["Ornith-1.5-35B-A3B-Q4_K_M.gguf"]);
   });
 });
 

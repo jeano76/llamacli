@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { selectModel } from "./modelSelect.js";
 import { findRung } from "./modelMetrics.js";
 
-const bonsai = findRung("bonsai-27b")!;
 const ornith = findRung("ornith-35b")!;
 
 /** Collect what selectModel wrote, without touching a real disk. */
@@ -40,14 +39,14 @@ test("selecting REPLACES the model — it does not accumulate a list", async () 
   // mean a silent mismatch between what /models says is selected and what the
   // stale `model` field says the server is serving.
   const h = harness({ model: "/models/old.gguf", llama: { modelPath: "/models/old.gguf", port: 8080 } }, COMPATIBLE);
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  const r = await selectModel({ projectRoot: "/p", rung: findRung("ornith-9b")!, modelsDir: "/models", ...h.deps });
 
   assert.equal(r.previousModel, "/models/old.gguf", "the previous model must be reported so the change is legible");
   assert.equal(h.written.length, 1);
   const cfg = h.written[0];
   assert.notEqual(cfg.model, "/models/old.gguf", "the old model must be replaced");
   assert.equal(cfg.llama.modelPath, cfg.model, "both fields must name the SAME model");
-  assert.match(String(cfg.model), /Bonsai/);
+  assert.match(String(cfg.model), /Ornith/);
   assert.equal(cfg.llama.port, 8080, "and unrelated settings must survive the switch");
 });
 
@@ -62,12 +61,11 @@ test("both model fields are written together, never one alone", async () => {
   assert.equal(cfg.model, cfg.llama.modelPath);
 });
 
-test("a Bonsai selection reports that PTQ1_0 needs a build that can read it", async () => {
-  // The whole reason this check exists: PTQ1_0 is unreadable by a stock
-  // llama.cpp, and it is the quant the Bonsai family is chosen FOR -- so picking
-  // Bonsai is the common case for hitting this, not an edge case.
+test("a selection reports when the build cannot read the quant: it needs a build that can read it", async () => {
+  // The whole reason this check exists: a quant newer than the installed
+  // llama.cpp is unreadable by it
   const h = harness(undefined, REJECTED_FOR_MODEL);
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  const r = await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
   assert.equal(r.llama.ok, false);
   assert.equal(r.llama.needsDifferentBuild, true, "a build mismatch must be flagged, not glossed over");
   assert.match(r.llama.detail, /읽지 못합니다|호환/, `detail should explain: ${r.llama.detail}`);
@@ -75,7 +73,7 @@ test("a Bonsai selection reports that PTQ1_0 needs a build that can read it", as
 
 test("a compatible build is reported as such", async () => {
   const h = harness(undefined, COMPATIBLE);
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  const r = await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
   assert.equal(r.llama.ok, true);
   assert.equal(r.llama.binPath, "/usr/bin/llama-server");
   assert.match(r.llama.detail, /읽을 수 있습니다/);
@@ -86,13 +84,13 @@ test("the config is written even when the build is incompatible, and the problem
   // silently does not happen. Recording it AND reporting the build gap is the
   // honest version -- the next launch's discovery already resolves it.
   const h = harness(undefined, REJECTED_FOR_MODEL);
-  await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
   assert.equal(h.written.length, 1, "the choice must still be recorded");
 });
 
 test("no installed server is reported honestly rather than as a failure", async () => {
   const h = harness(undefined, NONE);
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  const r = await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
   assert.equal(r.llama.ok, false);
   assert.match(r.llama.detail, /찾지 못했|빌드/, `detail should say what is missing: ${r.llama.detail}`);
 });
@@ -101,11 +99,11 @@ test("a changed model is flagged as needing a restart", async () => {
   // The running server has the OLD model loaded; nothing changes that without a
   // restart, so claiming the switch is already live would be false.
   const h = harness({ model: "/models/old.gguf", llama: { modelPath: "/models/old.gguf" } }, COMPATIBLE);
-  const changed = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  const changed = await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
   assert.equal(changed.requiresRestart, true);
 
   const h2 = harness(undefined, COMPATIBLE);
-  const fresh = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h2.deps });
+  const fresh = await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h2.deps });
   // Still a restart: whatever the server currently has loaded will not change
   // itself. An earlier version of this test asserted `false` here on the
   // reasoning that "nothing was configured, so nothing is being replaced" --
@@ -118,7 +116,7 @@ test("a discovery error is reported, not thrown", async () => {
   h.deps.findServer = async () => {
     throw new Error("probe blew up");
   };
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  const r = await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
   assert.equal(r.llama.ok, false);
   assert.match(r.llama.detail, /오류/);
 });
@@ -155,14 +153,14 @@ test("an existing model in a SUBDIRECTORY is found, not re-downloaded", async ()
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const root = await mkdtemp(join(tmpdir(), "msel2-"));
-  const sub = join(root, "models", "bonsai2");
+  const sub = join(root, "models", "gguf");
   await mkdir(sub, { recursive: true });
-  const real = join(sub, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+  const real = join(sub, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
   await writeFile(real, "x");
 
   const r = await selectModel({
     projectRoot: root,
-    rung: bonsai,
+    rung: ornith,
     detectRunningPort: async () => null,
     readConfigFile: async () => ({}),
     writeConfigFile: async () => {},
@@ -184,7 +182,7 @@ test("re-tuning for the new model does NOT move the port", async () => {
   const h = harness({ model: "/models/old.gguf", llama: { modelPath: "/models/old.gguf", port: 8084 } }, COMPATIBLE);
   const r = await selectModel({
     projectRoot: "/p",
-    rung: bonsai,
+    rung: ornith,
     tuning: { contextSize: 16384, threads: 10, cpuMoeLayers: 4 } as any,
     ...h.deps,
   });
@@ -202,7 +200,7 @@ test("an unrecorded port asks the RUNNING server, never defaults to 8080", async
   const h = harness({ model: "/models/old.gguf", llama: { modelPath: "/models/old.gguf" } }, COMPATIBLE);
   const r = await selectModel({
     projectRoot: "/p",
-    rung: bonsai,
+    rung: ornith,
     ...h.deps,
     detectRunningPort: async () => 8084,
   });
@@ -217,7 +215,7 @@ test("a recorded port yields to the llama-server that is really running elsewher
   const h = harness({ llama: { modelPath: "/m.gguf", port: 9090 } }, COMPATIBLE);
   const r = await selectModel({
     projectRoot: "/p",
-    rung: bonsai,
+    rung: ornith,
     ...h.deps,
     detectRunningPort: async () => 8084,
   });
@@ -226,13 +224,13 @@ test("a recorded port yields to the llama-server that is really running elsewher
 
 test("a recorded port is kept when no llama-server is running", async () => {
   const h = harness({ llama: { modelPath: "/m.gguf", port: 9090 } }, COMPATIBLE);
-  const r = await selectModel({ projectRoot: "/p", rung: bonsai, ...h.deps, detectRunningPort: async () => null });
+  const r = await selectModel({ projectRoot: "/p", rung: ornith, ...h.deps, detectRunningPort: async () => null });
   assert.equal(r.port, 9090);
 });
 
 test("the port the server is really on is written back to the config", async () => {
   const h = harness({ llama: { modelPath: "/m.gguf", port: 8080 } }, COMPATIBLE);
-  await selectModel({ projectRoot: "/p", rung: bonsai, ...h.deps, detectRunningPort: async () => 8084 });
+  await selectModel({ projectRoot: "/p", rung: ornith, ...h.deps, detectRunningPort: async () => 8084 });
   assert.equal(h.written[0].llama.port, 8084, "the stale 8080 must not be written back");
 });
 
@@ -242,7 +240,7 @@ test("with nothing running, an unrecorded port falls back to 8080", async () => 
   const h = harness(undefined, COMPATIBLE);
   const r = await selectModel({
     projectRoot: "/p",
-    rung: bonsai,
+    rung: ornith,
     ...h.deps,
     detectRunningPort: async () => null,
   });
@@ -258,13 +256,13 @@ test("a model already on disk is recorded at its REAL path, not a guessed one", 
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const root = await mkdtemp(join(tmpdir(), "msel4-"));
-  const real = join(root, "Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+  const real = join(root, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
   await mkdir(join(root, ".llamacli"), { recursive: true });
   await writeFile(real, "x");
 
   const r = await selectModel({
     projectRoot: root,
-    rung: bonsai,
+    rung: ornith,
     detectRunningPort: async () => null,
     readConfigFile: async () => ({ llama: { modelPath: real } }),
     writeConfigFile: async () => {},
@@ -275,41 +273,41 @@ test("a model already on disk is recorded at its REAL path, not a guessed one", 
 });
 
 test("/models: the same model on disk in the quant a download would fetch counts as already downloaded", async () => {
-  // The table says 8B PTQ1_0, but the Hub's 8B is PQ2_0. A user who has the PQ2_0 file
+  // The table says 9B Q4_K_M, but the user may hold the Q8_0 file. A user who has the Q8_0 file
   // already has this model; asking them to download it again (and to type `confirm`) was
   // the bug.
-  const eight = findRung("bonsai-8b")!;
+  const eight = findRung("ornith-9b")!;
   const h = harness(undefined, COMPATIBLE);
   const r = await selectModel({
     projectRoot: "/p", rung: eight, modelsDir: "/models", ...h.deps,
-    listLocalModels: async () => [{ path: "/media/disk2/models/Ternary-Bonsai-8B-PQ2_0.gguf", sizeBytes: 2_000_000_000 }],
+    listLocalModels: async () => [{ path: "/media/disk2/models/Ornith-1.5-9B-Q8_0.gguf", sizeBytes: 2_000_000_000 }],
   });
-  assert.equal(r.modelPath, "/media/disk2/models/Ternary-Bonsai-8B-PQ2_0.gguf");
+  assert.equal(r.modelPath, "/media/disk2/models/Ornith-1.5-9B-Q8_0.gguf");
   assert.equal(h.written[0].llama.modelPath, r.modelPath, "and the config records where it really is");
 });
 
 test("/models: a file of another FAMILY is never taken for the chosen model", async () => {
-  const eight = findRung("bonsai-8b")!;
+  const eight = findRung("ornith-9b")!;
   const h = harness(undefined, COMPATIBLE);
   const r = await selectModel({
     projectRoot: "/p", rung: eight, modelsDir: "/models", ...h.deps,
-    listLocalModels: async () => [{ path: "/media/disk2/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf", sizeBytes: 5_500_000_000 }],
+    listLocalModels: async () => [{ path: "/media/disk2/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf", sizeBytes: 5_500_000_000 }],
   });
-  assert.doesNotMatch(r.modelPath, /27B/);
+  assert.doesNotMatch(r.modelPath, /35B/);
 });
 
 import { recordServerState } from "./modelSelect.js";
 
 test("selecting a model records the build that can READ it, not the one that cannot", async () => {
   const h = harness({ llama: { modelPath: "/m/old.gguf", binPath: "/home/u/llama.cpp/build-opt/bin/llama-server", port: 8084 } },
-    { location: { binPath: "/home/u/.llamacli/prism-llama.cpp/cuda-12.8/llama-server", source: "x", backend: "cuda" }, rejected: [] });
-  await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
-  assert.equal(h.written[0].llama.binPath, "/home/u/.llamacli/prism-llama.cpp/cuda-12.8/llama-server");
+    { location: { binPath: "/home/u/.llamacli/llama.cpp-new/cuda-12.8/llama-server", source: "x", backend: "cuda" }, rejected: [] });
+  await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
+  assert.equal(h.written[0].llama.binPath, "/home/u/.llamacli/llama.cpp-new/cuda-12.8/llama-server");
 });
 
 test("no compatible build found: the existing binPath is left alone rather than blanked", async () => {
   const h = harness({ llama: { modelPath: "/m/old.gguf", binPath: "/keep/llama-server" } }, NONE);
-  await selectModel({ projectRoot: "/p", rung: bonsai, modelsDir: "/models", ...h.deps });
+  await selectModel({ projectRoot: "/p", rung: ornith, modelsDir: "/models", ...h.deps });
   assert.equal(h.written[0].llama.binPath, "/keep/llama-server");
 });
 

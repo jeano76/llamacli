@@ -16,7 +16,6 @@ mkdir -p "$OUT"
 
 MODELS=${BENCH_MODELS:-/media/jeano/nvme-usb/models}
 STOCK=${BENCH_STOCK_BIN:-$HOME/llama.cpp/build-opt/bin/llama-bench}                    # stock llama.cpp
-PRISM=${BENCH_PRISM_BIN:-$HOME/.llamacli/prism-llama.cpp/cuda-12.8/llama-bench}        # PrismML fork (reads PTQ1_0)
 
 # Production-shaped: full GPU offload, flash-attn, q8_0 KV cache, 6 threads, ub 512 / b 2048.
 # pp512 and tg128 at depth 0 and 8192 (compaction happens deep in the context, not at 0),
@@ -31,7 +30,6 @@ run() { # name binary model n-cpu-moe
   echo "=== $1 done rc=$? $(date +%T)" | tee -a "$OUT/bench.log"
 }
 
-run bonsai27b "$PRISM" "$MODELS/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf" 0
 run ornith35b "$STOCK" "$MODELS/Ornith-1.5-35B-A3B-Q4_K_M.gguf"           "$MOE_LAYERS"
 run qwen35b   "$STOCK" "$MODELS/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"           "$MOE_LAYERS"
 echo ALLDONE | tee -a "$OUT/bench.log"

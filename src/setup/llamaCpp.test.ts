@@ -12,7 +12,7 @@ import {
 // ── a binary that runs but cannot read the model is a different failure ─────
 //
 // Two llama.cpp builds coexisted on this machine: a stock `~/llama.cpp` build
-// (ggml types 0-42) and a PrismML fork that adds ternary 1-bit quantisation.
+// (ggml types 0-42) and a newer build that adds further quantisation types.
 // The stock build RAN fine — `--version` succeeded, every probe passed — and
 // then rejected the configured 1-bit model at server start with:
 //
@@ -43,7 +43,7 @@ test("a generic load failure is NOT claimed to be a build mismatch", () => {
 
 test("a build that cannot read the configured model is skipped in favour of the next candidate", async () => {
   // The stock build answers `--version` fine and would previously be accepted.
-  // With the ternary model it must be rejected specifically for the model, and
+  // With the newer-quant model it must be rejected specifically for the model, and
   // the search must continue to a build that can read it.
   const tried: string[] = [];
   const result = await findLlamaServer({
@@ -52,7 +52,7 @@ test("a build that cannot read the configured model is skipped in favour of the 
     exists: async (p) => p.endsWith("llama-server") && p.includes("llama.cpp"),
     listDirs: async () => ["build-opt"],
     probe: async () => true, // runs fine — that was never the problem
-    modelPath: "/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    modelPath: "/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async (bin) => {
       tried.push(bin);
       return { ok: false, error: "invalid ggml type 143. should be in [0, 43)" };
@@ -91,15 +91,15 @@ test("the search proceeds past a mismatched build to one that works", async () =
   // which is the only route by which a second llama.cpp install is reachable
   // at all — see the test below for what happens when it is not.
   const stock = "/usr/local/bin/llama-server";
-  const fork = "/opt/bonsai2-runtime/llama-server";
+  const fork = "/opt/alt-runtime/llama-server";
   const seen: string[] = [];
   const result = await findLlamaServer({
     home: "/home/jeano",
-    env: { PATH: "/usr/local/bin:/opt/bonsai2-runtime" },
+    env: { PATH: "/usr/local/bin:/opt/alt-runtime" },
     exists: async (p) => p === stock || p === fork,
     listDirs: async () => [],
     probe: async () => true,
-    modelPath: "/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    modelPath: "/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async (bin) => {
       seen.push(bin);
       return bin === fork ? { ok: true } : { ok: false, error: "invalid ggml type 143. should be in [0, 43)" };
@@ -113,20 +113,20 @@ test("the search proceeds past a mismatched build to one that works", async () =
 test("a working build outside every searched location is genuinely unreachable", async () => {
   // Recorded deliberately rather than papered over. The search covers env
   // overrides, PATH, and llama.cpp checkouts under $HOME — and nothing else.
-  // The fork that reads ternary models on this machine lives in neither, so
+  // The build that reads the model on this machine lives in neither, so
   // there is no automatic route to it: the honest outcome is "nothing found,
   // here is what was checked", and the user's next move is to name the binary
   // in llama.binPath. Widening the search by guessing at directories is not
   // available as a fix here without inventing paths nobody can verify.
   const stock = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
-  const unreachableFork = "/media/jeano/nvme-usb/bonsai2-runtime/llama-server";
+  const unreachableFork = "/media/jeano/nvme-usb/alt-runtime/llama-server";
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: { PATH: "/usr/bin" },
     exists: async (p) => p === stock || p === unreachableFork,
     listDirs: async () => ["build-opt"],
     probe: async () => true,
-    modelPath: "/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    modelPath: "/models/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async () => ({ ok: false, error: "invalid ggml type 143. should be in [0, 43)" }),
   });
   assert.equal(result.location, null);
@@ -300,22 +300,22 @@ test("a binary rejected for the model is listed once however many layouts expose
 // *checkout*, so it was in neither PATH nor any searched root.
 //
 // Observed on this machine: the model is at
-// `<drive>/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf` and the only build
-// that can read it is `<drive>/bonsai2-runtime/llama-server` — same disk, two
+// `<drive>/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf` and the only build
+// that can read it is `<drive>/alt-runtime/llama-server` — same disk, two
 // directories away, invisible to every existing rule.
 
 test("a runtime beside the model directory is found", async () => {
   const tree: Record<string, string[]> = {
-    "/m/models/bonsai2": [],
+    "/m/models/gguf": [],
     "/m/models": [],
-    "/m": ["models", "bonsai2-runtime", "llmwiki"],
+    "/m": ["models", "alt-runtime", "llmwiki"],
     "/": ["m", "home"],
   };
-  const found = await runtimeCandidatesNearModel("/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf", {
+  const found = await runtimeCandidatesNearModel("/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf", {
     listDirs: async (dir) => tree[dir] ?? [],
-    exists: async (p) => p === "/m/bonsai2-runtime/llama-server",
+    exists: async (p) => p === "/m/alt-runtime/llama-server",
   });
-  assert.deepEqual(found, ["/m/bonsai2-runtime/llama-server"]);
+  assert.deepEqual(found, ["/m/alt-runtime/llama-server"]);
 });
 
 test("the scan is bounded and stops at the filesystem root", async () => {
@@ -364,14 +364,14 @@ test("the search prefers a declared location over an adjacent runtime", async ()
   // adjacent runtime is a guess about where a tarball was unpacked. The guess
   // may be tried, but must never outrank the decision.
   const inPath = "/usr/local/bin/llama-server";
-  const adjacent = "/m/bonsai2-runtime/llama-server";
+  const adjacent = "/m/alt-runtime/llama-server";
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: { PATH: "/usr/local/bin" },
     exists: async (p) => p === inPath || p === adjacent,
-    listDirs: async (dir) => (dir === "/m" ? ["bonsai2-runtime"] : dir === "/home/jeano/llama.cpp" ? [] : []),
+    listDirs: async (dir) => (dir === "/m" ? ["alt-runtime"] : dir === "/home/jeano/llama.cpp" ? [] : []),
     probe: async () => true,
-    modelPath: "/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    modelPath: "/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async () => ({ ok: true }),
   });
   assert.equal(result.location?.binPath, inPath);
@@ -382,14 +382,14 @@ test("an adjacent runtime is used when the declared builds cannot read the model
   // The case that was actually dead-ended: a stock build in PATH that runs fine
   // and cannot read the model, and one working runtime beside the model files.
   const inPath = "/home/jeano/llama.cpp/build-opt/bin/llama-server";
-  const adjacent = "/m/bonsai2-runtime/llama-server";
+  const adjacent = "/m/alt-runtime/llama-server";
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
     exists: async (p) => p === inPath || p === adjacent,
-    listDirs: async (dir) => (dir === "/m" ? ["bonsai2-runtime"] : ["build-opt"]),
+    listDirs: async (dir) => (dir === "/m" ? ["alt-runtime"] : ["build-opt"]),
     probe: async () => true,
-    modelPath: "/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    modelPath: "/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async (bin) =>
       bin === adjacent ? { ok: true } : { ok: false, error: "invalid ggml type 143. should be in [0, 43)" },
   });
@@ -403,14 +403,14 @@ test("an unrelated sibling llama-server is probed and rejected, not launched", a
   // accept. A sibling project that happens to contain a llama-server must not
   // be able to talk its way in.
   const stray = "/m/some-project/llama-server";
-  const good = "/m/bonsai2-runtime/llama-server";
+  const good = "/m/alt-runtime/llama-server";
   const result = await findLlamaServer({
     home: "/home/jeano",
     env: {},
     exists: async (p) => p === stray || p === good,
-    listDirs: async (dir) => (dir === "/m" ? ["some-project", "bonsai2-runtime"] : []),
+    listDirs: async (dir) => (dir === "/m" ? ["some-project", "alt-runtime"] : []),
     probe: async () => true,
-    modelPath: "/m/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    modelPath: "/m/models/gguf/Ornith-1.5-35B-A3B-Q4_K_M.gguf",
     probeModel: async (bin) =>
       bin === good ? { ok: true } : { ok: false, error: "invalid ggml type 143. should be in [0, 43)" },
   });
@@ -465,7 +465,7 @@ test("a spawn that cannot start is NOT reported as ok", async () => {
   // The failure mode found while verifying this: a lazy `require` in an ESM
   // module threw, every probe returned a non-format error, and because that is
   // not a format complaint the candidate was KEPT -- silently reporting the
-  // stock build as able to read a ternary quant. A probe that never ran must
+  // stock build as able to read a newer quant. A probe that never ran must
   // never look like one that passed.
   const spawn: ProbeSpawn = (_bin, _args, { onError }) => {
     onError(new Error("spawn ENOENT"));
@@ -544,46 +544,4 @@ test("output that already decided the verdict wins over a later exit", async () 
   const { spawn } = fakeSpawn(["tensor 'output.weight' has invalid ggml type 143\n"], 0);
   const r = await probeModelCompatibility("/bin/llama-server", "/m.gguf", { spawn, timeoutMs: 60_000 });
   assert.equal(r.verdict, "unsupported");
-});
-
-// The round-trip that was broken: llamacli INSTALLS a ternary-capable runtime, then
-// has to FIND it on the next launch. It installed into
-// ~/.llamacli/prism-llama.cpp/<subdir>/ (a downloaded prebuilt) or
-// ~/.llamacli/llama.cpp-fork/<build>/ (a fork build), and searched neither — so
-// every launch re-downloaded or re-compiled the whole thing.
-test("a runtime llamacli installed for ternary models is found again", async () => {
-  const home = "/h";
-  const seen: string[] = [];
-  const prebuilt = "/h/.llamacli/prism-llama.cpp/cuda-12.8/llama-server";
-  const found = await findLlamaServer({
-    env: { HOME: home } as never,
-    home,
-    // Only the runtime llamacli itself would have installed exists, and it runs.
-    exists: async (p: string) => {
-      seen.push(p);
-      return p === prebuilt;
-    },
-    // The real code lists the subdirectories of each root; the installed runtime
-    // lives in one, and without it there is nothing for the layout to match.
-    listDirs: async (dir: string) => (dir.includes("prism-llama.cpp") ? ["cuda-12.8"] : []),
-    probe: async () => ({ ok: true, backend: "cuda" }),
-  } as never);
-  assert.equal(found.location?.binPath, prebuilt, `the installed runtime was not discovered; probed ${seen.length} paths`);
-  assert.ok(
-    seen.includes(prebuilt),
-    "the unpacked-release layout — binary directly in a subdir, no bin/ — must be one of the probed paths"
-  );
-});
-
-test("a fork build under ~/.llamacli/llama.cpp-fork is found again", async () => {
-  const home = "/h";
-  const built = "/h/.llamacli/llama.cpp-fork/build-cuda/bin/llama-server";
-  const found = await findLlamaServer({
-    env: { HOME: home } as never,
-    home,
-    exists: async (p: string) => p === built,
-    listDirs: async (dir: string) => (dir.includes("llama.cpp-fork") ? ["build-cuda"] : []),
-    probe: async () => ({ ok: true, backend: "cuda" }),
-  } as never);
-  assert.equal(found.location?.binPath, built);
 });

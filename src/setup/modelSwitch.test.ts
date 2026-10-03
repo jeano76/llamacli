@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { switchModelAndServer, type PortOwner } from "./modelSwitch.js";
 import { findRung } from "./modelMetrics.js";
 
-const bonsai = findRung("bonsai-27b")!;
+const ornith = findRung("ornith-35b")!;
 
 const TUNING = { contextSize: 16384, threads: 10, gpuLayers: 99, cpuMoeLayers: 0, flashAttn: true };
 
@@ -22,7 +22,7 @@ function fakeServer(sink: { events: string[] }, fail = false) {
 
 function base(owner: PortOwner, sink: { events: string[] }) {
   return {
-    modelPath: "/models/Bonsai.gguf",
+    modelPath: "/models/Ornith.gguf",
     port: 8080,
     binPath: "/opt/llama-server",
     tuning: TUNING,
@@ -136,7 +136,7 @@ test("the replacement server is configured like the old one", async () => {
   });
   assert.equal(cfg.gpuLayers, 99);
   assert.equal(cfg.contextSize, 16384);
-  assert.equal(cfg.modelPath, "/models/Bonsai.gguf");
+  assert.equal(cfg.modelPath, "/models/Ornith.gguf");
   assert.equal(cfg.binPath, "/opt/llama-server");
 });
 

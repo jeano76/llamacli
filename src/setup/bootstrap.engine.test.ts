@@ -24,11 +24,10 @@ const hw = {
 const emptyEnv = (dir: string) => ({ HOME: join(dir, "home"), PATH: "" }) as NodeJS.ProcessEnv;
 
 function spies() {
-  const calls = { stock: 0, ternary: 0 };
+  const calls = { stock: 0 };
   return {
     calls,
     acquireStock: (async () => { calls.stock++; return { binPath: "/fake/stock/llama-server", backend: "cuda", source: "downloaded", attempts: [] }; }) as never,
-    acquireTernary: (async () => { calls.ternary++; return { binPath: "/fake/prism/llama-server", backend: "cuda", attempts: [] }; }) as never,
   };
 }
 
@@ -39,10 +38,10 @@ test("a running server means NO engine is downloaded or compiled, even with no l
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "found" as const, server: { baseUrl: "http://127.0.0.1:8080", model: "/m/x.gguf" } }),
       fetchImpl: (async () => { throw new Error("no network"); }) as never,
-      acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      acquireStock: s.acquireStock,
     });
     assert.ok(report.ok);
-    assert.deepEqual(s.calls, { stock: 0, ternary: 0 });
+    assert.deepEqual(s.calls, { stock: 0 });
   }));
 
 test("an ordinary configured model with no engine installed gets the STOCK engine only", () =>
@@ -59,34 +58,10 @@ test("an ordinary configured model with no engine installed gets the STOCK engin
     const report = await ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
-      acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      acquireStock: s.acquireStock,
     });
-    assert.deepEqual(s.calls, { stock: 1, ternary: 0 }, JSON.stringify(report.steps.map((x) => [x.name, x.ok, x.detail])));
+    assert.deepEqual(s.calls, { stock: 1 }, JSON.stringify(report.steps.map((x) => [x.name, x.ok, x.detail])));
     assert.equal(report.llama?.binPath, "/fake/stock/llama-server");
-  }));
-
-test("first launch where the CHOSEN model is Bonsai acquires only the fork — stock is never built and thrown away", () =>
-  withTempDir(async (dir) => {
-    // No config at all: the engine used to be settled before any model was chosen, so this
-    // compiled stock llama.cpp and then fetched the fork on top of it.
-    const modelsDir = join(dir, "models");
-    await mkdir(modelsDir, { recursive: true });
-    await writeFile(join(modelsDir, "Ternary-Bonsai-2-27B-PTQ1_0.gguf"), Buffer.alloc(4096));
-    const fetchImpl = (async (url: any) => {
-      const u = String(url);
-      if (u.includes("/api/models/prism-ml/Ternary-Bonsai-2-27B-gguf")) {
-        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", size: 4096 }] }) } as any;
-      }
-      return { ok: false, status: 404, json: async () => ({}) } as any;
-    }) as unknown as typeof fetch;
-    const s = spies();
-    await ensureLocalStack({
-      projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
-      detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
-      modelsDir, fetchImpl, acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
-    });
-    assert.equal(s.calls.stock, 0, "stock llama.cpp must not be acquired for a ternary model");
-    assert.ok(s.calls.ternary >= 1);
   }));
 
 test("offline with no engine reports it, and acquires nothing", () =>
@@ -95,45 +70,45 @@ test("offline with no engine reports it, and acquires nothing", () =>
     const report = await ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), offline: true, probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }),
-      acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
+      acquireStock: s.acquireStock,
     });
-    assert.deepEqual(s.calls, { stock: 0, ternary: 0 });
+    assert.deepEqual(s.calls, { stock: 0 });
     assert.ok(report.steps.some((x) => x.name === "llama.cpp" && !x.ok));
   }));
 
 // ── a pinned (selected) model is downloaded as chosen ───────────────────────
 
-test("pinModelFilename: selecting the 8B downloads the 8B even though the hardware picker would take the 27B", () =>
+test("pinModelFilename: selecting the 9B downloads the 9B even though the hardware picker would take the 35B", () =>
   withTempDir(async (dir) => {
     const modelsDir = join(dir, "models");
     await mkdir(modelsDir, { recursive: true });
     // Present, so the "download" is a no-op — what is under test is WHICH model is chosen.
-    await writeFile(join(modelsDir, "Ternary-Bonsai-8B-PQ2_0.gguf"), Buffer.alloc(4096));
+    await writeFile(join(modelsDir, "Ornith-1.5-9B-Q4_K_M.gguf"), Buffer.alloc(4096));
     const siblings = (files: [string, number][]) => ({ siblings: files.map(([rfilename, size]) => ({ rfilename, size })) });
     const fetchImpl = (async (url: any) => {
       const u = String(url);
       const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as any;
-      if (u.includes("Ternary-Bonsai-2-27B-gguf")) return ok(siblings([["Ternary-Bonsai-2-27B-PTQ1_0.gguf", 5_500_000_000]]));
-      if (u.includes("Ternary-Bonsai-8B-gguf")) return ok(siblings([["Ternary-Bonsai-8B-PQ2_0.gguf", 4096], ["Ternary-Bonsai-8B-F16.gguf", 16_000_000_000]]));
+      if (u.includes("Ornith-1.5-35B-A3B-GGUF")) return ok(siblings([["Ornith-1.5-35B-A3B-Q4_K_M.gguf", 5_500_000_000]]));
+      if (u.includes("Ornith-1.5-9B-GGUF")) return ok(siblings([["Ornith-1.5-9B-Q4_K_M.gguf", 4096], ["Ornith-1.5-9B-F16.gguf", 16_000_000_000]]));
       return { ok: false, status: 404, json: async () => ({}) } as any;
     }) as unknown as typeof fetch;
     const s = spies();
     const report = await ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
-      modelsDir, fetchImpl, acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
-      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+      modelsDir, fetchImpl, acquireStock: s.acquireStock,
+      pinModelFilename: "Ornith-1.5-9B-Q8_0.gguf",
     });
-    assert.match(report.model?.candidate.filename ?? "", /^Ternary-Bonsai-8B-/, JSON.stringify(report.steps));
-    assert.ok(!/27B/.test(report.model?.candidate.filename ?? ""));
+    assert.match(report.model?.candidate.filename ?? "", /^Ornith-1\.5-9B-/, JSON.stringify(report.steps));
+    assert.ok(!/35B/.test(report.model?.candidate.filename ?? ""));
     assert.match(report.model?.reason ?? "", /선택한 모델/);
   }));
 
 test("pinModelFilename: a family the Hub does not have FAILS the step instead of downloading something else", () =>
   withTempDir(async (dir) => {
     const fetchImpl = (async (url: any) => {
-      if (String(url).includes("Ternary-Bonsai-2-27B-gguf")) {
-        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf", size: 5_500_000_000 }] }) } as any;
+      if (String(url).includes("Ornith-1.5-35B-A3B-GGUF")) {
+        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ornith-1.5-35B-A3B-Q4_K_M.gguf", size: 5_500_000_000 }] }) } as any;
       }
       return { ok: false, status: 404, json: async () => ({}) } as any;
     }) as unknown as typeof fetch;
@@ -141,8 +116,8 @@ test("pinModelFilename: a family the Hub does not have FAILS the step instead of
     const report = await ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
-      modelsDir: join(dir, "models"), fetchImpl, acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
-      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+      modelsDir: join(dir, "models"), fetchImpl, acquireStock: s.acquireStock,
+      pinModelFilename: "Ornith-1.5-9B-Q8_0.gguf",
     });
     assert.equal(report.model, undefined, "no model was chosen on the user's behalf");
     const step = report.steps.find((x) => x.name === "모델 결정");
@@ -154,8 +129,8 @@ function hub8b(resolved: string[]) {
   return (async (url: any) => {
     const u = String(url);
     if (u.includes("/resolve/")) { resolved.push(u); return { ok: false, status: 500, json: async () => ({}), headers: new Headers() } as any; }
-    if (u.includes("Ternary-Bonsai-8B-gguf")) {
-      return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-8B-PQ2_0.gguf", size: 2_000_000_000 }] }) } as any;
+    if (u.includes("Ornith-1.5-9B-GGUF")) {
+      return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ornith-1.5-9B-Q4_K_M.gguf", size: 2_000_000_000 }] }) } as any;
     }
     return { ok: false, status: 404, json: async () => ({}) } as any;
   }) as unknown as typeof fetch;
@@ -165,14 +140,14 @@ test("the same model already on ANOTHER disk is reused: no download request is m
   withTempDir(async (dir) => {
     const resolved: string[] = [];
     const s = spies();
-    const elsewhere = "/mnt/disk2/models/Ternary-Bonsai-8B-PQ2_0.gguf";
+    const elsewhere = "/mnt/disk2/models/Ornith-1.5-9B-Q4_K_M.gguf";
     const report = await ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }),
       // The lister is asked about every model directory; the model is in one of them.
       listExistingModels: async (d) => (d.endsWith("/models") ? [{ path: elsewhere, sizeBytes: 2_000_000_000 }] : []),
-      modelsDir: join(dir, "models"), fetchImpl: hub8b(resolved), acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
-      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+      modelsDir: join(dir, "models"), fetchImpl: hub8b(resolved), acquireStock: s.acquireStock,
+      pinModelFilename: "Ornith-1.5-9B-Q8_0.gguf",
     });
     assert.deepEqual(resolved, [], "nothing was fetched");
     assert.equal(report.modelPath, elsewhere);
@@ -188,8 +163,8 @@ test("when the model is NOT anywhere, the download is attempted (control for the
     await ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
-      modelsDir: join(dir, "models"), fetchImpl: hub8b(resolved), acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
-      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+      modelsDir: join(dir, "models"), fetchImpl: hub8b(resolved), acquireStock: s.acquireStock,
+      pinModelFilename: "Ornith-1.5-9B-Q8_0.gguf",
     });
     assert.ok(resolved.length > 0, "the control must reach the download, or the test above proves nothing");
   }));
@@ -199,8 +174,8 @@ test("a FAILED download leaves modelPath unset — it must not point at a file t
     const fetchImpl = (async (url: any) => {
       const u = String(url);
       if (u.includes("/resolve/")) throw new Error("connection reset");
-      if (u.includes("Ternary-Bonsai-8B-gguf")) {
-        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ternary-Bonsai-8B-PQ2_0.gguf", size: 2_000_000_000 }] }) } as any;
+      if (u.includes("Ornith-1.5-9B-GGUF")) {
+        return { ok: true, status: 200, json: async () => ({ siblings: [{ rfilename: "Ornith-1.5-9B-Q4_K_M.gguf", size: 2_000_000_000 }] }) } as any;
       }
       return { ok: false, status: 404, json: async () => ({}) } as any;
     }) as unknown as typeof fetch;
@@ -208,8 +183,8 @@ test("a FAILED download leaves modelPath unset — it must not point at a file t
     const report = await ensureLocalStack({
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }), listExistingModels: async () => [],
-      modelsDir: join(dir, "models"), fetchImpl, acquireStock: s.acquireStock, acquireTernary: s.acquireTernary,
-      pinModelFilename: "Ternary-Bonsai-8B-PTQ1_0.gguf",
+      modelsDir: join(dir, "models"), fetchImpl, acquireStock: s.acquireStock,
+      pinModelFilename: "Ornith-1.5-9B-Q8_0.gguf",
     });
     const step = report.steps.find((x) => x.name === "모델 다운로드");
     assert.equal(step?.ok, false);

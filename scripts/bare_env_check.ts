@@ -318,7 +318,7 @@ async function windowsPortParsing(): Promise<void> {
   // answer there is `unknown`, and the positive attribution — the case that
   // actually lets a switch proceed — would be untestable.
   const readCmdline = async (pid: number) =>
-    pid === 128976 ? "C:\\llama\\llama-server.exe -m C:\\models\\bonsai.gguf --port 8084" : "C:\\Windows\\System32\\svchost.exe";
+    pid === 128976 ? "C:\\llama\\llama-server.exe -m C:\\models\\model.gguf --port 8084" : "C:\\Windows\\System32\\svchost.exe";
 
   const ours = await detectPortOwner(8084, { platform: "win32", run: netstat, readCmdline });
   check(
@@ -463,7 +463,7 @@ async function windowsConfigRoundTrip(): Promise<void> {
   const root = join(outer, "my project");
   const cfgDir = join(root, ".llamacli");
   await mkdir(cfgDir, { recursive: true });
-  const modelPath = "C:\\Users\\jeano\\My Models\\Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+  const modelPath = "C:\\Users\\jeano\\My Models\\Example-9B-Q4_K_M.gguf";
   await writeConfig(root, {
     model: modelPath,
     llama: { binPath: "C:\\llama\\llama-server.exe", modelPath, port: 8080, contextSize: 4096 },

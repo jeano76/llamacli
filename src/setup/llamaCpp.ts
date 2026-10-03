@@ -239,9 +239,8 @@ export function candidatePaths(root: string, buildDirs: string[]): string[] {
  * simply not among the candidates.
  *
  * Observed directly: the model lives at
- * `<drive>/models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf` and the only
- * build that can read it is `<drive>/bonsai2-runtime/llama-server`, which no
- * existing rule reached. The result was a dead end — the one working binary was
+ * `<drive>/models/<family>/<model>.gguf` and the only build that can read it
+ * is `<drive>/<family>-runtime/llama-server`, which no existing rule reached. The result was a dead end — the one working binary was
  * on the same disk, two directories away.
  *
  * Scanned from the model's own directory upward, because that is the one
@@ -324,8 +323,8 @@ export async function findLlamaServer(opts: {
   listDirs?: (dir: string) => Promise<string[]>;
   probe?: (binPath: string) => Promise<boolean>;
   /** Model file the chosen binary must be able to read. Skips a build whose
-   *  type registry rejects it (a stock llama.cpp cannot read a ternary 1-bit
-   *  quant) instead of accepting it and failing at server-start time. */
+   *  type registry rejects it (an older llama.cpp that does not know the model's
+   *  quantisation) instead of accepting it and failing at server-start time. */
   modelPath?: string;
   probeModel?: typeof probeModelCompatibility;
   /** Injected for tests; defaults to a real spawn. */
@@ -361,7 +360,7 @@ export async function findLlamaServer(opts: {
   // each of the three real build layouts and the loop below tries all three.
   // Without this, one binary is probed with `--version` up to three times and —
   // far worse — `probeModelCompatibility` is a PROCESS SPAWN that parses a GGUF
-  // header, so a stock build rejected for a ternary model was launched and
+  // header, so a build that rejected the model was launched and
   // re-read three times over, and reported to the user three times.
   const decided = new Map<string, Promise<LlamaLocation | null>>();
   const accept = (binPath: string, source: LlamaLocation["source"]): Promise<LlamaLocation | null> => {
@@ -380,7 +379,7 @@ export async function findLlamaServer(opts: {
       return null;
     }
     // Running is not the same as being able to read the model. Without this the
-    // search happily returned a stock build for a ternary-quantised model and
+    // search happily returned a build that does not know the model's quantisation and
     // the failure surfaced much later, as a server that exited with
     // "invalid ggml type 143" and a message blaming the port.
     if (opts.checkModel !== false && opts.modelPath) {
@@ -400,7 +399,7 @@ export async function findLlamaServer(opts: {
       // binary is still kept — it is the best candidate available — but it is
       // ALSO recorded, because "kept" here means "not disproven", not "verified".
       // Presenting that as a positive result is how a stock build ends up
-      // reported as able to read a ternary quant.
+      // reported as able to read a quant it has never seen.
       if (compat.verdict === "inconclusive") unverified.push(binPath);
     }
     return { binPath, source, backend: backendFromPath(binPath) };
@@ -448,15 +447,6 @@ export async function findLlamaServer(opts: {
     // the other cannot be tested, and on a machine where HOME differs from
     // what `homedir()` reports it would look in two different places.
     { dir: join(home, ".llamacli", "llama.cpp"), source: "llamacli-build" as const },
-    // The two roots a TERNARY-capable runtime lands in (see ternaryRuntime.ts and
-    // buildLlamaCpp's `repo` option). They were missing, and that is not a
-    // cosmetic omission: llamacli downloaded its pinned PrismML prebuilt to
-    // ~/.llamacli/prism-llama.cpp/<subdir>/, or built the fork into
-    // ~/.llamacli/llama.cpp-fork/, and then never searched either — so the very
-    // next launch could not see what it had just installed and would fetch or
-    // compile the whole thing again. Every launch, forever.
-    { dir: join(home, ".llamacli", "prism-llama.cpp"), source: "llamacli-build" as const },
-    { dir: join(home, ".llamacli", "llama.cpp-fork"), source: "llamacli-build" as const },
     // Stock prebuilts installed by stockRuntime.ts, one subdirectory per backend.
     { dir: join(home, ".llamacli", "llama.cpp-prebuilt"), source: "llamacli-build" as const },
   ];
@@ -611,11 +601,11 @@ export async function probeLlamaServer(binPath: string, run: Run = defaultRun): 
  *
  *   tensor 'output.weight' has invalid ggml type 143. should be in [0, 43)
  *
- * Type 143 is a ternary (3-valued) quant, added by the PrismML fork. The stock
- * `~/llama.cpp` build on this machine tops out at 42, so it rejects a 1-bit
- * Bonsai outright — while a `bonsai2-runtime` build sitting elsewhere on the
- * same disk loads it fine. `findLlamaServer` ranks `~/llama.cpp/build-opt` first
- * and accepted it, because until now nothing asked the question.
+ * Type 143 is a quant newer than that build's type table (which here tops out
+ * at 42), so the build rejects the model outright — while a newer build sitting
+ * elsewhere on the same disk loads it fine. `findLlamaServer` ranks
+ * `~/llama.cpp/build-opt` first and accepted it, because until now nothing asked
+ * the question.
  *
  * So this loads nothing: it asks the binary to parse the GGUF header only,
  * which is a few hundred KB of the file, and treats the "invalid ggml type"
@@ -659,7 +649,7 @@ const realProbeSpawn: ProbeSpawn = (binPath, args, { onOutput, onError, onExit }
   // A top-level import, not a lazy `require`: this module is ESM, where
   // `require` is undefined. A lazy require threw, every probe returned "other",
   // and since "other" is not a format complaint the candidate was KEPT -- which
-  // silently reported the stock build as able to read a ternary quant. A probe
+  // silently reported a build as able to read a quant it had never seen. A probe
   // that cannot start must never look like a probe that passed.
   const proc = spawnProc(binPath, args);
   proc.stdout?.on("data", (d: Buffer) => onOutput(d.toString()));
@@ -870,16 +860,7 @@ export interface BuildOptions {
   /** Called with human-readable progress lines. */
   log?: (line: string) => void;
   installDeps?: boolean;
-  /** Which repository to build. Defaults to stock llama.cpp.
-   *
-   *  Overridable because it is not always interchangeable: the ternary quants
-   *  (PTQ1_0 / PQ2_0) that the Bonsai family ships in are a fork feature, and a
-   *  stock build rejects them with "invalid ggml type 143". Compiling the default
-   *  for such a model burns 10-40 minutes and produces a binary that cannot load
-   *  it. Callers that know the model needs the fork pass its URL. */
-  repo?: string;
-  /** Where to keep the checkout. Separate per repo, so building the fork does not
-   *  clobber a stock tree (or vice versa) and the two can coexist. */
+  /** Where to keep the checkout. */
   home?: string;
   /** Force a backend instead of choosing the best one the toolchain allows. The
    *  engine ladder uses this to retry as CPU when an accelerated build was unusable. */
@@ -903,11 +884,8 @@ export interface BuildOptions {
  */
 export async function buildLlamaCpp(opts: BuildOptions): Promise<string> {
   const { hw, run, log = () => {} } = opts;
-  const repo = opts.repo ?? LLAMA_CPP_REPO;
-  // One checkout per repository. A fork and stock share nothing, and overwriting
-  // one with the other would make `findLlamaServer` return whichever sorted first
-  // for a model only one of them can read.
-  const dir = opts.home ?? (repo === LLAMA_CPP_REPO ? LLAMA_CPP_HOME : join(LLAMA_CPP_HOME + "-fork"));
+  const repo = LLAMA_CPP_REPO;
+  const dir = opts.home ?? LLAMA_CPP_HOME;
 
   const cudaArch = hw.canBuildCuda ? await detectCudaArch(run as never) : null;
   const hip = hw.canBuildRocm && opts.backend !== "cpu" ? await detectHipInfo(run as never) : undefined;
