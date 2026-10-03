@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { stockRungsFor, parseReleases, acquireStockLlamaServer, type Release, type StockMachine } from "./stockRuntime.js";
 import type { Hardware } from "./hardware.js";
-import { B, P, SRV, PATHS } from "../testSupport.js";
+import { B, P, SRV, PATHS, posix } from "../testSupport.js";
 
 const TAG = "b11344";
 // Asset names copied from the real ggml-org/llama.cpp b11344 release listing.
@@ -127,7 +127,7 @@ test("ladder: a CUDA prebuilt that will not initialise falls to Vulkan, then CPU
     build: (async () => { throw new Error("must not build"); }) as never,
   });
   assert.equal(got?.backend, "cpu");
-  assert.deepEqual(verified.map((v) => v.split("/")[2]), ["cuda-12.8", "vulkan", "cpu"]);
+  assert.deepEqual(verified.map((v) => posix(v).split("/")[2]), ["cuda-12.8", "vulkan", "cpu"]);
   assert.equal(got?.attempts.filter((a) => !a.ok).length, 2);
 });
 

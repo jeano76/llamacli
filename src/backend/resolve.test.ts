@@ -388,7 +388,8 @@ test("case 2: a freshly spawned server serving garbage is reported, not handed t
     assert.match(res.reason, /steps steps steps steps/);
   } finally {
     for (const fn of cleanup) fn();
-    await rm(root, { recursive: true, force: true });
+    // Windows cannot delete a running .exe: the just-killed fake server may still hold it for a moment.
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   }
 });
 // ── `usable`: the distinction that decides exit-vs-launch ───────────────────

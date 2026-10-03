@@ -4,6 +4,7 @@ import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureLocalStack } from "./bootstrap.js";
+import { posix } from "../testSupport.js";
 
 // The engine (llama-server) used to be acquired BEFORE the running-server check and
 // BEFORE the model choice. These pin the new order: engine last, and only the one
@@ -145,7 +146,7 @@ test("the same model already on ANOTHER disk is reused: no download request is m
       projectRoot: dir, hardware: hw, env: emptyEnv(dir), probe: async () => "free",
       detectServer: async () => ({ kind: "none" as const }),
       // The lister is asked about every model directory; the model is in one of them.
-      listExistingModels: async (d) => (d.endsWith("/models") ? [{ path: elsewhere, sizeBytes: 2_000_000_000 }] : []),
+      listExistingModels: async (d) => (posix(d).endsWith("/models") ? [{ path: elsewhere, sizeBytes: 2_000_000_000 }] : []),
       modelsDir: join(dir, "models"), fetchImpl: hub8b(resolved), acquireStock: s.acquireStock,
       pinModelFilename: "Ornith-1.5-9B-Q8_0.gguf",
     });

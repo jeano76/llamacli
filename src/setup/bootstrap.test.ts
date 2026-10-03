@@ -8,7 +8,7 @@ import { findLlamaServer, installBuildPackages, candidatePaths } from "./llamaCp
 import { checkBinaryAgainstChosenModel, ensureLocalStack } from "./bootstrap.js";
 import { tuneForHardware, budgetVramGiB } from "./tuning.js";
 import { pickPrimaryGpu, parseNvidiaSmiCsv, type Hardware } from "./hardware.js";
-import { B, P, SRV, PATHS } from "../testSupport.js";
+import { B, P, SRV, PATHS, posix } from "../testSupport.js";
 const GiB = 1024 ** 3;
 
 /** A probe over a fixed set of busy ports. */
@@ -133,7 +133,7 @@ test("build-cpu — the directory THIS module's builder creates — is found aga
     env: { PATH: "" },
     exists: only(B("/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server")),
     home: "/home/u",
-    listDirs: async (dir) => (dir.endsWith(".llamacli/llama.cpp") ? ["build-cpu"] : []),
+    listDirs: async (dir) => (posix(dir).endsWith(".llamacli/llama.cpp") ? ["build-cpu"] : []),
     probe: async () => true,
   });
   assert.equal(location?.binPath, B("/home/u/.llamacli/llama.cpp/build-cpu/bin/llama-server"));
@@ -208,7 +208,7 @@ test("the three real build layouts are all covered", () => {
   // plain `make`, binaries at the checkout root
   assert.ok(paths.includes(B(`${root}/llama-server`)));
   // and nothing invents paths that exist nowhere
-  assert.equal(paths.some((p) => p.includes("/bin/bin/")), false);
+  assert.equal(paths.some((p) => posix(p).includes("/bin/bin/")), false);
 });
 
 test("build dependencies try passwordless sudo first so the common case never prompts", async () => {
