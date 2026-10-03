@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   sha256Hex, parseManifest, updateAvailable, checkAndApplyUpdate, LOCAL_HASH_FILE,
-  updateRefusedForCheckout, selfUpdateForced, readAppliedUpdate,
+  updateRefusedForCheckout, selfUpdateForced, readAppliedUpdate, readWithProgress,
 } from "./selfUpdate.js";
 import { APPLIED_UPDATE_FILE } from "./buildStamp.js";
 
@@ -606,3 +606,57 @@ test("a genuine newer build after a mismatched one is not mistaken for a stuck l
     assert.match(next.reason ?? "", /up to date/);
   });
 });
+
+// ── the archive download shows progress ─────────────────────────────────────
+
+function streamed(body: Buffer, chunk: number, withLength = true): Response {
+  let i = 0;
+  const rs = new ReadableStream<Uint8Array>({
+    pull(c) {
+      if (i >= body.length) return c.close();
+      c.enqueue(new Uint8Array(body.subarray(i, i + chunk)));
+      i += chunk;
+    },
+  });
+  return new Response(rs, { status: 200, headers: withLength ? { "content-length": String(body.length) } : {} });
+}
+
+test("readWithProgress returns the exact bytes and reports growing progress up to 100%", async () => {
+  const body = Buffer.from(Array.from({ length: 5000 }, (_, i) => i % 251));
+  const seen: { received: number; percent: number }[] = [];
+  let t = 0;
+  const out = await readWithProgress(streamed(body, 700), "x", (p) => seen.push({ received: p.receivedBytes, percent: p.percent }), () => (t += 200));
+  assert.deepEqual(out, body);
+  assert.ok(seen.length >= 3, "several updates for a multi-chunk body");
+  assert.ok(seen.every((s, i) => i === 0 || s.received >= seen[i - 1].received), "monotonic");
+  assert.equal(seen[seen.length - 1].percent, 100);
+});
+
+test("readWithProgress without Content-Length still reports bytes (percent unknown)", async () => {
+  const body = Buffer.alloc(3000, 1);
+  const seen: number[] = [];
+  const out = await readWithProgress(streamed(body, 1000, false), "x", (p) => seen.push(p.percent), () => 1e9);
+  assert.equal(out.length, 3000);
+  assert.ok(seen.length >= 2, "bytes are reported even when the total is unknown");
+});
+
+test("without a progress callback the body is read as before", async () => {
+  const body = Buffer.alloc(100, 7);
+  assert.deepEqual(await readWithProgress(streamed(body, 10), "x"), body);
+});
+
+test("checkAndApplyUpdate reports download progress while installing", () =>
+  withTempDir(async (distDir) => {
+    await writeFile(join(distDir, "index.js"), "old", "utf8");
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "b".repeat(64), "utf8");
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "new" });
+    const manifestBody = JSON.stringify({ version: "v1", sha256 });
+    const fetchImpl = (async (url: string) => {
+      if (url.endsWith("manifest.json")) return { ok: true, status: 200, text: async () => manifestBody } as Response;
+      return streamed(Buffer.from(bytes), 64);
+    }) as typeof fetch;
+    const seen: number[] = [];
+    const r = await checkAndApplyUpdate(distDir, { fetchImpl, onProgress: (p) => seen.push(p.receivedBytes) });
+    assert.equal(r.updated, true, r.reason);
+    assert.ok(seen.length > 1 && seen[seen.length - 1] === bytes.length, `progress ended at ${seen[seen.length - 1]} of ${bytes.length}`);
+  }));

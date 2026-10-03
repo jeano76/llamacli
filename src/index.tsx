@@ -39,6 +39,7 @@ import { reportServer } from "./setup/serverReport.js";
 import { runServerRestart, gateModelSwitch } from "./setup/serverCommand.js";
 import { provisionForSwitch } from "./setup/provision.js";
 import { transientProgress } from "./tui/transientProgress.js";
+import { formatProgress, type TransferProgress } from "./setup/download.js";
 import { totalmem } from "node:os";
 /** The tuning flags the config already records, for a restart that must NOT
  *  re-derive them.
@@ -452,8 +453,20 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
       process.stdout.write(`${line}\n`);
     }
   };
+  // Download progress: one redrawn line on a TTY; on a pipe a line per 25% (a redraw would flood a log).
+  let lastQuarter = -1;
+  const onProgress = (p: TransferProgress) => {
+    if (canRewrite) {
+      process.stdout.write(`\r\x1b[2K[self-update] ${formatProgress(p)}`);
+      wroteStage = true;
+    } else if (p.percent >= 0) {
+      const q = Math.floor(p.percent / 25);
+      if (q > lastQuarter) { lastQuarter = q; process.stdout.write(`[self-update] ${formatProgress(p)}\n`); }
+    }
+  };
   const result = await checkAndApplyUpdate(distDir, {
     onStage,
+    onProgress,
     onUpdateFound: (manifest) => {
       announcedUpdateFound = true;
       process.stdout.write(

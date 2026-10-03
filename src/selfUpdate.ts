@@ -32,6 +32,7 @@ import { promisify } from "node:util";
 import { join } from "node:path";
 import { isSourceCheckout, APPLIED_UPDATE_FILE } from "./buildStamp.js";
 import { extractTarGz } from "./setup/tarGz.js";
+import { Transfer, type TransferProgress } from "./setup/download.js";
 
 const { existsSync } = fs;
 
@@ -170,6 +171,34 @@ export interface SelfUpdateResult {
   reason: string;
 }
 
+/** Reads a response body fully, reporting byte progress as it arrives (the whole archive used to be awaited in
+ *  one `arrayBuffer()` call, so nothing could be shown while it downloaded). Total comes from Content-Length;
+ *  without it the bar shows bytes received only. */
+export async function readWithProgress(
+  res: Response,
+  label: string,
+  onProgress?: (p: TransferProgress) => void,
+  now: () => number = Date.now
+): Promise<Buffer> {
+  const total = Number(res.headers?.get?.("content-length") ?? 0);
+  if (!onProgress || !res.body) return Buffer.from(await res.arrayBuffer());
+  const transfer = new Transfer(label, Number.isFinite(total) && total > 0 ? total : 0, now);
+  const chunks: Buffer[] = [];
+  const reader = res.body.getReader();
+  let last = 0;
+  onProgress(transfer.progress());
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(Buffer.from(value));
+    transfer.add(value.byteLength);
+    const t = now();
+    if (t - last >= 100) { last = t; onProgress(transfer.progress()); }
+  }
+  onProgress(transfer.progress());
+  return Buffer.concat(chunks);
+}
+
 /** The actual check-and-install. `fetchImpl`/URLs are injectable so this
  *  is testable without a real network call or a real GitHub repo.
  *  `distDir` is the running build's own dist/ directory (index.js's own
@@ -208,6 +237,9 @@ export async function checkAndApplyUpdate(
      *  with "(7초)" reads as working.
      */
     onStage?: (stage: UpdateStage, elapsedMs: number) => void;
+    /** Byte progress of the archive download (received / total / speed / ETA), so a slow link reads as
+     *  progress rather than a frozen startup. Not called when there is nothing to download. */
+    onProgress?: (p: TransferProgress) => void;
     /** Injected so the opt-out and URL overrides are testable without
      *  mutating the real process environment. */
     env?: NodeJS.ProcessEnv;
@@ -292,7 +324,7 @@ export async function checkAndApplyUpdate(
   try {
     const res = await fetchImpl(archiveUrl, { signal: AbortSignal.timeout(opts.archiveTimeoutMs ?? 30000) });
     if (!res.ok) return { updated: false, reason: `archive fetch failed: HTTP ${res.status}` };
-    downloaded = Buffer.from(await res.arrayBuffer());
+    downloaded = await readWithProgress(res, "llamacli 업데이트", opts.onProgress);
   } catch (err: any) {
     return { updated: false, reason: `archive fetch failed: ${err.message ?? err}` };
   }
