@@ -31,6 +31,9 @@ export interface StatusBarProps {
    *  character while composing, so the same animation reads as normal
    *  motion here instead of visual noise. */
   busy: boolean;
+  /** Status-bar spinner frame, driven by App's unified tick (see UI_TICK_MS).
+   *  Omitted = Spinner runs its own interval (standalone/test use). */
+  spinnerFrame?: number;
   /** Whether the terminal can render the block/shade glyphs the gauge is
    *  drawn with. From terminal.ts's `unicode`; false switches to an ASCII
    *  gauge of the same width rather than letting `█` become `?`. */
@@ -261,7 +264,7 @@ export function formatPlanProgress(planProgress: { done: number; total: number }
   return text.length <= PLAN_PROGRESS_WIDTH ? text : "";
 }
 
-export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns, busy, unicode, scroll }: StatusBarProps) {
+export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compactionStatus, columns, busy, spinnerFrame, unicode, scroll }: StatusBarProps) {
   // Read the SAME chrome record statusBarFieldWidth budgeted against. Drawing
   // from a second, independent set of width tests is precisely the bug that
   // put this row 41 columns wide on a 40-column terminal: the math dropped
@@ -287,7 +290,7 @@ export function StatusBar({ cwd, model, contextUsedRatio, planProgress, compacti
         <Text dimColor>{tailToWidth(cwd, fieldWidth)}</Text>
       </Text>
       <Text>
-        {chrome.divider && (busy ? <Spinner active /> : <Text dimColor>{divider}</Text>)}
+        {chrome.divider && (busy ? <Spinner active frame={spinnerFrame} /> : <Text dimColor>{divider}</Text>)}
         {chrome.divider && <Text> </Text>}
         <Text color="cyan">{tailToWidth(model, fieldWidth)}</Text>
       </Text>

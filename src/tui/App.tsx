@@ -257,7 +257,34 @@ export function shimmerBands(
 
 const SHIMMER_BAND_WIDTH = 10;
 const SHIMMER_SPEED_CHARS_PER_TICK = 2;
-export const SHIMMER_TICK_MS = 80;
+/** The single UI tick driving streaming flushes, the shimmer reveal wave and
+ *  the status-bar spinner (see the unified-tick effect in App): one interval
+ *  instead of three unsynchronized ones, so a fast decode costs ~10
+ *  renders/s rather than ~40. Previously the shimmer (80ms) and the spinner
+ *  (80ms, its own interval in Spinner.tsx) plus one render per streamed
+ *  token each reconciled the whole screen on their own schedule — reported
+ *  directly as flicker from the prompt input down to the bottom (tmux). */
+export const UI_TICK_MS = 100;
+
+/** Batches per-token streaming text into ~10Hz log updates (see UI_TICK_MS).
+ *  Pure container only — the component owns the timer — so the batching
+ *  itself is unit-testable without mounting Ink. */
+export function createDeltaBuffer() {
+  let pending = "";
+  return {
+    /** Accumulates one streamed chunk; never renders on its own. */
+    push(text: string): void {
+      pending += text;
+    },
+    /** The batch since the last take ("" when nothing arrived — the tick
+     *  uses that to skip its setLog and avoid a pointless render). */
+    take(): string {
+      const batch = pending;
+      pending = "";
+      return batch;
+    },
+  };
+}
 
 /**
  * Writes a control sequence straight to the real stdout, past Ink.
@@ -1026,6 +1053,11 @@ export function App({
   // appending to, so successive deltas mutate one line instead of spawning
   // a new one per chunk.
   const streamingIdRef = useRef<number | null>(null);
+  // Per-token streaming text accumulates here and is flushed into the log by
+  // the unified UI tick (~10/s) instead of re-rendering on every chunk
+  // (~30/s at full decode speed) — see UI_TICK_MS.
+  const assistantDeltaRef = useRef(createDeltaBuffer());
+  const reasoningDeltaRef = useRef(createDeltaBuffer());
   // Tracks the most recently pushed tool-call line, so finalizeToolCall()
   // (fired by loop.ts's onToolCallDone) knows which one just finished —
   // tool calls run sequentially within a turn, never concurrently, so
@@ -1050,11 +1082,10 @@ export function App({
   // setShimmerTick(0) wherever a new line of either kind begins).
   const [streamingAssistantId, setStreamingAssistantId] = useState<number | null>(null);
   const [shimmerTick, setShimmerTick] = useState(0);
-  useEffect(() => {
-    if (thinkingLineId === null && streamingAssistantId === null) return;
-    const id = setInterval(() => setShimmerTick((t) => t + 1), SHIMMER_TICK_MS);
-    return () => clearInterval(id);
-  }, [thinkingLineId, streamingAssistantId]);
+  // Status-bar spinner frame, driven by the unified tick below instead of
+  // Spinner's own interval, so the spinner never renders on its own
+  // schedule (see UI_TICK_MS).
+  const [spinnerFrame, setSpinnerFrame] = useState(0);
   const reasoningStreamingIdRef = useRef<number | null>(null);
   // Finished reasoning blocks the user has clicked open — everything else
   // finished renders as one folded summary line (foldedReasoningSummary).
@@ -1173,7 +1204,12 @@ export function App({
   const setTransient = (text: string) => transientLine.update(text);
   const endTransient = () => transientLine.end();
 
-  function pushAssistantDelta(text: string) {
+  /** Moves the buffered assistant text into the log (one render for the whole
+   *  batch). Called by the unified tick and synchronously by
+   *  finalizeAssistant, so no buffered text is ever lost at turn end. */
+  function flushAssistantBuffer() {
+    const text = assistantDeltaRef.current.take();
+    if (!text) return;
     setLog((prev) => {
       if (streamingIdRef.current !== null) {
         return prev.map((line) =>
@@ -1197,7 +1233,14 @@ export function App({
     });
   }
 
+  function pushAssistantDelta(text: string) {
+    // Buffered: the unified tick (UI_TICK_MS) moves this into the log ~10x/s
+    // instead of re-rendering the whole screen on every streamed token.
+    assistantDeltaRef.current.push(text);
+  }
+
   function finalizeAssistant() {
+    flushAssistantBuffer();
     // The row cache is keyed on (id, text, width) — text doesn't change
     // between the last delta and finalizing, so without this the NEXT
     // render would reuse the streaming render's plain-shimmer rows
@@ -1225,7 +1268,10 @@ export function App({
     });
   }
 
-  function pushReasoningDelta(text: string) {
+  /** Same batching as flushAssistantBuffer, for the thinking stream. */
+  function flushReasoningBuffer() {
+    const text = reasoningDeltaRef.current.take();
+    if (!text) return;
     setLog((prev) => {
       if (reasoningStreamingIdRef.current !== null) {
         return prev.map((line) => (line.id === reasoningStreamingIdRef.current ? { ...line, text: line.text + text } : line));
@@ -1240,10 +1286,32 @@ export function App({
     });
   }
 
+  function pushReasoningDelta(text: string) {
+    reasoningDeltaRef.current.push(text);
+  }
+
   function finalizeReasoning() {
+    flushReasoningBuffer();
     reasoningStreamingIdRef.current = null;
     setThinkingLineId(null);
   }
+
+  /** One interval for everything that animates or streams: buffered deltas
+   *  are flushed, the shimmer wave advances, the spinner turns — all in the
+   *  same task, so React batches them into a single render (~10/s while
+   *  streaming instead of ~40/s from three unsynchronized timers plus one
+   *  render per token). Runs only while something needs it (busy spinner,
+   *  streaming text); idle costs nothing. */
+  useEffect(() => {
+    if (!busy && thinkingLineId === null && streamingAssistantId === null) return;
+    const id = setInterval(() => {
+      flushAssistantBuffer();
+      flushReasoningBuffer();
+      if (thinkingLineId !== null || streamingAssistantId !== null) setShimmerTick((t) => t + 1);
+      if (busy) setSpinnerFrame((f) => f + 1);
+    }, UI_TICK_MS);
+    return () => clearInterval(id);
+  }, [busy, thinkingLineId, streamingAssistantId]);
 
   function pushCompactionDetail(detail: { droppedCount: number; droppedTokens: number; droppedPreview: string[]; keptCount: number; keptTokens: number; summary: string }) {
     const foldLabel = foldedCompactionSummary(detail.droppedCount, detail.droppedTokens, detail.keptCount);
@@ -1907,7 +1975,7 @@ export function App({
   // is given height={rows} with overflow="hidden", so its rendered output is
   // exactly `rows` lines tall — which trips that `outputHeight >= stdout.rows`
   // check on literally every single render. Combined with the startup
-  // banner's shimmer animation (an 80ms setInterval — see SHIMMER_TICK_MS),
+  // banner's shimmer animation (a 48ms setInterval during the intro only),
   // that's a full-screen clear roughly 12 times a second during the intro,
   // visibly flickering (worse on Windows terminals, which paint escape
   // sequences slower than a typical Linux terminal emulator). Reserving one
@@ -2097,12 +2165,22 @@ export function App({
         ? 1 /* paddingX */ + 1 /* leading space */ + widthToCursor + 1
         : 1 /* paddingX */ + widthToCursor + 1;
     const hideCursor = shouldHideCursor({ quitting, busy, input });
-    lastCursorWriteRef.current = `\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`;
+    const placementSeq = `\x1b[${inputRow};${promptColumn}H${hideCursor ? "\x1b[?25l" : "\x1b[?25h"}`;
     // Registered as well as written. The registration is what makes the
     // placement survive an Ink repaint — see cursorPlacement.ts for why a
     // write from this effect is not enough on its own.
-    setCursorPlacement(lastCursorWriteRef.current);
-    writeDirect(lastCursorWriteRef.current);
+    setCursorPlacement(placementSeq);
+    // This effect runs after EVERY render (no dep array) while the placement
+    // is usually unchanged — streaming re-renders don't move the cursor — so
+    // skip the redundant raw write. It raced Ink's own frame writes and read
+    // as flicker over the input-to-bottom region. Still correct without it:
+    // the stdout wrapper re-asserts the registered placement after every
+    // frame Ink actually paints, and the 2s backstop covers anything that
+    // bypasses Ink entirely.
+    if (placementSeq !== lastCursorWriteRef.current) {
+      lastCursorWriteRef.current = placementSeq;
+      writeDirect(placementSeq);
+    }
   });
 
   // Reported directly: the blinking cursor sometimes ends up sitting
@@ -2548,6 +2626,7 @@ export function App({
         compactionStatus={compactionStatus}
         columns={columns}
         busy={busy}
+        spinnerFrame={spinnerFrame}
         unicode={getCapabilities().unicode}
         scroll={{ offset: clampedScroll, max: maxScroll }}
       />

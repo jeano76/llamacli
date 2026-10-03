@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import stringWidth from "string-width";
-import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk, wordLeft, wordRight, cursorRowCol, scrolledBannerText } from "./App.js";
+import { filterMenuItems, appendHistory, MAX_PROMPT_HISTORY, shouldHideCursor, quittingStatusText, parseMouseWheel, WHEEL_SCROLL_ROWS, runHintText, shimmerBands, parseMouseClicks, foldedReasoningSummary, foldToggleHintExpanded, foldedCompactionSummary, compactionDetailBody, parseDiffStats, foldedDiffSummary, foldedToolResultSummary, bufferMouseChunk, wordLeft, wordRight, cursorRowCol, scrolledBannerText, createDeltaBuffer, UI_TICK_MS } from "./App.js";
 import { formatDiff } from "../tools/diff.js";
 import { SLASH_MENU_ITEMS } from "./SlashMenu.js";
 
@@ -404,4 +404,28 @@ test("runHintText intentionally returns the shortest form even when it does not 
   for (const columns of [34, 40, 80, 200]) {
     assert.ok(stringWidth(runHintText(columns)) <= columns - 1, `columns=${columns}`);
   }
+});
+
+// Streaming deltas are batched into ~10Hz log updates (UI_TICK_MS) instead
+// of re-rendering on every token — reported directly as flicker from the
+// prompt input down to the bottom (tmux). The buffer itself is pure so the
+// batching contract is testable without mounting Ink; the timer wiring
+// (unified tick + finalize flush) is deliberately thin on top of it.
+test("createDeltaBuffer concatenates pushes and drains them in one take", () => {
+  const buf = createDeltaBuffer();
+  buf.push("Hello, ");
+  buf.push("world");
+  assert.equal(buf.take(), "Hello, world");
+  assert.equal(buf.take(), "", "a second take with no new pushes drains nothing (the tick skips its setLog)");
+});
+
+test("createDeltaBuffer starts empty", () => {
+  assert.equal(createDeltaBuffer().take(), "");
+});
+
+test("UI_TICK_MS batches streaming renders well below the per-token rate", () => {
+  // At ~30 tok/s, per-token renders would reconcile the whole screen ~30x/s
+  // (plus shimmer + spinner on their own timers). One 100ms tick covers
+  // flush + shimmer + spinner in a single render instead.
+  assert.ok(UI_TICK_MS >= 50 && UI_TICK_MS <= 250, `UI_TICK_MS=${UI_TICK_MS} should batch visibly without feeling laggy`);
 });

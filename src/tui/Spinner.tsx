@@ -15,15 +15,19 @@ import { Text } from "ink";
 const FRAMES = ["|", "/", "-", "\\"];
 
 /** ASCII spinner shown in front of the prompt while the agent is working (§6). */
-export function Spinner({ active }: { active: boolean }) {
-  const [frame, setFrame] = useState(0);
+export function Spinner({ active, frame }: { active: boolean; frame?: number }) {
+  const [internal, setInternal] = useState(0);
 
   useEffect(() => {
-    if (!active) return;
-    const id = setInterval(() => setFrame((f) => (f + 1) % FRAMES.length), 80);
+    // Controlled mode (frame provided by App's unified tick) needs no timer
+    // of its own — that is the point: one interval for shimmer + spinner +
+    // streaming flushes instead of three unsynchronized ones. Standalone
+    // mode keeps the old internal timer.
+    if (!active || frame !== undefined) return;
+    const id = setInterval(() => setInternal((f) => (f + 1) % FRAMES.length), 80);
     return () => clearInterval(id);
-  }, [active]);
+  }, [active, frame]);
 
   if (!active) return <Text> </Text>;
-  return <Text color="cyan">{FRAMES[frame]}</Text>;
+  return <Text color="cyan">{FRAMES[(frame ?? internal) % FRAMES.length]}</Text>;
 }
