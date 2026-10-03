@@ -135,3 +135,48 @@ Node 단일 실행 파일 = `node.exe` + `postject` 블롭, 동작은 옆의 JSO
 Windows 러너 결과: 처음 실행 1,268 통과 / 3 실패 / 6 건너뜀 → 3건 수정(경로 단언의 `posix()`, 방금 종료한 가짜 `.exe` 삭제 재시도) 후 **1,271 통과 / 0 실패 / 6 건너뜀**.
 남은 6개는 Windows 에 해당 없음: `/media`·`/mnt` 마운트(2), POSIX 사용자 공간 cmake(1), 실행 권한 비트(2), 심볼릭 링크(1).
 macOS·Linux 는 1,277 / 1,277.
+
+## 9. 남은 미검증 항목 진행 (2026-10-04)
+
+### 9.1 실제 llama-server end-to-end (`test/e2e/real-server.mjs`) — 세 OS CI 모두 7/7
+
+Hub 의 1.1 MB GGUF(`ggml-org/test-model-stories260K`, sha256 검증) → GitHub 의 stock 사전빌드를 **제품의 엔진 사다리**로 받아 실행 검증 → 모델 호환 프로브 → 실제 `llama-server` 기동(빈 포트) →
+`/health` → 실제 채팅 완성(8 토큰) → 종료 후 포트 해제.
+
+| OS | 엔진 | 결과 | 비고 |
+|---|---|---|---|
+| Linux (CI, 로컬) | CPU 사전빌드 (`b11379`) | 7/7 | 로컬은 `E2E_BACKEND=none` 으로 GPU 빌드를 건너뜀 |
+| Windows (`windows-latest`) | CPU 사전빌드 `llama-server.exe` | 7/7 (약 6초) | |
+| macOS (`macos-14`, Apple M1 VM) | **Metal** 사전빌드 | 7/7 (약 25~33초) | 한 번은 러너 VM 에 Metal 이 없어 실패 → 아래 9.3 |
+
+### 9.2 이 e2e 가 찾은 제품 결함 3건
+1. **모델 호환 프로브가 기본 포트 8080 으로 서버를 띄움.** 현재 llama.cpp 는 모델을 올리기 *전에* HTTP 소켓부터 열어서, 이미 8080 에서 서버가 도는 머신(가장 흔한 경우)에서는 프로브가 `couldn't bind` 로 항상 실패(verdict `other`)했다. `--host 127.0.0.1 --port 0` 으로 수정, 테스트 추가.
+2. **드래그가 놓은 위치의 칸을 빼고 복사** (`[server]` 를 `[`~`]` 로 드래그하면 `[server`). macOS pty 드래그 복사 테스트가 드러냈다. 양 끝 칸을 모두 포함하도록 수정(`selectionBetweenCells`, 방향 무관), 테스트 5개.
+3. **Metal 이 시작하지 못하는 macOS(가상 머신 등)에서 엔진 사다리가 비어 실패.** macOS 는 자산이 하나(Metal+CPU 한 바이너리)라 CPU 후보가 없다. Metal 실패 시 같은 바이너리를 `--device none --list-devices` 로 CPU 전용 확인 후 CPU 빌드로 수용(튜너는 `-ngl 0`), 테스트 3개. **실제 러너에서 이 폴백이 실행된 적은 아직 없다**(마지막 실행은 Metal 이 있는 VM 이 배정됨) — 단위 테스트로만 검증됨.
+
+### 9.3 실제 TUI (pty / ConPTY) — 하네스 `test/tui/term.py`
+
+POSIX pty 와 Windows ConPTY(pywinpty)를 같은 인터페이스로 구동해 pyte 로 화면을 재구성한다. 깨끗한 머신에서는 서버가 없어 첫 실행 다운로드로 들어가므로 8080 이 비어 있으면 가짜 llama-server(`stub-llama.py`)를 띄운다.
+
+| 검증 | Linux | macOS | Windows |
+|---|---|---|---|
+| TUI 스모크(기본, `TERM=dumb`, 마우스 끔, `CI=true`) | 8/8 (+ 읽기 전용/없는/잘못된 HOME) | 4/4 | 4/4 (ConPTY) |
+| **Shift 없는 드래그 → OS 클립보드** (`test/tui/drag-copy.py`) | ✅ (`wl-copy`, `xclip`) | ✅ (`pbcopy`) | ✅ (PowerShell, ConPTY 의 마우스 입력 포함) |
+
+Windows 에서는 파이썬 콘솔이 cp1252 라 한글 화면 출력이 깨져 첫 결과가 가려졌다 → `PYTHONUTF8=1`/`stdout.reconfigure`.
+드래그 테스트는 폭이 2칸인 한글 구간이 아니라 ASCII 라벨(`[server]`)을 드래그한다(화면 모델마다 와이드 문자 칸 계산이 달라 클립보드가 아닌 칸 산술을 테스트하게 되므로).
+
+### 9.4 CI 가 `CI=true` 에서 찾은 결함 (앞 라운드)
+Ink 4 는 `CI` 가 설정되면 마지막 프레임만 출력한다 → `CI=true`(개발 컨테이너, 하네스 포함) 에서 TUI 가 시작 문구 뒤로 그려지지 않았다. Ink 를 불러오기 전에 `CI=false`, 시작 후 원래 값 복원. 스모크 변형 `ci-env` 로 고정.
+
+### 9.5 실행 환경 이슈 기록
+- GitHub 호스티드 macOS 러너(Apple M1 VM)는 실행마다 Metal 유무가 다르다(9.2-3).
+- GitHub API 속도 제한을 피하려고 e2e 는 `GITHUB_TOKEN` 으로 릴리스를 조회한다.
+- 배포 dist 를 `node_modules` 밖에 풀면 `node-fetch` 를 못 찾는다 → Windows/macOS e2e 는 체크아웃에서 빌드한 앱으로 실행(처음에는 가져오기 오류가 삼켜져 `0/0 steps` 로 보였고, 오류가 보이도록 스크립트를 고침).
+
+### 9.6 여전히 미검증
+- GPU 가 있는 Windows(CUDA/Vulkan), 로컬 RTX 2070 SUPER 외의 실제 GPU, 실제 Vulkan/ROCm 하드웨어.
+- 터미널 **앱 자체**(Windows Terminal, conhost, Terminal.app, iTerm2)의 TUI(마우스, OSC 52). 러너는 pty/ConPTY 까지만.
+- `winget` 설치 실행, WSL, Wine(`test/windows/wine-check.sh` 는 있으나 미실행).
+- 9.2-3 의 macOS CPU 폴백의 **실제 러너** 실행.
+- 큰 모델·GPU 오프로드를 쓰는 서버 기동(e2e 는 1 MB 모델, CPU).
