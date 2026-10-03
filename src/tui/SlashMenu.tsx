@@ -39,7 +39,7 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   // served; `/server` reports what is running right now and `/server restart`
   // re-serves the model already in config. They are deliberately separate -- one
   // command that did both would make "restart my server" silently switch models.
-  { key: "server", label: "/server", description: "모델 제공 서버 상태 확인 · /server restart 로 같은 포트에서 재시작" },
+  { key: "server", label: "/server", description: "모델 제공 서버 상태 확인 · /server restart 로 같은 포트에서 재시작(확인 후)" },
   { key: "skills", label: "/skills", description: "List loaded skills" },
   { key: "rules", label: "/rules", description: "List loaded rules" },
   // Label and key must agree. This one didn't: the key is "plan-clear"

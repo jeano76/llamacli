@@ -90,6 +90,8 @@
 | `/reset` | 현재 GPU·VRAM·RAM 으로 모델/설정/컨텍스트 **재계산**한 결과를 diff 로 미리보기 | 아니오 | — |
 | `/reset confirm` | 재계산 결과 적용(+필요 시 엔진/모델 확보) 후 서버 반영 | 예 | **diff + Y/N** (R4.3) |
 
+> **구현된 확인 방식**: Y/N 대화상자가 아니라 **명시적 `confirm` 단어**다 — `/server restart confirm`, `/models <선택> confirm`, `/reset confirm`. 위 표의 "diff + Y/N" 은 "diff 표시 후 `confirm` 입력"으로 읽는다. 미확정(미입력)은 N 과 동일하게 무변경이다.
+
 ### 연계 요구사항
 1. **세 명령 + 시작 시 bootstrap 이 동일한 단일 서버 정책**을 쓴다: 포트 소유자 판별, `foreign` 불가침, 동일 설정이면 재기동 없음, 두 번째 서버 금지, 교체는 diff+확인.
 2. **상태 일관성**: `/models` 로 모델을 바꾸면 `/server` 가 즉시 "실행 중 서버 모델 ≠ config 모델, 재시작 시 X→Y" 를 보여주고, `/server restart` 한 번으로 그 결과가 반영된다. `/reset` 도 같은 불일치를 diff 로 보여준다.

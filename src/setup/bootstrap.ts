@@ -44,6 +44,7 @@ import { discoverRunningServer, modelLoadBudgetMs, type Discovery } from "../bac
 import { rm } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 import { defaultModelsDir } from "./hostEnv.js";
+import { MODEL_RUNGS, evaluateFit } from "./modelMetrics.js";
 
 export interface BootstrapStep {
   name: string;
@@ -180,9 +181,10 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
   //
   // Without it `/reset` would be a near no-op on a machine whose hardware has
   // not changed, and the user would reasonably conclude it did nothing.
+  const before = await readConfig(opts.projectRoot);
   const existing = opts.force
-    ? keepUserOwnedKeys(await readConfig(opts.projectRoot))
-    : await readConfig(opts.projectRoot);
+    ? await keepSelectedModelOnReset(before, keepUserOwnedKeys(before), hardware)
+    : before;
 
   // ── 2. llama-server binary ────────────────────────────────────────────────
   // The model is chosen in step 3, but a config that already names one is
@@ -880,6 +882,29 @@ async function readConfig(projectRoot: string): Promise<Record<string, any> | un
  *  `buildConfig` merges rather than replaces, and this is the list of what
  *  "merges" is protecting; the persona harness asserts the separation is real
  *  by checking a removed feature's block does not survive a merge. */
+/**
+ * `/reset` re-derives what the MACHINE decides (flags, context, port). It must not
+ * silently undo what the USER decided with `/models`: the selected model stays, as long
+ * as its file is on disk and it still runs on this hardware (a catalogue model that no
+ * longer fits is dropped, and the reset's own diff says so). A model outside the
+ * catalogue is the user's own and is kept.
+ */
+export async function keepSelectedModelOnReset(
+  before: Record<string, any> | undefined,
+  kept: Record<string, any> | undefined,
+  hardware: Hardware
+): Promise<Record<string, any> | undefined> {
+  const path =
+    typeof before?.llama?.modelPath === "string" && before.llama.modelPath ? before.llama.modelPath
+      : typeof before?.model === "string" && before.model.startsWith("/") ? before.model
+      : undefined;
+  if (!path || (await fileSize(path)) <= 0) return kept;
+  const name = basename(path).toLowerCase();
+  const rung = MODEL_RUNGS.find((r) => name.includes(r.label.toLowerCase()));
+  if (rung && evaluateFit(rung, hardware).fit === "no") return kept;
+  return { ...(kept ?? {}), model: path, llama: { modelPath: path } };
+}
+
 export function keepUserOwnedKeys(config: Record<string, any> | undefined): Record<string, any> | undefined {
   if (!config) return config;
   const kept: Record<string, any> = {};

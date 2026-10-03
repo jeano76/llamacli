@@ -58,6 +58,8 @@ export interface ServerReport {
     /** Builds that exist and run but reject the model. */
     rejectedForModel: string[];
   };
+  /** Every llama-server found listening (more than one is a policy violation to surface). */
+  servers: LiveLlamaServer[];
   /** One-line summary for the status line. */
   summary: string;
   /** What a restart would do, stated before it is attempted. */
@@ -159,6 +161,7 @@ export async function reportServer(opts: ReportOptions): Promise<ServerReport> {
     stalePort,
     fromRunningServer,
     serverArgs,
+    servers: resolved.servers ?? [],
     modelMismatch,
     configuredModel,
     configuredBin,

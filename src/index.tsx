@@ -32,8 +32,10 @@ import { describeGpuPlan } from "./setup/gpuReport.js";
 import { isMoeModel, readGgufKvShape } from "./setup/ggufMeta.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
-import { switchModelAndServer } from "./setup/modelSwitch.js";
+import { switchModelAndServer, detectPortOwner, resolveLiveServerPort, parseLlamaServerArgs } from "./setup/modelSwitch.js";
+import { gateServerReplacement, diffServer } from "./setup/serverPolicy.js";
 import { reportServer } from "./setup/serverReport.js";
+import { runServerRestart } from "./setup/serverCommand.js";
 import { provisionForSwitch } from "./setup/provision.js";
 import { transientProgress } from "./tui/transientProgress.js";
 import { totalmem } from "node:os";
@@ -1110,7 +1112,7 @@ async function main() {
                   "",
                   ...lines,
                   "",
-                  "선택하려면  /models <번호>  를 입력하세요. 현재 사용 중인 모델이 교체됩니다.",
+                  "선택하려면  /models <번호>  를 입력하세요. 서버가 떠 있으면 변경 내용을 보여주고, /models <번호> confirm 으로 확정해야 교체합니다.",
                 ].join("\n")
               );
               break;
@@ -1186,6 +1188,24 @@ async function main() {
               // relaunching to do something this session can do, and meant the
               // selection sat recorded-but-unserved in between. It now provisions
               // first and switches in the same breath.
+              // Single-server policy: replacing a LIVE server needs an explicit `confirm`
+              // (the selection itself is already recorded above, so declining loses nothing).
+              {
+                const resolvedPort = await resolveLiveServerPort(result.port);
+                const owner = await detectPortOwner(resolvedPort.port);
+                const live = resolvedPort.servers.find((x) => x.port === resolvedPort.port);
+                const gate = gateServerReplacement({
+                  owner, port: resolvedPort.port, servers: resolvedPort.servers,
+                  changes: diffServer(live ? parseLlamaServerArgs(live.cmdline) : undefined, undefined, { modelPath: result.modelPath, tuning: tuning as never }),
+                  confirmed,
+                  confirmCommand: `/models ${arg} confirm`,
+                });
+                if (!gate.proceed) {
+                  ui?.pushStatus([...head, ...gate.lines.map((l) => `  · ${l}`), "  · 선택은 config 에 기록되어 있습니다."].join("\n"));
+                  break;
+                }
+              }
+
               let binPath = result.llama.binPath;
               let modelPath = result.modelPath;
               let switchTuning = tuning;
@@ -1295,25 +1315,12 @@ async function main() {
           // switch models. It answers the question that has no other route —
           // after a crash, or after something else took the port.
           case "server": {
-            const arg = (argument ?? "").trim().toLowerCase();
+            const arg = (argument ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean).join(" ");
             const report = await reportServer({ config: config as unknown as Record<string, any>, projectRoot });
 
-            if (arg === "restart") {
-              // The restart plan is computed from the SAME report, so what the
-              // user is told will happen and what is attempted cannot diverge.
-              const blocked = /읽지 못|systemd|확인 불가/.test(report.restartPlan);
-              if (blocked) {
-                ui?.pushStatus(`[server] 재시작하지 않습니다 — ${report.restartPlan}`);
-                break;
-              }
+            if (arg === "restart" || arg === "restart confirm") {
               ui?.setBusy(true);
               try {
-                ui?.pushStatus(`[server] ${report.restartPlan}`);
-                const binPath = report.build?.binPath ?? (config as any)?.llama?.binPath;
-                if (!binPath) {
-                  ui?.pushStatus("[server] llama-server 실행 파일을 찾지 못했습니다. /models 로 모델을 다시 선택하세요.");
-                  break;
-                }
                 // Tuning: the config's when it has any; otherwise what the running server was
                 // started with (a hand-started server has no llama block, and the defaults
                 // here — 8192 context, -ngl 0 — would silently downgrade it to CPU).
@@ -1325,29 +1332,23 @@ async function main() {
                       ...recordedTuning(config),
                       ...Object.fromEntries(Object.entries(sa).filter(([k, v]) => v !== undefined && k !== "modelPath" && k !== "port")),
                     } as ReturnType<typeof recordedTuning>;
-                const sw = await switchModelAndServer({
-                  modelPath: report.configuredModel!,
-                  // The port the server is on (report.port: where a llama-server is
-                  // actually listening, else the record). Never re-planned — but NOT the
-                  // record alone, which is stale when the server was started by hand.
-                  port: report.port,
-                  binPath,
-                  tuning: recorded,
-                  // The recorded tuning is re-applied as is; this only reports whether the
-                  // GPU will be used, on a reading taken after the old server released it.
-                  retune: async () => ({
-                    lines: describeGpuPlan(await detectHardware(), {
-                      gpuLayers: recorded.gpuLayers,
-                      contextSize: recorded.contextSize,
-                      cpuMoeLayers: recorded.cpuMoeLayers ?? 0,
-                    }),
-                  }),
-                });
-                if (sw.ok && sw.launched) {
-                  await recordServerState(projectRoot, { port: sw.port, binPath: sw.launched.binPath, modelPath: sw.launched.modelPath }).catch(() => false);
-                }
-                const synced = sw.ok ? await syncSessionToServer(report.configuredModel!, { contextSize: recorded.contextSize }) : [];
-                ui?.pushStatus(`[server] ${[...sw.lines, ...synced].join("\n")}`);
+                // The single-server policy lives in runServerRestart/gateServerReplacement: a
+                // live server is only stopped after an explicit `/server restart confirm`.
+                const out = await runServerRestart(
+                  { report, configBin: (config as any)?.llama?.binPath, tuning: recorded, confirmed: arg === "restart confirm" },
+                  {
+                    switchServer: (o) => switchModelAndServer(o),
+                    record: (st) => recordServerState(projectRoot, st),
+                    sync: (m, o) => syncSessionToServer(m, o),
+                    describePlan: async (t) =>
+                      describeGpuPlan(await detectHardware(), {
+                        gpuLayers: t.gpuLayers ?? 0,
+                        contextSize: t.contextSize ?? 8192,
+                        cpuMoeLayers: t.cpuMoeLayers ?? 0,
+                      }),
+                  }
+                );
+                ui?.pushStatus(`[server] ${out.lines.join("\n")}`);
               } catch (err) {
                 ui?.pushStatus(`[server 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
               } finally {
@@ -1365,7 +1366,7 @@ async function main() {
                   : "",
                 "",
                 `[server] 재시작 시: ${report.restartPlan}`,
-                "  · 지금 재시작하려면  /server restart",
+                "  · 지금 재시작하려면  /server restart  (변경 내용을 보여주고 /server restart confirm 으로 확정)",
               ]
                 .filter(Boolean)
                 .join("\n")
@@ -1383,7 +1384,9 @@ async function main() {
                   "  ·           컨텍스트 " + Number(llama.contextSize ?? 0).toLocaleString() +
                     " 토큰, 스레드 " + String(llama.threads ?? "?"),
                   "  · 직접 입력한 값(apiKey·verify·browser·compaction)은 그대로 유지됩니다.",
-                  "  · 세션 중이므로 모델은 내려받지 않습니다 (다음 실행 시 获取).",
+                  "  · /models 로 직접 고른 모델은, 파일이 있고 이 머신에서 구동 가능하면 유지됩니다.",
+                  "  · 실행 중인 서버는 건드리지 않습니다 — 적용은 /server restart (확인 후).",
+                  "  · 세션 중이므로 모델은 내려받지 않습니다 (필요하면 /models 로 받습니다).",
                   "",
                   "실행하려면  /reset confirm  을 입력하세요. 취소하려면 아무것도 하지 마세요.",
                 ].join("\n")
@@ -1415,7 +1418,7 @@ async function main() {
                 changed.length > 0
                   ? `[reset] 완료. 바뀐 항목 ${changed.length}개:\n${changed.map((c) => `  · ${c}`).join("\n")}\n` +
                     `[reset] 적용된 설정\n${inForce.map((c) => `  · ${c}`).join("\n")}\n` +
-                    "새 설정을 적용하려면 llamacli 를 재시작하세요."
+                    "설정만 갱신했습니다. 실행 중인 서버에 적용하려면  /server  로 차이를 확인하고  /server restart  를 실행하세요."
                   : "[reset] 현재 시스템에 이미 최적이었습니다. 바뀐 항목이 없습니다.\n" +
                     `[reset] 적용된 설정\n${inForce.map((c) => `  · ${c}`).join("\n")}\n` +
                     "재시작할 필요도 없습니다."

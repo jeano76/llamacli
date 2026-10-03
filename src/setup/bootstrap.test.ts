@@ -427,3 +427,39 @@ test("with no model on disk there is nothing to probe, so no warning is raised",
   const missing = join(tmpdir(), "definitely-not-here-12345", "model.gguf");
   assert.equal(await checkBinaryAgainstChosenModel("/build/llama-server", "Ornith-1.5-35B-A3B-Q4_K_M.gguf", missing), null);
 });
+
+// ── /reset must not undo a /models selection ────────────────────────────────
+import { keepSelectedModelOnReset } from "./bootstrap.js";
+
+test("reset keeps the model the user selected when its file is on disk and it still fits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "llamacli-keep-"));
+  try {
+    const f = join(root, "Ornith-1.5-9B-Q4_K_M.gguf");
+    await writeFile(f, Buffer.alloc(2048));
+    const hw = { cpuCount: 12, ramTotalBytes: 32 * 1024 ** 3, ramAvailableBytes: 24 * 1024 ** 3,
+      gpus: [{ index: 0, name: "g", vramTotalBytes: 12 * 1024 ** 3, vramFreeBytes: 11 * 1024 ** 3 }],
+      gpuBackend: "cuda", canBuildCuda: true, tools: {}, platform: "linux" } as never;
+    const kept = await keepSelectedModelOnReset({ model: f, llama: { modelPath: f, contextSize: 4096 } }, { apiKey: "k" }, hw);
+    assert.equal(kept?.model, f);
+    assert.equal(kept?.llama.modelPath, f);
+    assert.equal(kept?.llama.contextSize, undefined, "machine-derived values are still re-derived");
+    assert.equal(kept?.apiKey, "k");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("reset drops a selection whose file is gone", async () => {
+  const hw = { cpuCount: 4, ramTotalBytes: 8 * 1024 ** 3, ramAvailableBytes: 6 * 1024 ** 3, gpus: [], gpuBackend: "none", canBuildCuda: false, tools: {}, platform: "linux" } as never;
+  const kept = await keepSelectedModelOnReset({ model: "/nope/x.gguf", llama: { modelPath: "/nope/x.gguf" } }, { apiKey: "k" }, hw);
+  assert.deepEqual(kept, { apiKey: "k" });
+});
+
+test("reset drops a catalogue model that no longer runs on this hardware", async () => {
+  const root = await mkdtemp(join(tmpdir(), "llamacli-keep-"));
+  try {
+    const f = join(root, "Ornith-1.5-35B-A3B-Q4_K_M.gguf");
+    await writeFile(f, Buffer.alloc(2048));
+    const tiny = { cpuCount: 2, ramTotalBytes: 4 * 1024 ** 3, ramAvailableBytes: 3 * 1024 ** 3, gpus: [], gpuBackend: "none", canBuildCuda: false, tools: {}, platform: "linux" } as never;
+    const kept = await keepSelectedModelOnReset({ model: f }, {}, tiny);
+    assert.equal(kept?.model, undefined);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
