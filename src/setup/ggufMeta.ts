@@ -39,7 +39,7 @@ class Reader {
     return s;
   }
   skip(n: number) { this.need(n); this.off += n; }
-  value(type: number): number | string | undefined {
+  value(type: number): number | string | number[] | undefined {
     switch (type) {
       case T.U8: case T.I8: case T.BOOL: { this.need(1); const v = this.buf[this.off]; this.off += 1; return v; }
       case T.U16: case T.I16: { this.need(2); const v = this.buf.readUInt16LE(this.off); this.off += 2; return v; }
@@ -53,12 +53,126 @@ class Reader {
       case T.ARR: {
         const et = this.u32();
         const n = this.u64();
-        if (FIXED_SIZE[et] !== undefined) this.skip(n * FIXED_SIZE[et]);
-        else for (let i = 0; i < n; i++) this.value(et);
+        if (FIXED_SIZE[et] !== undefined) {
+          // Per-layer arrays (e.g. head_count_kv on a hybrid) are short and carry information; the
+          // vocabulary arrays are huge but come after the keys that matter, so only small ones are kept.
+          if (n <= 4096 && (et === T.U32 || et === T.I32 || et === T.U64 || et === T.I64 || et === T.U16 || et === T.U8)) {
+            const out: number[] = [];
+            for (let i = 0; i < n; i++) out.push(this.value(et) as number);
+            return out;
+          }
+          this.skip(n * FIXED_SIZE[et]);
+        } else for (let i = 0; i < n; i++) this.value(et);
         return undefined;
       }
       default: throw new RangeError(`unknown value type ${type}`);
     }
+  }
+}
+
+/** Every scalar / small-numeric-array key before the tokenizer, by name. */
+export function parseGgufKeys(buf: Buffer): Record<string, number | string | number[]> | null {
+  try {
+    if (buf.length < 24 || buf.toString("latin1", 0, 4) !== "GGUF") return null;
+    const r = new Reader(buf);
+    r.off = 4;
+    if (r.u32() < 2) return null;
+    r.u64();
+    const kvCount = r.u64();
+    const out: Record<string, number | string | number[]> = {};
+    for (let i = 0; i < kvCount; i++) {
+      const key = r.str();
+      if (key.startsWith("tokenizer.")) break;
+      const v = r.value(r.u32());
+      if (v !== undefined) out[key] = v;
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export interface KvShape {
+  /** K + V elements stored per token of context, summed over the layers that keep a KV cache. */
+  elementsPerToken: number;
+  /** Layers that actually keep a KV cache (all of them, unless the model is a hybrid). */
+  attentionLayers: number;
+  layers: number;
+  /** True for hybrids: only every Nth layer is full attention, the rest keep a fixed-size state. */
+  hybrid: boolean;
+}
+
+const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined);
+const sum = (v: number[]): number => v.reduce((a, b) => a + b, 0);
+
+/**
+ * KV elements per token, from the header — what the cache really costs, instead of a guess from
+ * the file size.
+ *
+ *   per attention layer: n_kv_heads * (key_length + value_length)
+ *   attention layers:    block_count, or block_count / full_attention_interval on a hybrid
+ *
+ * The size-based guess assumed every layer keeps a cache; on Qwen3.6-35B-A3B only 10 of 40 do, so it
+ * over-stated the cost ~29x and capped the context at a fraction of what the card holds.
+ * Sliding-window layers are conservatively counted as full attention (over-stating, never under).
+ * Returns undefined when any needed field is missing — the caller then keeps the old estimate.
+ */
+export function kvShapeFromKeys(keys: Record<string, number | string | number[]>): KvShape | undefined {
+  const arch = typeof keys["general.architecture"] === "string" ? (keys["general.architecture"] as string) : undefined;
+  if (!arch) return undefined;
+  const k = (name: string) => keys[`${arch}.${name}`];
+  const layers = num(k("block_count"));
+  if (!layers) return undefined;
+  const heads = num(k("attention.head_count"));
+  const kvRaw = k("attention.head_count_kv");
+  // head_count_kv may be one number or one per layer.
+  const kvHeadsPerLayer = Array.isArray(kvRaw) ? kvRaw : undefined;
+  const kvHeads = Array.isArray(kvRaw) ? undefined : num(kvRaw) ?? heads;
+  const embd = num(k("embedding_length"));
+  const keyLen = num(k("attention.key_length")) ?? (embd && heads ? Math.floor(embd / heads) : undefined);
+  const valLen = num(k("attention.value_length")) ?? keyLen;
+  if (!keyLen || !valLen) return undefined;
+  const interval = num(k("full_attention_interval"));
+  const hybrid = interval !== undefined && interval > 1;
+  const attentionLayers = hybrid ? Math.floor(layers / interval!) : layers;
+  if (attentionLayers <= 0) return undefined;
+  let elements: number;
+  if (kvHeadsPerLayer) {
+    // One entry per layer: a layer with 0 heads keeps no cache. Hybrids list every layer, so the sum is exact.
+    elements = sum(kvHeadsPerLayer) * (keyLen + valLen);
+  } else if (kvHeads) {
+    elements = attentionLayers * kvHeads * (keyLen + valLen);
+  } else return undefined;
+  return { elementsPerToken: elements, attentionLayers, layers, hybrid };
+}
+
+/** Bytes per element of a llama.cpp KV cache type (block-quantized types amortize their scales). */
+export function kvBytesPerElement(cacheType: string): number {
+  switch (cacheType) {
+    case "f32": return 4;
+    case "f16": case "bf16": return 2;
+    case "q8_0": return 34 / 32;
+    case "q5_1": return 24 / 32;
+    case "q5_0": return 22 / 32;
+    case "q4_1": return 20 / 32;
+    case "q4_0": return 18 / 32;
+    default: return 2; // unknown: assume the largest sane one
+  }
+}
+
+/** Reads the head of `path` and returns its KV shape, or undefined when it cannot be determined. Never throws. */
+export async function readGgufKvShape(path: string, headBytes = 4 * 1024 * 1024): Promise<KvShape | undefined> {
+  let fh;
+  try {
+    fh = await open(path, "r");
+    const buf = Buffer.alloc(headBytes);
+    const { bytesRead } = await fh.read(buf, 0, headBytes, 0);
+    const keys = parseGgufKeys(buf.subarray(0, bytesRead));
+    return keys ? kvShapeFromKeys(keys) : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await fh?.close().catch(() => {});
   }
 }
 

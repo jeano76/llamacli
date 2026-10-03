@@ -221,7 +221,9 @@ README 의 확정 설정(컨텍스트 98,304 / `--n-cpu-moe 33`)의 근거. 서�
 
 세 모델 모두 3개 중 1개 레이어만 일반 어텐션이고 나머지는 컨텍스트와 무관한 고정 크기 SSM 상태를 쓴다(하이브리드).
 튜너(`src/setup/tuning.ts` 의 `kvBytesPerToken`)는 모델 파일 크기만 보고 "35B급은 토큰당 0.3 MiB"로 가정하는데,
-이는 **Qwen3.6 에서 약 29배 과대 추정**이다.
+이는 **Qwen3.6 에서 약 29배 과대 추정**이었다. → 수정됨: 튜너는 이제 모델 헤더(`block_count`, `full_attention_interval`,
+`head_count_kv`, `key_length`/`value_length`)에서 토큰당 KV 를 정확히 계산한다(`src/setup/ggufMeta.ts: readGgufKvShape`).
+수정 후 튜너 출력: Qwen3.6/Ornith 20,480 → 32,768(튜너 상한; 이 영역은 위 C.2 에서 `nc 32`·32,768 = 6,971 MiB 로 확인), Bonsai 는 32,768 그대로.
 
 ### C.2 기동 가능 여부와 VRAM (MiB)
 

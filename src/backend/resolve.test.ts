@@ -618,12 +618,28 @@ const MISMATCH = "tensor 'output.weight' has invalid ggml type 143. should be in
  * Case 2 entirely and lands in the installer — a different code path that would
  * have let these tests pass for entirely the wrong reason.
  */
-async function configWithModel(dir: string, binPath: string): Promise<LlamacliConfig> {
+/** A port nothing is listening on RIGHT NOW. The spawn-failure tests launch the real llama-server binary
+ *  with a model that cannot load and expect the session to end; with the default 8080, a llama-server
+ *  that is genuinely running on the machine answers the readiness probe instead and the "failed" spawn
+ *  reports success — the test then measures the machine, not the code. */
+async function freePort(): Promise<number> {
+  const { createServer } = await import("node:net");
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as { port: number }).port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+async function configWithModel(dir: string, binPath: string, port?: number): Promise<LlamacliConfig> {
   const modelPath = join(dir, "model.gguf");
   await writeFile(modelPath, Buffer.alloc(4096));
   return localConfig({
     model: modelPath,
-    llama: { binPath, modelPath, port: 8080, contextSize: 4096, threads: 4, gpuLayers: 0 },
+    llama: { binPath, modelPath, port: port ?? (await freePort()), contextSize: 4096, threads: 4, gpuLayers: 0 },
   });
 }
 
@@ -662,7 +678,7 @@ test("a build mismatch is never reported as a port or VRAM problem", async () =>
     // message legitimately says "this is not a port or VRAM problem", which is
     // the useful part. What must be gone is the suggestion to go change them.
     assert.doesNotMatch(reason, /사용 중이거나 GPU 메모리가 부족할 수 있습니다/);
-    assert.doesNotMatch(reason, /포트\(8080\)가 사용 중/);
+    assert.doesNotMatch(reason, /포트\(\d+\)가 사용 중/);
     assert.match(reason, /포트나 GPU 메모리 문제가 아니며/, "and it rules them out explicitly");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -687,7 +703,7 @@ test("a genuine spawn failure still offers the port/VRAM explanation", async () 
 
     assert.equal(res.kind, "unresolved");
     const reason = (res as { reason?: string }).reason ?? "";
-    assert.match(reason, /포트\(8080\)가 사용 중|GPU 메모리/);
+    assert.match(reason, /포트\(\d+\)가 사용 중|GPU 메모리/);
     assert.doesNotMatch(reason, /양자화/);
   } finally {
     await rm(root, { recursive: true, force: true });

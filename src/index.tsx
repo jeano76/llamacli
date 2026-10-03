@@ -29,7 +29,7 @@ import { describeReset, describeInForce } from "./setup/resetDiff.js";
 import { evaluateAll, evaluateFit, findRung, formatModelTable, usableVramGiB } from "./setup/modelMetrics.js";
 import { selectModel, recordServerPort, recordServerState } from "./setup/modelSelect.js";
 import { describeGpuPlan } from "./setup/gpuReport.js";
-import { isMoeModel } from "./setup/ggufMeta.js";
+import { isMoeModel, readGgufKvShape } from "./setup/ggufMeta.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
 import { switchModelAndServer } from "./setup/modelSwitch.js";
@@ -1262,7 +1262,10 @@ async function main() {
                 // its memory.
                 retune: async () => {
                   const hw2 = await detectHardware();
-                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes, moe });
+                  // The file is on disk by now, so its KV cost is read from the header. No recorded
+                  // context is passed: it belonged to the previous model's KV cost.
+                  const kv2 = await readGgufKvShape(modelPath);
+                  const t2 = tuneForHardware(hw2, { modelBytes: rung.sizeBytes, moe, kvElementsPerToken: kv2?.elementsPerToken });
                   return { tuning: t2, lines: describeGpuPlan(hw2, t2) };
                 },
               });

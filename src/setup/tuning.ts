@@ -17,6 +17,7 @@
  */
 
 import { Hardware, Gpu, totalVram, pickPrimaryGpu, UNITS } from "./hardware.js";
+import { kvBytesPerElement } from "./ggufMeta.js";
 
 export interface LlamaTuning {
   /** -ngl: layers offloaded to the GPU. 999 = "all of them" (llama.cpp clamps
@@ -77,9 +78,12 @@ const MAX_CONTEXT = 32768;
 /**
  * Bytes of KV cache per token of context, from the model file size alone.
  *
+ * This is the FALLBACK, used only when the GGUF header cannot be read (a model that is not
+ * downloaded yet): the exact figure comes from `readGgufKvShape` and replaces it. It assumes every
+ * layer keeps a cache, which over-states a hybrid model (Qwen3.6-35B-A3B: ~29x).
+ *
  * The true figure is `2 * n_layer * n_kv_head * head_dim * bytes_per_element`,
- * which needs the GGUF header to know exactly. We do not parse it here, so
- * this is an estimate keyed on model size — deliberately, because the failure
+ * which needs the GGUF header to know exactly. This is an estimate keyed on model size — deliberately, because the failure
  * mode it replaces was worse: the previous code ignored the model entirely and
  * keyed only on card size, so the LARGEST model (the one that OOMs) got the
  * same generous context as a small one.
@@ -133,6 +137,21 @@ export function tuneForHardware(
      * model not yet downloaded and not in the catalogue) keeps the previous behaviour.
      */
     moe?: boolean;
+    /**
+     * K+V elements stored per token of context, read from the model's GGUF header
+     * (`readGgufKvShape`). When given, the KV cost is EXACT and replaces the size-based guess
+     * below, which assumes every layer keeps a cache and over-states a hybrid model ~29x.
+     * Absent (model not downloaded yet, header unreadable) keeps the old estimate.
+     */
+    kvElementsPerToken?: number;
+    /**
+     * A context size already chosen — in config.yaml, or measured. It is honoured when it is LARGER
+     * than the one derived here: a person who raised it did so on purpose (the derived value is a
+     * conservative bound, and the measured limits of a specific card can be far above it), whereas
+     * a smaller recorded value is just an earlier derivation and is replaced by the better one.
+     * Hardware that shrank since is `/reset`'s job, which drops recorded llama values.
+     */
+    contextSize?: number;
   }
 ): LlamaTuning {
   const rationale: string[] = [];
@@ -190,7 +209,14 @@ export function tuneForHardware(
   // one case that actually OOMs. We don't parse the GGUF here (see
   // kvBytesPerToken's caller), so the model size stands in for it, which is
   // monotonic in the true cost across the sizes llamacli ships.
-  const kvPerToken = kvBytesPerToken(modelBytes);
+  // The KV precision depends only on the budget, so it is decided here, before it is needed to turn
+  // an exact element count into bytes (the rationale for it is pushed where it always was).
+  const cacheTypeK = budgetGiB >= 3 ? "q8_0" : "q4_0";
+  const cacheTypeV = cacheTypeK;
+  const exactKv = opts?.kvElementsPerToken !== undefined && opts.kvElementsPerToken > 0;
+  const kvPerToken = exactKv
+    ? opts!.kvElementsPerToken! * kvBytesPerElement(cacheTypeK)
+    : kvBytesPerToken(modelBytes);
   // Reserve for the weights and load-time overhead, then spend what's left on
   // the KV cache.
   //
@@ -221,9 +247,17 @@ export function tuneForHardware(
   contextSize = Math.max(MIN_CONTEXT, Math.min(MAX_CONTEXT, contextSize));
   rationale.push(
     `컨텍스트는 ${contextSize} 토큰으로 설정했습니다 (사용 가능 VRAM ≈ ${budgetGiB.toFixed(1)} GiB, ` +
-      `KV 예산 ≈ ${kvBudgetGiB.toFixed(1)} GiB ÷ ${(kvPerToken / 1024).toFixed(0)} KiB/토큰). ` +
+      `KV 예산 ≈ ${kvBudgetGiB.toFixed(1)} GiB ÷ ${(kvPerToken / 1024).toFixed(1)} KiB/토큰` +
+      `${exactKv ? " — 모델 헤더에서 읽은 실제 값" : " — 모델 크기로 추정한 값"}). ` +
       `이 값이 실제 서버보다 작으면 컴팩션이 과하게 자주, 크면 KV 캐시가 가중치 자리를 침범합니다.`
   );
+  if (opts?.contextSize !== undefined && opts.contextSize > contextSize) {
+    rationale.push(
+      `config 에 기록된 컨텍스트 ${opts.contextSize} 이(가) 계산값 ${contextSize} 보다 커서 그대로 유지합니다 ` +
+        `(직접 키운 값은 덮어쓰지 않습니다. 하드웨어가 바뀌었다면 /reset 으로 다시 계산하세요).`
+    );
+    contextSize = opts.contextSize;
+  }
 
   // --- KV cache precision -------------------------------------------------- //
   // q8_0 halves the KV cache versus f16 at a speed cost small enough to be
@@ -231,8 +265,6 @@ export function tuneForHardware(
   // cache is the difference between 16k and 32k of context. Below 3 GiB we go
   // to q4_0, which is a further halving and is where the small-VRAM boxes stop
   // fitting anything useful otherwise.
-  const cacheTypeK = budgetGiB >= 3 ? "q8_0" : "q4_0";
-  const cacheTypeV = cacheTypeK;
   rationale.push(
     `KV 캐시를 ${cacheTypeK}로 두어 캐시 점유를 절반으로 줄였습니다. (f16 대비 정확도 손실은 미니, 효과는 그대로)`
   );
@@ -311,7 +343,9 @@ export function tuneForHardware(
     // fit is a model-choice problem (chooseModel), not a tuning one.
     rationale.push("통합 메모리라 MoE expert 를 CPU 로 옮겨도 메모리가 늘지 않아 --n-cpu-moe 를 쓰지 않습니다.");
   } else if (gpu && modelBytes) {
-    const deficit = modelBytes + 0.3 * GiB * (contextSize / 1024) - gpu.vramTotalBytes;
+    // The KV term: exact when the header was read, otherwise the legacy 0.3 MiB/token (unchanged).
+    const kvBytes = exactKv ? kvPerToken * contextSize : 0.3 * GiB * (contextSize / 1024);
+    const deficit = modelBytes + kvBytes - gpu.vramTotalBytes;
     if (deficit > 0) {
       // Each MoE expert layer moved to CPU buys back ~ (fileBytes/layers) of
       // VRAM but costs latency proportional to the fraction moved. We convert

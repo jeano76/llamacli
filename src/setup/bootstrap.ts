@@ -37,7 +37,7 @@ import { planPorts, tcpPortProbe, COMMON_PORTS, LLAMA_PORT, type PortProbe } fro
 import { acquireTernaryLlamaServer, PRISM_LLAMA_CPP_REPO } from "./ternaryRuntime.js";
 import { acquireStockLlamaServer } from "./stockRuntime.js";
 import { chooseModel, resolveModel, pickPinnedCandidate, isKnownDenseFamily, type ModelChoice } from "./modelCatalog.js";
-import { isMoeModel } from "./ggufMeta.js";
+import { isMoeModel, readGgufKvShape } from "./ggufMeta.js";
 import { downloadFile, formatProgress, type TransferProgress } from "./download.js";
 import { selectModelPath, hasRoom, RESERVE_BYTES } from "./disk.js";
 import { scanModels, pickReusable } from "./existingModel.js";
@@ -820,11 +820,23 @@ export async function ensureLocalStack(opts: BootstrapOptions): Promise<Bootstra
     filename: model?.candidate.filename ?? (modelPath ? basename(modelPath) : undefined),
     dense: isKnownDenseFamily(model?.candidate.filename ?? basename(modelPath || "")),
   });
+  // The model's real KV cost, from its header, when the file is on disk (a model still to be
+  // downloaded falls back to the size-based estimate).
+  const kvShape = modelPath ? await readGgufKvShape(modelPath) : undefined;
+  // A context size recorded for THIS model is kept when it is larger than the derived one (see
+  // tuneForHardware). Only for the same model: a value pinned for another model's KV cost could be
+  // many times what this one can hold.
+  const pinnedContext =
+    typeof existing?.llama?.contextSize === "number" && existing?.llama?.modelPath === modelPath
+      ? existing.llama.contextSize
+      : undefined;
   const tuning = tuneForHardware(hardware, {
     modelBytes: model?.candidate.sizeBytes,
     cpuMoeLayers: measuredCpuMoe,
     ownServerVramGiB,
     moe,
+    kvElementsPerToken: kvShape?.elementsPerToken,
+    contextSize: pinnedContext,
   });
   for (const r of tuning.rationale) log(r);
 
