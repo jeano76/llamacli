@@ -24,13 +24,14 @@
  *  a bug in it. */
 
 import { createHash } from "node:crypto";
-import { readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile, rm } from "node:fs/promises";
 import * as fs from "node:fs";
 import * as zlib from "node:zlib";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { join } from "node:path";
-import { isSourceCheckout, APPLIED_UPDATE_FILE } from "./buildStamp.js";
+import { dirname, join } from "node:path";
+import { isSourceCheckout, APPLIED_UPDATE_FILE, readLocalVersion } from "./buildStamp.js";
+import { saveSlot } from "./updateSlots.js";
 import { extractTarGz } from "./setup/tarGz.js";
 import { Transfer, type TransferProgress } from "./setup/download.js";
 
@@ -45,6 +46,33 @@ export interface UpdateManifest {
 
 export function sha256Hex(content: Buffer | string): string {
   return createHash("sha256").update(content).digest("hex");
+}
+
+/** What actually landed in a tree: entry presence + file count. */
+export async function countTreeFiles(distDir: string): Promise<{ hasEntry: boolean; files: number }> {
+  const fsp = await import("node:fs/promises");
+  let hasEntry = false;
+  try {
+    hasEntry = (await fsp.stat(join(distDir, "index.js"))).isFile();
+  } catch {
+    hasEntry = false;
+  }
+  let files = 0;
+  const walk = async (dir: string): Promise<void> => {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) await walk(p);
+      else if (e.isFile()) files++;
+    }
+  };
+  await walk(distDir);
+  return { hasEntry, files };
 }
 
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
@@ -284,7 +312,7 @@ export async function checkForUpdate(
       reason:
         `already applied ${manifest.version} (${manifest.sha256.slice(0, 12)}…) on a previous ` +
         `startup, and this build still doesn't match it — the update did not take effect. ` +
-        `Not retrying; run \`npm run build\` to rebuild from source.`,
+        `Not retrying; run \`npm run build\` to rebuild from source, or /rollback to a previous slot.`,
     };
   }
 
@@ -299,6 +327,8 @@ export interface ApplyUpdateOptions {
   onStage?: (stage: UpdateStage) => void;
   /** Byte progress of the archive download (received / total / speed / ETA). */
   onProgress?: (p: TransferProgress) => void;
+  /** 슬롯 루트. 미지정 시 dist/의 형제 update-slots/. 테스트에서 격리용. */
+  slotsRoot?: string;
 }
 
 /**
@@ -332,6 +362,13 @@ export async function applyUpdate(
   }
 
   const tmpArchivePath = join(distDir, `.self-update-tmp-${process.pid}.tar.gz`);
+  // Staged extraction: unpack into a scratch tree BESIDE dist/, verify what
+  // landed, and only then swap it over the live tree. Extracting straight
+  // into dist/ cannot be verified honestly — old files mask a zero-file
+  // unpack, and a half-unpacked tree is already live damage. The stage sits
+  // beside dist/, never inside it: replacing dist/ deletes everything under
+  // it, stage included.
+  const tmpStageDir = join(dirname(distDir), `.self-update-stage-${process.pid}`);
   try {
     await writeFile(tmpArchivePath, downloaded);
     // Verify #2: re-hash from DISK, not the in-memory buffer just written —
@@ -342,13 +379,24 @@ export async function applyUpdate(
       return { updated: false, reason: "on-disk hash after write didn't match the manifest — refusing to install it" };
     }
     // Only after BOTH hash checks pass does anything about the actual running
-    // dist/ tree change. Extraction prefers `tar` (scripts/update-bin.mjs
+    // dist/ tree change — and before that, the CURRENT tree goes into a slot,
+    // so a new build that never boots can be rolled back to exactly this.
+    // A slot that cannot be saved (disk full, permissions) aborts the update:
+    // proceeding without a way back is how a failed install becomes unrecoverable.
+    try {
+      await saveSlot(distDir, { version: readLocalVersion(distDir), slotsRoot: opts.slotsRoot });
+    } catch (err: any) {
+      return { updated: false, reason: `couldn't save a rollback slot (${err.message ?? err}) — refusing to install without a way back` };
+    }
+    // Extraction prefers `tar` (scripts/update-bin.mjs
     // extracts the same way, and it preserves the permissions the release
     // tarball relies on). On Windows, where no `tar` executable ships by
     // default — the exact bug this fix targets — fall back to a pure-Node
     // gzip+tar extractor below (zero new dependencies), so Windows installs
     // don't silently throw and leave dist/ untouched.
     opts.onStage?.("extract");
+    await rm(tmpStageDir, { recursive: true, force: true });
+    await mkdir(tmpStageDir, { recursive: true });
     if (process.platform === "win32") {
       // The shared extractor, not a private copy. The copy this replaced unpacked
       // ZERO files out of the real 122-file dist archive: it advanced `pos` by
@@ -358,13 +406,32 @@ export async function applyUpdate(
       // also resolved its promise before the writes it had issued completed. On
       // Windows that made self-update a no-op that reported success, leaving the
       // next startup to report "the update did not take effect".
-      extractTarGz(tmpArchivePath, distDir);
+      extractTarGz(tmpArchivePath, tmpStageDir);
     } else {
-      await execFileAsync("tar", ["-xzf", tmpArchivePath, "-C", distDir]);
+      await execFileAsync("tar", ["-xzf", tmpArchivePath, "-C", tmpStageDir]);
     }
+    // Boot-gate lite, on the STAGED tree (verifying dist/ itself would count
+    // the old files it is about to replace): the archive hashed fine, but
+    // that says nothing about what actually UNPACKED. The entry must exist
+    // and at least one file must have landed — otherwise dist/ is never
+    // touched at all. The bar is deliberately "non-empty", not a real-dist
+    // file count: the manifest carries no file list, so any larger number
+    // would be a guess that a future smaller dist could trip over.
+    const landed = await countTreeFiles(tmpStageDir);
+    if (!landed.hasEntry || landed.files < 1) {
+      return {
+        updated: false,
+        reason:
+          `extracted tree failed the landing check (entry: ${landed.hasEntry}, files: ${landed.files}) — ` +
+          `dist/ untouched, nothing to roll back`,
+      };
+    }
+    // Swap: the old tree goes away only once the new one is verified.
+    await rm(distDir, { recursive: true, force: true });
+    await rename(tmpStageDir, distDir);
     await writeFile(join(distDir, LOCAL_HASH_FILE), manifest.sha256);
-    // Recorded only after both hash checks and the extraction succeeded, and
-    // read back at the next startup as the loop breaker above: the honest
+    // Recorded only after both hash checks, a verified landing and the swap,
+    // and read back at the next startup as the loop breaker above: the honest
     // signal that this sha was installed here, so a surviving mismatch means
     // the install did not take rather than meaning there is something new.
     await writeFile(join(distDir, APPLIED_UPDATE_FILE), manifest.sha256);
@@ -372,6 +439,7 @@ export async function applyUpdate(
     return { updated: false, reason: `install failed: ${err.message ?? err}` };
   } finally {
     await rm(tmpArchivePath, { force: true }).catch(() => {});
+    await rm(tmpStageDir, { recursive: true, force: true }).catch(() => {});
   }
 
   return { updated: true, reason: `updated to ${manifest.version}` };

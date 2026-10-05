@@ -714,3 +714,16 @@ test("askUpdateConfirm: y/Enter yes, n no, EOF no", async () => {
   assert.equal(await ask("n\n"), false);
   assert.equal(await ask(null), false, "a piped/closed stdin must never trigger an install");
 });
+
+test("applyUpdate with an archive that unpacks nothing leaves dist/ untouched", () =>
+  withTempDir(async (distDir) => {
+    const { applyUpdate } = await import("./selfUpdate.js");
+    const { bytes, sha256 } = await buildFixtureArchive({});
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "b".repeat(64), "utf8");
+    await writeFile(join(distDir, "index.js"), "// old", "utf8");
+    const fetchImpl = (async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes })) as unknown as typeof fetch;
+    const r = await applyUpdate(distDir, { version: "20990101-empty", sha256 }, { fetchImpl });
+    assert.equal(r.updated, false, "empty landing must not install");
+    assert.match(r.reason, /landing check/);
+    assert.equal(await readFile(join(distDir, "index.js"), "utf8"), "// old", "dist/ must be untouched");
+  }));

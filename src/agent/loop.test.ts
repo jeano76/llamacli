@@ -3431,3 +3431,100 @@ test("reasoning past the per-turn cap suppresses thinking for the rest of the tu
       "a new turn must not inherit the previous turn's suppression"
     );
   }));
+
+test("a denied tool call is refused with an error message, not executed", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({
+      turnResponses: [
+        assistantMessage(null, [{ id: "c1", type: "function", function: { name: "run_shell", arguments: '{"command":"rm -rf /"}' } }]),
+        assistantMessage("understood, skipping"),
+      ],
+      tokenCounts: [10],
+    });
+    const seen: string[] = [];
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 1_000_000 },
+      approvalGate: async ({ name }) => {
+        seen.push(name);
+        return false;
+      },
+    });
+    await loop.send("go");
+    assert.deepEqual(seen, ["run_shell"], "the gate must see the destructive call");
+  }));
+
+test("an allowed tool call passes the gate and runs", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({
+      turnResponses: [
+        assistantMessage(null, [{ id: "c1", type: "function", function: { name: "run_shell", arguments: '{"command":"echo hi"}' } }]),
+        assistantMessage("done"),
+      ],
+      tokenCounts: [10],
+    });
+    let gated = 0;
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 1_000_000 },
+      approvalGate: async () => {
+        gated++;
+        return true;
+      },
+    });
+    await loop.send("go");
+    assert.equal(gated, 1);
+  }));
+
+test("read-only tools never reach the gate", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({
+      turnResponses: [
+        assistantMessage(null, [{ id: "c1", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "nope.ts" }) } }]),
+        assistantMessage("done"),
+      ],
+      tokenCounts: [10],
+    });
+    let gated = 0;
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 1_000_000 },
+      approvalGate: async () => {
+        gated++;
+        return true;
+      },
+    });
+    await loop.send("go");
+    assert.equal(gated, 0, "read-only tools must not prompt");
+  }));
+
+test("snapshot/restoreSnapshot round-trips the live conversation, rejecting garbage", () =>
+  withTempProject(async (dir) => {
+    const { backend } = scriptedBackend({ turnResponses: [assistantMessage("done")], tokenCounts: [10] });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 1_000_000 },
+    });
+    await loop.send("hello");
+    const snap = await loop.snapshot();
+    assert.ok(snap.length >= 2 && snap[0]!.role === "system", "snapshot must carry the conversation");
+    snap[1]!.content = "MUTATED";
+    const snap2 = await loop.snapshot();
+    assert.notEqual(snap2[1]!.content, "MUTATED", "snapshot must be a copy, not a live reference");
+    assert.equal(await loop.restoreSnapshot([]), false);
+    assert.equal(await loop.restoreSnapshot([{ role: "user", content: "no-system-first" }]), false);
+    assert.equal(await loop.restoreSnapshot("garbage"), false);
+    assert.equal(await loop.restoreSnapshot(snap), true);
+  }));

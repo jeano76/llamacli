@@ -14,12 +14,14 @@ import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
 import { clearNotes } from "./compaction/notes.js";
+import { saveSessionSnapshot, loadSessionSnapshot, clearSessionSnapshot } from "./sessionSnapshot.js";
 import { recommendThresholds, type CompactionThresholds } from "./compaction/compactor.js";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
 import { buildVersionString } from "./tui/banner.js";
 import { checkForUpdate, applyUpdate, askUpdateConfirm, spawnRestart, UPDATE_STAGE_LABEL, type UpdateStage, type UpdateManifest } from "./selfUpdate.js";
+import { listSlots, restoreSlot, recordRestore, slotsRootFor } from "./updateSlots.js";
 import { checkBuildFreshness, stalenessMessage, readLocalVersion } from "./buildStamp.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth, stripAnsi } from "./tui/terminal.js";
 import { copySelection, describeCopy, stripAnsiForCopy } from "./tui/selection.js";
@@ -865,6 +867,9 @@ async function main() {
   }
 
 
+  // "이번 세션에 항상 허용" answers. Session-scoped by design: a standing
+  // permission must not survive into the next launch silently.
+  const alwaysAllowedTools = new Set<string>();
   const loop = new AgentLoop({
     projectRoot,
     model: config.model,
@@ -875,6 +880,18 @@ async function main() {
     // would never take effect.
     thresholds,
     autoResume: config.compaction.autoResume,
+    // Destructive tools pause here for a TUI y/n/a answer. Read-only tools
+    // never reach this (the loop's classifier passes them), and without a
+    // TUI (tests, embedding) everything passes — a gate that can't ask must
+    // not block.
+    approvalGate: async ({ name, args }) => {
+      if (alwaysAllowedTools.has(name)) return true;
+      const ui = (globalThis as any).__llamacli_ui;
+      if (typeof ui?.requestApproval !== "function") return true;
+      const { allow, always } = await ui.requestApproval({ name, args });
+      if (allow && always) alwaysAllowedTools.add(name);
+      return allow;
+    },
     // Default ON. The old `?? false` was guarding against a budgeting bug — the
     // reply budget had no allowance for reasoning, so a tight budget produced
     // reasoning-only responses with zero tool calls (measured: 420 tokens ->
@@ -921,6 +938,18 @@ async function main() {
     onCompactionDetail: (detail) => (globalThis as any).__llamacli_ui?.pushCompactionDetail(detail),
     onTurnStart: () => (globalThis as any).__llamacli_ui?.collapseDiffs(),
   });
+
+  // Crash recovery: snapshot the visible conversation every 30s, so a kill
+  // mid-turn loses at most half a minute of visible history (the checkpoint
+  // keeps the plan; this keeps what the user actually saw). Silent on
+  // failure, unref'd so it can never hold the process open on the way out.
+  const snapshotTimer = setInterval(() => {
+    loop
+      .snapshot()
+      .then((msgs) => saveSessionSnapshot(projectRoot, msgs))
+      .catch(() => {});
+  }, 30_000);
+  (snapshotTimer as unknown as { unref?: () => void }).unref?.();
 
   /**
    * Brings the RUNNING session in line with the server that was just switched.
@@ -976,6 +1005,11 @@ async function main() {
     const ui = (globalThis as any).__llamacli_ui;
     const save = ui?.isBusy?.() ? loop.cancelCurrentTurn() : loop.saveStateOnQuit();
     ui?.beginQuitting?.();
+    const snapshot = () =>
+      loop
+        .snapshot()
+        .then((msgs) => saveSessionSnapshot(projectRoot, msgs))
+        .catch(() => {});
     const timeout = new Promise<void>((resolve) =>
       setTimeout(() => {
         ui?.pushStatus("[saving is taking too long — quitting without waiting for it]");
@@ -983,9 +1017,11 @@ async function main() {
       }, QUIT_SAVE_TIMEOUT_MS)
     );
     Promise.race([
-      save.catch((err: any) =>
-        ui?.pushStatus(`[couldn't save progress: ${summarizeErrorForDisplay(err.message)}] quitting anyway.`)
-      ),
+      save
+        .catch((err: any) =>
+          ui?.pushStatus(`[couldn't save progress: ${summarizeErrorForDisplay(err.message)}] quitting anyway.`)
+        )
+        .then(() => snapshot()),
       timeout,
     ]).finally(exitNow);
   };
@@ -1031,11 +1067,19 @@ async function main() {
           // reason to block starting the session.
           clearCheckpoint(projectRoot).catch(() => {});
           clearNotes(projectRoot).catch(() => {});
+          clearSessionSnapshot(projectRoot).catch(() => {});
           return;
         }
         ui?.setBusy(true);
-        loop
-          .resumeIfCheckpointExists()
+        // The snapshot (visible conversation) goes back first, then the
+        // checkpoint resume prompt on top of it — without the snapshot the
+        // plan resumes but the screen stays empty. A bad snapshot never
+        // blocks the resume: restoreSnapshot says false and we continue
+        // with the prompt alone, exactly the old behavior.
+        loadSessionSnapshot(projectRoot)
+          .then((msgs) => (msgs ? loop.restoreSnapshot(msgs) : false))
+          .catch(() => false)
+          .then(() => loop.resumeIfCheckpointExists())
           .catch((err: any) => ui?.pushStatus(`[error] failed to resume from checkpoint: ${summarizeErrorForDisplay(err.message)}`))
           .finally(() => ui?.setBusy(false));
       }}
@@ -1062,6 +1106,13 @@ async function main() {
           // that compaction NOW instead of leaving it for the next send()
           // to pay for synchronously. See warmCompactIfNeeded's doc comment.
           loop.warmCompactIfNeeded();
+          // Snapshot the visible conversation for crash recovery (fire-and-
+          // forget like prompt history: a failed write only means the resume
+          // falls back to the checkpoint prompt alone, never a blocked turn).
+          loop
+            .snapshot()
+            .then((msgs) => saveSessionSnapshot(projectRoot, msgs))
+            .catch(() => {});
         }
       }}
       onQueueMessage={(text) => loop.queueMessage(text)}
@@ -1669,6 +1720,49 @@ async function main() {
               .then(() => ui?.pushStatus("Plan progress cleared."))
               .catch((err: any) => ui?.pushStatus(`[error] failed to clear plan: ${summarizeErrorForDisplay(err.message)}`));
             break;
+          case "rollback": {
+            // 업데이트 슬롯으로 되돌리기 — 깨진 새 빌드가 뜬 뒤의 탈출로.
+            // `confirm` 없이는 목록만 보여준다: 되돌리기는 dist/ 통째 교체라
+            // 되묻지 않고 실행하면 안 된다.
+            const arg = (argument ?? "").trim().toLowerCase();
+            let entryPath: string;
+            try {
+              entryPath = fileURLToPath(import.meta.url);
+            } catch {
+              ui?.pushStatus("[rollback] 진입 경로를 알 수 없습니다.");
+              break;
+            }
+            if (!entryPath.endsWith(".js")) {
+              ui?.pushStatus("[rollback] 개발 실행(tsx)에서는 슬롯이 없습니다 — 설치본에서만 동작합니다.");
+              break;
+            }
+            const distDir = dirname(entryPath);
+            const root = slotsRootFor(distDir);
+            const slots = await listSlots(root);
+            if (arg !== "confirm") {
+              ui?.pushStatus(
+                slots.length === 0
+                  ? "[rollback] 되돌릴 슬롯이 없습니다."
+                  : `[rollback] 슬롯 ${slots.length}개 (최신이 맨 위):\n${slots.map((s) => `  · ${s}`).join("\n")}\n되돌리려면  /rollback confirm`
+              );
+              break;
+            }
+            if (slots.length === 0) {
+              ui?.pushStatus("[rollback] 되돌릴 슬롯이 없습니다.");
+              break;
+            }
+            const r = await restoreSlot(distDir, slots[0]!, { slotsRoot: root });
+            if (!r.ok) {
+              ui?.pushStatus(`[rollback 실패] ${r.detail}`);
+              break;
+            }
+            await recordRestore(distDir, slots[0]!);
+            ui?.pushStatus(`[rollback] ${r.detail}\n재시작하면 이전 버전으로 뜹니다…`);
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            spawnRestart(entryPath);
+            process.exit(0);
+            break;
+          }
         }
       }}
     />,

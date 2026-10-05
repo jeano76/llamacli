@@ -1,5 +1,6 @@
 import type { ChatMessage, ModelBackend } from "../backend/types.js";
 import { AGENT_STATE_TOOLS, FILE_TOOLS, activeToolDefs, executeTool } from "../tools/index.js";
+import { decideToolApproval, type ApprovalGate } from "../tools/approval.js";
 import { CircuitBreaker } from "../hermes/selfHeal.js";
 import { DecodeRateTracker } from "./decodeRate.js";
 import {
@@ -437,6 +438,9 @@ export interface AgentLoopOptions {
    *  previous process) already does this unconditionally — this extends the
    *  same behavior to a compaction that fires live, mid-session. */
   autoResume?: boolean;
+  /** 승인 게이트 — 파괴적 도구 호출을 통과시킨다. 없으면 게이트 없이 실행(테스트용).
+   *  읽기 전용 도구는 분류기(decideToolApproval)가 게이트 호출 전에 통과시킨다. */
+  approvalGate?: ApprovalGate | null;
 }
 
 /**
@@ -1469,6 +1473,23 @@ export class AgentLoop {
 
         this.opts.onToolCall?.(call.function.name, call.function.arguments);
 
+        // 승인 게이트: 쓰는 도구는 실행 전에 묻는다. 읽기 전용은 분류기가
+        // 통과시키고, 게이트가 없으면(테스트·임베딩) 전부 통과한다.
+        // AGENT_STATE_TOOLS(note/update_plan)도 읽기 전용이라 분류상 allow —
+        // 게이트를 태우지 않고 바로 아래 분기로 간다.
+        if (!AGENT_STATE_TOOLS.has(call.function.name) && decideToolApproval(call.function.name) === "ask") {
+          const gate = this.opts.approvalGate;
+          const allowed = gate ? await gate({ name: call.function.name, args: call.function.arguments }) : true;
+          if (!allowed) {
+            const content =
+              `ERROR: refused — the user denied this tool call (${call.function.name}). ` +
+              `Do not retry the same call; either do the step another way or explain what you need.`;
+            this.messages.push({ role: "tool", tool_call_id: call.id, content });
+            this.opts.onToolCallDone?.(call.function.name, call.function.arguments);
+            continue;
+          }
+        }
+
         if (AGENT_STATE_TOOLS.has(call.function.name)) {
           const result = await this.applyStateTool(call.function.name, call.function.arguments);
           this.messages.push({ role: "tool", tool_call_id: call.id, content: result });
@@ -1716,6 +1737,34 @@ export class AgentLoop {
    *  regardless of current context usage. */
   async forceCompact(): Promise<void> {
     await this.enqueue(() => this.compact("manual", null));
+  }
+
+  /** Current conversation, deep-copied — session snapshot fuel (see
+   *  sessionSnapshot.ts). Read-only: mutating the return must not move the
+   *  live turn. Serialized through the enqueue chain so a snapshot never
+   *  catches `messages` mid-mutation. */
+  async snapshot(): Promise<ChatMessage[]> {
+    let out: ChatMessage[] = [];
+    await this.enqueue(async () => {
+      out = JSON.parse(JSON.stringify(this.messages)) as ChatMessage[];
+    });
+    return out;
+  }
+
+  /** Replace the conversation with a snapshot (startup resume path only).
+   *  Validates shape first: garbage in must leave the live session alone.
+   *  Returns whether anything was restored. */
+  async restoreSnapshot(messages: unknown): Promise<boolean> {
+    if (!Array.isArray(messages) || messages.length === 0) return false;
+    const [first] = messages as ChatMessage[];
+    if (!first || first.role !== "system") return false;
+    if (!messages.every((m: any) => m && typeof m.role === "string" && (m.role === "system" || m.role === "user" || m.role === "assistant" || m.role === "tool"))) {
+      return false;
+    }
+    await this.enqueue(async () => {
+      this.messages = JSON.parse(JSON.stringify(messages)) as ChatMessage[];
+    });
+    return true;
   }
 
   /** Called right before actually quitting (index.tsx's /quit handler) —

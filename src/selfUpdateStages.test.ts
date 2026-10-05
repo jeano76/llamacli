@@ -18,9 +18,10 @@ import { join } from "node:path";
 function fixture(): { dir: string; tgz: Buffer; sha: string } {
   const dir = mkdtempSync(join(tmpdir(), "su-test-"));
   writeFileSync(join(dir, "hello.js"), "console.log('hi');");
-  execFileSync("tar", ["-czf", "a.tgz", "-C", dir, "hello.js"], { cwd: dir }); // relative name: GNU tar reads "C:\\…" as a remote host
+  writeFileSync(join(dir, "index.js"), "console.log('entry');");
+  execFileSync("tar", ["-czf", "a.tgz", "-C", dir, "hello.js", "index.js"], { cwd: dir }); // relative name: GNU tar reads "C:\\…" as a remote host
   const tgz = readFileSync(join(dir, "a.tgz"));
-  rmSync(join(dir, "a.tgz"), { force: true }); rmSync(join(dir, "hello.js"), { force: true });
+  rmSync(join(dir, "a.tgz"), { force: true }); rmSync(join(dir, "hello.js"), { force: true }); rmSync(join(dir, "index.js"), { force: true });
   return { dir, tgz, sha: createHash("sha256").update(tgz).digest("hex") };
 }
 

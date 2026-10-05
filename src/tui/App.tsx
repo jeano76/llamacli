@@ -7,6 +7,7 @@ import { StatusBar } from "./StatusBar.js";
 import { SlashMenu, SLASH_MENU_ITEMS, SlashMenuItem, menuVisibleRows } from "./SlashMenu.js";
 import { tailToWidth, wrapToWidth, wrapAnsiSafe, wrapPreservingTables } from "./textWidth.js";
 import { stripToolCallTemplateLeak } from "../agent/textSanitize.js";
+import { approvalPreview } from "../tools/approval.js";
 import { renderMarkdown } from "./markdown.js";
 import { buildArt, colored, SETTLED_SGR, BALL_SGR, LETTER_WIDTH, rightAlign, shineMultilineFrame, shineMultilineFrameCount, bounceFrame, bounceFrameCount } from "./banner.js";
 import { startupHintText, KEY_BINDINGS, formatKeyRow, KEY_COLUMN_WIDTH } from "./keybindings.js";
@@ -1007,6 +1008,17 @@ export function App({
   // user can start typing a real message or the auto-resume machinery
   // (AgentLoop.resumeIfCheckpointExists()) runs on its own.
   const [resumeConfirmPending, setResumeConfirmPending] = useState(!!pendingResumeGoal);
+  // 승인 대기 — 턴이 도구 호출 앞에서 멈춰 있다. {req, resolve} 를 들고 있고,
+  // y/n/a/Esc 중 하나가 resolve 로 답한다. resume/quit 확인과 같은 자리에
+  // 앉는다(아래 useInput 분기): 셋이 동시에 뜰 일은 없지만, 떴다면 승인이
+  // 먼저다 — 턴이 멈춰 있는 동안의 키는 승인에 대한 답이어야지 입력창에
+  // 들어가거나 종료 확인으로 읽히면 안 된다.
+  const [approvalPending, setApprovalPending] = useState<{
+    req: { name: string; args: string };
+    resolve: (v: { allow: boolean; always: boolean }) => void;
+  } | null>(null);
+  const approvalPendingRef = useRef<typeof approvalPending>(null);
+  approvalPendingRef.current = approvalPending;
   // Prompt history (Up/Down arrow), most recent last — see appendHistory.
   // Loaded once from disk (initialHistory) and kept in sync locally after
   // that; onHistoryChange pushes each update back out for index.tsx to
@@ -1566,6 +1578,27 @@ export function App({
       return;
     }
 
+    // Tool approval, asked mid-turn while the loop waits on a promise (see
+    // requestApproval below). First of the three Y/N gates: while a tool
+    // waits, every key is an answer to it — it must not leak into the input
+    // box, and Esc must deny THIS call, not open the quit dialog.
+    // y = once, a = always this session, n/Esc = deny.
+    if (approvalPendingRef.current) {
+      const lower = char.toLowerCase();
+      const pending = approvalPendingRef.current;
+      if (lower === "y" || lower === "a") {
+        setApprovalPending(null);
+        pushLine(`[approved${lower === "a" ? " always this session" : ""}: ${pending.req.name}]`, "status");
+        pending.resolve({ allow: true, always: lower === "a" });
+      } else if (lower === "n" || key.escape) {
+        setApprovalPending(null);
+        pushLine(`[denied: ${pending.req.name}]`, "status");
+        pending.resolve({ allow: false, always: false });
+      }
+      // any other key: still waiting for a real answer — ignored.
+      return;
+    }
+
     // Startup resume question, answered before anything else can happen —
     // set once from pendingResumeGoal (index.tsx found a checkpoint on
     // disk before this ever rendered) and never re-armed after being
@@ -1951,6 +1984,10 @@ export function App({
     endTransient,
     pushTool,
     finalizeToolCall,
+    requestApproval: (req: { name: string; args: string }) =>
+      new Promise<{ allow: boolean; always: boolean }>((resolve) => {
+        setApprovalPending({ req, resolve });
+      }),
     pushDiff: (t: string) => pushLine(t, "diff"),
     setBusy,
     isBusy: () => busy,
@@ -2008,8 +2045,13 @@ export function App({
   // pasted multi-line string — see useInput below), so wrapping it here is
   // what actually turns that into visible multi-line growth instead of a
   // broken row.
+  const APPROVAL_TEXT = approvalPending
+    ? `실행할까요? ${approvalPreview(approvalPending.req.name, approvalPending.req.args)} ([Y]한번 [A]항상 [N]거부)`
+    : "";
   const singleLineStatus = quitting
     ? tailToWidth(quittingText, maxInputWidth)
+    : approvalPending
+    ? tailToWidth(APPROVAL_TEXT, maxInputWidth)
     : resumeConfirmPending
     ? tailToWidth(RESUME_CONFIRM_TEXT, maxInputWidth)
     : quitConfirmPending
@@ -2457,7 +2499,7 @@ export function App({
   // busy drops, the very same input-is-empty (or busy) check that shows it
   // stops being true, no separate dismiss logic needed. No row reserved
   // for it anymore since it's sharing the input box's own first line.
-  const showRunHint = busy && !quitting && !quitConfirmPending && !resumeConfirmPending && !menuOpen && input === "";
+  const showRunHint = busy && !quitting && !quitConfirmPending && !resumeConfirmPending && !approvalPending && !menuOpen && input === "";
   const hintRows = 0;
   const scrollableContentRows = menuOpen
     ? Math.max(0, logHeight - menuBoxHeight)
@@ -2534,7 +2576,7 @@ export function App({
           })
         : stickySelection;
 
-  const inputBorderColor = quitting || quitConfirmPending || resumeConfirmPending
+  const inputBorderColor = quitting || quitConfirmPending || resumeConfirmPending || approvalPending
     ? "yellow"
     : busy
       ? "magenta"

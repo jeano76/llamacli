@@ -19,6 +19,7 @@ export const SLASH_MENU_ITEMS: SlashMenuItem[] = [
   { key: "quit", label: "/quit", description: "Quit" },
   { key: "queue", label: "/queue", description: "Add a message to the queue" },
   { key: "compact", label: "/compact", description: "Run context compaction now" },
+  { key: "rollback", label: "/rollback", description: "이전 업데이트 슬롯으로 되돌리기 (확인 후)" },
   { key: "term", label: "/term", description: "감지된 터미널과 지원 기능 상태" },
   { key: "mouse", label: "/mouse", description: "마우스 스크롤/클릭 켜기·끄기" },
   // /copy is the keyboard route to the same clipboard a mouse drag writes to.

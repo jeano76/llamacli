@@ -80,6 +80,8 @@ export const KEY_BINDINGS: KeyBindingGroup[] = [
       { keys: "/reset", description: "현재 GPU·VRAM·RAM 기준으로 모델/설정 재계산 (파괴적)" },
       { keys: "/models [번호]", description: "구동 가능한 로컬 모델 메트릭스 보기·교체 (서버도 함께 교체)" },
       { keys: "/server [restart]", description: "모델 제공 서버 상태 확인 · 같은 포트에서 재시작" },
+      { keys: "/server calibrate", description: "실측 VRAM·헤더로 튜닝 재계산 (확인 후 적용)" },
+      { keys: "/rollback", description: "이전 업데이트 슬롯으로 되돌리기 (확인 후)" },
       { keys: "/queue", description: "큐에 메시지 추가" },
       { keys: "/skills, /rules", description: "불러온 스킬 / 룰 목록" },
       { keys: "/plan-clear", description: "멈춘 계획 표시 초기화" },
