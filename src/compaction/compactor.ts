@@ -43,6 +43,15 @@ export interface CompactionThresholds {
    *  reason: on a server shared with other sessions it occupies the single
    *  slot the way any long request would. */
   warmPrefill?: boolean;
+  /** Where a successful compaction lands, as a fraction of the trigger
+   *  level. Lower = longer interval until the next compaction, at the cost
+   *  of keeping less recent history verbatim. Defaults to 0.4 in loop.ts. */
+  postCompactionTargetRatio?: number;
+  /** Minimum growth since the last compaction (fraction of window) before
+   *  another auto-compaction may fire. Guards against back-to-back
+   *  compactions when the post-budget math leaves no room. Defaults to
+   *  0.05 in loop.ts. Overflow-retry still calls compact() directly. */
+  minGrowthFraction?: number;
 }
 
 /** What a compaction actually did to the conversation — requested directly
@@ -380,6 +389,66 @@ export const DEFAULT_TAIL_BUDGET_FRACTION = 0.4;
  *  Override with `compaction.summaryMaxTokens` in config.yaml. Raise it if a
  *  summary is dropping detail you need; lower it for a faster, terser summary. */
 export const DEFAULT_SUMMARY_MAX_TOKENS = 1024;
+/** Default trigger and post-compaction target, used when the window is large
+ *  enough that fixed overhead is noise. See recommendThresholds(). */
+export const DEFAULT_AUTO_TRIGGER_RATIO = 0.6;
+export const DEFAULT_POST_COMPACTION_TARGET_RATIO = 0.4;
+export const DEFAULT_MIN_GROWTH_FRACTION = 0.05;
+
+/**
+ * Adaptive compaction thresholds for a calibrated context size.
+ *
+ * A hardcoded trigger/window pair drifts out of sync with whatever the server
+ * is actually running — a 16384-token server measured against a 32768-token
+ * assumption compacts late (then overflows), and a 98304-token server measured
+ * against a small one compacts far too often. The trigger ratio, summary
+ * budget and post-compaction target all scale with the window instead:
+ *
+ * - `autoTriggerRatio`: 0.6 while the window is large. On a small window the
+ *   FIXED overhead (system prompt + tool schema, ~1-3k tokens) eats the room
+ *   the next reply needs, so the trigger moves earlier — but never below 0.4,
+ *   or sessions would compact almost immediately after every compaction.
+ * - `summaryMaxTokens`: ~6% of the window in [256, 1024]. 1024 is the
+ *   latency-measured default on large windows; a small window gets a smaller
+ *   summary rather than one that barely fits the window itself.
+ * - `postCompactionTargetRatio`: 0.4, tightened to 0.3 when the fixed overhead
+ *   alone exceeds a quarter of the trigger-level room (the shape that used to
+ *   re-compact on the very next step, every step, forever).
+ * - `minGrowthFraction`: 0.05 — loop.ts's back-to-back guard baseline.
+ *
+ * Pure: no I/O, no backend, so calibration and tests can call it with
+ * whatever was measured. `overheadTokens` is the base-prompt + tool schema
+ * cost when the caller measured it (loop.ts does, per request); otherwise a
+ * documented approximation is used.
+ */
+export function recommendThresholds(
+  contextWindowTokens: number,
+  opts: { overheadTokens?: number } = {}
+): CompactionThresholds {
+  const window = Math.max(1024, Math.floor(contextWindowTokens));
+  // Measured live on a 4096-token window: base prompt + tool schema alone =
+  // 1,283 tokens. A real session carries a larger system prompt, so the
+  // default errs upward; callers with the real number pass it in.
+  const overhead = opts.overheadTokens ?? 1500;
+  // The next reply needs the same headroom loop.ts's computeMaxTokens()
+  // reserves before generating into the remaining space.
+  const SAFETY_MARGIN_TOKENS = 2048;
+  const autoTriggerRatio = Math.min(
+    DEFAULT_AUTO_TRIGGER_RATIO,
+    Math.max(0.4, 1 - (SAFETY_MARGIN_TOKENS + overhead) / window)
+  );
+  const summaryMaxTokens = Math.max(256, Math.min(DEFAULT_SUMMARY_MAX_TOKENS, Math.floor(window * 0.06)));
+  const triggerRoom = window * autoTriggerRatio;
+  const postCompactionTargetRatio =
+    overhead > triggerRoom * 0.25 ? 0.3 : DEFAULT_POST_COMPACTION_TARGET_RATIO;
+  return {
+    autoTriggerRatio,
+    contextWindowTokens: window,
+    summaryMaxTokens,
+    postCompactionTargetRatio,
+    minGrowthFraction: DEFAULT_MIN_GROWTH_FRACTION,
+  };
+}
 /** `repeat_penalty` for the summary request. Mirrors the main turn's default
  *  (loop.ts: `this.opts.repeatPenalty ?? 1.1`) — llama-server leaves it off by
  *  default, confirmed live via GET /slots, which is exactly the condition the

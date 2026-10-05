@@ -101,6 +101,19 @@ export interface LlamacliConfig {
      */
     summaryMaxTokens?: number;
     /**
+     * Where a successful compaction lands, as a fraction of the trigger
+     * level (default 0.4). Lower = longer until the next compaction,
+     * keeping less recent history verbatim. See loop.ts postCompactionBudget.
+     */
+    postCompactionTargetRatio?: number;
+    /**
+     * Minimum NEW growth since the last compaction (fraction of window,
+     * default 0.05) before another auto-compaction may fire. Prevents a
+     * compaction-every-step loop when fixed overhead leaves little room.
+     * Overflow-retry still compacts directly.
+     */
+    minGrowthFraction?: number;
+    /**
      * Wall-clock ceiling for the summary generation, in milliseconds. Unset /
      * 0 = no ceiling, which is the historical behavior.
      *

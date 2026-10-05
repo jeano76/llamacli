@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens, CONTINUE_AFTER_COMPACTION, invalidateTokenEstimate, trimPartialSummary, DEFAULT_REPEAT_PENALTY } from "./compactor.js";
+import { estimateTokens, shouldCompact, buildResumePrompt, runCompaction, recommendThresholds, DEFAULT_TAIL_BUDGET_FRACTION, composeSystemMessage, selectKeptTail, splitSystemMessage, stripResumePrefix, estimateTextTokens, CONTINUE_AFTER_COMPACTION, invalidateTokenEstimate, trimPartialSummary, DEFAULT_REPEAT_PENALTY } from "./compactor.js";
 import { writeCheckpoint, Checkpoint } from "./checkpoint.js";
 import type { ChatCompletionRequest, ChatMessage, ChatCompletionResponse, ModelBackend } from "../backend/types.js";
 
@@ -1569,3 +1569,34 @@ test("the summary request carries repeat_penalty, defaulting to the main turn's 
       await rm(dir, { recursive: true, force: true });
     }
   })());
+
+test("recommendThresholds keeps the proven defaults on a large calibrated window", () => {
+  const t = recommendThresholds(32_768);
+  assert.equal(t.contextWindowTokens, 32_768);
+  assert.equal(t.autoTriggerRatio, 0.6);
+  assert.equal(t.summaryMaxTokens, 1024);
+  assert.equal(t.postCompactionTargetRatio, 0.4);
+  assert.equal(t.minGrowthFraction, 0.05);
+});
+
+test("recommendThresholds moves the trigger earlier on a small window, never below the floor", () => {
+  const small = recommendThresholds(4096);
+  assert.ok(small.autoTriggerRatio < 0.6, `expected an earlier trigger on 4096, got ${small.autoTriggerRatio}`);
+  assert.ok(small.autoTriggerRatio >= 0.4, `floor breached: ${small.autoTriggerRatio}`);
+  const mid = recommendThresholds(8192);
+  assert.ok(mid.autoTriggerRatio >= small.autoTriggerRatio && mid.autoTriggerRatio <= 0.6, "trigger must rise monotonically with the window");
+  const measured = recommendThresholds(8192, { overheadTokens: 3000 });
+  assert.ok(measured.autoTriggerRatio <= mid.autoTriggerRatio, "measured overhead must not loosen the trigger");
+});
+
+test("recommendThresholds scales the summary budget with the window inside its latency bounds", () => {
+  assert.equal(recommendThresholds(200_000).summaryMaxTokens, 1024);
+  const mid = recommendThresholds(8192).summaryMaxTokens!;
+  assert.ok(mid < 1024 && mid >= 256, `got ${mid}`);
+  assert.equal(recommendThresholds(1024).summaryMaxTokens, 256);
+});
+
+test("recommendThresholds tightens the post-compaction target only when overhead dominates", () => {
+  assert.equal(recommendThresholds(32_768).postCompactionTargetRatio, 0.4);
+  assert.equal(recommendThresholds(4096).postCompactionTargetRatio, 0.3);
+});

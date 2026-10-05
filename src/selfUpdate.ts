@@ -199,6 +199,217 @@ export async function readWithProgress(
   return Buffer.concat(chunks);
 }
 
+export interface UpdateCheckOptions {
+  fetchImpl?: typeof fetch;
+  manifestUrl?: string;
+  manifestTimeoutMs?: number;
+  env?: NodeJS.ProcessEnv;
+  onStage?: (stage: UpdateStage) => void;
+}
+
+export type UpdateCheckResult =
+  | { available: true; manifest: UpdateManifest }
+  | { available: false; reason: string };
+
+/**
+ * Check only: is there something newer, without downloading anything.
+ * Split out of checkAndApplyUpdate so the caller can ask the user FIRST
+ * ("새 버전이 있습니다. 적용할까요?") instead of updating unconditionally.
+ * The loop-breaker refusal lives here, not in apply: a surviving mismatch
+ * means retrying cannot fix it, so there is nothing to ask about.
+ */
+export async function checkForUpdate(
+  distDir: string,
+  opts: UpdateCheckOptions = {}
+): Promise<UpdateCheckResult> {
+  // Checked first so the opt-out is absolute: no manifest fetch, no archive
+  // download, and above all no write to dist/. See selfUpdateDisabled's
+  // comment for why this matters when working on the tool itself.
+  if (selfUpdateDisabled(opts.env)) {
+    return { available: false, reason: "self-update disabled via LLAMACLI_NO_UPDATE=1" };
+  }
+  // Before any network call, and for the same reason as the opt-out above:
+  // the answer cannot change what is already on disk, so there is nothing to
+  // learn from asking GitHub. See updateRefusedForCheckout for the failure
+  // this prevents — it is the one that silently reverted three local builds.
+  const refusal = updateRefusedForCheckout(distDir, opts.env ?? process.env);
+  if (refusal.refused) {
+    return { available: false, reason: refusal.reason! };
+  }
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const manifestUrl = opts.manifestUrl ?? opts.env?.LLAMACLI_UPDATE_MANIFEST_URL ?? DEFAULT_MANIFEST_URL;
+
+  // Announced BEFORE the request, not after it succeeds. This window is where a
+  // slow or unreachable GitHub used to produce total silence: the process had
+  // started, printed nothing, and looked frozen until the timeout fired.
+  opts.onStage?.("manifest");
+  let manifest: UpdateManifest;
+  try {
+    const res = await fetchImpl(manifestUrl, { signal: AbortSignal.timeout(opts.manifestTimeoutMs ?? 5000) });
+    if (!res.ok) return { available: false, reason: `manifest fetch failed: HTTP ${res.status}` };
+    manifest = parseManifest(await res.text());
+  } catch (err: any) {
+    return { available: false, reason: `manifest fetch failed: ${err.message ?? err}` };
+  }
+
+  let localSha256: string;
+  try {
+    localSha256 = (await readFile(join(distDir, LOCAL_HASH_FILE), "utf8")).trim();
+  } catch (err: any) {
+    return { available: false, reason: `couldn't read local build hash: ${err.message ?? err}` };
+  }
+
+  if (!updateAvailable(localSha256, manifest)) {
+    return { available: false, reason: "already up to date" };
+  }
+
+  // Loop breaker. Reaching here means the manifest's sha disagrees with what
+  // this dist/ records about itself. If the sha we last CLAIMED to install is
+  // this same one, then a previous startup already downloaded and extracted
+  // this exact archive, wrote LOCAL_HASH_FILE from the manifest anyway, and
+  // the disagreement survived — so the bytes that run are still not the bytes
+  // the manifest describes. Repeating the download cannot fix that; it can only
+  // loop forever, because each pass restarts the process and the next pass
+  // sees the same mismatch.
+  //
+  // An extraction that "succeeds" but does not take effect is a real mode
+  // here: `tar` missing (Windows), an archive whose entries land somewhere
+  // unexpected, or a dist/ tree the process is not actually running from. In
+  // every such case the honest outcome is a refusal with an explanation, not
+  // an unbounded restart loop.
+  const previouslyApplied = await readAppliedUpdate(distDir);
+  if (previouslyApplied && previouslyApplied === manifest.sha256.toLowerCase()) {
+    return {
+      available: false,
+      reason:
+        `already applied ${manifest.version} (${manifest.sha256.slice(0, 12)}…) on a previous ` +
+        `startup, and this build still doesn't match it — the update did not take effect. ` +
+        `Not retrying; run \`npm run build\` to rebuild from source.`,
+    };
+  }
+
+  return { available: true, manifest };
+}
+
+export interface ApplyUpdateOptions {
+  fetchImpl?: typeof fetch;
+  archiveUrl?: string;
+  archiveTimeoutMs?: number;
+  env?: NodeJS.ProcessEnv;
+  onStage?: (stage: UpdateStage) => void;
+  /** Byte progress of the archive download (received / total / speed / ETA). */
+  onProgress?: (p: TransferProgress) => void;
+}
+
+/**
+ * Install only: download, double-verify and extract an already-checked
+ * manifest. The caller asks the user between checkForUpdate() and this —
+ * by the time this runs, consent exists, so there is no second prompt here.
+ */
+export async function applyUpdate(
+  distDir: string,
+  manifest: UpdateManifest,
+  opts: ApplyUpdateOptions = {}
+): Promise<SelfUpdateResult> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const archiveUrl = opts.archiveUrl ?? opts.env?.LLAMACLI_UPDATE_ARCHIVE_URL ?? DEFAULT_ARCHIVE_URL;
+
+  opts.onStage?.("download");
+
+  let downloaded: Buffer;
+  try {
+    const res = await fetchImpl(archiveUrl, { signal: AbortSignal.timeout(opts.archiveTimeoutMs ?? 30000) });
+    if (!res.ok) return { updated: false, reason: `archive fetch failed: HTTP ${res.status}` };
+    downloaded = await readWithProgress(res, "llamacli 업데이트", opts.onProgress);
+  } catch (err: any) {
+    return { updated: false, reason: `archive fetch failed: ${err.message ?? err}` };
+  }
+
+  opts.onStage?.("verify");
+  // Verify #1: the downloaded bytes, before anything touches disk.
+  if (sha256Hex(downloaded) !== manifest.sha256) {
+    return { updated: false, reason: "downloaded archive's hash doesn't match the manifest — refusing to install it" };
+  }
+
+  const tmpArchivePath = join(distDir, `.self-update-tmp-${process.pid}.tar.gz`);
+  try {
+    await writeFile(tmpArchivePath, downloaded);
+    // Verify #2: re-hash from DISK, not the in-memory buffer just written —
+    // a corrupted write (full disk, killed mid-write) must never be
+    // trusted just because the bytes looked right in memory a moment ago.
+    const onDiskSha256 = sha256Hex(await readFile(tmpArchivePath));
+    if (onDiskSha256 !== manifest.sha256) {
+      return { updated: false, reason: "on-disk hash after write didn't match the manifest — refusing to install it" };
+    }
+    // Only after BOTH hash checks pass does anything about the actual running
+    // dist/ tree change. Extraction prefers `tar` (scripts/update-bin.mjs
+    // extracts the same way, and it preserves the permissions the release
+    // tarball relies on). On Windows, where no `tar` executable ships by
+    // default — the exact bug this fix targets — fall back to a pure-Node
+    // gzip+tar extractor below (zero new dependencies), so Windows installs
+    // don't silently throw and leave dist/ untouched.
+    opts.onStage?.("extract");
+    if (process.platform === "win32") {
+      // The shared extractor, not a private copy. The copy this replaced unpacked
+      // ZERO files out of the real 122-file dist archive: it advanced `pos` by
+      // `512 + 512 + size + pad`, double-counting the header and so landing
+      // mid-record, AND compared a 6-byte magic field against the 5-character
+      // "ustar", which GNU tar writes as "ustar " — every record was skipped. It
+      // also resolved its promise before the writes it had issued completed. On
+      // Windows that made self-update a no-op that reported success, leaving the
+      // next startup to report "the update did not take effect".
+      extractTarGz(tmpArchivePath, distDir);
+    } else {
+      await execFileAsync("tar", ["-xzf", tmpArchivePath, "-C", distDir]);
+    }
+    await writeFile(join(distDir, LOCAL_HASH_FILE), manifest.sha256);
+    // Recorded only after both hash checks and the extraction succeeded, and
+    // read back at the next startup as the loop breaker above: the honest
+    // signal that this sha was installed here, so a surviving mismatch means
+    // the install did not take rather than meaning there is something new.
+    await writeFile(join(distDir, APPLIED_UPDATE_FILE), manifest.sha256);
+  } catch (err: any) {
+    return { updated: false, reason: `install failed: ${err.message ?? err}` };
+  } finally {
+    await rm(tmpArchivePath, { force: true }).catch(() => {});
+  }
+
+  return { updated: true, reason: `updated to ${manifest.version}` };
+}
+
+/**
+ * Asks "update now?" on the terminal, BEFORE any download starts.
+ * Empty answer (plain Enter) means yes — the historical behavior was
+ * unconditional auto-update, so the default stays on that side; the point of
+ * the question is giving "n" a place to exist, not nagging. EOF/closed
+ * stream means no (a script piping stdin must never trigger an install).
+ * Streams are injectable so the answers are testable without a terminal.
+ */
+export async function askUpdateConfirm(
+  manifest: UpdateManifest,
+  opts: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {}
+): Promise<boolean> {
+  const input = opts.input ?? process.stdin;
+  const output = opts.output ?? process.stdout;
+  const { createInterface } = await import("node:readline");
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const rl = createInterface({ input, output });
+    const done = (v: boolean) => {
+      if (settled) return;
+      settled = true;
+      try { rl.close(); } catch { /* already closed */ }
+      resolve(v);
+    };
+    rl.on("close", () => done(false));
+    rl.on("error", () => done(false));
+    rl.question(`새 버전(${manifest.version})이 있습니다. 지금 업데이트할까요? [Y/n] `, (answer) => {
+      const a = answer.trim().toLowerCase();
+      done(a === "" || a === "y" || a === "yes");
+    });
+  });
+}
+
 /** The actual check-and-install. `fetchImpl`/URLs are injectable so this
  *  is testable without a real network call or a real GitHub repo.
  *  `distDir` is the running build's own dist/ directory (index.js's own
@@ -251,134 +462,23 @@ export async function checkAndApplyUpdate(
   // Every stage is timed from here, and announced when it BEGINS rather than
   // when it ends -- so the user is told what is happening while it happens.
   const startedAt = Date.now();
-  const stage = (name: UpdateStage) => opts.onStage?.(name, Date.now() - startedAt);
-
-  if (selfUpdateDisabled(opts.env)) {
-    return { updated: false, reason: "self-update disabled via LLAMACLI_NO_UPDATE=1" };
-  }
-  // Before any network call, and for the same reason as the opt-out above:
-  // the answer cannot change what is already on disk, so there is nothing to
-  // learn from asking GitHub. See updateRefusedForCheckout for the failure
-  // this prevents — it is the one that silently reverted three local builds.
-  const refusal = updateRefusedForCheckout(distDir, opts.env ?? process.env);
-  if (refusal.refused) {
-    return { updated: false, reason: refusal.reason! };
-  }
-  const fetchImpl = opts.fetchImpl ?? fetch;
-  const manifestUrl = opts.manifestUrl ?? opts.env?.LLAMACLI_UPDATE_MANIFEST_URL ?? DEFAULT_MANIFEST_URL;
-  const archiveUrl = opts.archiveUrl ?? opts.env?.LLAMACLI_UPDATE_ARCHIVE_URL ?? DEFAULT_ARCHIVE_URL;
-
-  // Announced BEFORE the request, not after it succeeds. This window is where a
-  // slow or unreachable GitHub used to produce total silence: the process had
-  // started, printed nothing, and looked frozen until the timeout fired.
-  stage("manifest");
-  let manifest: UpdateManifest;
-  try {
-    const res = await fetchImpl(manifestUrl, { signal: AbortSignal.timeout(opts.manifestTimeoutMs ?? 5000) });
-    if (!res.ok) return { updated: false, reason: `manifest fetch failed: HTTP ${res.status}` };
-    manifest = parseManifest(await res.text());
-  } catch (err: any) {
-    return { updated: false, reason: `manifest fetch failed: ${err.message ?? err}` };
-  }
-
-  let localSha256: string;
-  try {
-    localSha256 = (await readFile(join(distDir, LOCAL_HASH_FILE), "utf8")).trim();
-  } catch (err: any) {
-    return { updated: false, reason: `couldn't read local build hash: ${err.message ?? err}` };
-  }
-
-  if (!updateAvailable(localSha256, manifest)) {
-    return { updated: false, reason: "already up to date" };
-  }
-
-  // Loop breaker. Reaching here means the manifest's sha disagrees with what
-  // this dist/ records about itself. If the sha we last CLAIMED to install is
-  // this same one, then a previous startup already downloaded and extracted
-  // this exact archive, wrote LOCAL_HASH_FILE from the manifest anyway, and
-  // the disagreement survived — so the bytes that run are still not the bytes
-  // the manifest describes. Repeating the download cannot fix that; it can only
-  // loop forever, because each pass restarts the process and the next pass
-  // sees the same mismatch.
-  //
-  // An extraction that "succeeds" but does not take effect is a real mode
-  // here: `tar` missing (Windows), an archive whose entries land somewhere
-  // unexpected, or a dist/ tree the process is not actually running from. In
-  // every such case the honest outcome is a refusal with an explanation, not
-  // an unbounded restart loop.
-  const previouslyApplied = await readAppliedUpdate(distDir);
-  if (previouslyApplied && previouslyApplied === manifest.sha256.toLowerCase()) {
-    return {
-      updated: false,
-      reason:
-        `already applied ${manifest.version} (${manifest.sha256.slice(0, 12)}…) on a previous ` +
-        `startup, and this build still doesn't match it — the update did not take effect. ` +
-        `Not retrying; run \`npm run build\` to rebuild from source.`,
-    };
-  }
-
-  opts.onUpdateFound?.(manifest);
-  stage("download");
-
-  let downloaded: Buffer;
-  try {
-    const res = await fetchImpl(archiveUrl, { signal: AbortSignal.timeout(opts.archiveTimeoutMs ?? 30000) });
-    if (!res.ok) return { updated: false, reason: `archive fetch failed: HTTP ${res.status}` };
-    downloaded = await readWithProgress(res, "llamacli 업데이트", opts.onProgress);
-  } catch (err: any) {
-    return { updated: false, reason: `archive fetch failed: ${err.message ?? err}` };
-  }
-
-  stage("verify");
-  // Verify #1: the downloaded bytes, before anything touches disk.
-  if (sha256Hex(downloaded) !== manifest.sha256) {
-    return { updated: false, reason: "downloaded archive's hash doesn't match the manifest — refusing to install it" };
-  }
-
-  const tmpArchivePath = join(distDir, `.self-update-tmp-${process.pid}.tar.gz`);
-  try {
-    await writeFile(tmpArchivePath, downloaded);
-    // Verify #2: re-hash from DISK, not the in-memory buffer just written —
-    // a corrupted write (full disk, killed mid-write) must never be
-    // trusted just because the bytes looked right in memory a moment ago.
-    const onDiskSha256 = sha256Hex(await readFile(tmpArchivePath));
-    if (onDiskSha256 !== manifest.sha256) {
-      return { updated: false, reason: "on-disk hash after write didn't match the manifest — refusing to install it" };
-    }
-    // Only after BOTH hash checks pass does anything about the actual running
-    // dist/ tree change. Extraction prefers `tar` (scripts/update-bin.mjs
-    // extracts the same way, and it preserves the permissions the release
-    // tarball relies on). On Windows, where no `tar` executable ships by
-    // default — the exact bug this fix targets — fall back to a pure-Node
-    // gzip+tar extractor below (zero new dependencies), so Windows installs
-    // don't silently throw and leave dist/ untouched.
-    stage("extract");
-    if (process.platform === "win32") {
-      // The shared extractor, not a private copy. The copy this replaced unpacked
-      // ZERO files out of the real 122-file dist archive: it advanced `pos` by
-      // `512 + 512 + size + pad`, double-counting the header and so landing
-      // mid-record, AND compared a 6-byte magic field against the 5-character
-      // "ustar", which GNU tar writes as "ustar " — every record was skipped. It
-      // also resolved its promise before the writes it had issued completed. On
-      // Windows that made self-update a no-op that reported success, leaving the
-      // next startup to report "the update did not take effect".
-      extractTarGz(tmpArchivePath, distDir);
-    } else {
-      await execFileAsync("tar", ["-xzf", tmpArchivePath, "-C", distDir]);
-    }
-    await writeFile(join(distDir, LOCAL_HASH_FILE), manifest.sha256);
-    // Recorded only after both hash checks and the extraction succeeded, and
-    // read back at the next startup as the loop breaker above: the honest
-    // signal that this sha was installed here, so a surviving mismatch means
-    // the install did not take rather than meaning there is something new.
-    await writeFile(join(distDir, APPLIED_UPDATE_FILE), manifest.sha256);
-  } catch (err: any) {
-    return { updated: false, reason: `install failed: ${err.message ?? err}` };
-  } finally {
-    await rm(tmpArchivePath, { force: true }).catch(() => {});
-  }
-
-  return { updated: true, reason: `updated to ${manifest.version}` };
+  const checked = await checkForUpdate(distDir, {
+    fetchImpl: opts.fetchImpl,
+    manifestUrl: opts.manifestUrl,
+    manifestTimeoutMs: opts.manifestTimeoutMs,
+    env: opts.env,
+    onStage: (s) => opts.onStage?.(s, Date.now() - startedAt),
+  });
+  if (!checked.available) return { updated: false, reason: checked.reason };
+  opts.onUpdateFound?.(checked.manifest);
+  return applyUpdate(distDir, checked.manifest, {
+    fetchImpl: opts.fetchImpl,
+    archiveUrl: opts.archiveUrl,
+    archiveTimeoutMs: opts.archiveTimeoutMs,
+    env: opts.env,
+    onStage: (s) => opts.onStage?.(s, Date.now() - startedAt),
+    onProgress: opts.onProgress,
+  });
 }
 
 /** Restarts as a NEW, independent process running the (now updated)

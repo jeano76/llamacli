@@ -13,11 +13,12 @@ import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
 import { clearNotes } from "./compaction/notes.js";
+import { recommendThresholds, type CompactionThresholds } from "./compaction/compactor.js";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve as pathResolve } from "node:path";
 import { buildVersionString } from "./tui/banner.js";
-import { checkAndApplyUpdate, spawnRestart, UPDATE_STAGE_LABEL, type UpdateStage } from "./selfUpdate.js";
+import { checkForUpdate, applyUpdate, askUpdateConfirm, spawnRestart, UPDATE_STAGE_LABEL, type UpdateStage, type UpdateManifest } from "./selfUpdate.js";
 import { checkBuildFreshness, stalenessMessage, readLocalVersion } from "./buildStamp.js";
 import { getCapabilities, setTerminalCapabilities, buildSequences, withMouse, applyColorDepth, stripAnsi } from "./tui/terminal.js";
 import { copySelection, describeCopy, stripAnsiForCopy } from "./tui/selection.js";
@@ -468,21 +469,56 @@ async function maybeSelfUpdateAndRestart(): Promise<void> {
       if (q > lastQuarter) { lastQuarter = q; process.stdout.write(`[self-update] ${formatProgress(p)}\n`); }
     }
   };
-  const result = await checkAndApplyUpdate(distDir, {
-    onStage,
-    onProgress,
-    onUpdateFound: (manifest) => {
-      announcedUpdateFound = true;
+  const startedAt = Date.now();
+  const checked = await checkForUpdate(distDir, {
+    onStage: (s) => onStage(s, Date.now() - startedAt),
+  }).catch((err: any) => ({ available: false as const, reason: String(err?.message ?? err) }));
+  if (!checked.available) {
+    const result = { updated: false as const, reason: checked.reason };
+    if (wroteStage && canRewrite) {
+      // ALREADY UP TO DATE is the overwhelmingly common case, and the manifest
+      // stage has to be announced before the fetch to close the silent window —
+      // which means it flashes on every single startup. Erased rather than
+      // newline-terminated, so a normal launch leaves the terminal exactly as
+      // it found it and only a real update leaves a trace.
+      process.stdout.write("\r\x1b[2K");
+    }
+    // Said out loud rather than swallowed. A silent no-op is indistinguishable
+    // from "up to date", which is how a developer ends up believing they ran
+    // the published build when in fact they ran something else — or, worse,
+    // believing a local change took effect when the refusal is precisely why
+    // it did not. Only the checkout case is worth a line; the routine
+    // "already up to date" stays quiet.
+    if (/source checkout|disabled/i.test(result.reason)) {
+      process.stderr.write(`[self-update] ${result.reason}\n`);
+    }
+    return;
+  }
+  // Available. Announce FIRST, then ask — the download must not start before
+  // the user said yes. Non-TTY (piped/CI) keeps the historical auto behavior:
+  // there is nobody to ask, and hanging on a silent readline would freeze
+  // automation that used to just work.
+  announcedUpdateFound = true;
+  process.stdout.write(
+    "\n" +
+      "==================== llamacli 업데이트 ====================\n" +
+      `새 버전(${checked.manifest.version})을 발견했습니다.\n` +
+      "적용하면 다운로드·검증 뒤 이 프로그램이 자동으로 종료됐다가 다시 시작됩니다.\n" +
+      "===========================================================\n\n"
+  );
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    const go = await askUpdateConfirm(checked.manifest);
+    if (!go) {
       process.stdout.write(
-        "\n" +
-          "==================== llamacli 자동 업데이트 ====================\n" +
-          `새 버전(${manifest.version})을 발견했습니다. 지금 다운로드하고 검증합니다.\n` +
-          "완료되면 이 프로그램이 자동으로 종료됐다가 다시 시작됩니다 — 화면이\n" +
-          "잠깐 사라졌다가 나타나는 것은 오작동이 아니라 정상적인 업데이트\n" +
-          "과정이니 그대로 기다려 주세요.\n" +
-          "==================================================================\n\n"
+        "업데이트를 건너뜁니다 — 지금 버전 그대로 시작합니다.\n" +
+        "다음 실행 때 다시 묻습니다. 묻지 않게 하려면 LLAMACLI_NO_UPDATE=1 로 실행하십시오.\n"
       );
-    },
+      return;
+    }
+  }
+  const result = await applyUpdate(distDir, checked.manifest, {
+    onStage: (s) => onStage(s, Date.now() - startedAt),
+    onProgress,
   }).catch((err: any) => ({ updated: false, reason: String(err?.message ?? err) }));
   if (wroteStage && canRewrite && result.updated) {
     // Close the transient line, or the next write lands on the same row and the
@@ -716,6 +752,30 @@ async function main() {
     // Off unless explicitly enabled — it occupies the single slot the way
     // any long request would, which matters on a shared server.
     warmPrefill: config.compaction.warmPrefill,
+    // Adaptive compaction (recommendThresholds): the trigger/summary/target
+    // below are recomputed from the real window once it is known
+    // (applyAdaptiveThresholds). Explicit config values win per-key.
+    postCompactionTargetRatio: config.compaction.postCompactionTargetRatio,
+    minGrowthFraction: config.compaction.minGrowthFraction,
+  };
+  /**
+   * Recomputes the adaptive compaction thresholds from a real window size.
+   * Runs wherever the window becomes known: the server's /props report at
+   * startup and a model/server switch mid-session. Explicit config.yaml
+   * values win per-key; the trigger ratio additionally keeps the user's
+   * value on large windows (where the adaptive rule agrees with the default
+   * anyway) and only moves earlier on small ones, where fixed overhead would
+   * otherwise leave no room for the next reply.
+   */
+  const applyAdaptiveThresholds = (window: number) => {
+    const rec = recommendThresholds(window);
+    thresholds.contextWindowTokens = window;
+    if (window < 16384) thresholds.autoTriggerRatio = rec.autoTriggerRatio;
+    if (config.compaction.summaryMaxTokens === undefined) thresholds.summaryMaxTokens = rec.summaryMaxTokens;
+    if (config.compaction.postCompactionTargetRatio === undefined) {
+      thresholds.postCompactionTargetRatio = rec.postCompactionTargetRatio;
+    }
+    if (config.compaction.minGrowthFraction === undefined) thresholds.minGrowthFraction = rec.minGrowthFraction;
   };
   const ui = () => (globalThis as any).__llamacli_ui;
 
@@ -795,7 +855,9 @@ async function main() {
   // by this point, so the value comes from the server that is really serving.
   try {
     const reported = await backend.getContextSize?.();
-    if (reported) thresholds.contextWindowTokens = reported;
+    if (reported) {
+      applyAdaptiveThresholds(reported);
+    }
   } catch {
     // Non-llama.cpp backend, or /props unavailable — the config value stands.
   }
@@ -882,7 +944,7 @@ async function main() {
       const window = reported || recorded.contextSize;
       if (window && window !== thresholds.contextWindowTokens) {
         out.push(`컨텍스트 창을 ${thresholds.contextWindowTokens.toLocaleString()} → ${window.toLocaleString()} 토큰으로 맞췄습니다 (컴팩션 기준).`);
-        thresholds.contextWindowTokens = window;
+        applyAdaptiveThresholds(window);
       }
     } catch { /* /props unavailable: the previous window stands, and that is said nothing about */ }
     out.push(`세션이 새 서버에 연결되었습니다 — 모델 ${baseName(modelId)}`);

@@ -9,6 +9,8 @@ import {
   CompactionThresholds,
   DEFAULT_TAIL_BUDGET_FRACTION,
   DEFAULT_SUMMARY_MAX_TOKENS,
+  DEFAULT_POST_COMPACTION_TARGET_RATIO,
+  DEFAULT_MIN_GROWTH_FRACTION,
   DEFAULT_REPEAT_PENALTY,
   splitSystemMessage,
   stripResumePrefix,
@@ -92,11 +94,18 @@ const THINKING_MIN_REPLY_TOKENS = 1024;
 // older messages can ever recover from that — the conversation becomes
 // unrecoverable forever the moment one such result lands, which defeats
 // the whole point of having a cap. Scale it to a fraction of the real
-// window instead, with the previous 24k as an upper bound for the common
-// case of a large (64k+) real context, and a floor so it's never
-// pathologically tiny for a very small window either.
+// window instead, with a 12k upper bound for the common case of a large
+// (64k+) real context, and a floor so it's never pathologically tiny for a
+// very small window either.
+//
+// Sized at 8% (was 15%): a single tool result at 15% of a 32k window is
+// ~20k chars (~5k tokens) — two such steps alone cover the whole
+// trigger-to-target room, so compaction fired every 1-2 tool steps live.
+// 8% roughly halves per-step growth and doubles the interval. The head+tail
+// shape below is kept: the END of a shell result is where the exit status,
+// the error and the summary are.
 function toolResultCharCap(contextWindowTokens: number): number {
-  return Math.max(2_000, Math.min(24_000, Math.floor(contextWindowTokens * 4 * 0.15)));
+  return Math.max(2_000, Math.min(12_000, Math.floor(contextWindowTokens * 4 * 0.08)));
 }
 
 function capToolResult(content: string, contextWindowTokens: number): string {
@@ -462,6 +471,10 @@ export class AgentLoop {
   /** Warn only once per session that the fixed prompt overhead leaves no
    *  room for compaction to work with — see compact(). */
   private warnedWindowTooSmall = false;
+  /** Post-compaction token baseline for maybeCompact()'s minimum-growth
+   *  guard — see its doc comment. Null until the first successful
+   *  compaction this session. */
+  private lastCompactionUsed: number | null = null;
   /** Files touched via read_file/write_file/edit_file, most-recent status wins. */
   private filesTouched = new Map<string, Checkpoint["files"][number]["status"]>();
   /** Fallback step history when the model never calls update_plan: every
@@ -1697,7 +1710,27 @@ export class AgentLoop {
   ): Promise<{ compacted: boolean; used: number }> {
     const used = await estimateTokens(this.messages, this.opts.backend, toolDefsJson(), activeToolDefs());
     this.opts.onContextUsage?.(used, this.opts.thresholds.contextWindowTokens);
-    if (used >= this.opts.thresholds.contextWindowTokens * this.opts.thresholds.autoTriggerRatio) {
+    const window = this.opts.thresholds.contextWindowTokens;
+    if (used >= window * this.opts.thresholds.autoTriggerRatio) {
+      // Skip a compaction that would fire again almost immediately after
+      // the previous one: when the fixed overhead (system prompt + tool
+      // schema) alone leaves little room, postCompactionBudget() can land
+      // barely under the trigger, and the very next step re-compacts —
+      // every step, forever, each pass re-summarizing the last. Require a
+      // minimum amount of NEW growth since the post-compaction baseline
+      // before auto-firing again. The overflow-retry path calls compact()
+      // directly and is unaffected, so a genuinely oversized request still
+      // recovers instead of being skipped here. The baseline check only
+      // applies while the baseline itself is under the trigger — a baseline
+      // still at/over it means we never actually got out, so keep working.
+      const minGrowth = window * (this.opts.thresholds.minGrowthFraction ?? DEFAULT_MIN_GROWTH_FRACTION);
+      if (
+        this.lastCompactionUsed !== null &&
+        this.lastCompactionUsed < window * this.opts.thresholds.autoTriggerRatio &&
+        used - this.lastCompactionUsed < minGrowth
+      ) {
+        return { compacted: false, used };
+      }
       await this.compact("auto-threshold", pendingToolCall);
       return { compacted: true, used };
     }
@@ -1804,13 +1837,15 @@ export class AgentLoop {
       toolDefsJson(),
       activeToolDefs()
     );
-    // Land at half the trigger level, so the conversation can grow for a
-    // while before the next compaction. Was 75%: measured live on a 24,576
-    // window, that left ~4-6K tokens of room, and tool-heavy steps add
-    // 2-5K each, so compaction (30-40s of summary generation) came every
-    // 2-5 minutes. Half the trigger roughly doubles the room, at the cost
-    // of keeping less recent conversation verbatim.
-    const target = Math.floor(window * this.opts.thresholds.autoTriggerRatio * 0.5);
+    // Land below the trigger level, so the conversation can grow for a
+    // while before the next compaction. Was 0.5 (and 0.75 before that):
+    // measured live on a 24,576 window, 0.75 left ~4-6K tokens of room,
+    // and tool-heavy steps add 2-5K each, so compaction came every 2-5
+    // minutes. 0.4 roughly doubles the room vs 0.75, at the cost of
+    // keeping less recent conversation verbatim. Configurable via
+    // thresholds.postCompactionTargetRatio.
+    const targetRatio = this.opts.thresholds.postCompactionTargetRatio ?? DEFAULT_POST_COMPACTION_TARGET_RATIO;
+    const target = Math.floor(window * this.opts.thresholds.autoTriggerRatio * targetRatio);
     const room = target - overhead;
     if (room < 512 && !this.warnedWindowTooSmall) {
       this.warnedWindowTooSmall = true;
@@ -1920,6 +1955,16 @@ export class AgentLoop {
         // The whole conversation was just replaced; the memoized count belongs
         // to the one that was summarized away.
         invalidateTokenEstimate();
+        // Baseline for maybeCompact()'s minimum-growth guard. A failed
+        // post-budget (overhead alone near the trigger) would otherwise
+        // re-fire on the very next step; this records where we landed so
+        // only real NEW growth triggers again. Best-effort: a failed
+        // estimate leaves the previous baseline (or null) in place.
+        try {
+          this.lastCompactionUsed = await estimateTokens(this.messages, this.opts.backend, toolDefsJson(), activeToolDefs());
+        } catch {
+          // keep previous baseline
+        }
         this.progress.onCompaction();
         this.opts.onStatus?.(
           `[compaction] ${((Date.now() - startedAt) / 1000).toFixed(1)}s ` +

@@ -3359,3 +3359,27 @@ test("warm prefill never starts against a backend that cannot cancel it", () =>
     await new Promise((r) => setTimeout(r, 300));
     assert.ok(!calls.some((c) => c.max_tokens === 1), "a prefill that cannot be stopped must never be launched");
   }));
+
+test("maybeCompact skips a back-to-back auto-compaction without real new growth, but fires again after growth", () =>
+  withTempProject(async (dir) => {
+    // Window 100, trigger 50, min-growth 5. Token script, in estimateTokens()
+    // call order: send1-maybeCompact, send1-postBudget, send1-baseline,
+    // send2-maybeCompact, send3-maybeCompact.
+    const { backend, summaryRequests } = scriptedBackend({
+      turnResponses: [assistantMessage("done"), assistantMessage("done"), assistantMessage("done")],
+      tokenCounts: [1000, 10, 48, 50, 60],
+    });
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.5, contextWindowTokens: 100 },
+    });
+    await loop.send("one"); // 1000 >= 50 → compacts (baseline refresh reads 48)
+    assert.equal(summaryRequests.length, 1);
+    await loop.send("two"); // 50 >= 50 but growth 50-48=2 < 5 → skipped
+    assert.equal(summaryRequests.length, 1, "no real growth since the last compaction — must not re-compact");
+    await loop.send("three"); // growth 60-48=12 >= 5 → compacts again
+    assert.equal(summaryRequests.length, 2, "real growth arrived — must compact again");
+  }));

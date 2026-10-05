@@ -661,3 +661,56 @@ test("checkAndApplyUpdate reports download progress while installing", () =>
     assert.equal(r.updated, true, r.reason);
     assert.ok(seen.length > 1 && seen[seen.length - 1] === bytes.length, `progress ended at ${seen[seen.length - 1]} of ${bytes.length}`);
   }));
+
+test("checkForUpdate reports availability without downloading anything", () =>
+  withTempDir(async (distDir) => {
+    const newSha = "c".repeat(64);
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "b".repeat(64), "utf8");
+    let archiveRequested = false;
+    const fetchImpl = (async (url: string) => {
+      if (String(url).endsWith(".tar.gz")) { archiveRequested = true; throw new Error("must not fetch archive during check"); }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ version: "20990101-abcd", sha256: newSha }) };
+    }) as unknown as typeof fetch;
+    const { checkForUpdate } = await import("./selfUpdate.js");
+    const r = await checkForUpdate(distDir, { fetchImpl });
+    assert.equal(r.available, true);
+    assert.equal(r.available && r.manifest.sha256, newSha);
+    assert.equal(archiveRequested, false, "check must not touch the network beyond the manifest");
+  }));
+
+test("checkForUpdate says up to date when hashes match, and never throws offline", () =>
+  withTempDir(async (distDir) => {
+    const { checkForUpdate } = await import("./selfUpdate.js");
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "c".repeat(64), "utf8");
+    const same = (async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ version: "x", sha256: "c".repeat(64) }) })) as unknown as typeof fetch;
+    assert.equal((await checkForUpdate(distDir, { fetchImpl: same })).available, false);
+    const down = (async () => { throw new Error("no network"); }) as unknown as typeof fetch;
+    const r = await checkForUpdate(distDir, { fetchImpl: down });
+    assert.equal(r.available, false, "offline must be a quiet no, not a throw");
+  }));
+
+test("applyUpdate installs a checked manifest (download→double-verify→extract)", () =>
+  withTempDir(async (distDir) => {
+    const { applyUpdate } = await import("./selfUpdate.js");
+    const { bytes, sha256 } = await buildFixtureArchive({ "index.js": "new" });
+    await writeFile(join(distDir, LOCAL_HASH_FILE), "b".repeat(64), "utf8");
+    const fetchImpl = (async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes })) as unknown as typeof fetch;
+    const r = await applyUpdate(distDir, { version: "20990101-abcd", sha256 }, { fetchImpl });
+    assert.equal(r.updated, true, `apply failed: ${r.reason}`);
+    assert.equal(await readFile(join(distDir, "index.js"), "utf8"), "new");
+  }));
+
+test("askUpdateConfirm: y/Enter yes, n no, EOF no", async () => {
+  const { askUpdateConfirm } = await import("./selfUpdate.js");
+  const { Readable, Writable } = await import("node:stream");
+  const sink = () => new Writable({ write(_c, _e, cb) { cb(); } });
+  const ask = (input: string | null) =>
+    askUpdateConfirm({ version: "v", sha256: "c".repeat(64) }, {
+      input: input === null ? Readable.from([]) : Readable.from([input]),
+      output: sink(),
+    });
+  assert.equal(await ask("y\n"), true);
+  assert.equal(await ask("\n"), true, "plain Enter keeps the historical auto-update default");
+  assert.equal(await ask("n\n"), false);
+  assert.equal(await ask(null), false, "a piped/closed stdin must never trigger an install");
+});
