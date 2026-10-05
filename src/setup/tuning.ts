@@ -52,6 +52,27 @@ export interface LlamaTuning {
   gpu: Gpu | null;
 }
 
+export interface ThreadPlan {
+  /** `-t`: generation threads. */
+  threads: number;
+  /** `-tb`: prompt-processing threads. */
+  threadsBatch: number;
+}
+
+/**
+ * `-t` / `-tb` from a core count. Single rule shared by the first-run tuner
+ * and calibration — a second copy is how `-t 2` on a 1-core box happened.
+ */
+export function threadPlan(cpuCount: number, hasGpu: boolean): ThreadPlan {
+  const cores = Math.max(1, cpuCount);
+  return hasGpu
+    ? {
+        threads: Math.min(cores, Math.max(2, Math.floor(cores / 2))),
+        threadsBatch: Math.min(cores, Math.max(2, cores - 1)),
+      }
+    : { threads: Math.min(cores, Math.max(1, cores - 1)), threadsBatch: Math.min(cores, Math.max(1, cores - 1)) };
+}
+
 const GiB = UNITS.GiB;
 
 /** Ceiling on the fraction of a MoE model kept on the CPU.
@@ -353,15 +374,13 @@ export function tuneForHardware(
   // it by sweeping 1/2/3-core machines — the dev box is 12 cores, where
   // `max(2, 6)` accidentally lands on a legal value and hides the bug entirely.
   // The floor is now clamped to the core count rather than assuming >= 2.
-  const threads = gpu
-    ? Math.min(cpuCount, Math.max(2, Math.floor(cpuCount / 2)))
-    : Math.min(cpuCount, Math.max(1, cpuCount - 1));
+  // Extracted as threadPlan() so calibration re-derives threads from the SAME
+  // rule instead of a second copy of the arithmetic — two copies of a rule is
+  // how `-t 2` on a 1-core box (more threads than cores) came to exist.
+  const { threads, threadsBatch } = threadPlan(cpuCount, gpu !== null);
   // Prompt processing is not GPU-bound in the same way (it's a big batched
   // matmul that does use the GPU, but is far more sensitive to thread count),
   // so it gets the full complement when there's a GPU to share with.
-  const threadsBatch = gpu
-    ? Math.min(cpuCount, Math.max(2, cpuCount - 1))
-    : Math.min(cpuCount, Math.max(1, cpuCount - 1));
   rationale.push(
     gpu
       ? `스레드는 생성 ${threads} / 프롬프트 처리 ${threadsBatch} 로 나눴습니다 (코어 ${cpuCount}개, GPU가 계산하므로 CPU 스레드 과할당은 역효과).`

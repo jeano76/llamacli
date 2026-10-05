@@ -235,6 +235,10 @@ export interface LlamacliConfig {
    *  of requests and hides reasoning from the log. Note that a server started
    *  with `--reasoning on` emits reasoning regardless of this setting. */
   enableThinking?: boolean;
+  /** Cap on reasoning (`reasoning_content`) tokens per turn — past it, the
+   *  rest of the turn suppresses thinking (see AgentLoopOptions).
+   *  Clamp rule lives in shared/reasoning.ts; unset = default 4096. */
+  maxReasoningTokens?: number;
 
 }
 

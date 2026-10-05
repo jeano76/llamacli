@@ -9,6 +9,7 @@ import { SLASH_MENU_ITEMS } from "./tui/SlashMenu.js";
 import { resolveBackend } from "./backend/resolve.js";
 import type { Resolution } from "./backend/resolve.js";
 import { AgentLoop, summarizeErrorForDisplay } from "./agent/loop.js";
+import { clampReasoningBudget } from "./shared/reasoning.js";
 import { configureBrowserTools, configureSkills } from "./tools/index.js";
 import { loadPromptHistory, savePromptHistory } from "./tui/promptHistory.js";
 import { readCheckpoint, clearCheckpoint } from "./compaction/checkpoint.js";
@@ -36,9 +37,10 @@ import { isMoeModel, readGgufKvShape } from "./setup/ggufMeta.js";
 import { probeModelCompatibility } from "./setup/llamaCpp.js";
 import { detectHardware, findOwnLlamaServerPids, ownLlamaServerVramGiB } from "./setup/hardware.js";
 import { tuneForHardware } from "./setup/tuning.js";
-import { switchModelAndServer, detectPortOwner, resolveLiveServerPort, parseLlamaServerArgs } from "./setup/modelSwitch.js";
+import { switchModelAndServer, detectPortOwner, resolveLiveServerPort, parseLlamaServerArgs, type SwitchOptions } from "./setup/modelSwitch.js";
 import { reportServer } from "./setup/serverReport.js";
 import { runServerRestart, gateModelSwitch } from "./setup/serverCommand.js";
+import { measureCalibration, runCalibration } from "./setup/calibrateCommand.js";
 import { provisionForSwitch } from "./setup/provision.js";
 import { transientProgress } from "./tui/transientProgress.js";
 import { formatProgress, type TransferProgress } from "./setup/download.js";
@@ -880,6 +882,9 @@ async function main() {
     // THINKING_TOKEN_ALLOWANCE when thinking is enabled, so the guard is no
     // longer load-bearing and the default only cost us working deliberation.
     enableThinking: config.enableThinking ?? true,
+    // Clamped once, here — the loop compares raw counts against it, so any
+    // second interpretation elsewhere would silently disagree about the cap.
+    maxReasoningTokens: clampReasoningBudget((config as any).maxReasoningTokens),
     verify: config.verify?.afterEdit,
     gitCheckpoint: config.checkpoint?.git ?? false,
     repeatPenalty: config.repeatPenalty,
@@ -1435,6 +1440,21 @@ async function main() {
             const arg = (argument ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean).join(" ");
             const report = await reportServer({ config: config as unknown as Record<string, any>, projectRoot });
 
+            // Shared by restart and calibrate-confirm: one wiring for
+            // "stop the live server and serve this tuning instead", so the two
+            // commands cannot drift into different replacement semantics.
+            const restartDeps = {
+              switchServer: (o: SwitchOptions) => switchModelAndServer(o),
+              record: (st: { port: number; binPath: string; modelPath: string; tuning?: Record<string, unknown>; calibratedFor?: string }) =>
+                recordServerState(projectRoot, st),
+              sync: (m: string, o: { contextSize?: number }) => syncSessionToServer(m, o),
+              describePlan: async (t: SwitchOptions["tuning"]) =>
+                describeGpuPlan(await detectHardware(), {
+                  gpuLayers: t.gpuLayers ?? 0,
+                  contextSize: t.contextSize ?? 8192,
+                  cpuMoeLayers: t.cpuMoeLayers ?? 0,
+                }),
+            };
             if (arg === "restart" || arg === "restart confirm") {
               ui?.setBusy(true);
               try {
@@ -1453,21 +1473,52 @@ async function main() {
                 // live server is only stopped after an explicit `/server restart confirm`.
                 const out = await runServerRestart(
                   { report, configBin: (config as any)?.llama?.binPath, tuning: recorded, confirmed: arg === "restart confirm" },
-                  {
-                    switchServer: (o) => switchModelAndServer(o),
-                    record: (st) => recordServerState(projectRoot, st),
-                    sync: (m, o) => syncSessionToServer(m, o),
-                    describePlan: async (t) =>
-                      describeGpuPlan(await detectHardware(), {
-                        gpuLayers: t.gpuLayers ?? 0,
-                        contextSize: t.contextSize ?? 8192,
-                        cpuMoeLayers: t.cpuMoeLayers ?? 0,
-                      }),
-                  }
+                  restartDeps
                 );
                 ui?.pushStatus(`[server] ${out.lines.join("\n")}`);
               } catch (err) {
                 ui?.pushStatus(`[server 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
+              } finally {
+                ui?.setBusy(false);
+              }
+              break;
+            }
+
+            if (arg === "calibrate" || arg === "calibrate confirm") {
+              ui?.setBusy(true);
+              try {
+                // Measure the RUNNING server (not the config): free VRAM with
+                // our own server holding its weights, plus the model's own
+                // header (KV cost, layers, trained context). A prediction
+                // re-derived from itself is still a prediction.
+                const running = {
+                  ...(report.serverArgs ?? {}),
+                  modelPath: report.configuredModel ?? report.serverArgs?.modelPath,
+                };
+                const binPath = report.build?.binPath ?? (config as any)?.llama?.binPath;
+                const measured = await measureCalibration(running, {
+                  llamaDir: typeof binPath === "string" ? dirname(binPath) : undefined,
+                });
+                const res = await runCalibration(
+                  {
+                    report,
+                    running,
+                    measured,
+                    previousTuning: recordedTuning(config),
+                    confirmed: arg === "calibrate confirm",
+                  },
+                  {
+                    rereport: () => reportServer({ config: config as unknown as Record<string, any>, projectRoot }),
+                    restart: (rep, tuning) =>
+                      runServerRestart(
+                        { report: rep, configBin: (config as any)?.llama?.binPath, tuning, confirmed: true },
+                        restartDeps
+                      ),
+                  }
+                );
+                ui?.pushStatus(res.lines.join("\n"));
+              } catch (err) {
+                ui?.pushStatus(`[calibrate 실패] ${summarizeErrorForDisplay((err as any)?.message ?? String(err))}`);
               } finally {
                 ui?.setBusy(false);
               }

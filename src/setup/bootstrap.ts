@@ -943,6 +943,7 @@ export function keepUserOwnedKeys(config: Record<string, any> | undefined): Reco
   if (config.browser !== undefined) kept.browser = config.browser;
   if (config.checkpoint !== undefined) kept.checkpoint = config.checkpoint;
   if (config.enableThinking !== undefined) kept.enableThinking = config.enableThinking;
+  if (config.maxReasoningTokens !== undefined) kept.maxReasoningTokens = config.maxReasoningTokens;
   if (config.repeatPenalty !== undefined) kept.repeatPenalty = config.repeatPenalty;
   if (config.compaction?.autoTriggerRatio !== undefined) {
     kept.compaction = {

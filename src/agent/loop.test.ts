@@ -3383,3 +3383,51 @@ test("maybeCompact skips a back-to-back auto-compaction without real new growth,
     await loop.send("three"); // growth 60-48=12 >= 5 → compacts again
     assert.equal(summaryRequests.length, 2, "real growth arrived — must compact again");
   }));
+
+test("reasoning past the per-turn cap suppresses thinking for the rest of the turn, then resets", () =>
+  withTempProject(async (dir) => {
+    const requests: ChatCompletionRequest[] = [];
+    const statuses: string[] = [];
+    const reasoningBlast = (n: number) => ({ choices: [{ delta: { reasoning_content: "가".repeat(n) }, finish_reason: null }] });
+    const backend: ModelBackend = {
+      async chat(req: ChatCompletionRequest, onDelta?: (c: any) => void): Promise<ChatCompletionResponse> {
+        requests.push(req);
+        if (req.tools && requests.filter((r) => r.tools).length === 1) {
+          // First round: heavy reasoning (past the 64 cap) plus a tool call.
+          for (let i = 0; i < 5; i++) onDelta?.(reasoningBlast(200) as any);
+          return assistantMessage(null, [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }]);
+        }
+        return assistantMessage("done");
+      },
+      async listModels() {
+        return ["fake-model"];
+      },
+    };
+    const loop = new AgentLoop({
+      projectRoot: dir,
+      model: "m",
+      backend,
+      systemPrompt: "sys",
+      thresholds: { autoTriggerRatio: 0.99, contextWindowTokens: 1_000_000 },
+      enableThinking: true,
+      maxReasoningTokens: 64,
+      onStatus: (s) => statuses.push(s),
+    });
+    await loop.send("go");
+    const second = requests.filter((r) => r.tools)[1];
+    assert.ok(second, "expected a second round after the tool call");
+    assert.deepEqual(
+      (second as any).chat_template_kwargs,
+      { enable_thinking: false },
+      "past the cap, the rest of the turn must suppress thinking"
+    );
+    assert.ok(statuses.some((s) => s.startsWith("[think]")), `expected a [think] status, got: ${statuses.join(" | ")}`);
+    // Next turn starts fresh — the previous turn's deliberation must not silence it.
+    await loop.send("again");
+    const third = requests.filter((r) => r.tools)[2];
+    assert.equal(
+      (third as any).chat_template_kwargs,
+      undefined,
+      "a new turn must not inherit the previous turn's suppression"
+    );
+  }));

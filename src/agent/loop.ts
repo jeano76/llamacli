@@ -12,6 +12,7 @@ import {
   DEFAULT_POST_COMPACTION_TARGET_RATIO,
   DEFAULT_MIN_GROWTH_FRACTION,
   DEFAULT_REPEAT_PENALTY,
+  estimateTextTokens,
   splitSystemMessage,
   stripResumePrefix,
   invalidateTokenEstimate,
@@ -20,6 +21,7 @@ import {
 import { clearCheckpoint, writeCheckpoint, readCheckpoint } from "../compaction/checkpoint.js";
 import type { Checkpoint } from "../compaction/checkpoint.js";
 import { stripToolCallTemplateLeak } from "./textSanitize.js";
+import { DEFAULT_MAX_REASONING } from "../shared/reasoning.js";
 import { salvagePartialFileWrite } from "./toolCallSalvage.js";
 import { existsSync } from "node:fs";
 import {
@@ -330,6 +332,13 @@ export interface AgentLoopOptions {
    *  reasoning) emits `reasoning_content` regardless, and it is surfaced either
    *  way — see the onReasoningDelta call site. */
   enableThinking?: boolean;
+  /** Cap on reasoning (`reasoning_content`) tokens per turn. Past it, the
+   *  rest of the turn goes out with thinking disabled (the model must answer
+   *  or call tools instead of deliberating further). From config.yaml's
+   *  `maxReasoningTokens`, clamped once by shared/reasoning.ts. Defaults to
+   *  4096. Reset every turn — a long deliberation in one turn must not
+   *  silence thinking in the next. */
+  maxReasoningTokens?: number;
   /** Per-extension checks run after each file edit (see harness.ts);
    *  false turns them off. From config.yaml's verify.afterEdit. */
   verify?: VerifyConfig;
@@ -495,6 +504,13 @@ export class AgentLoop {
    *  chain, so there's no single `throw` site that would actually reach
    *  the right place. */
   private cancelRequested = false;
+  /** Reasoning tokens seen so far THIS turn (estimateTextTokens). Reset in
+   *  runUntilIdle; past maxReasoningTokens the rest of the turn suppresses
+   *  thinking (see thinkingSuppressedThisTurn). */
+  private reasoningTokensThisTurn = 0;
+  /** Latched when the reasoning budget is spent mid-turn; cleared with the
+   *  counter above. While latched, requests carry enable_thinking:false. */
+  private thinkingSuppressedThisTurn = false;
 
   constructor(private opts: AgentLoopOptions) {
     this.messages = [{ role: "system", content: opts.systemPrompt }];
@@ -828,6 +844,12 @@ export class AgentLoop {
   }
 
   private async runUntilIdle(): Promise<void> {
+    // A new turn gets a fresh reasoning budget: a long deliberation in one
+    // turn must not silence thinking in the next (the web client had exactly
+    // this bug — counters accumulated across turns and every later turn
+    // warned about a budget it never spent).
+    this.reasoningTokensThisTurn = 0;
+    this.thinkingSuppressedThisTurn = false;
     // Defense in depth against the estimate in maybeCompact() ever still
     // being wrong (e.g. a future backend field it doesn't account for):
     // the backend's own hard rejection is ground truth and should trigger
@@ -1027,7 +1049,12 @@ export class AgentLoop {
             // thinking OFF gave 0 reasoning deltas and 362 tool_calls
             // deltas from the identical budget. Everything else in this
             // file's truncation handling is a safety net under this.
-            ...(this.opts.enableThinking ? {} : { chat_template_kwargs: { enable_thinking: false } }),
+            // Suppressed for the rest of the turn once the reasoning budget
+            // is spent (see reasoningTokensThisTurn below): the model must
+            // answer or call tools instead of deliberating further. The
+            // default stays OFF unless explicitly opted in (enableThinking
+            // defaults at the index/config layer, not here).
+            ...(this.opts.enableThinking !== true || this.thinkingSuppressedThisTurn ? { chat_template_kwargs: { enable_thinking: false } } : {}),
           },
           (chunk) => {
             // Defensive: `chunk.choices` isn't guaranteed non-empty/present
@@ -1054,6 +1081,20 @@ export class AgentLoop {
               reasoningRate.chunk();
               const liveReasoning = reasoningRate.live();
               if (liveReasoning !== null) this.opts.onReasoningRate?.(liveReasoning, false);
+              // Per-turn reasoning budget: past the cap the rest of the turn
+              // goes out with thinking disabled, so deliberation can never
+              // starve the tool calls the turn exists to make (the 420-token
+              // incident: thinking on, zero tool_calls, turn over). Counts
+              // every reasoning chunk the server sends, requested or not.
+              this.reasoningTokensThisTurn += estimateTextTokens(reasoning);
+              const cap = this.opts.maxReasoningTokens ?? DEFAULT_MAX_REASONING;
+              if (!this.thinkingSuppressedThisTurn && this.reasoningTokensThisTurn > cap) {
+                this.thinkingSuppressedThisTurn = true;
+                this.opts.onStatus?.(
+                  `[think] 사고 토큰이 상한(${cap.toLocaleString("ko-KR")})을 넘어 이번 턴의 남은 요청은 thinking 없이 갑니다 ` +
+                    `(추정치 ${this.reasoningTokensThisTurn.toLocaleString("ko-KR")} — 다음 턴부터 다시 켜집니다).`
+                );
+              }
             } else if (delta?.content || delta?.tool_calls?.length) {
               // The first non-reasoning chunk after reasoning is the end of thinking.
               finishReasoning();
